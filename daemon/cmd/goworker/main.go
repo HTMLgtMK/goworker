@@ -57,19 +57,23 @@ func (p *PluginB) Stop() error  { log.Printf("PluginB stopped"); return nil }
 
 func main() {
 	engine := core.NewEngine()
+	defer engine.StopAll()
 
 	// 注册中间件
 	engine.Use(core.LoggingMiddleware())
 
 	// 注册插件
 	if err := engine.Register(&PluginA{}); err != nil {
-		log.Fatalf("register: %v", err)
+		log.Printf("register PluginA: %v", err)
+		return
 	}
 	if err := engine.Register(&PluginB{}); err != nil {
-		log.Fatalf("register: %v", err)
+		log.Printf("register PluginB: %v", err)
+		return
 	}
 	if err := engine.Register(&agent.AgentPlugin{}); err != nil {
-		log.Fatalf("register: %v", err)
+		log.Printf("register AgentPlugin: %v", err)
+		return
 	}
 
 	// 内置命令
@@ -87,25 +91,30 @@ func main() {
 
 	// 启动插件
 	if err := engine.StartAll(); err != nil {
-		log.Fatalf("start: %v", err)
+		log.Printf("start plugins: %v", err)
+		return
 	}
 
 	// 发送启动事件
 	engine.Notify(spec.Event{Type: spec.EventPluginStarted, Payload: "system"})
 
-	// 启动前端
+	// 启动前端（goroutine，不阻塞）
 	frontend := stdin.NewStdinFrontend(engine)
-	if err := frontend.Run(); err != nil {
-		log.Fatalf("frontend: %v", err)
-		// 停止插件
-		engine.StopAll()
-	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- frontend.Run()
+	}()
 
-	log.Println("await for shutdown signal...")
-
+	// 等待信号或前端退出
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	<-sigCh
-	log.Println("shutting down...")
+	select {
+	case err := <-errCh:
+		if err != nil {
+			log.Printf("frontend error: %v", err)
+		}
+	case sig := <-sigCh:
+		log.Printf("received signal %v, shutting down...", sig)
+	}
 }
