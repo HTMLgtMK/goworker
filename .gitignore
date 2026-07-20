@@ -1,0 +1,56 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+daemon/goworker
+daemon/goworker.exe
+
+# Test binary
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Env
+.env
+*.local
+
+# Dependencies
+vendor/
+
+# Build artifacts
+/tmp/
+
+# Tooling runtime state
+.omc/
+omc/
+.specify/
+
+# Claude local config (keep CLAUDE.md in repo, skip the rest)
+.claude/settings.local.json
+.claude/skills/
+
+# Editor/IDE
+*.swp
+*.swo
+*~
