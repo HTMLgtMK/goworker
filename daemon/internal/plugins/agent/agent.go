@@ -3,16 +3,28 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/tinguo/goworker/daemon/internal/sandbox"
+	"github.com/tinguo/goworker/daemon/internal/spec"
 )
 
 const maxIterations = 15
+
+var requestIDCounter atomic.Int64
+
+// sandbox action result
+const (
+	sandboxExec  = iota // 执行 tool
+	sandboxSkip         // 跳过此 tool call
+	sandboxAbort        // 退出 goroutine
+)
 
 // Tool 是 Agent 可调用的工具。
 type Tool struct {
@@ -49,19 +61,13 @@ func DefaultTools(cfg *sandbox.Config) []Tool {
 				},
 				"required": []string{"command"},
 			},
+			// NOTE: sandbox 检查不在 tool.Execute 里做，而是在 agent.Run 的 tool call 循环中统一处理。
+			// 这样 sandbox 可以通过 interrupt token + decisions channel 与前端交互。
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
 				cmdStr, _ := args["command"].(string)
 				if cmdStr == "" {
 					return "", fmt.Errorf("bash: empty command")
 				}
-
-				// 沙箱安全检查
-				if cfg != nil {
-					if err := sandbox.Check(cmdStr, cfg); err != nil {
-						return fmt.Sprintf("⛔ %v", err), nil
-					}
-				}
-
 				timeout := 30
 				if t, ok := args["timeout"].(float64); ok {
 					timeout = int(t)
@@ -167,7 +173,7 @@ type Agent struct {
 	provider   Provider
 	tools      []Tool
 	toolMap    map[string]Tool
-	sandboxCfg sandbox.Config // 沙箱配置（仅影响 bash tool）
+	sandboxCfg sandbox.Config
 }
 
 func NewAgent(provider Provider, tools []Tool, cfg sandbox.Config) *Agent {
@@ -183,8 +189,9 @@ func NewAgent(provider Provider, tools []Tool, cfg sandbox.Config) *Agent {
 	}
 }
 
-// Run 执行 Agent 循环，返回 Token 流。调用者必须 drain 到 channel 关闭。
-func (a *Agent) Run(ctx context.Context, history []Message, input string) (<-chan Token, error) {
+// Run 执行 Agent 循环，返回 Token 流。
+// decisions 是前端注入的 channel，用于 HITL 确认决策。调用者必须 drain 到 channel 关闭。
+func (a *Agent) Run(ctx context.Context, history []Message, input string, decisions <-chan spec.HITLDecision) (<-chan Token, error) {
 	messages := a.buildMessages(history, input)
 
 	ch := make(chan Token)
@@ -225,6 +232,7 @@ func (a *Agent) Run(ctx context.Context, history []Message, input string) (<-cha
 				if tc.Type != "function" {
 					continue
 				}
+
 				tool, ok := a.toolMap[tc.Function.Name]
 				if !ok {
 					messages = append(messages, Message{
@@ -239,6 +247,17 @@ func (a *Agent) Run(ctx context.Context, history []Message, input string) (<-cha
 						Role: "tool", Content: fmt.Sprintf("invalid args: %v", err), ToolCallID: tc.ID,
 					})
 					continue
+				}
+
+				// HITL 沙箱检查（仅对 bash 工具执行）
+				if tool.Name == "bash" {
+					switch a.handleSandbox(ctx, ch, decisions, &tc, args, &messages) {
+					case sandboxSkip:
+						continue
+					case sandboxAbort:
+						return
+					}
+					// sandboxExec: fall through
 				}
 
 				callStr := fmt.Sprintf("\n● %s(%s)", tool.Name, tc.Function.Arguments)
@@ -272,6 +291,116 @@ func (a *Agent) Run(ctx context.Context, history []Message, input string) (<-cha
 	}()
 
 	return ch, nil
+}
+
+// handleSandbox 对 bash 命令执行沙箱检查并处理 HITL 确认交互。
+// 返回 sandboxExec / sandboxSkip / sandboxAbort。
+func (a *Agent) handleSandbox(
+	ctx context.Context,
+	ch chan<- Token,
+	decisions <-chan spec.HITLDecision,
+	tc *ToolCall,
+	args map[string]any,
+	messages *[]Message,
+) int {
+	cmdStr, _ := args["command"].(string)
+	if cmdStr == "" {
+		return sandboxExec
+	}
+
+	err := sandbox.Check(cmdStr, &a.sandboxCfg)
+	if err == nil {
+		return sandboxExec // 放行
+	}
+
+	// Denylist / Strict / ReadOnly 模式拒绝
+	var needsConf *sandbox.NeedsConfirmationError
+	if !errors.As(err, &needsConf) {
+		sendToken(ctx, ch, Token{Type: TokenTypeToolCall, Content: fmt.Sprintf("\n⛔ %v", err)})
+		*messages = append(*messages, Message{
+			Role: "tool", Content: "⛔ " + err.Error(), ToolCallID: tc.ID,
+		})
+		return sandboxSkip
+	}
+
+	// ---- Normal 模式：触发 HITL interrupt ----
+
+	req := &spec.InterruptRequest{
+		ID:         fmt.Sprintf("req-%d", requestIDCounter.Add(1)),
+		ToolName:   "bash",
+		Command:    cmdStr,
+		RiskReason: needsConf.Pattern,
+		CreatedAt:  time.Now(),
+		ExpiresAt:  time.Now().Add(30 * time.Second),
+	}
+
+	// 发送 interrupt token
+	sendToken(ctx, ch, Token{Type: TokenTypeInterrupt, Interrupt: req})
+
+	// 等待决策（阻塞 agent goroutine）
+	timeout := time.NewTimer(30 * time.Second)
+	defer timeout.Stop()
+
+	select {
+	case <-ctx.Done():
+		return sandboxAbort
+	case <-timeout.C:
+		sendToken(ctx, ch, Token{Type: TokenTypeText, Content: "\n⏰ confirmation timed out\n"})
+		*messages = append(*messages, Message{
+			Role: "tool", Content: "⏰ confirmation timed out", ToolCallID: tc.ID,
+		})
+		return sandboxSkip
+	case d, ok := <-decisions:
+		if !ok {
+			return sandboxAbort
+		}
+		return a.applyDecision(ctx, d, ch, tc, args, messages, cmdStr)
+	}
+}
+
+// applyDecision 根据用户决策处理后续动作。
+func (a *Agent) applyDecision(
+	ctx context.Context,
+	d spec.HITLDecision,
+	ch chan<- Token,
+	tc *ToolCall,
+	args map[string]any,
+	messages *[]Message,
+	originalCmd string,
+) int {
+	switch d.Type {
+	case spec.DecisionApprove:
+		return sandboxExec
+
+	case spec.DecisionEdit:
+		edited := strings.TrimSpace(d.Command)
+		if edited == "" {
+			edited = originalCmd
+		}
+		args["command"] = edited
+		return sandboxExec
+
+	case spec.DecisionReject:
+		sendToken(ctx, ch, Token{Type: TokenTypeToolResult, Content: "\n  ⎿  ⛔ rejected by user"})
+		*messages = append(*messages, Message{
+			Role: "tool", Content: "⛔ rejected by user", ToolCallID: tc.ID,
+		})
+		return sandboxSkip
+
+	case spec.DecisionRespond:
+		msg := strings.TrimSpace(d.Message)
+		if msg == "" {
+			msg = "user declined to answer"
+		}
+		sendToken(ctx, ch, Token{Type: TokenTypeToolResult, Content: "\n  ⎿  💬 " + msg})
+		*messages = append(*messages, Message{
+			Role: "user", Content: msg,
+		})
+		return sandboxSkip
+
+	default:
+		return sandboxExec
+	}
 }
 
 func (a *Agent) buildMessages(history []Message, input string) []Message {

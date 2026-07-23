@@ -3,14 +3,11 @@ package agent
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/tinguo/goworker/daemon/internal/sandbox"
@@ -35,9 +32,6 @@ var defaults = map[string]string{
 type AgentPlugin struct {
 	hub    *spec.Hub
 	config map[string]string // in-memory config, overrides env
-
-	mu        sync.Mutex
-	approved  map[string]bool // command hash -> 用户已批准的缓存
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }
@@ -45,7 +39,6 @@ func (p *AgentPlugin) Name() string { return "agent" }
 func (p *AgentPlugin) Init(h *spec.Hub) error {
 	p.hub = h
 	p.config = loadEnvFile()
-	p.approved = make(map[string]bool)
 
 	h.RegisterCommand(spec.Command{
 		Name:        "/agent",
@@ -148,20 +141,23 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 		return nil
 	}
 
-	// 构建沙箱配置
+	// 构建沙箱配置（不含 ConfirmationFn——沙箱现在通过 interrupt token + decisions channel 交互）
 	sandboxCfg := p.sandboxConfig()
 
 	// 收集工具
 	tools := p.collectTools(&sandboxCfg)
 
-	// 创建 Provider
+	// 创建 Provider 和 Agent
 	provider := NewOpenAIProvider(p.get(cfgEndpoint), p.get(cfgAPIKey), p.get(cfgModel))
 	agent := NewAgent(provider, tools, sandboxCfg)
 
 	agentCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	tokenCh, err := agent.Run(agentCtx, nil, input)
+	// decisions channel 用于 HITL 确认决策
+	decisions := make(chan spec.HITLDecision, 1)
+
+	tokenCh, err := agent.Run(agentCtx, nil, input, decisions)
 	if err != nil {
 		ctx.Writer(fmt.Sprintf("✘ %v\n", err))
 		return nil
@@ -171,11 +167,74 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 		if tok.Done {
 			break
 		}
+		if tok.Type == TokenTypeInterrupt && tok.Interrupt != nil {
+			decision := p.promptForDecision(ctx, tok.Interrupt)
+			select {
+			case decisions <- decision:
+			case <-agentCtx.Done():
+			}
+			continue
+		}
 		ctx.Writer(tok.Content)
 	}
 	ctx.Writer("\n")
 
 	return nil
+}
+
+// promptForDecision 使用前端的 I/O 展示审批选项并获取用户决策。
+func (p *AgentPlugin) promptForDecision(ctx *spec.Context, req *spec.InterruptRequest) spec.HITLDecision {
+	ctx.Writer(fmt.Sprintf("\n⚠️  Risky %s: %s\n", req.ToolName, req.Command))
+	ctx.Writer(fmt.Sprintf("  Reason: %s\n", req.RiskReason))
+	ctx.Writer("[a]pprove, [e]dit, [r]eject, res[p]ond [a]: ")
+
+	if ctx.ReadLine == nil {
+		return spec.HITLDecision{
+			InterruptID: req.ID,
+			Type:        spec.DecisionReject,
+		}
+	}
+
+	line, err := ctx.ReadLine()
+	if err != nil {
+		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}
+	}
+	line = strings.TrimSpace(line)
+
+	switch {
+	case line == "" || line == "a" || line == "approve":
+		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionApprove}
+
+	case line == "r" || line == "reject":
+		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}
+
+	case line == "e" || line == "edit":
+		ctx.Writer("  New command: ")
+		edited, err := ctx.ReadLine()
+		if err != nil {
+			return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}
+		}
+		return spec.HITLDecision{
+			InterruptID: req.ID,
+			Type:        spec.DecisionEdit,
+			Command:     strings.TrimSpace(edited),
+		}
+
+	case line == "p" || line == "respond":
+		ctx.Writer("  Your instruction: ")
+		msg, err := ctx.ReadLine()
+		if err != nil {
+			return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}
+		}
+		return spec.HITLDecision{
+			InterruptID: req.ID,
+			Type:        spec.DecisionRespond,
+			Message:     strings.TrimSpace(msg),
+		}
+
+	default:
+		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}
+	}
 }
 
 func (p *AgentPlugin) sandboxConfig() sandbox.Config {
@@ -187,43 +246,11 @@ func (p *AgentPlugin) sandboxConfig() sandbox.Config {
 		RiskyPatterns:  sandbox.MustCompile(sandbox.DefaultRiskyPatterns),
 	}
 
-	// 获取工作目录
 	if wd, err := os.Getwd(); err == nil {
 		cfg.AllowedWorkDir = wd
 	}
 
-	// normal 模式下注入确认回调
-	if mode == sandbox.ModeNormal {
-		cfg.ConfirmationFn = p.confirmCommand
-	}
-
 	return cfg
-}
-
-// confirmCommand 提示用户确认高风险命令，返回 true 表示放行。
-func (p *AgentPlugin) confirmCommand(cmd string) bool {
-	p.mu.Lock()
-	// 检查缓存
-	h := sha256.Sum256([]byte(cmd))
-	key := hex.EncodeToString(h[:])
-	if p.approved[key] {
-		p.mu.Unlock()
-		return true
-	}
-	p.mu.Unlock()
-
-	fmt.Fprintf(os.Stderr, "\n⚠️  高风险命令，确认执行？[y/N] %s\n> ", cmd)
-	reader := bufio.NewReader(os.Stdin)
-	line, _ := reader.ReadString('\n')
-	line = strings.TrimSpace(line)
-
-	if line == "y" || line == "Y" || line == "yes" {
-		p.mu.Lock()
-		p.approved[key] = true
-		p.mu.Unlock()
-		return true
-	}
-	return false
 }
 
 func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []Tool {
@@ -238,7 +265,7 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []Tool {
 			Parameters:  parseSchema(tool.Schema),
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
 				var buf strings.Builder
-				err := p.hub.Eval(spec.NewContext(func(s string) { buf.WriteString(s) }, nil), "/"+tool.Name)
+				err := p.hub.Eval(spec.NewContext(func(s string) { buf.WriteString(s) }, nil, nil), "/"+tool.Name)
 				if err != nil {
 					return buf.String(), err
 				}

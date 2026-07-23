@@ -1,5 +1,9 @@
 package agent
 
+import (
+	"github.com/tinguo/goworker/daemon/internal/spec"
+)
+
 // Message 是聊天会话中的单条消息。
 type Message struct {
 	Role       string     `json:"role"`
@@ -73,13 +77,15 @@ type Delta struct {
 
 // Token 流式输出中的一个 token。
 type Token struct {
-	Type    string // "text" / "tool_call" / "tool_result"
-	Content string
-	Done    bool
+	Type      string                  // "text" / "tool_call" / "tool_result" / "interrupt"
+	Content   string
+	Done      bool
+	Interrupt *spec.InterruptRequest  // Type == "interrupt" 时填充
 }
 
 const (
 	TokenTypeText       = "text"
 	TokenTypeToolCall   = "tool_call"
 	TokenTypeToolResult = "tool_result"
+	TokenTypeInterrupt  = "interrupt"
 )

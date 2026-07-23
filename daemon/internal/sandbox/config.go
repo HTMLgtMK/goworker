@@ -10,7 +10,7 @@ import (
 type Mode string
 
 const (
-	ModeNormal   Mode = "normal"   // 默认：risky 命令需要确认
+	ModeNormal   Mode = "normal"   // 默认：risky 命令需要 agent 向用户请求确认
 	ModeStrict   Mode = "strict"   // 拒绝所有 risky 命令
 	ModeReadOnly Mode = "readonly" // 只读模式，拒绝所有写操作
 	ModeOff      Mode = "off"      // 关闭沙箱（不推荐）
@@ -18,19 +18,30 @@ const (
 
 // Config 沙箱配置。
 type Config struct {
-	DeniedPatterns  []*regexp.Regexp // 拒绝执行的命令匹配
-	RiskyPatterns   []*regexp.Regexp // 需要用户确认的匹配
-	AllowedWorkDir  string           // 限制工作目录，空 = 不限制
-	AllowList       []*regexp.Regexp // 非空时只允许匹配的命令
-	ReadOnly        bool             // 只读模式
-	MaxOutputBytes  int              // 最大输出字节数，0=不限制
-	ConfirmationFn  func(cmd string) bool // 确认回调，返回 true=放行
-	Mode            Mode             // 沙箱模式
+	DeniedPatterns []*regexp.Regexp // 拒绝执行的命令匹配
+	RiskyPatterns  []*regexp.Regexp // 需要用户确认的匹配
+	AllowedWorkDir string           // 限制工作目录，空 = 不限制
+	AllowList      []*regexp.Regexp // 非空时只允许匹配的命令
+	ReadOnly       bool             // 只读模式
+	MaxOutputBytes int              // 最大输出字节数，0=不限制
+	Mode           Mode             // 沙箱模式
+}
+
+// NeedsConfirmationError 由 Check 返回，表示命令匹配风险模式，调用方应请求用户确认。
+// 这是 HITL (Human-in-the-Loop) 的触发信号，不是拒绝。
+type NeedsConfirmationError struct {
+	Command string // 触发检查的命令
+	Pattern string // 匹配的正则模式
+}
+
+func (e *NeedsConfirmationError) Error() string {
+	return fmt.Sprintf("risky command matching %q", e.Pattern)
 }
 
 // Check 检查命令 cmd 是否符合沙箱规则。
 //   - 返回 nil 表示放行
-//   - 返回 error 表示被拒绝（含拒绝原因）
+//   - 返回 *NeedsConfirmationError 表示需要用户确认
+//   - 返回其他 error 表示被拒绝
 func Check(cmd string, cfg *Config) error {
 	if cfg == nil {
 		return nil
@@ -67,20 +78,17 @@ func Check(cmd string, cfg *Config) error {
 		}
 	}
 
-	// Risk 检测 + 确认
+	// Risk 检测
 	if cfg.Mode == ModeStrict {
 		for _, p := range cfg.RiskyPatterns {
 			if p.MatchString(cmd) {
 				return fmt.Errorf("sandbox: risky command denied in strict mode")
 			}
 		}
-	} else if cfg.Mode == ModeNormal && cfg.ConfirmationFn != nil {
+	} else if cfg.Mode == ModeNormal {
 		for _, p := range cfg.RiskyPatterns {
 			if p.MatchString(cmd) {
-				if !cfg.ConfirmationFn(cmd) {
-					return fmt.Errorf("sandbox: command rejected by user")
-				}
-				break // 只确认一次
+				return &NeedsConfirmationError{Command: cmd, Pattern: p.String()}
 			}
 		}
 	}

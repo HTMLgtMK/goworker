@@ -85,10 +85,11 @@ type Event struct {
 // Context 是命令执行的上下文。
 // 由前端创建，经 Engine 传入命令 Handler。
 type Context struct {
-	Args    []string       // 命令参数，由 Engine.Eval 解析填入
-	Writer  func(string)   // 输出回调，由前端注入
-	Session Session        // 用户会话，由前端/中间件注入
-	Values  map[string]any // 扩展数据，中间件间传递
+	Args    []string              // 命令参数，由 Engine.Eval 解析填入
+	Writer  func(string)          // 输出回调，由前端注入
+	ReadLine func() (string, error) // 输入回调，由前端注入（nil 表示不支持交互式输入）
+	Session Session               // 用户会话，由前端/中间件注入
+	Values  map[string]any        // 扩展数据，中间件间传递
 }
 
 // Session 是只读的用户会话信息。
