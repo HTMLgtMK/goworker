@@ -30,8 +30,9 @@ var defaults = map[string]string{
 }
 
 type AgentPlugin struct {
-	hub    *spec.Hub
-	config map[string]string // in-memory config, overrides env
+	hub          *spec.Hub
+	config       map[string]string // in-memory config, overrides env
+	conversation []Message         // 跨 /agent 调用的对话历史
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }
@@ -141,7 +142,7 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 		return nil
 	}
 
-	// 构建沙箱配置（不含 ConfirmationFn——沙箱现在通过 interrupt token + decisions channel 交互）
+	// 构建沙箱配置
 	sandboxCfg := p.sandboxConfig()
 
 	// 收集工具
@@ -157,7 +158,7 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 	// decisions channel 用于 HITL 确认决策
 	decisions := make(chan spec.HITLDecision, 1)
 
-	tokenCh, err := agent.Run(agentCtx, nil, input, decisions)
+	tokenCh, msgCh, err := agent.Run(agentCtx, p.conversation, input, decisions)
 	if err != nil {
 		ctx.Writer(fmt.Sprintf("✘ %v\n", err))
 		return nil
@@ -178,6 +179,12 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 		ctx.Writer(tok.Content)
 	}
 	ctx.Writer("\n")
+
+	// 保存对话历史（剔除首条 system prompt）
+	messages := <-msgCh
+	if len(messages) > 1 {
+		p.conversation = messages[1:]
+	}
 
 	return nil
 }

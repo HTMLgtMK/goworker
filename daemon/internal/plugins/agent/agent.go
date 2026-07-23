@@ -189,14 +189,17 @@ func NewAgent(provider Provider, tools []Tool, cfg sandbox.Config) *Agent {
 	}
 }
 
-// Run 执行 Agent 循环，返回 Token 流。
-// decisions 是前端注入的 channel，用于 HITL 确认决策。调用者必须 drain 到 channel 关闭。
-func (a *Agent) Run(ctx context.Context, history []Message, input string, decisions <-chan spec.HITLDecision) (<-chan Token, error) {
+// Run 执行 Agent 循环，返回 Token 流和最终消息历史。
+// decisions 用于 HITL 确认决策。调用者必须 drain 到 tokenCh 关闭，然后读取 <-msgCh。
+func (a *Agent) Run(ctx context.Context, history []Message, input string, decisions <-chan spec.HITLDecision) (<-chan Token, <-chan []Message, error) {
 	messages := a.buildMessages(history, input)
 
 	ch := make(chan Token)
+	msgCh := make(chan []Message, 1)
+
 	go func() {
 		defer close(ch)
+		defer func() { msgCh <- messages }()
 
 		for iter := 0; iter < maxIterations; iter++ {
 			req := &ChatRequest{
@@ -290,7 +293,7 @@ func (a *Agent) Run(ctx context.Context, history []Message, input string, decisi
 		sendToken(ctx, ch, Token{Type: TokenTypeText, Done: true})
 	}()
 
-	return ch, nil
+	return ch, msgCh, nil
 }
 
 // handleSandbox 对 bash 命令执行沙箱检查并处理 HITL 确认交互。
