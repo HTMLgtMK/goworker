@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/tinguo/goworker/daemon/internal/sandbox"
 )
 
 const maxIterations = 15
@@ -33,7 +35,8 @@ func (t Tool) ToolSpec() map[string]any {
 }
 
 // DefaultTools 返回 Agent 的默认工具集。
-func DefaultTools() []Tool {
+// cfg 为沙箱配置，nil 表示不启用沙箱。
+func DefaultTools(cfg *sandbox.Config) []Tool {
 	return []Tool{
 		{
 			Name:        "bash",
@@ -51,6 +54,14 @@ func DefaultTools() []Tool {
 				if cmdStr == "" {
 					return "", fmt.Errorf("bash: empty command")
 				}
+
+				// 沙箱安全检查
+				if cfg != nil {
+					if err := sandbox.Check(cmdStr, cfg); err != nil {
+						return fmt.Sprintf("⛔ %v", err), nil
+					}
+				}
+
 				timeout := 30
 				if t, ok := args["timeout"].(float64); ok {
 					timeout = int(t)
@@ -58,6 +69,9 @@ func DefaultTools() []Tool {
 				ctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 				defer cancel()
 				cmd := exec.CommandContext(ctx, "bash", "-c", cmdStr)
+				if cfg != nil && cfg.AllowedWorkDir != "" {
+					cmd.Dir = cfg.AllowedWorkDir
+				}
 				out, err := cmd.CombinedOutput()
 				output := string(out)
 				if err != nil {
@@ -150,20 +164,22 @@ func DefaultTools() []Tool {
 
 // Agent 是一个可使用工具的 ReAct Agent。
 type Agent struct {
-	provider Provider
-	tools    []Tool
-	toolMap  map[string]Tool
+	provider   Provider
+	tools      []Tool
+	toolMap    map[string]Tool
+	sandboxCfg sandbox.Config // 沙箱配置（仅影响 bash tool）
 }
 
-func NewAgent(provider Provider, tools []Tool) *Agent {
+func NewAgent(provider Provider, tools []Tool, cfg sandbox.Config) *Agent {
 	tm := make(map[string]Tool, len(tools))
 	for _, t := range tools {
 		tm[t.Name] = t
 	}
 	return &Agent{
-		provider: provider,
-		tools:    tools,
-		toolMap:  tm,
+		provider:   provider,
+		tools:      tools,
+		toolMap:    tm,
+		sandboxCfg: cfg,
 	}
 }
 

@@ -7,7 +7,7 @@
 ## P0 — 核心 Bug & 安全
 
 - [x] **修复优雅关闭** — frontend 去除信号监听，main 接管生命周期，`defer StopAll` 覆盖所有退出路径
-- [ ] **bash 工具沙箱** — `agent.go` 的 bash tool 裸调 `bash -c`，LLM 给的 command 没有白名单/黑名单/路径限制/权限降级
+- [x] **bash 工具沙箱** — 三层安全模型：denylist 拦截、risk 检测弹确认、workdir 限制。支持 normal/strict/readonly/off 模式
 - [ ] **Context 传递断裂** — `plugin.go:144` 用 `context.Background()` 而不是继承请求链，超时传播链断了
 - [ ] **配置写入非原子** — `saveEnvFile()` 直接覆写文件，写入中途 crash 会丢数据或留下残缺文件
 
