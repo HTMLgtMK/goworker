@@ -17,29 +17,29 @@ import (
 //   - 中间件链
 //   - 事件广播
 type Engine struct {
-	plugins     map[string]spec.Plugin
-	commands    map[string]spec.Command
-	tools       map[string]spec.Tool
-	middlewares []spec.Middleware
-	listeners   []func(spec.Event)
+	plugins      map[string]spec.Plugin
+	commands     map[string]spec.Command
+	tools        map[string]spec.Tool
+	interceptors []spec.PluginInterceptor
+	listeners    []func(spec.Event)
 }
 
 // NewEngine 创建一个空引擎。
 func NewEngine() *Engine {
 	return &Engine{
-		plugins:     make(map[string]spec.Plugin),
-		commands:    make(map[string]spec.Command),
-		tools:       make(map[string]spec.Tool),
-		middlewares: make([]spec.Middleware, 0),
-		listeners:   make([]func(spec.Event), 0),
+		plugins:      make(map[string]spec.Plugin),
+		commands:     make(map[string]spec.Command),
+		tools:        make(map[string]spec.Tool),
+		interceptors: make([]spec.PluginInterceptor, 0),
+		listeners:    make([]func(spec.Event), 0),
 	}
 }
 
 // ---- Middleware ----
 
 // Use 注册一个中间件，按注册顺序依次执行。
-func (e *Engine) Use(mw spec.Middleware) {
-	e.middlewares = append(e.middlewares, mw)
+func (e *Engine) Use(interceptor spec.PluginInterceptor) {
+	e.interceptors = append(e.interceptors, interceptor)
 }
 
 // ---- Plugin ----
@@ -177,8 +177,8 @@ func (e *Engine) Eval(ctx *spec.Context, input string) error {
 
 	ctx.Args = parts[1:]
 
-	// 洋葱模型：从最后一个 middleware 开始往前层层包裹。
-	// 执行时从最外层往里剥，每个 middleware 调 next() 进入下一层，
+	// 洋葱模型：从最后一个 interceptor 开始往前层层包裹。
+	// 执行时从最外层往里剥，每个 interceptor 调 next() 进入下一层，
 	// next() 返回后执行收尾逻辑（剥洋葱）。
 	//
 	// 注册 [A, B, C] → 构建 [A → B → C → handler]
@@ -188,16 +188,16 @@ func (e *Engine) Eval(ctx *spec.Context, input string) error {
 	// 最内层：curry 住 ctx，把 Handler 转换成 func() error
 	next = func() error { return cmd.Handler(ctx) }
 
-	for i := len(e.middlewares) - 1; i >= 0; i-- {
-		mw := e.middlewares[i]
+	for i := len(e.interceptors) - 1; i >= 0; i-- {
+		interceptor := e.interceptors[i]
 		// 用中间变量固定住 "当前 next"，防止闭包捕获循环变量
 		handler := next
 		next = func() error {
-			return mw(ctx, handler)
+			return interceptor(ctx, handler)
 		}
 	}
 
-	// 从最外层 middleware 开始执行
+	// 从最外层 interceptor 开始执行
 	return next()
 }
 

@@ -33,14 +33,14 @@ type EventAwarePlugin interface {
 // Hub 是插件注册、事件广播的抽象接口。
 // 具体实现由 core.Engine 完成，插件在 Init 时通过 *Hub 注册命令。
 type Hub struct {
-	RegisterCommand   func(cmd Command) error
-	RegisterTool      func(tool Tool) error
-	AddEventListener  func(fn func(Event))
-	Plugin            func(name string) Plugin
-	Plugins           func() []string
-	Tools             func() []Tool
-	Notify            func(event Event)
-	Eval              func(ctx *Context, input string) error
+	RegisterCommand  func(cmd Command) error
+	RegisterTool     func(tool Tool) error
+	AddEventListener func(fn func(Event))
+	Plugin           func(name string) Plugin
+	Plugins          func() []string
+	Tools            func() []Tool
+	Notify           func(event Event)
+	Eval             func(ctx *Context, input string) error
 }
 
 // ---- 命令 ----
@@ -85,11 +85,11 @@ type Event struct {
 // Context 是命令执行的上下文。
 // 由前端创建，经 Engine 传入命令 Handler。
 type Context struct {
-	Args    []string              // 命令参数，由 Engine.Eval 解析填入
-	Writer  func(string)          // 输出回调，由前端注入
+	Args     []string               // 命令参数，由 Engine.Eval 解析填入
+	Writer   func(string)           // 输出回调，由前端注入
 	ReadLine func() (string, error) // 输入回调，由前端注入（nil 表示不支持交互式输入）
-	Session Session               // 用户会话，由前端/中间件注入
-	Values  map[string]any        // 扩展数据，中间件间传递
+	Session  Session                // 用户会话，由前端/中间件注入
+	Values   map[string]any         // 扩展数据，中间件间传递
 }
 
 // Session 是只读的用户会话信息。
@@ -103,11 +103,11 @@ func (s Session) IsValid() bool {
 	return s.UserID != ""
 }
 
-// ---- 中间件 ----
+// ---- 拦截器 ----
 
-// Middleware 是命令执行拦截器。
+// PluginInterceptor 是命令执行拦截器。
 // 可以读取/修改 Context，或提前返回错误中断执行。
-type Middleware func(ctx *Context, next func() error) error
+type PluginInterceptor func(ctx *Context, next func() error) error
 
 // SessionProvider 根据凭证还原 Session。
 type SessionProvider interface {

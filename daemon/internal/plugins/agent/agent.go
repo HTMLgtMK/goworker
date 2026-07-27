@@ -3,53 +3,22 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
-	"sync/atomic"
 	"time"
 
+	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
 	"github.com/tinguo/goworker/daemon/internal/sandbox"
-	"github.com/tinguo/goworker/daemon/internal/spec"
 )
 
 const maxIterations = 15
 
-var requestIDCounter atomic.Int64
-
-// sandbox action result
-const (
-	sandboxExec  = iota // 执行 tool
-	sandboxSkip         // 跳过此 tool call
-	sandboxAbort        // 退出 goroutine
-)
-
-// Tool 是 Agent 可调用的工具。
-type Tool struct {
-	Name        string
-	Description string
-	Parameters  map[string]any // JSON Schema
-	Execute     func(ctx context.Context, args map[string]any) (string, error)
-}
-
-// ToolSpec 返回 OpenAI 兼容的工具定义。
-func (t Tool) ToolSpec() map[string]any {
-	return map[string]any{
-		"type": "function",
-		"function": map[string]any{
-			"name":        t.Name,
-			"description": t.Description,
-			"parameters":  t.Parameters,
-		},
-	}
-}
-
 // DefaultTools 返回 Agent 的默认工具集。
 // cfg 为沙箱配置，nil 表示不启用沙箱。
-func DefaultTools(cfg *sandbox.Config) []Tool {
-	return []Tool{
+func DefaultTools(cfg *sandbox.Config) []core.Tool {
+	return []core.Tool{
 		{
 			Name:        "bash",
 			Description: "Execute a shell command. Returns stdout + stderr.",
@@ -170,47 +139,59 @@ func DefaultTools(cfg *sandbox.Config) []Tool {
 
 // Agent 是一个可使用工具的 ReAct Agent。
 type Agent struct {
-	provider   Provider
-	tools      []Tool
-	toolMap    map[string]Tool
-	sandboxCfg sandbox.Config
+	provider    core.Provider
+	tools       []core.Tool
+	toolMap     map[string]core.Tool
+	middlewares []core.Middleware
 }
 
-func NewAgent(provider Provider, tools []Tool, cfg sandbox.Config) *Agent {
-	tm := make(map[string]Tool, len(tools))
+func NewAgent(provider core.Provider, tools []core.Tool, mws []core.Middleware) *Agent {
+	tm := make(map[string]core.Tool, len(tools))
 	for _, t := range tools {
 		tm[t.Name] = t
 	}
 	return &Agent{
-		provider:   provider,
-		tools:      tools,
-		toolMap:    tm,
-		sandboxCfg: cfg,
+		provider:    provider,
+		tools:       tools,
+		toolMap:     tm,
+		middlewares: mws,
 	}
 }
 
 // Run 执行 Agent 循环，返回 Token 流和最终消息历史。
-// decisions 用于 HITL 确认决策。调用者必须 drain 到 tokenCh 关闭，然后读取 <-msgCh。
-func (a *Agent) Run(ctx context.Context, history []Message, input string, decisions <-chan spec.HITLDecision) (<-chan Token, <-chan []Message, error) {
+// 调用者必须 drain 到 tokenCh 关闭，然后读取 <-msgCh。
+// HITL 决策通过 middleware 的 DecisionProvider 处理，不在 Run 参数中传递。
+func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (<-chan core.Token, <-chan []core.Message, error) {
+	a.fireMiddlewareEvent(&core.BeforeAgentEvent{Ctx: ctx, Input: input})
 	messages := a.buildMessages(history, input)
 
-	ch := make(chan Token)
-	msgCh := make(chan []Message, 1)
+	ch := make(chan core.Token)
+	msgCh := make(chan []core.Message, 1)
 
 	go func() {
+		var runErr error
 		defer close(ch)
-		defer func() { msgCh <- messages }()
+		defer func() {
+			a.fireMiddlewareEvent(&core.AfterAgentEvent{Ctx: ctx, History: messages, Err: runErr})
+			msgCh <- messages
+		}()
 
 		for iter := 0; iter < maxIterations; iter++ {
-			req := &ChatRequest{
+			req := &core.ChatRequest{
 				Model:    a.provider.Model(),
 				Messages: messages,
 				Tools:    toolSpecs(a.tools),
 			}
 
+			a.fireMiddlewareEvent(&core.BeforeModelEvent{Ctx: ctx, History: messages, Input: input})
+
 			resp, err := a.provider.Chat(ctx, req)
+
+			a.fireMiddlewareEvent(&core.AfterModelEvent{Ctx: ctx, History: messages, Err: err})
+
 			if err != nil {
-				sendToken(ctx, ch, Token{Type: TokenTypeText, Content: fmt.Sprintf("\n✘ agent error: %v", err), Done: true})
+				runErr = err
+				sendToken(ctx, ch, core.Token{Type: core.TokenTypeText, Content: fmt.Sprintf("\n✘ agent error: %v", err), Done: true})
 				return
 			}
 			if len(resp.Choices) == 0 {
@@ -223,7 +204,7 @@ func (a *Agent) Run(ctx context.Context, history []Message, input string, decisi
 
 			// stream text
 			if msg.Content != "" {
-				sendToken(ctx, ch, Token{Type: TokenTypeText, Content: msg.Content})
+				sendToken(ctx, ch, core.Token{Type: core.TokenTypeText, Content: msg.Content})
 			}
 
 			// process tool calls
@@ -238,7 +219,7 @@ func (a *Agent) Run(ctx context.Context, history []Message, input string, decisi
 
 				tool, ok := a.toolMap[tc.Function.Name]
 				if !ok {
-					messages = append(messages, Message{
+					messages = append(messages, core.Message{
 						Role: "tool", Content: fmt.Sprintf("unknown tool: %s", tc.Function.Name), ToolCallID: tc.ID,
 					})
 					continue
@@ -246,32 +227,37 @@ func (a *Agent) Run(ctx context.Context, history []Message, input string, decisi
 
 				var args map[string]any
 				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-					messages = append(messages, Message{
+					messages = append(messages, core.Message{
 						Role: "tool", Content: fmt.Sprintf("invalid args: %v", err), ToolCallID: tc.ID,
 					})
 					continue
 				}
 
-				// HITL 沙箱检查（仅对 bash 工具执行）
-				if tool.Name == "bash" {
-					switch a.handleSandbox(ctx, ch, decisions, &tc, args, &messages) {
-					case sandboxSkip:
-						continue
-					case sandboxAbort:
-						return
-					}
-					// sandboxExec: fall through
+				// BeforeTool — middleware 可修改 args 或设置 Aborted
+				btEv := &core.BeforeToolEvent{
+					Ctx: ctx, History: messages, Tool: &tc,
+					TokenCh: ch,
+					Args:    args,
+				}
+				a.fireMiddlewareEvent(btEv)
+				if btEv.Aborted {
+					messages = append(messages, btEv.ResponseMessages...)
+					continue
 				}
 
 				callStr := fmt.Sprintf("\n● %s(%s)", tool.Name, tc.Function.Arguments)
-				sendToken(ctx, ch, Token{Type: TokenTypeToolCall, Content: callStr})
+				sendToken(ctx, ch, core.Token{Type: core.TokenTypeToolCall, Content: callStr})
 
 				toolCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-				result, err := tool.Execute(toolCtx, args)
+				result, execErr := tool.Execute(toolCtx, args)
 				cancel()
-				if err != nil {
-					result = fmt.Sprintf("error: %v", err)
+				if execErr != nil {
+					result = fmt.Sprintf("error: %v", execErr)
 				}
+
+				a.fireMiddlewareEvent(&core.AfterToolEvent{
+					Ctx: ctx, History: messages, Tool: &tc, Err: execErr,
+				})
 
 				resultPreview := result
 				lines := strings.Split(result, "\n")
@@ -282,139 +268,62 @@ func (a *Agent) Run(ctx context.Context, history []Message, input string, decisi
 					resultPreview = resultPreview[:500] + "..."
 				}
 				resultStr := fmt.Sprintf("\n  ⎿  %s", strings.ReplaceAll(resultPreview, "\n", "\n  ⎿  "))
-				sendToken(ctx, ch, Token{Type: TokenTypeToolResult, Content: resultStr})
+				sendToken(ctx, ch, core.Token{Type: core.TokenTypeToolResult, Content: resultStr})
 
-				messages = append(messages, Message{
+				messages = append(messages, core.Message{
 					Role: "tool", Content: result, ToolCallID: tc.ID,
 				})
 			}
 		}
 
-		sendToken(ctx, ch, Token{Type: TokenTypeText, Done: true})
+		sendToken(ctx, ch, core.Token{Type: core.TokenTypeText, Done: true})
 	}()
 
 	return ch, msgCh, nil
 }
 
-// handleSandbox 对 bash 命令执行沙箱检查并处理 HITL 确认交互。
-// 返回 sandboxExec / sandboxSkip / sandboxAbort。
-func (a *Agent) handleSandbox(
-	ctx context.Context,
-	ch chan<- Token,
-	decisions <-chan spec.HITLDecision,
-	tc *ToolCall,
-	args map[string]any,
-	messages *[]Message,
-) int {
-	cmdStr, _ := args["command"].(string)
-	if cmdStr == "" {
-		return sandboxExec
-	}
-
-	err := sandbox.Check(cmdStr, &a.sandboxCfg)
-	if err == nil {
-		return sandboxExec // 放行
-	}
-
-	// Denylist / Strict / ReadOnly 模式拒绝
-	var needsConf *sandbox.NeedsConfirmationError
-	if !errors.As(err, &needsConf) {
-		sendToken(ctx, ch, Token{Type: TokenTypeToolCall, Content: fmt.Sprintf("\n⛔ %v", err)})
-		*messages = append(*messages, Message{
-			Role: "tool", Content: "⛔ " + err.Error(), ToolCallID: tc.ID,
-		})
-		return sandboxSkip
-	}
-
-	// ---- Normal 模式：触发 HITL interrupt ----
-
-	req := &spec.InterruptRequest{
-		ID:         fmt.Sprintf("req-%d", requestIDCounter.Add(1)),
-		ToolName:   "bash",
-		Command:    cmdStr,
-		RiskReason: needsConf.Pattern,
-		CreatedAt:  time.Now(),
-		ExpiresAt:  time.Now().Add(30 * time.Second),
-	}
-
-	// 发送 interrupt token
-	sendToken(ctx, ch, Token{Type: TokenTypeInterrupt, Interrupt: req})
-
-	// 等待决策（阻塞 agent goroutine）
-	timeout := time.NewTimer(30 * time.Second)
-	defer timeout.Stop()
-
-	select {
-	case <-ctx.Done():
-		return sandboxAbort
-	case <-timeout.C:
-		sendToken(ctx, ch, Token{Type: TokenTypeText, Content: "\n⏰ confirmation timed out\n"})
-		*messages = append(*messages, Message{
-			Role: "tool", Content: "⏰ confirmation timed out", ToolCallID: tc.ID,
-		})
-		return sandboxSkip
-	case d, ok := <-decisions:
-		if !ok {
-			return sandboxAbort
+// fireMiddlewareEvent 统一分发 middleware 事件到各 hook 接口。
+// event 必须是 *core.{Before,After}{Agent,Model,Tool}Event 的指针。
+func (a *Agent) fireMiddlewareEvent(event any) {
+	for _, mw := range a.middlewares {
+		switch ev := event.(type) {
+		case *core.BeforeAgentEvent:
+			if m, ok := mw.(core.BeforeAgent); ok {
+				m.OnBeforeAgent(ev)
+			}
+		case *core.AfterAgentEvent:
+			if m, ok := mw.(core.AfterAgent); ok {
+				m.OnAfterAgent(ev)
+			}
+		case *core.BeforeModelEvent:
+			if m, ok := mw.(core.BeforeModel); ok {
+				m.OnBeforeModel(ev)
+			}
+		case *core.AfterModelEvent:
+			if m, ok := mw.(core.AfterModel); ok {
+				m.OnAfterModel(ev)
+			}
+		case *core.BeforeToolEvent:
+			if m, ok := mw.(core.BeforeTool); ok {
+				m.OnBeforeTool(ev)
+			}
+		case *core.AfterToolEvent:
+			if m, ok := mw.(core.AfterTool); ok {
+				m.OnAfterTool(ev)
+			}
 		}
-		return a.applyDecision(ctx, d, ch, tc, args, messages, cmdStr)
 	}
 }
 
-// applyDecision 根据用户决策处理后续动作。
-func (a *Agent) applyDecision(
-	ctx context.Context,
-	d spec.HITLDecision,
-	ch chan<- Token,
-	tc *ToolCall,
-	args map[string]any,
-	messages *[]Message,
-	originalCmd string,
-) int {
-	switch d.Type {
-	case spec.DecisionApprove:
-		return sandboxExec
-
-	case spec.DecisionEdit:
-		edited := strings.TrimSpace(d.Command)
-		if edited == "" {
-			edited = originalCmd
-		}
-		args["command"] = edited
-		return sandboxExec
-
-	case spec.DecisionReject:
-		sendToken(ctx, ch, Token{Type: TokenTypeToolResult, Content: "\n  ⎿  ⛔ rejected by user"})
-		*messages = append(*messages, Message{
-			Role: "tool", Content: "⛔ rejected by user", ToolCallID: tc.ID,
-		})
-		return sandboxSkip
-
-	case spec.DecisionRespond:
-		msg := strings.TrimSpace(d.Message)
-		if msg == "" {
-			msg = "user declined to answer"
-		}
-		sendToken(ctx, ch, Token{Type: TokenTypeToolResult, Content: "\n  ⎿  💬 " + msg})
-		*messages = append(*messages, Message{
-			Role: "user", Content: msg,
-		})
-		return sandboxSkip
-
-	default:
-		return sandboxExec
-	}
-}
-
-func (a *Agent) buildMessages(history []Message, input string) []Message {
-	msgs := make([]Message, 0, len(history)+2)
-	msgs = append(msgs, Message{Role: "system", Content: systemPrompt(a.tools)})
+func (a *Agent) buildMessages(history []core.Message, input string) []core.Message {
+	msgs := make([]core.Message, 0, len(history)+2)
+	msgs = append(msgs, core.Message{Role: "system", Content: systemPrompt(a.tools)})
 	msgs = append(msgs, history...)
-	msgs = append(msgs, Message{Role: "user", Content: input})
+	msgs = append(msgs, core.Message{Role: "user", Content: input})
 	return msgs
 }
 
-func systemPrompt(tools []Tool) string {
+func systemPrompt(tools []core.Tool) string {
 	var b strings.Builder
 	b.WriteString("You are a coding assistant with tool access.\n")
 	b.WriteString("Use tools when you need to explore, run commands, or modify files.\n")
@@ -428,7 +337,7 @@ func systemPrompt(tools []Tool) string {
 	return b.String()
 }
 
-func toolSpecs(tools []Tool) []map[string]any {
+func toolSpecs(tools []core.Tool) []map[string]any {
 	specs := make([]map[string]any, 0, len(tools))
 	for _, t := range tools {
 		specs = append(specs, t.ToolSpec())
@@ -436,7 +345,7 @@ func toolSpecs(tools []Tool) []map[string]any {
 	return specs
 }
 
-func sendToken(ctx context.Context, ch chan<- Token, tok Token) {
+func sendToken(ctx context.Context, ch chan<- core.Token, tok core.Token) {
 	select {
 	case ch <- tok:
 	case <-ctx.Done():

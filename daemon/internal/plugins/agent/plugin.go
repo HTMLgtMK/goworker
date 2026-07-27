@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
+	"github.com/tinguo/goworker/daemon/internal/plugins/agent/middlewares"
 	"github.com/tinguo/goworker/daemon/internal/sandbox"
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
@@ -32,7 +34,7 @@ var defaults = map[string]string{
 type AgentPlugin struct {
 	hub          *spec.Hub
 	config       map[string]string // in-memory config, overrides env
-	conversation []Message         // 跨 /agent 调用的对话历史
+	conversation []core.Message    // 跨 /agent 调用的对话历史
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }
@@ -148,17 +150,16 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 	// 收集工具
 	tools := p.collectTools(&sandboxCfg)
 
-	// 创建 Provider 和 Agent
+	// 创建 Provider、Middleware 和 Agent
 	provider := NewOpenAIProvider(p.get(cfgEndpoint), p.get(cfgAPIKey), p.get(cfgModel))
-	agent := NewAgent(provider, tools, sandboxCfg)
+	decisions := make(chan spec.HITLDecision, 1)
+	hitlMw := middlewares.NewHITLMiddleware(sandboxCfg, middlewares.NewChannelDecisionProvider(decisions))
+	agent := NewAgent(provider, tools, []core.Middleware{hitlMw})
 
 	agentCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// decisions channel 用于 HITL 确认决策
-	decisions := make(chan spec.HITLDecision, 1)
-
-	tokenCh, msgCh, err := agent.Run(agentCtx, p.conversation, input, decisions)
+	tokenCh, msgCh, err := agent.Run(agentCtx, p.conversation, input)
 	if err != nil {
 		ctx.Writer(fmt.Sprintf("✘ %v\n", err))
 		return nil
@@ -168,7 +169,7 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 		if tok.Done {
 			break
 		}
-		if tok.Type == TokenTypeInterrupt && tok.Interrupt != nil {
+		if tok.Type == core.TokenTypeInterrupt && tok.Interrupt != nil {
 			decision := p.promptForDecision(ctx, tok.Interrupt)
 			select {
 			case decisions <- decision:
@@ -260,13 +261,13 @@ func (p *AgentPlugin) sandboxConfig() sandbox.Config {
 	return cfg
 }
 
-func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []Tool {
-	var tools []Tool
+func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
+	var tools []core.Tool
 	tools = append(tools, DefaultTools(cfg)...)
 
 	for _, t := range p.hub.Tools() {
 		tool := t
-		tools = append(tools, Tool{
+		tools = append(tools, core.Tool{
 			Name:        tool.Name,
 			Description: tool.Description,
 			Parameters:  parseSchema(tool.Schema),

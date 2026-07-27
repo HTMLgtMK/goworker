@@ -10,15 +10,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
-)
 
-// Provider 是 LLM 后端的接口。
-type Provider interface {
-	Name() string
-	Model() string
-	Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error)
-	ChatStream(ctx context.Context, req *ChatRequest) (<-chan Token, error)
-}
+	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
+)
 
 // OpenAIProvider 兼容 OpenAI API（OpenAI, Ollama, vLLM, etc.）。
 type OpenAIProvider struct {
@@ -46,7 +40,7 @@ func NewOpenAIProvider(endpoint, apiKey, model string) *OpenAIProvider {
 func (p *OpenAIProvider) Name() string  { return "openai" }
 func (p *OpenAIProvider) Model() string { return p.model }
 
-func (p *OpenAIProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
+func (p *OpenAIProvider) Chat(ctx context.Context, req *core.ChatRequest) (*core.ChatResponse, error) {
 	if req.Model == "" {
 		req.Model = p.model
 	}
@@ -76,14 +70,14 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespo
 		return nil, fmt.Errorf("API %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 
-	var chatResp ChatResponse
+	var chatResp core.ChatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	return &chatResp, nil
 }
 
-func (p *OpenAIProvider) ChatStream(ctx context.Context, req *ChatRequest) (<-chan Token, error) {
+func (p *OpenAIProvider) ChatStream(ctx context.Context, req *core.ChatRequest) (<-chan core.Token, error) {
 	if req.Model == "" {
 		req.Model = p.model
 	}
@@ -113,12 +107,12 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req *ChatRequest) (<-ch
 		return nil, fmt.Errorf("API %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 
-	tokenCh := make(chan Token)
+	tokenCh := make(chan core.Token)
 	go p.readSSE(ctx, resp.Body, tokenCh)
 	return tokenCh, nil
 }
 
-func (p *OpenAIProvider) readSSE(ctx context.Context, body io.ReadCloser, tokenCh chan<- Token) {
+func (p *OpenAIProvider) readSSE(ctx context.Context, body io.ReadCloser, tokenCh chan<- core.Token) {
 	defer body.Close()
 	defer close(tokenCh)
 
@@ -144,7 +138,7 @@ func (p *OpenAIProvider) readSSE(ctx context.Context, body io.ReadCloser, tokenC
 			return
 		}
 
-		var chunk StreamChunk
+		var chunk core.StreamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
 		}
@@ -156,7 +150,7 @@ func (p *OpenAIProvider) readSSE(ctx context.Context, body io.ReadCloser, tokenC
 		finishReason := chunk.Choices[0].FinishReason
 
 		select {
-		case tokenCh <- Token{Type: TokenTypeText, Content: content, Done: finishReason != ""}:
+		case tokenCh <- core.Token{Type: core.TokenTypeText, Content: content, Done: finishReason != ""}:
 		case <-ctx.Done():
 			return
 		}

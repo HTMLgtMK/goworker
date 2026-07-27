@@ -7,7 +7,7 @@ import (
 )
 
 // LoggingMiddleware 记录每个命令的执行日志。
-func LoggingMiddleware() spec.Middleware {
+func LoggingInterceptor() spec.PluginInterceptor {
 	return func(ctx *spec.Context, next func() error) error {
 		user := ctx.Session.UserID
 		if user == "" {
@@ -19,7 +19,7 @@ func LoggingMiddleware() spec.Middleware {
 }
 
 // SessionMiddleware 从 ctx.Values["token"] 还原 Session 信息。
-func SessionMiddleware(provider spec.SessionProvider) spec.Middleware {
+func SessionInterceptor(provider spec.SessionProvider) spec.PluginInterceptor {
 	return func(ctx *spec.Context, next func() error) error {
 		if provider != nil {
 			if token, ok := ctx.Values["token"].(string); ok && token != "" {

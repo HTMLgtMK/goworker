@@ -59,8 +59,8 @@ func main() {
 	engine := core.NewEngine()
 	defer engine.StopAll()
 
-	// 注册中间件
-	engine.Use(core.LoggingMiddleware())
+	// 注册拦截器
+	engine.Use(core.LoggingInterceptor())
 
 	// 注册插件
 	if err := engine.Register(&PluginA{}); err != nil {
