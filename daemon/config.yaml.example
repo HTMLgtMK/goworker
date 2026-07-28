@@ -1,0 +1,11 @@
+llm:
+    # LLM API 端点
+    endpoint: http://localhost:8000/v1
+    # 模型名称
+    model: gpt-4o
+    # API Key（留空表示不需要认证）
+    api_key: ""
+
+sandbox:
+    # sandbox 模式：off | normal | strict | readonly
+    mode: normal

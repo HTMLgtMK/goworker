@@ -35,6 +35,9 @@ Thumbs.db
 .env
 *.local
 
+# Config
+config.yaml
+
 # Dependencies
 vendor/
 

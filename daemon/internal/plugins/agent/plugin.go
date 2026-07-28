@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,32 +15,17 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
 
-// config keys
-const (
-	cfgEndpoint    = "LLM_ENDPOINT"
-	cfgModel       = "LLM_MODEL"
-	cfgAPIKey      = "LLM_API_KEY"
-	cfgSandboxMode = "SANDBOX_MODE"
-)
-
-var defaults = map[string]string{
-	cfgEndpoint:    "http://localhost:8000/v1",
-	cfgModel:       "gpt-4o",
-	cfgAPIKey:      "",
-	cfgSandboxMode: string(sandbox.ModeNormal),
-}
-
 type AgentPlugin struct {
 	hub          *spec.Hub
-	config       map[string]string // in-memory config, overrides env
-	conversation []core.Message    // 跨 /agent 调用的对话历史
+	config       *Config        // YAML 配置
+	conversation []core.Message // 跨 /agent 调用的对话历史
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }
 
 func (p *AgentPlugin) Init(h *spec.Hub) error {
 	p.hub = h
-	p.config = loadEnvFile()
+	p.config = loadConfig()
 
 	h.RegisterCommand(spec.Command{
 		Name:        "/agent",
@@ -92,23 +76,21 @@ func (p *AgentPlugin) handleModel(ctx *spec.Context) error {
 		}
 		key, val := kv[0], kv[1]
 
-		envKey := ""
 		switch key {
 		case "endpoint":
-			envKey = cfgEndpoint
+			p.config.LLM.Endpoint = val
 		case "model":
-			envKey = cfgModel
+			p.config.LLM.Model = val
 		case "api_key":
-			envKey = cfgAPIKey
+			p.config.LLM.APIKey = val
 		case "sandbox_mode":
-			envKey = cfgSandboxMode
+			p.config.Sandbox.Mode = val
 		default:
 			ctx.Writer(fmt.Sprintf("未知配置项: %s（可用: endpoint, model, api_key, sandbox_mode）\n", key))
 			return nil
 		}
 
-		p.config[envKey] = val
-		if err := saveEnvFile(p.config); err != nil {
+		if err := saveConfig(p.config); err != nil {
 			ctx.Writer(fmt.Sprintf("✘ 保存失败: %v\n", err))
 			return nil
 		}
@@ -122,17 +104,17 @@ func (p *AgentPlugin) handleModel(ctx *spec.Context) error {
 }
 
 func (p *AgentPlugin) showConfig(ctx *spec.Context) {
-	keyDisplay := p.get(cfgAPIKey)
+	keyDisplay := p.config.LLM.APIKey
 	if keyDisplay != "" {
 		keyDisplay = "***"
 	} else {
 		keyDisplay = "(未设置)"
 	}
 
-	ctx.Writer(fmt.Sprintf("Endpoint:     %s\n", p.get(cfgEndpoint)))
-	ctx.Writer(fmt.Sprintf("Model:        %s\n", p.get(cfgModel)))
+	ctx.Writer(fmt.Sprintf("Endpoint:     %s\n", p.config.LLM.Endpoint))
+	ctx.Writer(fmt.Sprintf("Model:        %s\n", p.config.LLM.Model))
 	ctx.Writer(fmt.Sprintf("API Key:      %s\n", keyDisplay))
-	ctx.Writer(fmt.Sprintf("Sandbox Mode: %s\n", p.get(cfgSandboxMode)))
+	ctx.Writer(fmt.Sprintf("Sandbox Mode: %s\n", p.config.Sandbox.Mode))
 }
 
 // ---- /agent 命令 ----
@@ -151,7 +133,7 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 	tools := p.collectTools(&sandboxCfg)
 
 	// 创建 Provider、Middleware 和 Agent
-	provider := NewOpenAIProvider(p.get(cfgEndpoint), p.get(cfgAPIKey), p.get(cfgModel))
+	provider := NewOpenAIProvider(p.config.LLM.Endpoint, p.config.LLM.APIKey, p.config.LLM.Model)
 	decisions := make(chan spec.HITLDecision, 1)
 	hitlMw := middlewares.NewHITLMiddleware(sandboxCfg, middlewares.NewChannelDecisionProvider(decisions))
 	agent := NewAgent(provider, tools, []core.Middleware{hitlMw})
@@ -246,10 +228,8 @@ func (p *AgentPlugin) promptForDecision(ctx *spec.Context, req *spec.InterruptRe
 }
 
 func (p *AgentPlugin) sandboxConfig() sandbox.Config {
-	mode := sandbox.Mode(p.get(cfgSandboxMode))
-
 	cfg := sandbox.Config{
-		Mode:           mode,
+		Mode:           sandbox.Mode(p.config.Sandbox.Mode),
 		DeniedPatterns: sandbox.MustCompile(sandbox.DefaultDeniedPatterns),
 		RiskyPatterns:  sandbox.MustCompile(sandbox.DefaultRiskyPatterns),
 	}
@@ -284,17 +264,7 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 	return tools
 }
 
-// ---- Config helpers ----
-
-func (p *AgentPlugin) get(key string) string {
-	if v, ok := p.config[key]; ok && v != "" {
-		return v
-	}
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return defaults[key]
-}
+// ---- Config dir ----
 
 func configDir() string {
 	if d := os.Getenv("GOWORKER_CONFIG_DIR"); d != "" {
@@ -305,52 +275,6 @@ func configDir() string {
 		return "."
 	}
 	return filepath.Join(home, ".config", "goworker")
-}
-
-func envPath() string {
-	return filepath.Join(configDir(), ".env")
-}
-
-func loadEnvFile() map[string]string {
-	m := make(map[string]string)
-	f, err := os.Open(envPath())
-	if err != nil {
-		return m
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) == 2 {
-			m[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-		}
-	}
-	return m
-}
-
-func saveEnvFile(config map[string]string) error {
-	dir := configDir()
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("mkdir config dir: %w", err)
-	}
-
-	f, err := os.Create(envPath())
-	if err != nil {
-		return fmt.Errorf("create env file: %w", err)
-	}
-	defer f.Close()
-
-	for _, key := range []string{cfgEndpoint, cfgModel, cfgAPIKey, cfgSandboxMode} {
-		if v, ok := config[key]; ok {
-			fmt.Fprintf(f, "%s=%s\n", key, v)
-		}
-	}
-	return nil
 }
 
 // ---- Util ----
