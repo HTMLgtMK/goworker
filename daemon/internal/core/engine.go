@@ -41,6 +41,12 @@ func NewEngine(cfg *config.Config) *Engine {
 // Config 返回全局配置。
 func (e *Engine) Config() *config.Config { return e.config }
 
+// SaveConfig 持久化配置到 YAML 文件并同步内存。
+func (e *Engine) SaveConfig(cfg *config.Config) error {
+	*e.config = *cfg
+	return config.Save(cfg, config.DefaultPath())
+}
+
 // ---- Middleware ----
 
 // Use 注册一个中间件，按注册顺序依次执行。
@@ -111,10 +117,7 @@ func (e *Engine) pluginHub() *spec.Hub {
 			return e.Eval(ctx, input)
 		},
 		Config: e.config,
-		SaveConfig: func(cfg *config.Config) error {
-			*e.config = *cfg // 同步内存
-			return config.Save(cfg, config.DefaultPath())
-		},
+		SaveConfig: e.SaveConfig,
 	}
 }
 

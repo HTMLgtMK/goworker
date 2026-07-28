@@ -5,6 +5,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -54,6 +55,37 @@ func DefaultPath() string {
 		return "config.yaml"
 	}
 	return filepath.Join(home, ".config", "goworker", "config.yaml")
+}
+
+// Display 返回 YAML 格式的配置文本（API Key 自动脱敏）。
+func (c *Config) Display() string {
+	cfg := *c // 浅拷贝，不修改原对象
+	if cfg.LLM.APIKey != "" {
+		cfg.LLM.APIKey = "***"
+	}
+	// 忽略序列化错误，Marshal 基本不会失败
+	data, _ := yaml.Marshal(cfg)
+	return string(data)
+}
+
+// SetField 按点分 key 设置配置项（如 "llm.endpoint"、"sandbox.mode"）。
+func (c *Config) SetField(key, value string) error {
+	switch key {
+	case "llm.endpoint":
+		c.LLM.Endpoint = value
+	case "llm.model":
+		c.LLM.Model = value
+	case "llm.api_key":
+		c.LLM.APIKey = value
+	case "sandbox.mode":
+		c.Sandbox.Mode = value
+	case "sandbox.allowed_work_dir":
+		c.Sandbox.AllowedWorkDir = value
+	default:
+		valid := "llm.endpoint, llm.model, llm.api_key, sandbox.mode, sandbox.allowed_work_dir"
+		return fmt.Errorf("未知配置项: %s（可用: %s）", key, valid)
+	}
+	return nil
 }
 
 // Load 读取 YAML 配置文件，返回合并默认值后的 Config。
