@@ -202,14 +202,18 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 			msg := choice.Message
 			messages = append(messages, msg)
 
-			// stream text
-			if msg.Content != "" {
-				sendToken(ctx, ch, core.Token{Type: core.TokenTypeText, Content: msg.Content})
+			// process tool calls — before text emit so we know which type
+			if len(msg.ToolCalls) == 0 {
+				// final response — will be markdown-rendered by frontend
+				if msg.Content != "" {
+					sendToken(ctx, ch, core.Token{Type: core.TokenTypeFinal, Content: msg.Content})
+				}
+				break
 			}
 
-			// process tool calls
-			if len(msg.ToolCalls) == 0 {
-				break // final response
+			// intermediate thinking text
+			if msg.Content != "" {
+				sendToken(ctx, ch, core.Token{Type: core.TokenTypeText, Content: msg.Content})
 			}
 
 			for _, tc := range msg.ToolCalls {
@@ -267,7 +271,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 				if len(resultPreview) > 500 {
 					resultPreview = resultPreview[:500] + "..."
 				}
-				resultStr := fmt.Sprintf("\n  ⎿  %s", strings.ReplaceAll(resultPreview, "\n", "\n  ⎿  "))
+				resultStr := fmt.Sprintf("\n● ⎿  %s", strings.ReplaceAll(resultPreview, "\n", "\n  "))
 				sendToken(ctx, ch, core.Token{Type: core.TokenTypeToolResult, Content: resultStr})
 
 				messages = append(messages, core.Message{

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tinguo/goworker/daemon/internal/frontend/stdin"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/middlewares"
 	"github.com/tinguo/goworker/daemon/internal/sandbox"
@@ -159,6 +160,31 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 			case decisions <- decision:
 			case <-agentCtx.Done():
 			}
+			continue
+		}
+		// tool call：● 保持默认色，参数用灰色
+		if tok.Type == core.TokenTypeToolCall {
+			content := tok.Content
+			if len(content) > 0 && content[0] == '\n' {
+				ctx.Writer("\n\033[38;5;244m● " + strings.TrimPrefix(content[1:], "● ") + "\033[0m")
+			} else {
+				ctx.Writer("\033[38;5;244m" + content + "\033[0m")
+			}
+			continue
+		}
+		// tool 结果：● 保持默认色，⎿ 及内容灰色
+		if tok.Type == core.TokenTypeToolResult {
+			content := tok.Content
+			if idx := strings.Index(content, "⎿"); idx >= 0 {
+				ctx.Writer(content[:idx] + "\033[38;5;244m" + content[idx:] + "\033[0m")
+			} else {
+				ctx.Writer("\033[38;5;244m" + content + "\033[0m")
+			}
+			continue
+		}
+		// 最终回复：加 ● 标记并通过 markdown 渲染
+		if tok.Type == core.TokenTypeFinal {
+			ctx.Writer("\n● " + stdin.RenderMarkdown(strings.TrimSpace(tok.Content)))
 			continue
 		}
 		ctx.Writer(tok.Content)

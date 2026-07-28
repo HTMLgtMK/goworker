@@ -117,4 +117,5 @@ const (
 	TokenTypeToolCall   = "tool_call"
 	TokenTypeToolResult = "tool_result"
 	TokenTypeInterrupt  = "interrupt"
+	TokenTypeFinal      = "final"       // 最终模型回复（需要 markdown 渲染）
 )

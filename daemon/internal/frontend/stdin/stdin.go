@@ -1,55 +1,66 @@
 package stdin
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/tinguo/goworker/daemon/internal/core"
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
 
+// rawNL 在 raw mode 下 \n 不会自动回车到行首，需要补 \r
+const rawNL = "\r\n"
+
+// StdinFrontend 是一个基于标准输入/输出的用户界面，使用 raw mode 行编辑器。
 type StdinFrontend struct {
-	engine *core.Engine
-	mu     sync.Mutex
-	reader *bufio.Reader
+	engine  *core.Engine
+	editor  *LineEditor
 }
 
 func NewStdinFrontend(engine *core.Engine) *StdinFrontend {
 	return &StdinFrontend{engine: engine}
 }
 
-func (frontend *StdinFrontend) Write(s string) {
-	fmt.Println(s)
+// Write 实现 spec.Context 的 Writer 回调。
+// raw mode 下 \n 不回车，手动补 \r。先清掉已有的 \r 避免双倍。
+func (f *StdinFrontend) Write(s string) {
+	s = strings.ReplaceAll(s, "\r", "")
+	fmt.Print(strings.ReplaceAll(s, "\n", rawNL))
 }
 
-// readLine 供 agent 的 HITL 确认使用。
-// 与主循环共享同一个 bufio.Reader，不再有 scanner/reader 竞争 stdin 的问题。
-func (frontend *StdinFrontend) readLine() (string, error) {
-	frontend.mu.Lock()
-	defer frontend.mu.Unlock()
-	return frontend.reader.ReadString('\n')
+// readLine 供 HITL 确认使用。
+func (f *StdinFrontend) readLine() (string, error) {
+	oldPrompt := f.editor.Prompt
+	f.editor.Prompt = ""
+	defer func() { f.editor.Prompt = oldPrompt }()
+	line, _, err := f.editor.ReadLine()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
 }
 
-func (frontend *StdinFrontend) Run() error {
-	frontend.reader = bufio.NewReader(os.Stdin)
+// Run 启动主事件循环。
+func (f *StdinFrontend) Run() error {
+	editor, err := NewLineEditor()
+	if err != nil {
+		return fmt.Errorf("line editor: %w", err)
+	}
+	f.editor = editor
+	defer editor.Close()
 
 	for {
-		fmt.Print("> ")
-
-		frontend.mu.Lock()
-		line, err := frontend.reader.ReadString('\n')
-		frontend.mu.Unlock()
-
+		line, canceled, err := editor.ReadLine()
 		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return fmt.Errorf("read stdin: %w", err)
+			return err
+		}
+
+		// Esc 取消当前输入
+		if canceled {
+			fmt.Print("\r\n") // 换行，准备下一次输入
+			continue
 		}
 
 		line = strings.TrimRight(line, "\r\n")
@@ -57,13 +68,30 @@ func (frontend *StdinFrontend) Run() error {
 		case line == "":
 			continue
 		case line == "/quit" || line == "/exit" || line == "/q":
-			fmt.Println("bye")
+			fmt.Print("bye\r\n")
 			return nil
 		}
 
-		ctx := spec.NewContext(context.Background(), frontend.Write, frontend.readLine, nil)
-		if err := frontend.engine.Eval(ctx, line); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		ctx := spec.NewContext(context.Background(), f.Write, f.readLine, nil)
+
+		// 判断是否需要启用取消监听（agent 交互）
+		isAgent := !strings.HasPrefix(line, "/") || strings.HasPrefix(line, "/agent")
+		if isAgent {
+			f.runWithCancel(ctx, line)
+		} else if err := f.engine.Eval(ctx, line); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\r\n", err)
 		}
+	}
+}
+
+// runWithCancel 启动 agent 并监听 Esc 取消。
+func (f *StdinFrontend) runWithCancel(ctx *spec.Context, line string) {
+	// 暂不实现 Esc 取消 agent 执行，避免 stdin 竞争
+	// Esc 在输入时可用（editor.ReadLine），agent 运行期间按 Esc 会在后续 DrainInput 被清掉
+	err := f.engine.Eval(ctx, line)
+	f.editor.DrainInput()
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\r\n", err)
 	}
 }
