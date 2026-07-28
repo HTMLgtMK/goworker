@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -228,17 +227,7 @@ func (p *AgentPlugin) promptForDecision(ctx *spec.Context, req *spec.InterruptRe
 }
 
 func (p *AgentPlugin) sandboxConfig() sandbox.Config {
-	cfg := sandbox.Config{
-		Mode:           sandbox.Mode(p.hub.Config.Sandbox.Mode),
-		DeniedPatterns: sandbox.MustCompile(sandbox.DefaultDeniedPatterns),
-		RiskyPatterns:  sandbox.MustCompile(sandbox.DefaultRiskyPatterns),
-	}
-
-	if wd, err := os.Getwd(); err == nil {
-		cfg.AllowedWorkDir = wd
-	}
-
-	return cfg
+	return *sandbox.NewFromConfig(&p.hub.Config.Sandbox)
 }
 
 func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {

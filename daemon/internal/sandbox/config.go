@@ -3,7 +3,10 @@ package sandbox
 
 import (
 	"fmt"
+	"os"
 	"regexp"
+
+	"github.com/tinguo/goworker/daemon/internal/config"
 )
 
 // Mode 沙箱运行模式。
@@ -25,6 +28,33 @@ type Config struct {
 	ReadOnly       bool             // 只读模式
 	MaxOutputBytes int              // 最大输出字节数，0=不限制
 	Mode           Mode             // 沙箱模式
+}
+
+// NewFromConfig 从全局配置构建 sandbox.Config，编译正则并填充默认值。
+func NewFromConfig(cfg *config.SandboxConfig) *Config {
+	denied := cfg.DeniedPatterns
+	if len(denied) == 0 {
+		denied = DefaultDeniedPatterns
+	}
+	risky := cfg.RiskyPatterns
+	if len(risky) == 0 {
+		risky = DefaultRiskyPatterns
+	}
+
+	workDir := cfg.AllowedWorkDir
+	if workDir == "" {
+		if wd, err := os.Getwd(); err == nil {
+			workDir = wd
+		}
+	}
+
+	return &Config{
+		Mode:           Mode(cfg.Mode),
+		AllowedWorkDir: workDir,
+		DeniedPatterns: MustCompile(denied),
+		RiskyPatterns:  MustCompile(risky),
+		ReadOnly:       Mode(cfg.Mode) == ModeReadOnly,
+	}
 }
 
 // NeedsConfirmationError 由 Check 返回，表示命令匹配风险模式，调用方应请求用户确认。

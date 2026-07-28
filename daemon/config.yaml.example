@@ -7,5 +7,18 @@ llm:
     api_key: ""
 
 sandbox:
-    # sandbox 模式：off | normal | strict | readonly
+    # 沙箱模式：off | normal | strict | readonly
     mode: normal
+
+    # 允许的工作目录（空 = 使用当前目录）
+    allowed_work_dir: ""
+
+    # 拒绝执行的命令模式（空 = 使用内置默认值）
+    # denied_patterns:
+    #   - "rm -rf /"
+    #   - ":(){ :|:& };:"
+
+    # 高风险命令模式（空 = 使用内置默认值）
+    # risky_patterns:
+    #   - "rm "
+    #   - "sudo "

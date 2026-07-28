@@ -24,7 +24,10 @@ type LLMConfig struct {
 }
 
 type SandboxConfig struct {
-	Mode string `yaml:"mode"`
+	Mode           string   `yaml:"mode"`
+	AllowedWorkDir string   `yaml:"allowed_work_dir"` // 空 = 使用当前目录
+	DeniedPatterns []string `yaml:"denied_patterns"`   // 空 = 使用 sandbox 默认
+	RiskyPatterns  []string `yaml:"risky_patterns"`    // 空 = 使用 sandbox 默认
 }
 
 // Default 返回带默认值的 Config。
