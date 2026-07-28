@@ -217,11 +217,11 @@ func (e *LineEditor) drawPrompt() {
 
 func (e *LineEditor) redrawInput() {
 	display := string(e.buf)
-	fmt.Fprintf(os.Stderr, "\r> %s\033[K", display)
-	// 光标定位：用 uniseg 处理 CJK 等宽字符
+	pw := uniseg.StringWidth(e.Prompt)
+	fmt.Fprintf(os.Stderr, "\r%s%s\033[K", e.Prompt, display)
 	if e.pos < len(e.buf) {
 		prefix := string(e.buf[:e.pos])
-		w := 2 + uniseg.StringWidth(prefix) // "> " = 2
+		w := pw + uniseg.StringWidth(prefix)
 		fmt.Fprintf(os.Stderr, "\r\033[%dC", w)
 	}
 }

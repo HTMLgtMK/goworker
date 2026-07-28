@@ -15,8 +15,8 @@ const rawNL = "\r\n"
 
 // StdinFrontend 是一个基于标准输入/输出的用户界面，使用 raw mode 行编辑器。
 type StdinFrontend struct {
-	engine  *core.Engine
-	editor  *LineEditor
+	engine *core.Engine
+	editor *LineEditor
 }
 
 func NewStdinFrontend(engine *core.Engine) *StdinFrontend {
@@ -28,6 +28,32 @@ func NewStdinFrontend(engine *core.Engine) *StdinFrontend {
 func (f *StdinFrontend) Write(s string) {
 	s = strings.ReplaceAll(s, "\r", "")
 	fmt.Print(strings.ReplaceAll(s, "\n", rawNL))
+}
+
+// writeText 渲染文本类 token（markdown 输出）。
+func (f *StdinFrontend) writeText(content string) {
+	rendered := strings.TrimSpace(RenderMarkdown(strings.TrimSpace(content)))
+	f.Write("\n● " + rendered)
+}
+
+// writeToolCall 渲染工具调用 token。
+func (f *StdinFrontend) writeToolCall(content string) {
+	if len(content) > 0 && content[0] == '\n' {
+		f.Write("\n● " + strings.TrimPrefix(content[1:], "● "))
+	} else {
+		f.Write(content)
+	}
+}
+
+// writeToolResult 渲染工具结果 token。
+// agent 层只输出纯数据，frontend 负责加 ⎿ 前缀、灰色和缩进。
+func (f *StdinFrontend) writeToolResult(content string) {
+	content = strings.TrimLeft(content, "\n")
+	if content == "" {
+		return
+	}
+	indented := strings.ReplaceAll(content, "\n", "\n   ")
+	f.Write("\n\033[38;5;244m  ⎿  " + indented + "\033[0m")
 }
 
 // readLine 供 HITL 确认使用。
@@ -73,6 +99,19 @@ func (f *StdinFrontend) Run() error {
 		}
 
 		ctx := spec.NewContext(context.Background(), f.Write, f.readLine, nil)
+
+		// 注入 WriteToken — 所有渲染逻辑收敛至此
+		ctx.WriteToken = func(kind spec.RenderKind, content string) {
+
+			switch kind {
+			case spec.KindText:
+				f.writeText(content)
+			case spec.KindToolCall:
+				f.writeToolCall(content)
+			case spec.KindToolResult:
+				f.writeToolResult(content)
+			}
+		}
 
 		// 判断是否需要启用取消监听（agent 交互）
 		isAgent := !strings.HasPrefix(line, "/") || strings.HasPrefix(line, "/agent")

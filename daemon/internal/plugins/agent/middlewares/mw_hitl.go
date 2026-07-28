@@ -88,7 +88,7 @@ func (mw *HITLMiddleware) OnBeforeTool(ev *core.BeforeToolEvent) *core.Middlewar
 		}
 	case spec.DecisionReject:
 		select {
-		case ev.TokenCh <- core.Token{Type: core.TokenTypeToolResult, Content: "\n  ⎿  ⛔ rejected by user"}:
+		case ev.TokenCh <- core.Token{Type: core.TokenTypeToolResult, Content: "⛔ rejected by user"}:
 		case <-ev.Ctx.Done():
 		}
 		ev.Aborted = true
@@ -101,7 +101,7 @@ func (mw *HITLMiddleware) OnBeforeTool(ev *core.BeforeToolEvent) *core.Middlewar
 			msg = "user declined to answer"
 		}
 		select {
-		case ev.TokenCh <- core.Token{Type: core.TokenTypeToolResult, Content: "\n  ⎿  💬 " + msg}:
+		case ev.TokenCh <- core.Token{Type: core.TokenTypeToolResult, Content: "💬 " + msg}:
 		case <-ev.Ctx.Done():
 		}
 		ev.Aborted = true

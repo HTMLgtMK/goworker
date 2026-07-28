@@ -8,10 +8,12 @@ import "context"
 // readLine 由前端注入，负责交互式输入（nil 表示不支持）。
 func NewContext(ctx context.Context, writer func(string), readLine func() (string, error), args []string) *Context {
 	return &Context{
-		Ctx:      ctx,
-		Writer:   writer,
-		ReadLine: readLine,
-		Args:     args,
-		Values:   make(map[string]any),
+		Ctx:  ctx,
+		Args: args,
+		FrontendContext: FrontendContext{
+			Writer:   writer,
+			ReadLine: readLine,
+		},
+		Values: make(map[string]any),
 	}
 }

@@ -38,16 +38,16 @@ type EventAwarePlugin interface {
 // Hub 是插件注册、事件广播的抽象接口。
 // 具体实现由 core.Engine 完成，插件在 Init 时通过 *Hub 注册命令。
 type Hub struct {
-	RegisterCommand  func(cmd Command) error
-	RegisterTool     func(tool Tool) error
-	AddEventListener func(fn func(Event))
-	Plugin           func(name string) Plugin
-	Plugins          func() []string
-	Tools            func() []Tool
-	Notify           func(event Event)
-	Eval             func(ctx *Context, input string) error
-	Config             *config.Config              // 全局配置（只读/修改后需调 SaveConfig）
-	SaveConfig         func(*config.Config) error  // 持久化配置到 YAML 文件
+	RegisterCommand    func(cmd Command) error
+	RegisterTool       func(tool Tool) error
+	AddEventListener   func(fn func(Event))
+	Plugin             func(name string) Plugin
+	Plugins            func() []string
+	Tools              func() []Tool
+	Notify             func(event Event)
+	Eval               func(ctx *Context, input string) error
+	Config             *config.Config                 // 全局配置（只读/修改后需调 SaveConfig）
+	SaveConfig         func(*config.Config) error     // 持久化配置到 YAML 文件
 	SetFallbackHandler func(func(ctx *Context) error) // 设置未匹配命令的兜底处理器
 }
 
@@ -90,15 +90,20 @@ type Event struct {
 
 // ---- 执行上下文 ----
 
+type FrontendContext struct {
+	ReadLine   func() (string, error)                // 输入回调，由前端注入（nil 表示不支持交互式输入）
+	Writer     func(string)                          // 输出回调，由前端注入
+	WriteToken func(kind RenderKind, content string) // 前端注入：带类型的 token 渲染
+}
+
 // Context 是命令执行的上下文。
 // 由前端创建，经 Engine 传入命令 Handler。
 type Context struct {
-	Ctx      context.Context        // 请求上下文，用于超时/取消传播（从请求链继承）
-	Args     []string               // 命令参数，由 Engine.Eval 解析填入
-	Writer   func(string)           // 输出回调，由前端注入
-	ReadLine func() (string, error) // 输入回调，由前端注入（nil 表示不支持交互式输入）
-	Session  Session                // 用户会话，由前端/中间件注入
-	Values   map[string]any         // 扩展数据，中间件间传递
+	FrontendContext
+	Ctx     context.Context // 请求上下文，用于超时/取消传播（从请求链继承）
+	Args    []string        // 命令参数，由 Engine.Eval 解析填入
+	Session Session         // 用户会话，由前端/中间件注入
+	Values  map[string]any  // 扩展数据，中间件间传递
 }
 
 // Session 是只读的用户会话信息。

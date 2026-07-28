@@ -206,7 +206,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 			if len(msg.ToolCalls) == 0 {
 				// final response — will be markdown-rendered by frontend
 				if msg.Content != "" {
-					sendToken(ctx, ch, core.Token{Type: core.TokenTypeFinal, Content: msg.Content})
+					sendToken(ctx, ch, core.Token{Type: core.TokenTypeText, Content: msg.Content})
 				}
 				break
 			}
@@ -263,16 +263,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 					Ctx: ctx, History: messages, Tool: &tc, Err: execErr,
 				})
 
-				resultPreview := result
-				lines := strings.Split(result, "\n")
-				if len(lines) > 4 {
-					resultPreview = strings.Join(lines[:4], "\n") + "..."
-				}
-				if len(resultPreview) > 500 {
-					resultPreview = resultPreview[:500] + "..."
-				}
-				resultStr := fmt.Sprintf("\n● ⎿  %s", strings.ReplaceAll(resultPreview, "\n", "\n  "))
-				sendToken(ctx, ch, core.Token{Type: core.TokenTypeToolResult, Content: resultStr})
+				sendToken(ctx, ch, core.Token{Type: core.TokenTypeToolResult, Content: result})
 
 				messages = append(messages, core.Message{
 					Role: "tool", Content: result, ToolCallID: tc.ID,
