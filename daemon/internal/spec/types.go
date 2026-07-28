@@ -1,10 +1,13 @@
 // Package spec 定义 goworker 引擎的核心类型。
 //
 // 这是纯协议层——只有接口和结构体，零实现。
-// 不依赖任何其他内部包。
 package spec
 
-import "context"
+import (
+	"context"
+
+	"github.com/tinguo/goworker/daemon/internal/config"
+)
 
 // Plugin 是每个插件必须实现的接口。
 //
@@ -43,6 +46,8 @@ type Hub struct {
 	Tools            func() []Tool
 	Notify           func(event Event)
 	Eval             func(ctx *Context, input string) error
+	Config           *config.Config              // 全局配置（只读/修改后需调 SaveConfig）
+	SaveConfig       func(*config.Config) error  // 持久化配置到 YAML 文件
 }
 
 // ---- 命令 ----

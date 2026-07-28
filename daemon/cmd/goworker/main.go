@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/core"
 	"github.com/tinguo/goworker/daemon/internal/frontend/stdin"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent"
@@ -56,7 +57,12 @@ func (p *PluginB) Stop() error  { log.Printf("PluginB stopped"); return nil }
 // ---- 入口 ----
 
 func main() {
-	engine := core.NewEngine()
+	// 加载全局配置
+	cfgPath := config.DefaultPath()
+	cfg := config.Load(cfgPath)
+	log.Printf("[main] config loaded from %s", cfgPath)
+
+	engine := core.NewEngine(cfg)
 	defer engine.StopAll()
 
 	// 注册拦截器

@@ -5,6 +5,7 @@ import (
 	"log"
 	"strings"
 
+	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
 
@@ -17,6 +18,7 @@ import (
 //   - 中间件链
 //   - 事件广播
 type Engine struct {
+	config       *config.Config
 	plugins      map[string]spec.Plugin
 	commands     map[string]spec.Command
 	tools        map[string]spec.Tool
@@ -24,9 +26,10 @@ type Engine struct {
 	listeners    []func(spec.Event)
 }
 
-// NewEngine 创建一个空引擎。
-func NewEngine() *Engine {
+// NewEngine 创建一个引擎并关联全局配置。
+func NewEngine(cfg *config.Config) *Engine {
 	return &Engine{
+		config:       cfg,
 		plugins:      make(map[string]spec.Plugin),
 		commands:     make(map[string]spec.Command),
 		tools:        make(map[string]spec.Tool),
@@ -34,6 +37,9 @@ func NewEngine() *Engine {
 		listeners:    make([]func(spec.Event), 0),
 	}
 }
+
+// Config 返回全局配置。
+func (e *Engine) Config() *config.Config { return e.config }
 
 // ---- Middleware ----
 
@@ -103,6 +109,11 @@ func (e *Engine) pluginHub() *spec.Hub {
 		},
 		Eval: func(ctx *spec.Context, input string) error {
 			return e.Eval(ctx, input)
+		},
+		Config: e.config,
+		SaveConfig: func(cfg *config.Config) error {
+			*e.config = *cfg // 同步内存
+			return config.Save(cfg, config.DefaultPath())
 		},
 	}
 }

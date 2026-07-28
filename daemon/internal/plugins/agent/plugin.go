@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,7 +16,6 @@ import (
 
 type AgentPlugin struct {
 	hub          *spec.Hub
-	config       *Config        // YAML 配置
 	conversation []core.Message // 跨 /agent 调用的对话历史
 }
 
@@ -25,7 +23,6 @@ func (p *AgentPlugin) Name() string { return "agent" }
 
 func (p *AgentPlugin) Init(h *spec.Hub) error {
 	p.hub = h
-	p.config = loadConfig()
 
 	h.RegisterCommand(spec.Command{
 		Name:        "/agent",
@@ -76,21 +73,22 @@ func (p *AgentPlugin) handleModel(ctx *spec.Context) error {
 		}
 		key, val := kv[0], kv[1]
 
+		cfg := p.hub.Config
 		switch key {
 		case "endpoint":
-			p.config.LLM.Endpoint = val
+			cfg.LLM.Endpoint = val
 		case "model":
-			p.config.LLM.Model = val
+			cfg.LLM.Model = val
 		case "api_key":
-			p.config.LLM.APIKey = val
+			cfg.LLM.APIKey = val
 		case "sandbox_mode":
-			p.config.Sandbox.Mode = val
+			cfg.Sandbox.Mode = val
 		default:
 			ctx.Writer(fmt.Sprintf("未知配置项: %s（可用: endpoint, model, api_key, sandbox_mode）\n", key))
 			return nil
 		}
 
-		if err := saveConfig(p.config); err != nil {
+		if err := p.hub.SaveConfig(cfg); err != nil {
 			ctx.Writer(fmt.Sprintf("✘ 保存失败: %v\n", err))
 			return nil
 		}
@@ -104,17 +102,18 @@ func (p *AgentPlugin) handleModel(ctx *spec.Context) error {
 }
 
 func (p *AgentPlugin) showConfig(ctx *spec.Context) {
-	keyDisplay := p.config.LLM.APIKey
+	cfg := p.hub.Config
+	keyDisplay := cfg.LLM.APIKey
 	if keyDisplay != "" {
 		keyDisplay = "***"
 	} else {
 		keyDisplay = "(未设置)"
 	}
 
-	ctx.Writer(fmt.Sprintf("Endpoint:     %s\n", p.config.LLM.Endpoint))
-	ctx.Writer(fmt.Sprintf("Model:        %s\n", p.config.LLM.Model))
+	ctx.Writer(fmt.Sprintf("Endpoint:     %s\n", cfg.LLM.Endpoint))
+	ctx.Writer(fmt.Sprintf("Model:        %s\n", cfg.LLM.Model))
 	ctx.Writer(fmt.Sprintf("API Key:      %s\n", keyDisplay))
-	ctx.Writer(fmt.Sprintf("Sandbox Mode: %s\n", p.config.Sandbox.Mode))
+	ctx.Writer(fmt.Sprintf("Sandbox Mode: %s\n", cfg.Sandbox.Mode))
 }
 
 // ---- /agent 命令 ----
@@ -133,7 +132,8 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 	tools := p.collectTools(&sandboxCfg)
 
 	// 创建 Provider、Middleware 和 Agent
-	provider := NewOpenAIProvider(p.config.LLM.Endpoint, p.config.LLM.APIKey, p.config.LLM.Model)
+	cfg := p.hub.Config
+	provider := NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
 	decisions := make(chan spec.HITLDecision, 1)
 	hitlMw := middlewares.NewHITLMiddleware(sandboxCfg, middlewares.NewChannelDecisionProvider(decisions))
 	agent := NewAgent(provider, tools, []core.Middleware{hitlMw})
@@ -229,7 +229,7 @@ func (p *AgentPlugin) promptForDecision(ctx *spec.Context, req *spec.InterruptRe
 
 func (p *AgentPlugin) sandboxConfig() sandbox.Config {
 	cfg := sandbox.Config{
-		Mode:           sandbox.Mode(p.config.Sandbox.Mode),
+		Mode:           sandbox.Mode(p.hub.Config.Sandbox.Mode),
 		DeniedPatterns: sandbox.MustCompile(sandbox.DefaultDeniedPatterns),
 		RiskyPatterns:  sandbox.MustCompile(sandbox.DefaultRiskyPatterns),
 	}
@@ -262,19 +262,6 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 		})
 	}
 	return tools
-}
-
-// ---- Config dir ----
-
-func configDir() string {
-	if d := os.Getenv("GOWORKER_CONFIG_DIR"); d != "" {
-		return d
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "."
-	}
-	return filepath.Join(home, ".config", "goworker")
 }
 
 // ---- Util ----
