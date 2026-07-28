@@ -2,6 +2,7 @@ package stdin
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -60,7 +61,7 @@ func (frontend *StdinFrontend) Run() error {
 			return nil
 		}
 
-		ctx := spec.NewContext(frontend.Write, frontend.readLine, nil)
+		ctx := spec.NewContext(context.Background(), frontend.Write, frontend.readLine, nil)
 		if err := frontend.engine.Eval(ctx, line); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		}

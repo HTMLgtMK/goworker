@@ -156,7 +156,7 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 	hitlMw := middlewares.NewHITLMiddleware(sandboxCfg, middlewares.NewChannelDecisionProvider(decisions))
 	agent := NewAgent(provider, tools, []core.Middleware{hitlMw})
 
-	agentCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	agentCtx, cancel := context.WithTimeout(ctx.Ctx, 5*time.Minute)
 	defer cancel()
 
 	tokenCh, msgCh, err := agent.Run(agentCtx, p.conversation, input)
@@ -273,7 +273,7 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 			Parameters:  parseSchema(tool.Schema),
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
 				var buf strings.Builder
-				err := p.hub.Eval(spec.NewContext(func(s string) { buf.WriteString(s) }, nil, nil), "/"+tool.Name)
+				err := p.hub.Eval(spec.NewContext(context.Background(), func(s string) { buf.WriteString(s) }, nil, nil), "/"+tool.Name)
 				if err != nil {
 					return buf.String(), err
 				}

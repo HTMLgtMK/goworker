@@ -4,6 +4,8 @@
 // 不依赖任何其他内部包。
 package spec
 
+import "context"
+
 // Plugin 是每个插件必须实现的接口。
 //
 // 生命周期：
@@ -85,6 +87,7 @@ type Event struct {
 // Context 是命令执行的上下文。
 // 由前端创建，经 Engine 传入命令 Handler。
 type Context struct {
+	Ctx      context.Context        // 请求上下文，用于超时/取消传播（从请求链继承）
 	Args     []string               // 命令参数，由 Engine.Eval 解析填入
 	Writer   func(string)           // 输出回调，由前端注入
 	ReadLine func() (string, error) // 输入回调，由前端注入（nil 表示不支持交互式输入）
