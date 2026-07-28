@@ -21,13 +21,14 @@ const (
 
 // Config 沙箱配置。
 type Config struct {
-	DeniedPatterns []*regexp.Regexp // 拒绝执行的命令匹配
-	RiskyPatterns  []*regexp.Regexp // 需要用户确认的匹配
-	AllowedWorkDir string           // 限制工作目录，空 = 不限制
-	AllowList      []*regexp.Regexp // 非空时只允许匹配的命令
-	ReadOnly       bool             // 只读模式
-	MaxOutputBytes int              // 最大输出字节数，0=不限制
-	Mode           Mode             // 沙箱模式
+	DeniedPatterns []*regexp.Regexp  // 拒绝执行的命令匹配
+	RiskyPatterns  []*regexp.Regexp  // 需要用户确认的匹配
+	PatternDescs   map[string]string // pattern → 人类可读描述（来自配置或内置默认）
+	AllowedWorkDir string            // 限制工作目录，空 = 不限制
+	AllowList      []*regexp.Regexp  // 非空时只允许匹配的命令
+	ReadOnly       bool              // 只读模式
+	MaxOutputBytes int               // 最大输出字节数，0=不限制
+	Mode           Mode              // 沙箱模式
 }
 
 // NewFromConfig 从全局配置构建 sandbox.Config，编译正则并填充默认值。
@@ -36,9 +37,21 @@ func NewFromConfig(cfg *config.SandboxConfig) *Config {
 	if len(denied) == 0 {
 		denied = DefaultDeniedPatterns
 	}
-	risky := cfg.RiskyPatterns
-	if len(risky) == 0 {
-		risky = DefaultRiskyPatterns
+
+	// 从 RiskPatternConfig 提取 pattern 字符串和用户自定的 desc
+	var riskyStrs []string
+	var patternDescs map[string]string
+	if len(cfg.RiskyPatterns) == 0 {
+		riskyStrs = DefaultRiskyPatterns
+	} else {
+		riskyStrs = make([]string, len(cfg.RiskyPatterns))
+		patternDescs = make(map[string]string, len(cfg.RiskyPatterns))
+		for i, r := range cfg.RiskyPatterns {
+			riskyStrs[i] = r.Pattern
+			if r.Desc != "" {
+				patternDescs[r.Pattern] = r.Desc
+			}
+		}
 	}
 
 	workDir := cfg.AllowedWorkDir
@@ -52,7 +65,8 @@ func NewFromConfig(cfg *config.SandboxConfig) *Config {
 		Mode:           Mode(cfg.Mode),
 		AllowedWorkDir: workDir,
 		DeniedPatterns: MustCompile(denied),
-		RiskyPatterns:  MustCompile(risky),
+		RiskyPatterns:  MustCompile(riskyStrs),
+		PatternDescs:   patternDescs,
 		ReadOnly:       Mode(cfg.Mode) == ModeReadOnly,
 	}
 }
@@ -62,10 +76,11 @@ func NewFromConfig(cfg *config.SandboxConfig) *Config {
 type NeedsConfirmationError struct {
 	Command string // 触发检查的命令
 	Pattern string // 匹配的正则模式
+	Reason  string // 人类可读的描述
 }
 
 func (e *NeedsConfirmationError) Error() string {
-	return fmt.Sprintf("risky command matching %q", e.Pattern)
+	return fmt.Sprintf("risky command: %s (%q)", e.Reason, e.Pattern)
 }
 
 // Check 检查命令 cmd 是否符合沙箱规则。
@@ -118,7 +133,14 @@ func Check(cmd string, cfg *Config) error {
 	} else if cfg.Mode == ModeNormal {
 		for _, p := range cfg.RiskyPatterns {
 			if p.MatchString(cmd) {
-				return &NeedsConfirmationError{Command: cmd, Pattern: p.String()}
+				patStr := p.String()
+				reason := PatternDesc(patStr)
+				if cfg.PatternDescs != nil {
+					if d, ok := cfg.PatternDescs[patStr]; ok {
+						reason = d
+					}
+				}
+				return &NeedsConfirmationError{Command: cmd, Pattern: patStr, Reason: reason}
 			}
 		}
 	}

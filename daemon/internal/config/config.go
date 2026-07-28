@@ -24,11 +24,32 @@ type LLMConfig struct {
 	APIKey   string `yaml:"api_key"`
 }
 
+// RiskPatternConfig 表示一个风险命令模式及其人类可读描述。
+type RiskPatternConfig struct {
+	Pattern string `yaml:"pattern"`
+	Desc    string `yaml:"desc"`
+}
+
+// UnmarshalYAML 兼容两种格式：
+//   - "rm\s+"           ← 纯字符串（旧格式）
+//   - {pattern, desc}   ← struct 格式
+func (r *RiskPatternConfig) UnmarshalYAML(value *yaml.Node) error {
+	// 先试纯字符串
+	var s string
+	if err := value.Decode(&s); err == nil {
+		r.Pattern = s
+		return nil
+	}
+	// 再试 struct
+	type raw RiskPatternConfig
+	return value.Decode((*raw)(r))
+}
+
 type SandboxConfig struct {
-	Mode           string   `yaml:"mode"`
-	AllowedWorkDir string   `yaml:"allowed_work_dir"` // 空 = 使用当前目录
-	DeniedPatterns []string `yaml:"denied_patterns"`   // 空 = 使用 sandbox 默认
-	RiskyPatterns  []string `yaml:"risky_patterns"`    // 空 = 使用 sandbox 默认
+	Mode           string              `yaml:"mode"`
+	AllowedWorkDir string              `yaml:"allowed_work_dir"` // 空 = 使用当前目录
+	DeniedPatterns []string            `yaml:"denied_patterns"`  // 空 = 使用 sandbox 默认
+	RiskyPatterns  []RiskPatternConfig `yaml:"risky_patterns"`   // 空 = 使用 sandbox 默认
 }
 
 // Default 返回带默认值的 Config。

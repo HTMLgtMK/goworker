@@ -23,20 +23,47 @@ var DefaultDeniedPatterns = []string{
 // DefaultRiskyPatterns 是默认高风险命令模式。
 // 匹配的命令在 normal 模式下需要用户确认，在 strict 模式下直接拒绝。
 var DefaultRiskyPatterns = []string{
-	`rm\s+`,      // 删除
-	`mv\s+`,      // 移动
-	`dd\s+`,      // 磁盘操作
-	`>`,          // 重定向写
-	`>>`,         // 追加重定向
-	`\|`,         // 管道（可能链式执行）
-	`sudo\s+`,    // 提权
-	`chmod\s+`,   // 改权限
-	`chown\s+`,   // 改所有者
-	`kill\s+`,    // 杀进程
-	`shutdown`,   // 关机
-	`reboot`,     // 重启
-	`init\s+0`,   // 关机（init）
-	`init\s+6`,   // 重启（init）
+	`rm\s+`,             // 删除
+	`mv\s+`,             // 移动
+	`dd\s+`,             // 磁盘操作
+	`>\s+\S`,            // 输出重定向到文件（不匹配 2>&1 这种 fd 复制）
+	`>>\s+\S`,           // 追加重定向
+	`\|`,                // 管道（可能链式执行）
+	`sudo\s+`,           // 提权
+	`chmod\s+`,          // 改权限
+	`chown\s+`,          // 改所有者
+	`kill\s+`,           // 杀进程
+	`shutdown`,          // 关机
+	`reboot`,            // 重启
+	`init\s+0`,          // 关机（init）
+	`init\s+6`,          // 重启（init）
+}
+
+// riskPatternDesc 给出默认风险模式的人类可读描述。
+var riskPatternDesc = map[string]string{
+	`rm\s+`:    "删除文件/目录",
+	`mv\s+`:    "移动/重命名文件",
+	`dd\s+`:    "磁盘直接读写（危险）",
+	`>\s+\S`:   "输出重定向到文件",
+	`>>\s+\S`:  "追加重定向到文件",
+	`\|`:       "管道链式执行",
+	`sudo\s+`:  "提权（root 权限）",
+	`chmod\s+`: "改变文件权限",
+	`chown\s+`: "改变文件所有者",
+	`kill\s+`:  "杀死进程",
+	`shutdown`: "关机",
+	`reboot`:   "重启",
+	`init\s+0`: "关机",
+	`init\s+6`: "重启",
+}
+
+// PatternDesc 返回正则模式对应的人类可读描述。
+// 如果是内置模式返回中文描述，否则返回原始模式字符串。
+func PatternDesc(pattern string) string {
+	if desc, ok := riskPatternDesc[pattern]; ok {
+		return desc
+	}
+	return pattern
 }
 
 // CompilePatterns 编译字符串模式列表为正则表达式列表。

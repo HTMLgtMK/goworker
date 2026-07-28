@@ -46,8 +46,9 @@ type Hub struct {
 	Tools            func() []Tool
 	Notify           func(event Event)
 	Eval             func(ctx *Context, input string) error
-	Config           *config.Config              // 全局配置（只读/修改后需调 SaveConfig）
-	SaveConfig       func(*config.Config) error  // 持久化配置到 YAML 文件
+	Config             *config.Config              // 全局配置（只读/修改后需调 SaveConfig）
+	SaveConfig         func(*config.Config) error  // 持久化配置到 YAML 文件
+	SetFallbackHandler func(func(ctx *Context) error) // 设置未匹配命令的兜底处理器
 }
 
 // ---- 命令 ----

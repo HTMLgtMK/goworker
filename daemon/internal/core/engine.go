@@ -18,12 +18,13 @@ import (
 //   - 中间件链
 //   - 事件广播
 type Engine struct {
-	config       *config.Config
-	plugins      map[string]spec.Plugin
-	commands     map[string]spec.Command
-	tools        map[string]spec.Tool
-	interceptors []spec.PluginInterceptor
-	listeners    []func(spec.Event)
+	config          *config.Config
+	plugins         map[string]spec.Plugin
+	commands        map[string]spec.Command
+	tools           map[string]spec.Tool
+	interceptors    []spec.PluginInterceptor
+	listeners       []func(spec.Event)
+	fallbackHandler func(ctx *spec.Context) error // 未匹配命令的兜底处理器
 }
 
 // NewEngine 创建一个引擎并关联全局配置。
@@ -45,6 +46,12 @@ func (e *Engine) Config() *config.Config { return e.config }
 func (e *Engine) SaveConfig(cfg *config.Config) error {
 	*e.config = *cfg
 	return config.Save(cfg, config.DefaultPath())
+}
+
+// SetFallbackHandler 设置未匹配命令的兜底处理器。
+// 当用户输入不是任何已注册命令时，引擎会调用此 handler 而非返回错误。
+func (e *Engine) SetFallbackHandler(fn func(ctx *spec.Context) error) {
+	e.fallbackHandler = fn
 }
 
 // ---- Middleware ----
@@ -116,8 +123,11 @@ func (e *Engine) pluginHub() *spec.Hub {
 		Eval: func(ctx *spec.Context, input string) error {
 			return e.Eval(ctx, input)
 		},
-		Config: e.config,
+		Config:     e.config,
 		SaveConfig: e.SaveConfig,
+		SetFallbackHandler: func(fn func(ctx *spec.Context) error) {
+			e.SetFallbackHandler(fn)
+		},
 	}
 }
 
@@ -186,6 +196,15 @@ func (e *Engine) Eval(ctx *spec.Context, input string) error {
 	name := parts[0]
 	cmd, exists := e.commands[name]
 	if !exists {
+		if e.fallbackHandler != nil {
+			// 不以 / 开头的是自然语言输入，把全部内容传给 fallback
+			if strings.HasPrefix(input, "/") {
+				ctx.Args = parts[1:]
+			} else {
+				ctx.Args = parts
+			}
+			return e.fallbackHandler(ctx)
+		}
 		return fmt.Errorf("unknown command: %q", name)
 	}
 

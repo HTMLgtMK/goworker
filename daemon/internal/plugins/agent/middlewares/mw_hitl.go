@@ -65,7 +65,7 @@ func (mw *HITLMiddleware) OnBeforeTool(ev *core.BeforeToolEvent) *core.Middlewar
 		ID:         fmt.Sprintf("req-%d", reqID.Add(1)),
 		ToolName:   "bash",
 		Command:    cmdStr,
-		RiskReason: needsConf.Pattern,
+		RiskReason: needsConf.Reason,
 		CreatedAt:  time.Now(),
 		ExpiresAt:  time.Now().Add(30 * time.Second),
 	}

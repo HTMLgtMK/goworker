@@ -36,6 +36,9 @@ func (p *AgentPlugin) Init(h *spec.Hub) error {
 		Handler:     p.handleModel,
 	})
 
+	// 未匹配的任何命令都转发给 agent 处理
+	h.SetFallbackHandler(p.handleAgent)
+
 	return nil
 }
 
