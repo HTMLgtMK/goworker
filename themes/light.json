@@ -1,0 +1,51 @@
+{
+  "document": {
+    "margin": 2
+  },
+  "text": {
+    "color": "#141413"
+  },
+  "strong": {
+    "bold": false,
+    "color": "#000000"
+  },
+  "emph": {
+    "italic": true,
+    "color": "#3A3A38"
+  },
+  "heading": {
+    "bold": false,
+    "color": "#D97757",
+    "block_prefix": "## ",
+    "block_suffix": ""
+  },
+  "link": {
+    "color": "#3668A0",
+    "underline": true
+  },
+  "link_text": {
+    "color": "#3668A0"
+  },
+  "code": {
+    "color": "#A53A2E",
+    "background_color": "#E8E6DC",
+    "block_prefix": " ",
+    "block_suffix": " "
+  },
+  "code_block": {
+    "color": "#141413",
+    "background_color": "#F3F1E8",
+    "margin": 1,
+    "chroma": {
+      "text": { "color": "#141413" },
+      "keyword": { "color": "#A53A2E" },
+      "literal_string": { "color": "#4A7038" },
+      "comment": { "color": "#B0AEA5" },
+      "literal_number": { "color": "#8A6A10" }
+    }
+  },
+  "item": {
+    "color": "#141413",
+    "block_prefix": "• "
+  }
+}

@@ -22,7 +22,10 @@ type StdinFrontend struct {
 	termWidth int // 终端列数，用于 markdown 渲染的 word wrap 和 HR 宽度
 }
 
-func NewStdinFrontend(engine *core.Engine) *StdinFrontend {
+func NewStdinFrontend(engine *core.Engine, theme string) *StdinFrontend {
+	if theme != "" {
+		SetTheme(theme)
+	}
 	return &StdinFrontend{engine: engine}
 }
 

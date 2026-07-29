@@ -2,11 +2,18 @@ package stdin
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/rivo/uniseg"
 )
+
+func TestMain(m *testing.M) {
+	// 测试前初始化默认主题
+	SetTheme("light")
+	os.Exit(m.Run())
+}
 
 func ansiStrip(s string) string {
 	var b strings.Builder

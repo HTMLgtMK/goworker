@@ -14,8 +14,17 @@ import (
 
 // Config 是 goworker 的整体配置。
 type Config struct {
-	LLM     LLMConfig     `yaml:"llm"`
-	Sandbox SandboxConfig `yaml:"sandbox"`
+	Frontend FrontendConfig `yaml:"frontend"`
+	LLM      LLMConfig      `yaml:"llm"`
+	Sandbox  SandboxConfig  `yaml:"sandbox"`
+}
+
+type FrontendConfig struct {
+	Stdin StdinConfig `yaml:"stdin"`
+}
+
+type StdinConfig struct {
+	Theme string `yaml:"theme"` // "default" 或主题 JSON 文件路径
 }
 
 type LLMConfig struct {
@@ -55,6 +64,11 @@ type SandboxConfig struct {
 // Default 返回带默认值的 Config。
 func Default() *Config {
 	return &Config{
+		Frontend: FrontendConfig{
+			Stdin: StdinConfig{
+				Theme: "default",
+			},
+		},
 		LLM: LLMConfig{
 			Endpoint: "http://localhost:8000/v1",
 			Model:    "gpt-4o",
@@ -92,6 +106,8 @@ func (c *Config) Display() string {
 // SetField 按点分 key 设置配置项（如 "llm.endpoint"、"sandbox.mode"）。
 func (c *Config) SetField(key, value string) error {
 	switch key {
+	case "frontend.stdin.theme":
+		c.Frontend.Stdin.Theme = value
 	case "llm.endpoint":
 		c.LLM.Endpoint = value
 	case "llm.model":
@@ -103,7 +119,7 @@ func (c *Config) SetField(key, value string) error {
 	case "sandbox.allowed_work_dir":
 		c.Sandbox.AllowedWorkDir = value
 	default:
-		valid := "llm.endpoint, llm.model, llm.api_key, sandbox.mode, sandbox.allowed_work_dir"
+		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, sandbox.mode, sandbox.allowed_work_dir"
 		return fmt.Errorf("未知配置项: %s（可用: %s）", key, valid)
 	}
 	return nil

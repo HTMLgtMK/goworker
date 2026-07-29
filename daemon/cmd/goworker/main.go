@@ -94,7 +94,7 @@ func main() {
 	engine.Notify(spec.Event{Type: spec.EventPluginStarted, Payload: "system"})
 
 	// 启动前端（goroutine，不阻塞）
-	frontend := stdin.NewStdinFrontend(engine)
+	frontend := stdin.NewStdinFrontend(engine, cfg.Frontend.Stdin.Theme)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- frontend.Run()
