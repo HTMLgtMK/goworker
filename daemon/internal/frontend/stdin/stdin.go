@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 
+	term "github.com/charmbracelet/x/term"
+
 	"github.com/tinguo/goworker/daemon/internal/core"
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
@@ -15,8 +17,9 @@ const rawNL = "\r\n"
 
 // StdinFrontend 是一个基于标准输入/输出的用户界面，使用 raw mode 行编辑器。
 type StdinFrontend struct {
-	engine *core.Engine
-	editor *LineEditor
+	engine    *core.Engine
+	editor    *LineEditor
+	termWidth int // 终端列数，用于 markdown 渲染的 word wrap 和 HR 宽度
 }
 
 func NewStdinFrontend(engine *core.Engine) *StdinFrontend {
@@ -31,9 +34,12 @@ func (f *StdinFrontend) Write(s string) {
 }
 
 // writeText 渲染文本类 token（markdown 输出）。
+// 每行统一缩进 2 格（首行用 ● 前缀，后续行用空格），避免多行表格/列表对齐错乱。
 func (f *StdinFrontend) writeText(content string) {
-	rendered := strings.TrimSpace(RenderMarkdown(strings.TrimSpace(content)))
-	f.Write("\n● " + rendered)
+	rendered := RenderMarkdown(strings.TrimSpace(content), f.termWidth)
+	// 首行 ● + 后续行 2 空格缩进，保持多行内容对齐
+	rendered = "● " + strings.ReplaceAll(rendered, "\n", "\n  ")
+	f.Write("\n" + rendered)
 }
 
 // writeToolCall 渲染工具调用 token。
@@ -76,6 +82,12 @@ func (f *StdinFrontend) Run() error {
 	}
 	f.editor = editor
 	defer editor.Close()
+
+	// 获取终端宽度，失败则用 80 列作为兜底
+	f.termWidth = 80
+	if w, _, err := term.GetSize(os.Stdin.Fd()); err == nil && w > 0 {
+		f.termWidth = w
+	}
 
 	for {
 		line, canceled, err := editor.ReadLine()
