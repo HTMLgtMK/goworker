@@ -192,9 +192,8 @@ func (p *AgentPlugin) renderKind(t core.Token) (spec.RenderKind, string) {
 
 // promptForDecision 使用前端的 I/O 展示审批选项并获取用户决策。
 func (p *AgentPlugin) promptForDecision(ctx *spec.Context, req *spec.InterruptRequest) spec.HITLDecision {
-	ctx.Writer(fmt.Sprintf("\nRisky %s: %s\n", req.ToolName, req.Command))
-	ctx.Writer(fmt.Sprintf("  Reason: %s\n", req.RiskReason))
-	ctx.Writer("[a]pprove, [e]dit, [r]eject, res[p]ond [a]: \n")
+	ctx.Writer(fmt.Sprintf("\n⚠ %s (%s)\n", req.Command, req.RiskReason))
+	ctx.Writer("[a]pprove, [e]dit, [r]eject, res[p]ond [a]: ")
 
 	if ctx.ReadLine == nil {
 		return spec.HITLDecision{

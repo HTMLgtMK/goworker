@@ -13,46 +13,6 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
 
-// ---- 示例插件 ----
-
-type PluginA struct{}
-
-func (p *PluginA) Name() string { return "PluginA" }
-
-func (p *PluginA) Init(h *spec.Hub) error {
-	return h.RegisterCommand(spec.Command{
-		Name:        "/a",
-		Aliases:     []string{"/A"},
-		Description: "A 命令",
-		Handler: func(ctx *spec.Context) error {
-			ctx.Writer("Executing A\n")
-			return nil
-		},
-	})
-}
-
-func (p *PluginA) Start() error { log.Printf("PluginA started"); return nil }
-func (p *PluginA) Stop() error  { log.Printf("PluginA stopped"); return nil }
-
-type PluginB struct{}
-
-func (p *PluginB) Name() string { return "PluginB" }
-
-func (p *PluginB) Init(h *spec.Hub) error {
-	return h.RegisterCommand(spec.Command{
-		Name:        "/b",
-		Aliases:     []string{"/B"},
-		Description: "B 命令",
-		Handler: func(ctx *spec.Context) error {
-			ctx.Writer("Executing B\n")
-			return nil
-		},
-	})
-}
-
-func (p *PluginB) Start() error { log.Printf("PluginB started"); return nil }
-func (p *PluginB) Stop() error  { log.Printf("PluginB stopped"); return nil }
-
 // ---- 入口 ----
 
 func main() {
@@ -68,14 +28,6 @@ func main() {
 	engine.Use(core.LoggingInterceptor())
 
 	// 注册插件
-	if err := engine.Register(&PluginA{}); err != nil {
-		log.Printf("register PluginA: %v", err)
-		return
-	}
-	if err := engine.Register(&PluginB{}); err != nil {
-		log.Printf("register PluginB: %v", err)
-		return
-	}
 	if err := engine.Register(&agent.AgentPlugin{}); err != nil {
 		log.Printf("register AgentPlugin: %v", err)
 		return
@@ -94,7 +46,7 @@ func main() {
 	engine.Notify(spec.Event{Type: spec.EventPluginStarted, Payload: "system"})
 
 	// 启动前端（goroutine，不阻塞）
-	frontend := stdin.NewStdinFrontend(engine, cfg.Frontend.Stdin.Theme)
+	frontend := stdin.NewStdinFrontend(engine, &cfg.Frontend.Stdin)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- frontend.Run()

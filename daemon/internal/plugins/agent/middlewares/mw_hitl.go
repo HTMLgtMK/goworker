@@ -16,7 +16,7 @@ var reqID atomic.Int64
 
 // HITLMiddleware 通过 DecisionProvider 对接沙箱检查，拦截风险命令。
 type HITLMiddleware struct {
-	sandboxCfg      sandbox.Config
+	sandboxCfg       sandbox.Config
 	decisionProvider core.DecisionProvider
 }
 

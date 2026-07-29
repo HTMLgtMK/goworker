@@ -82,7 +82,7 @@ var (
 		},
 		HorizontalRule: ansi.StylePrimitive{
 			Faint:  boolPtr(true),
-			Format: "\n────────────────────────────────────\n",
+			Format: "\n---\n",
 		},
 		List: ansi.StyleList{
 			StyleBlock: ansi.StyleBlock{

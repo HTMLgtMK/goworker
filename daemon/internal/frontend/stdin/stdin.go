@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	term "github.com/charmbracelet/x/term"
 
+	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/core"
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
@@ -15,18 +18,41 @@ import (
 // rawNL 在 raw mode 下 \n 不会自动回车到行首，需要补 \r
 const rawNL = "\r\n"
 
-// StdinFrontend 是一个基于标准输入/输出的用户界面，使用 raw mode 行编辑器。
+// StdinFrontend 是一个基于标准输入/输出的用户界面。
+//
+// 字节从 os.Stdin 由 dispatchStdin goroutine 读取，投递到 stdinCh channel，
+// 各消费者（LineEditor、key watcher）从 channel 取字节，不存在 fd 竞争。
 type StdinFrontend struct {
 	engine    *core.Engine
 	editor    *LineEditor
 	termWidth int // 终端列数，用于 markdown 渲染的 word wrap 和 HR 宽度
+
+	stdinCh chan byte // dispatcher → consumers
+
+	agentCtx    context.Context
+	agentCancel context.CancelFunc
+
+	hitlActive      atomic.Bool // HITL 激活时 key watcher 休眠
+	cancelledByUser atomic.Bool // 用户按了 Esc/Ctrl+C
 }
 
-func NewStdinFrontend(engine *core.Engine, theme string) *StdinFrontend {
-	if theme != "" {
-		SetTheme(theme)
+func NewStdinFrontend(engine *core.Engine, config *config.StdinConfig) *StdinFrontend {
+	if config.Theme != "" {
+		SetTheme(config.Theme)
 	}
 	return &StdinFrontend{engine: engine}
+}
+
+// dispatchStdin 是唯一的 os.Stdin 字节读取者，持续将字节投递到 stdinCh。
+func (f *StdinFrontend) dispatchStdin() {
+	var b [1]byte
+	for {
+		n, err := os.Stdin.Read(b[:])
+		if err != nil || n == 0 {
+			return
+		}
+		f.stdinCh <- b[0]
+	}
 }
 
 // Write 实现 spec.Context 的 Writer 回调。
@@ -67,19 +93,37 @@ func (f *StdinFrontend) writeToolResult(content string) {
 
 // readLine 供 HITL 确认使用。
 func (f *StdinFrontend) readLine() (string, error) {
+	f.hitlActive.Store(true)
+	defer f.hitlActive.Store(false)
+
+	// 清残留字节（agent 运行期间积压的 Enter/乱敲）
+	drainChannel(f.stdinCh)
+
 	oldPrompt := f.editor.Prompt
 	f.editor.Prompt = ""
 	defer func() { f.editor.Prompt = oldPrompt }()
-	line, _, err := f.editor.ReadLine()
+
+	line, canceled, err := f.editor.ReadLine()
 	if err != nil {
 		return "", err
+	}
+	if canceled {
+		// 用户在 HITL 时按 Esc/Ctrl+C → 取消整个 agent 执行
+		f.cancelledByUser.Store(true)
+		if f.agentCancel != nil {
+			f.agentCancel()
+		}
+		return "", fmt.Errorf("cancelled")
 	}
 	return strings.TrimRight(line, "\r\n"), nil
 }
 
 // Run 启动主事件循环。
 func (f *StdinFrontend) Run() error {
-	editor, err := NewLineEditor()
+	f.stdinCh = make(chan byte, 64)
+	go f.dispatchStdin()
+
+	editor, err := NewLineEditor(f.stdinCh)
 	if err != nil {
 		return fmt.Errorf("line editor: %w", err)
 	}
@@ -117,7 +161,6 @@ func (f *StdinFrontend) Run() error {
 
 		// 注入 WriteToken — 所有渲染逻辑收敛至此
 		ctx.WriteToken = func(kind spec.RenderKind, content string) {
-
 			switch kind {
 			case spec.KindText:
 				f.writeText(content)
@@ -138,14 +181,67 @@ func (f *StdinFrontend) Run() error {
 	}
 }
 
-// runWithCancel 启动 agent 并监听 Esc 取消。
+// runWithCancel 启动 agent 并监听 Esc/Ctrl+C 取消。
 func (f *StdinFrontend) runWithCancel(ctx *spec.Context, line string) {
-	// 暂不实现 Esc 取消 agent 执行，避免 stdin 竞争
-	// Esc 在输入时可用（editor.ReadLine），agent 运行期间按 Esc 会在后续 DrainInput 被清掉
-	err := f.engine.Eval(ctx, line)
-	f.editor.DrainInput()
+	f.cancelledByUser.Store(false)
+	f.agentCtx, f.agentCancel = context.WithCancel(context.Background())
 
-	if err != nil {
+	defer func() {
+		f.agentCancel()
+		f.agentCtx = nil
+		f.agentCancel = nil
+		f.editor.DrainInput()
+	}()
+
+	// 注入可取消的 context（handleAgent 会 WithTimeout 派生，取消沿链传播）
+	ctx.Ctx = f.agentCtx
+
+	// 启动按键监听 goroutine，非 HITL 阶段检测 Esc/Ctrl+C
+	go f.runKeyWatcher(f.agentCtx)
+
+	err := f.engine.Eval(ctx, line)
+
+	if !f.cancelledByUser.Load() && err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\r\n", err)
+	}
+}
+
+// runKeyWatcher 在 agent 执行期间（非 HITL 阶段）监听 Esc/Ctrl+C。
+// HITL 阶段通过 hitlActive flag 休眠，避免与 LineEditor 竞争。
+func (f *StdinFrontend) runKeyWatcher(ctx context.Context) {
+	for {
+		// HITL 激活时休眠，让 LineEditor 独占 stdinCh
+		if f.hitlActive.Load() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(50 * time.Millisecond):
+				continue
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case b := <-f.stdinCh:
+			if b == escByte || b == ctrlCByte {
+				f.cancelledByUser.Store(true)
+				f.agentCancel()
+				// 立即写反馈，不等 agent goroutine 退出（stderr raw mode 要 \r\n）
+				fmt.Fprint(os.Stderr, "\r\n  ⏹ cancelling...\r\n")
+				return
+			}
+		}
+	}
+}
+
+// drainChannel 非阻塞清空 channel。
+func drainChannel(ch <-chan byte) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
 	}
 }

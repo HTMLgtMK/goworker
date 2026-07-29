@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
@@ -44,6 +45,15 @@ func DefaultTools(cfg *sandbox.Config) []core.Tool {
 				ctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 				defer cancel()
 				cmd := exec.CommandContext(ctx, "bash", "-c", cmdStr)
+				cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+				// context 取消时 kill 整个进程组（含管道子进程），
+				// exec.CommandContext 只 kill bash 本身，子进程变孤儿可能阻塞 CombinedOutput
+				go func() {
+					<-ctx.Done()
+					if cmd.Process != nil {
+						syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+					}
+				}()
 				if cfg != nil && cfg.AllowedWorkDir != "" {
 					cmd.Dir = cfg.AllowedWorkDir
 				}
