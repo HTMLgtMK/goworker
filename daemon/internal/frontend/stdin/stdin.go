@@ -12,6 +12,7 @@ import (
 
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/core"
+	"github.com/tinguo/goworker/daemon/internal/frontend/statusbar"
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
 
@@ -34,13 +35,22 @@ type StdinFrontend struct {
 
 	hitlActive      atomic.Bool // HITL 激活时 key watcher 休眠
 	cancelledByUser atomic.Bool // 用户按了 Esc/Ctrl+C
+
+	sb *statusbar.Bar
 }
 
 func NewStdinFrontend(engine *core.Engine, config *config.StdinConfig) *StdinFrontend {
 	if config.Theme != "" {
 		SetTheme(config.Theme)
 	}
-	return &StdinFrontend{engine: engine}
+
+	sb := statusbar.New()
+	sb.Use(NewSpinnerAddon(), NewElapsedAddon(), NewIterationAddon())
+
+	return &StdinFrontend{
+		engine: engine,
+		sb:     sb,
+	}
 }
 
 // dispatchStdin 是唯一的 os.Stdin 字节读取者，持续将字节投递到 stdinCh。
@@ -57,9 +67,19 @@ func (f *StdinFrontend) dispatchStdin() {
 
 // Write 实现 spec.Context 的 Writer 回调。
 // raw mode 下 \n 不回车，手动补 \r。先清掉已有的 \r 避免双倍。
+// 如果有 status bar 在底部，先清再写最后重绘，确保新内容在状态栏上方。
 func (f *StdinFrontend) Write(s string) {
-	s = strings.ReplaceAll(s, "\r", "")
-	fmt.Print(strings.ReplaceAll(s, "\n", rawNL))
+	content := strings.ReplaceAll(strings.ReplaceAll(s, "\r", ""), "\n", rawNL)
+	f.sb.WithLock(func() {
+		if f.sb.Active() && !f.hitlActive.Load() {
+			f.sb.Clear()
+		}
+		fmt.Print(content)
+		if f.sb.Active() && !f.hitlActive.Load() {
+			fmt.Fprint(os.Stderr, "\r\n")
+			f.sb.Draw()
+		}
+	})
 }
 
 // writeText 渲染文本类 token（markdown 输出）。
@@ -186,7 +206,13 @@ func (f *StdinFrontend) runWithCancel(ctx *spec.Context, line string) {
 	f.cancelledByUser.Store(false)
 	f.agentCtx, f.agentCancel = context.WithCancel(context.Background())
 
+	// 注入事件总线，agent plugin 可通过 Publish 广播事件给 status bar addon
+	ctx.Publish = f.sb.Publish
+	f.sb.Start()
+
 	defer func() {
+		f.sb.Stop()
+
 		f.agentCancel()
 		f.agentCtx = nil
 		f.agentCancel = nil
@@ -196,8 +222,9 @@ func (f *StdinFrontend) runWithCancel(ctx *spec.Context, line string) {
 	// 注入可取消的 context（handleAgent 会 WithTimeout 派生，取消沿链传播）
 	ctx.Ctx = f.agentCtx
 
-	// 启动按键监听 goroutine，非 HITL 阶段检测 Esc/Ctrl+C
+	// 启动按键监听 goroutine + 状态栏
 	go f.runKeyWatcher(f.agentCtx)
+	go f.sb.Run(f.agentCtx, func() bool { return f.hitlActive.Load() })
 
 	err := f.engine.Eval(ctx, line)
 

@@ -153,6 +153,8 @@ type Agent struct {
 	tools       []core.Tool
 	toolMap     map[string]core.Tool
 	middlewares []core.Middleware
+
+	OnIteration func() // 可选：每次 ReAct 循环前调用，用于 UI 反馈（status bar 迭代计数）
 }
 
 func NewAgent(provider core.Provider, tools []core.Tool, mws []core.Middleware) *Agent {
@@ -187,6 +189,9 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 		}()
 
 		for iter := 0; iter < maxIterations; iter++ {
+			if a.OnIteration != nil {
+				a.OnIteration()
+			}
 			req := &core.ChatRequest{
 				Model:    a.provider.Model(),
 				Messages: messages,

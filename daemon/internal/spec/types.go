@@ -94,6 +94,7 @@ type FrontendContext struct {
 	ReadLine   func() (string, error)                // 输入回调，由前端注入（nil 表示不支持交互式输入）
 	Writer     func(string)                          // 输出回调，由前端注入
 	WriteToken func(kind RenderKind, content string) // 前端注入：带类型的 token 渲染
+	Publish    func(event string, data any)          // 可选：广播事件（status bar 用），线程安全
 }
 
 // Context 是命令执行的上下文。

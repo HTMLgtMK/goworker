@@ -11,6 +11,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/middlewares"
 	"github.com/tinguo/goworker/daemon/internal/sandbox"
 	"github.com/tinguo/goworker/daemon/internal/spec"
+	"github.com/tinguo/goworker/daemon/internal/frontend/statusbar"
 )
 
 type AgentPlugin struct {
@@ -139,6 +140,11 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 	decisions := make(chan spec.HITLDecision, 1)
 	hitlMw := middlewares.NewHITLMiddleware(sandboxCfg, middlewares.NewChannelDecisionProvider(decisions))
 	agent := NewAgent(provider, tools, []core.Middleware{hitlMw})
+	agent.OnIteration = func() {
+		if ctx.Publish != nil {
+			ctx.Publish(statusbar.EventIteration, nil)
+		}
+	}
 
 	agentCtx, cancel := context.WithTimeout(ctx.Ctx, 5*time.Minute)
 	defer cancel()
