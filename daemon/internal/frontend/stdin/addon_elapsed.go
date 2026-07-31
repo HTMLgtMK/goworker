@@ -22,7 +22,7 @@ func NewElapsedAddon() *ElapsedAddon {
 	return &ElapsedAddon{}
 }
 
-func (a *ElapsedAddon) Name() string            { return "elapsed" }
+func (a *ElapsedAddon) Name() string             { return "elapsed" }
 func (a *ElapsedAddon) Tick(ctx context.Context) {}
 func (a *ElapsedAddon) Render() string {
 	elapsed := time.Since(a.start).Round(100 * time.Millisecond)

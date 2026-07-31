@@ -7,11 +7,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tinguo/goworker/daemon/internal/frontend/statusbar"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/middlewares"
 	"github.com/tinguo/goworker/daemon/internal/sandbox"
 	"github.com/tinguo/goworker/daemon/internal/spec"
-	"github.com/tinguo/goworker/daemon/internal/frontend/statusbar"
 )
 
 type AgentPlugin struct {

@@ -29,10 +29,10 @@ func NewSpinnerAddon() *SpinnerAddon {
 	}
 }
 
-func (a *SpinnerAddon) Name() string               { return "spinner" }
-func (a *SpinnerAddon) Tick(ctx context.Context)    { a.idx = (a.idx + 1) % len(a.frames) }
-func (a *SpinnerAddon) Reset()                      { a.idx = 0; a.stopped = false }
-func (a *SpinnerAddon) OnStop()                     { a.stopped = true }
+func (a *SpinnerAddon) Name() string             { return "spinner" }
+func (a *SpinnerAddon) Tick(ctx context.Context) { a.idx = (a.idx + 1) % len(a.frames) }
+func (a *SpinnerAddon) Reset()                   { a.idx = 0; a.stopped = false }
+func (a *SpinnerAddon) OnStop()                  { a.stopped = true }
 func (a *SpinnerAddon) Render() string {
 	if a.stopped {
 		return "✓"

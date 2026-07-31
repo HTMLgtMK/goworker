@@ -175,10 +175,16 @@ func TestReadLine_HistoryUpDown(t *testing.T) {
 	rch := readLineAsync(ed)
 
 	// ↑ 两次: second → first（CSI 序列: ESC [ A）
-	ch <- escByte; ch <- '['; ch <- 'A'
-	ch <- escByte; ch <- '['; ch <- 'A'
+	ch <- escByte
+	ch <- '['
+	ch <- 'A'
+	ch <- escByte
+	ch <- '['
+	ch <- 'A'
 	// ↓ 一次: 回到 second（ESC [ B）
-	ch <- escByte; ch <- '['; ch <- 'B'
+	ch <- escByte
+	ch <- '['
+	ch <- 'B'
 	// 回车
 	ch <- enterByte
 
@@ -198,7 +204,9 @@ func TestReadLine_HistoryEmpty(t *testing.T) {
 
 	// 没历史时 ↑ 应该无效果
 	rch := readLineAsync(ed)
-	ch <- escByte; ch <- '['; ch <- 'A' // CSI Up — 历史为空，什么都不发生
+	ch <- escByte
+	ch <- '['
+	ch <- 'A' // CSI Up — 历史为空，什么都不发生
 	writeBytes(ch, "new")
 	ch <- enterByte
 

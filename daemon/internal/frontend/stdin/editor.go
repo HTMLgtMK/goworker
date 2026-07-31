@@ -26,12 +26,12 @@ var escTimeout = 15 * time.Millisecond
 type LineEditor struct {
 	stdinCh <-chan byte
 	state   *term.State
-	Prompt  string    // 输入提示符，可临时置空避免 HITL 时画重复提示
-	buf     []rune    // 以 rune 为单位跟踪输入（正确支持中文等 UTF-8）
-	pos     int       // rune 索引
-	history []string  // 历史记录，最新在末尾
-	histIdx int       // -1 = 新输入，0 到 len-1 = 历史中的索引
-	ubuf    []byte    // UTF-8 多字节累积缓冲
+	Prompt  string   // 输入提示符，可临时置空避免 HITL 时画重复提示
+	buf     []rune   // 以 rune 为单位跟踪输入（正确支持中文等 UTF-8）
+	pos     int      // rune 索引
+	history []string // 历史记录，最新在末尾
+	histIdx int      // -1 = 新输入，0 到 len-1 = 历史中的索引
+	ubuf    []byte   // UTF-8 多字节累积缓冲
 }
 
 // NewLineEditor 创建并进入 raw mode。

@@ -105,7 +105,7 @@ type Delta struct {
 
 // Token 流式输出中的一个 token。
 type Token struct {
-	Type      string                  // "text" / "tool_call" / "tool_result" / "interrupt"
+	Type      string // "text" / "tool_call" / "tool_result" / "interrupt"
 	Content   string
 	Done      bool
 	Interrupt *spec.InterruptRequest // Type == "interrupt" 时填充
