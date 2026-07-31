@@ -1,19 +1,18 @@
 package core
 
 import (
-	"log"
-
+	"github.com/tinguo/goworker/daemon/internal/logger"
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
 
 // LoggingMiddleware 记录每个命令的执行日志。
-func LoggingInterceptor() spec.PluginInterceptor {
+func LoggingInterceptor(l *logger.Logger) spec.PluginInterceptor {
 	return func(ctx *spec.Context, next func() error) error {
 		user := ctx.Session.UserID
 		if user == "" {
 			user = "anonymous"
 		}
-		log.Printf("[cmd] user=%s args=%v", user, ctx.Args)
+		l.Info("command invoked", "user", user, "args", ctx.Args)
 		return next()
 	}
 }

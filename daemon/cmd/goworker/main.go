@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -9,6 +9,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/core"
 	"github.com/tinguo/goworker/daemon/internal/frontend/stdin"
+	"github.com/tinguo/goworker/daemon/internal/logger"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent"
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
@@ -19,17 +20,30 @@ func main() {
 	// 加载全局配置
 	cfgPath := config.DefaultPath()
 	cfg := config.Load(cfgPath)
-	log.Printf("[main] config loaded from %s", cfgPath)
 
-	engine := core.NewEngine(cfg)
+	// 初始化日志器（等级过滤 + 可选文件轮转/清理）
+	log, err := logger.Setup(cfg.Log)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "init logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer log.Close()
+	log.Info("config loaded", "path", cfgPath)
+	if cfg.Log.File != "" {
+		log.Info("log file", "path", cfg.Log.File)
+	} else {
+		log.Info("log to stderr only")
+	}
+
+	engine := core.NewEngine(cfg, log)
 	defer engine.StopAll()
 
 	// 注册拦截器
-	engine.Use(core.LoggingInterceptor())
+	engine.Use(core.LoggingInterceptor(log))
 
 	// 注册插件
 	if err := engine.Register(&agent.AgentPlugin{}); err != nil {
-		log.Printf("register AgentPlugin: %v", err)
+		log.Error("register AgentPlugin failed", "error", err)
 		return
 	}
 
@@ -38,7 +52,7 @@ func main() {
 
 	// 启动插件
 	if err := engine.StartAll(); err != nil {
-		log.Printf("start plugins: %v", err)
+		log.Error("start plugins failed", "error", err)
 		return
 	}
 
@@ -59,9 +73,9 @@ func main() {
 	select {
 	case err := <-errCh:
 		if err != nil {
-			log.Printf("frontend error: %v", err)
+			log.Error("frontend error", "error", err)
 		}
 	case sig := <-sigCh:
-		log.Printf("received signal %v, shutting down...", sig)
+		log.Info("received signal, shutting down", "signal", sig.String())
 	}
 }

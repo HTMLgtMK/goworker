@@ -16,7 +16,7 @@
 
 ## P1 — 生产基础设施
 
-- [ ] **结构化日志** — 替换 `log.Printf`，引入 log level（debug/info/warn/error）、结构化字段（request_id, plugin, cmd）、可插拔输出后端
+- [x] **结构化日志** — 替换 `log.Printf`，引入 log level（debug/info/warn/error）、结构化字段（request_id, plugin, cmd）、可插拔输出后端（slog Handler）。`internal/logger/`：`Setup` 装配、按大小轮转、按天清理，`config.yaml` 新增 `log:` 段（level/file/max_size_mb/max_age_days）
 - [ ] **LLM 调用限流 & 重试** — 429/5xx 自动重试 + exponential backoff，可配置的 rate limit，防止 API 被打爆
 - [ ] **Makefile** — 常用命令封装（build/test/lint/run/clean），不用手敲 `go run` 长路径
 - [ ] **版本信息** — `-version` 标志 + `ldflags` 注入版本号/commit/构建时间，方便线上定位

@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
+	"github.com/tinguo/goworker/daemon/internal/logger"
 	"gopkg.in/yaml.v3"
 )
 
@@ -17,6 +19,7 @@ type Config struct {
 	Frontend FrontendConfig `yaml:"frontend"`
 	LLM      LLMConfig      `yaml:"llm"`
 	Sandbox  SandboxConfig  `yaml:"sandbox"`
+	Log      logger.Config  `yaml:"log"`
 }
 
 type FrontendConfig struct {
@@ -63,6 +66,8 @@ type SandboxConfig struct {
 
 // Default 返回带默认值的 Config。
 func Default() *Config {
+	logCfg := logger.Default()
+	logCfg.File = defaultLogPath()
 	return &Config{
 		Frontend: FrontendConfig{
 			Stdin: StdinConfig{
@@ -77,7 +82,18 @@ func Default() *Config {
 		Sandbox: SandboxConfig{
 			Mode: "normal",
 		},
+		Log: logCfg,
 	}
+}
+
+// defaultLogPath 返回默认日志文件路径。
+// 放 <tmp>/goworker/<uid>/ 下，按 uid 隔离避免多用户互相污染日志。
+func defaultLogPath() string {
+	base := filepath.Join(os.TempDir(), "goworker")
+	if uid := os.Getuid(); uid >= 0 {
+		base = filepath.Join(base, strconv.Itoa(uid))
+	}
+	return filepath.Join(base, "goworker.log")
 }
 
 // DefaultPath 返回默认的配置文件路径。
@@ -118,8 +134,27 @@ func (c *Config) SetField(key, value string) error {
 		c.Sandbox.Mode = value
 	case "sandbox.allowed_work_dir":
 		c.Sandbox.AllowedWorkDir = value
+	case "log.level":
+		if !logger.ValidLevel(value) {
+			return fmt.Errorf("无效日志等级: %s（可用: debug/info/warn/error）", value)
+		}
+		c.Log.Level = value
+	case "log.file":
+		c.Log.File = value
+	case "log.max_size_mb":
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("无效 max_size_mb: %s", value)
+		}
+		c.Log.MaxSizeMB = n
+	case "log.max_age_days":
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("无效 max_age_days: %s", value)
+		}
+		c.Log.MaxAgeDays = n
 	default:
-		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, sandbox.mode, sandbox.allowed_work_dir"
+		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days"
 		return fmt.Errorf("未知配置项: %s（可用: %s）", key, valid)
 	}
 	return nil

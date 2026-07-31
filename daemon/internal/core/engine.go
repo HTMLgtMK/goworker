@@ -2,10 +2,10 @@ package core
 
 import (
 	"fmt"
-	"log"
 	"strings"
 
 	"github.com/tinguo/goworker/daemon/internal/config"
+	"github.com/tinguo/goworker/daemon/internal/logger"
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
 
@@ -19,6 +19,7 @@ import (
 //   - 事件广播
 type Engine struct {
 	config          *config.Config
+	log             *logger.Logger
 	plugins         map[string]spec.Plugin
 	commands        map[string]spec.Command
 	tools           map[string]spec.Tool
@@ -27,10 +28,15 @@ type Engine struct {
 	fallbackHandler func(ctx *spec.Context) error // 未匹配命令的兜底处理器
 }
 
-// NewEngine 创建一个引擎并关联全局配置。
-func NewEngine(cfg *config.Config) *Engine {
+// NewEngine 创建一个引擎并关联全局配置与日志器。
+// l 为 nil 时回落到 stderr logger，避免调用方误传 nil 导致内部 panic。
+func NewEngine(cfg *config.Config, l *logger.Logger) *Engine {
+	if l == nil {
+		l, _ = logger.Setup(logger.Default()) // 空 File 配置必然成功
+	}
 	return &Engine{
 		config:       cfg,
+		log:          l,
 		plugins:      make(map[string]spec.Plugin),
 		commands:     make(map[string]spec.Command),
 		tools:        make(map[string]spec.Tool),
@@ -88,7 +94,7 @@ func (e *Engine) Register(p spec.Plugin) error {
 	}
 
 	e.plugins[name] = p
-	log.Printf("[core] plugin %q registered", name)
+	e.log.Info("plugin registered", "name", name)
 	return nil
 }
 
@@ -142,13 +148,13 @@ func (e *Engine) RegisterCommand(cmd spec.Command) error {
 
 	for _, alias := range cmd.Aliases {
 		if _, exists := e.commands[alias]; exists {
-			log.Printf("[core] alias %q conflicts, skipping", alias)
+			e.log.Warn("alias conflicts, skipping", "alias", alias)
 			continue
 		}
 		e.commands[alias] = cmd
 	}
 
-	log.Printf("[core] command %q registered", cmd.Name)
+	e.log.Info("command registered", "command", cmd.Name)
 	return nil
 }
 
@@ -172,7 +178,7 @@ func (e *Engine) RegisterTool(tool spec.Tool) error {
 		return fmt.Errorf("tool %q already registered", tool.Name)
 	}
 	e.tools[tool.Name] = tool
-	log.Printf("[core] tool %q registered", tool.Name)
+	e.log.Info("tool registered", "tool", tool.Name)
 	return nil
 }
 
@@ -242,7 +248,7 @@ func (e *Engine) StartAll() error {
 			return fmt.Errorf("plugin %q start: %w", name, err)
 		}
 		e.Notify(spec.Event{Type: spec.EventPluginStarted, Payload: name})
-		log.Printf("[core] plugin %q started", name)
+		e.log.Info("plugin started", "name", name)
 	}
 	return nil
 }
@@ -256,10 +262,10 @@ func (e *Engine) StopAll() {
 	for i := len(order) - 1; i >= 0; i-- {
 		name := order[i]
 		if err := e.plugins[name].Stop(); err != nil {
-			log.Printf("[core] plugin %q stop error: %v", name, err)
+			e.log.Error("plugin stop error", "name", name, "error", err)
 		}
 		e.Notify(spec.Event{Type: spec.EventPluginStopped, Payload: name})
-		log.Printf("[core] plugin %q stopped", name)
+		e.log.Info("plugin stopped", "name", name)
 	}
 }
 
@@ -268,7 +274,7 @@ func (e *Engine) Notify(event spec.Event) {
 	for name, p := range e.plugins {
 		if ep, ok := p.(spec.EventAwarePlugin); ok {
 			if err := ep.OnEvent(event); err != nil {
-				log.Printf("[core] plugin %q OnEvent(%s): %v", name, event.Type, err)
+				e.log.Error("plugin OnEvent error", "name", name, "event", event.Type, "error", err)
 			}
 		}
 	}
