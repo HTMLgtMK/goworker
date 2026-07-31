@@ -264,8 +264,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 					continue
 				}
 
-				callStr := fmt.Sprintf("\n● %s(%s)", tool.Name, tc.Function.Arguments)
-				sendToken(ctx, ch, core.Token{Type: core.TokenTypeToolCall, Content: callStr})
+				sendToken(ctx, ch, core.Token{Type: core.TokenTypeToolCall, Content: fmt.Sprintf("%s(%s)", tool.Name, tc.Function.Arguments)})
 
 				toolCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 				result, execErr := tool.Execute(toolCtx, args)

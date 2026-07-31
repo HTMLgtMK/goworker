@@ -49,7 +49,7 @@ func (mw *HITLMiddleware) OnBeforeTool(ev *core.BeforeToolEvent) *core.Middlewar
 	var needsConf *sandbox.NeedsConfirmationError
 	if !errors.As(err, &needsConf) {
 		select {
-		case ev.TokenCh <- core.Token{Type: core.TokenTypeToolCall, Content: fmt.Sprintf("\n⛔ %v", err)}:
+		case ev.TokenCh <- core.Token{Type: core.TokenTypeToolCall, Content: fmt.Sprintf("⛔ %v", err)}:
 		case <-ev.Ctx.Done():
 		}
 		ev.Aborted = true

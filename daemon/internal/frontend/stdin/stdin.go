@@ -83,32 +83,30 @@ func (f *StdinFrontend) Write(s string) {
 }
 
 // writeText 渲染文本类 token（markdown 输出）。
-// 每行统一缩进 2 格（首行用 ● 前缀，后续行用空格），避免多行表格/列表对齐错乱。
+// 统一走 block() 编组：首行 ● 前缀，延续行对齐到内容列。
 func (f *StdinFrontend) writeText(content string) {
 	rendered := RenderMarkdown(strings.TrimSpace(content), f.termWidth)
-	// 首行 ● + 后续行 2 空格缩进，保持多行内容对齐
-	rendered = "● " + strings.ReplaceAll(rendered, "\n", "\n  ")
-	f.Write("\n" + rendered)
+	f.Write("\n" + block(markerText, rendered))
 }
 
 // writeToolCall 渲染工具调用 token。
+// agent 层只发 name(args) 纯数据，marker（●）和空行分隔归前端。
 func (f *StdinFrontend) writeToolCall(content string) {
-	if len(content) > 0 && content[0] == '\n' {
-		f.Write("\n● " + strings.TrimPrefix(content[1:], "● "))
-	} else {
-		f.Write(content)
+	if content == "" {
+		return
 	}
+	f.Write("\n" + block(markerText, content))
 }
 
 // writeToolResult 渲染工具结果 token。
 // agent 层只输出纯数据，frontend 负责加 ⎿ 前缀、灰色和缩进。
 func (f *StdinFrontend) writeToolResult(content string) {
 	content = strings.TrimLeft(content, "\n")
+	content = strings.TrimRight(content, "\n") // 去尾随换行，避免 block() 垫出幽灵空白行
 	if content == "" {
 		return
 	}
-	indented := strings.ReplaceAll(content, "\n", "\n   ")
-	f.Write("\n\033[38;5;244m  ⎿  " + indented + "\033[0m")
+	f.Write("\n\033[38;5;244m" + block(markerTool, content) + "\033[0m")
 }
 
 // readLine 供 HITL 确认使用。
