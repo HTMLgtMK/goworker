@@ -196,10 +196,18 @@ func (p *AgentPlugin) renderKind(t core.Token) (spec.RenderKind, string) {
 	}
 }
 
+const (
+	hitlStyle = "\x1b[1;36m" // 加粗青色
+	hitlReset = "\x1b[0m"
+)
+
+// hitl 加粗青色：HITL 决策提示的统一样式，与普通 agent 输出区分。
+func hitl(s string) string { return hitlStyle + s + hitlReset }
+
 // promptForDecision 使用前端的 I/O 展示审批选项并获取用户决策。
 func (p *AgentPlugin) promptForDecision(ctx *spec.Context, req *spec.InterruptRequest) spec.HITLDecision {
-	ctx.Writer(fmt.Sprintf("\n⚠ %s (%s)\n", req.Command, req.RiskReason))
-	ctx.Writer("[a]pprove, [e]dit, [r]eject, res[p]ond [a]: ")
+	ctx.Writer("\n" + hitl("⚠ "+req.Command+" ("+req.RiskReason+")") + "\n")
+	ctx.Writer(hitl("[a]pprove, [e]dit, [r]eject, res[p]ond [a]: ") + " ")
 
 	if ctx.ReadLine == nil {
 		return spec.HITLDecision{
@@ -222,7 +230,7 @@ func (p *AgentPlugin) promptForDecision(ctx *spec.Context, req *spec.InterruptRe
 		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}
 
 	case line == "e" || line == "edit":
-		ctx.Writer("  New command: ")
+		ctx.Writer(hitl("  New command: "))
 		edited, err := ctx.ReadLine()
 		if err != nil {
 			return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}
@@ -234,7 +242,7 @@ func (p *AgentPlugin) promptForDecision(ctx *spec.Context, req *spec.InterruptRe
 		}
 
 	case line == "p" || line == "respond":
-		ctx.Writer("  Your instruction: ")
+		ctx.Writer(hitl("  Your instruction: "))
 		msg, err := ctx.ReadLine()
 		if err != nil {
 			return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}

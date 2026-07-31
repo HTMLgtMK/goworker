@@ -45,7 +45,7 @@ func NewStdinFrontend(engine *core.Engine, config *config.StdinConfig) *StdinFro
 	}
 
 	sb := statusbar.New()
-	sb.Use(NewSpinnerAddon(), NewElapsedAddon(), NewIterationAddon())
+	sb.Use(NewProgressAddon(), NewIterationAddon())
 
 	return &StdinFrontend{
 		engine: engine,
@@ -117,9 +117,13 @@ func (f *StdinFrontend) readLine() (string, error) {
 	// 清残留字节（agent 运行期间积压的 Enter/乱敲）
 	drainChannel(f.stdinCh)
 
-	oldPrompt := f.editor.Prompt
-	f.editor.Prompt = ""
-	defer func() { f.editor.Prompt = oldPrompt }()
+	// 清掉状态栏残留行并换行，给输入独占一行，避免和状态栏抢位置
+	f.sb.WithLock(func() {
+		if f.sb.Active() {
+			f.sb.Clear()
+		}
+		fmt.Fprint(os.Stderr, rawNL)
+	})
 
 	line, canceled, err := f.editor.ReadLine()
 	if err != nil {
@@ -232,30 +236,49 @@ func (f *StdinFrontend) runWithCancel(ctx *spec.Context, line string) {
 }
 
 // runKeyWatcher 在 agent 执行期间（非 HITL 阶段）监听 Esc/Ctrl+C。
-// HITL 阶段通过 hitlActive flag 休眠，避免与 LineEditor 竞争。
+// 用 ticker + 非阻塞消费：HITL 激活或 ctx 取消时立刻让出 stdinCh，
+// 绝不阻塞在 channel 上，否则会和 LineEditor 抢字节——把 HITL 的第一个输入吃掉。
 func (f *StdinFrontend) runKeyWatcher(ctx context.Context) {
-	for {
-		// HITL 激活时休眠，让 LineEditor 独占 stdinCh
-		if f.hitlActive.Load() {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(50 * time.Millisecond):
-				continue
-			}
-		}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
 
+	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			if f.hitlActive.Load() {
+				continue
+			}
+			if f.drainKeys(ctx) {
+				return
+			}
+		}
+	}
+}
+
+// drainKeys 非阻塞消费当前积压的输入字节，监听 Esc/Ctrl+C。
+// 命中取消键返回 true；HITL 激活、ctx 取消或缓冲清空时返回 false。
+func (f *StdinFrontend) drainKeys(ctx context.Context) bool {
+	for {
+		if f.hitlActive.Load() {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
 		case b := <-f.stdinCh:
 			if b == escByte || b == ctrlCByte {
 				f.cancelledByUser.Store(true)
-				f.agentCancel()
+				if f.agentCancel != nil { // defer 可能已置 nil，避免 nil 调用 panic
+					f.agentCancel()
+				}
 				// 立即写反馈，不等 agent goroutine 退出（stderr raw mode 要 \r\n）
 				fmt.Fprint(os.Stderr, "\r\n  ⏹ cancelling...\r\n")
-				return
+				return true
 			}
+		default:
+			return false
 		}
 	}
 }

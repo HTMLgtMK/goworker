@@ -26,7 +26,7 @@ var escTimeout = 15 * time.Millisecond
 type LineEditor struct {
 	stdinCh <-chan byte
 	state   *term.State
-	Prompt  string   // 输入提示符，可临时置空避免 HITL 时画重复提示
+	Prompt  string   // 输入提示符；HITL 输入独占一行，直接用默认 "> "
 	buf     []rune   // 以 rune 为单位跟踪输入（正确支持中文等 UTF-8）
 	pos     int      // rune 索引
 	history []string // 历史记录，最新在末尾
