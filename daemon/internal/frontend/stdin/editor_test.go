@@ -6,24 +6,20 @@ import (
 )
 
 // testLineEditor 创建一个不进入 raw mode 的 LineEditor 用于测试。
-func testLineEditor(ch chan byte) *LineEditor {
+// 返回 cancelCh 写端，供取消场景模拟 keyWatcher 触发。
+func testLineEditor() (*LineEditor, chan struct{}) {
+	cancelCh := make(chan struct{}, 1)
 	return &LineEditor{
-		stdinCh: ch,
-		Prompt:  "",
-		history: make([]string, 0, maxHistory),
-		histIdx: -1,
-	}
-}
-
-// writeBytes 模拟键盘输入，将字符串的每个字节逐个写入 channel。
-// 注意用 []byte 转换确保多字节 UTF-8 的每个字节都写入（不能用 for range string）。
-func writeBytes(ch chan<- byte, s string) {
-	for _, b := range []byte(s) {
-		ch <- b
-	}
+		keyCh:    make(chan KeyEvent, 256),
+		cancelCh: cancelCh,
+		Prompt:   "",
+		history:  make([]string, 0, maxHistory),
+		histIdx:  -1,
+	}, cancelCh
 }
 
 // readLineAsync 在 goroutine 中运行 ReadLine，结果通过 channel 返回。
+// 返回前等 ReadLine 进入活跃读行状态，避免测试主 goroutine 提前投递被 Consume 拒绝。
 type readLineResult struct {
 	line     string
 	canceled bool
@@ -35,18 +31,58 @@ func readLineAsync(ed *LineEditor) chan readLineResult {
 		line, canceled, _ := ed.ReadLine()
 		ch <- readLineResult{line, canceled}
 	}()
+	for !ed.active.Load() {
+		time.Sleep(time.Millisecond)
+	}
 	return ch
+}
+
+// ---- Consume 语义 ----
+
+func TestConsume_InactiveDrops(t *testing.T) {
+	// 无活跃 ReadLine 时，编辑键不被消费、不积压（agent 运行期的误敲直接丢弃）
+	ed, _ := testLineEditor()
+	if ed.Consume(char('a')) {
+		t.Fatal("inactive editor should not consume edit keys")
+	}
+	if len(ed.keyCh) != 0 {
+		t.Fatalf("keyCh has %d events after inactive consume, want 0", len(ed.keyCh))
+	}
+}
+
+func TestConsume_KeyEscNeverConsumed(t *testing.T) {
+	// 取消键无条件放行（归 keyWatcher），即便在读行状态
+	ed, _ := testLineEditor()
+	if ed.Consume(key(KeyEsc)) {
+		t.Fatal("editor should never consume cancel keys")
+	}
+}
+
+func TestConsume_ActiveConsumes(t *testing.T) {
+	ed, _ := testLineEditor()
+	rch := readLineAsync(ed)
+	if !ed.Consume(char('a')) {
+		t.Fatal("active editor should consume edit keys")
+	}
+	typeKey(ed, key(KeyEnter))
+	select {
+	case r := <-rch:
+		if r.line != "a" {
+			t.Fatalf("got %q, want %q", r.line, "a")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for ReadLine")
+	}
 }
 
 // ---- 正常输入 ----
 
 func TestReadLine_NormalInput(t *testing.T) {
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
+	ed, _ := testLineEditor()
 
 	rch := readLineAsync(ed)
-	writeBytes(ch, "hello world")
-	ch <- enterByte
+	typeString(ed, "hello world")
+	typeKey(ed, key(KeyEnter))
 
 	select {
 	case r := <-rch:
@@ -62,11 +98,10 @@ func TestReadLine_NormalInput(t *testing.T) {
 }
 
 func TestReadLine_EmptyEnter(t *testing.T) {
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
+	ed, _ := testLineEditor()
 
 	rch := readLineAsync(ed)
-	ch <- enterByte
+	typeKey(ed, key(KeyEnter))
 
 	select {
 	case r := <-rch:
@@ -81,14 +116,13 @@ func TestReadLine_EmptyEnter(t *testing.T) {
 	}
 }
 
-// ---- Esc 取消 ----
+// ---- 取消（keyWatcher 经 cancelCh 触发）----
 
-func TestReadLine_EscCancel(t *testing.T) {
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
+func TestReadLine_CancelViaCancelCh(t *testing.T) {
+	ed, cancelCh := testLineEditor()
 
 	rch := readLineAsync(ed)
-	ch <- escByte // 独立 Esc → 15ms 超时 → canceled
+	cancelCh <- struct{}{} // 模拟 keyWatcher 收到 Esc
 
 	select {
 	case r := <-rch:
@@ -103,32 +137,12 @@ func TestReadLine_EscCancel(t *testing.T) {
 	}
 }
 
-func TestReadLine_EscWithInputCancels(t *testing.T) {
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
+func TestReadLine_CancelWithInput(t *testing.T) {
+	ed, cancelCh := testLineEditor()
 
 	rch := readLineAsync(ed)
-	writeBytes(ch, "partial")
-	ch <- escByte // 有输入时按 Esc → 取消
-
-	select {
-	case r := <-rch:
-		if !r.canceled {
-			t.Fatal("expected canceled")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for ReadLine")
-	}
-}
-
-// ---- Ctrl+C 取消 ----
-
-func TestReadLine_CtrlC(t *testing.T) {
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
-
-	rch := readLineAsync(ed)
-	ch <- ctrlCByte
+	typeString(ed, "partial")
+	cancelCh <- struct{}{}
 
 	select {
 	case r := <-rch:
@@ -143,14 +157,13 @@ func TestReadLine_CtrlC(t *testing.T) {
 // ---- 退格 ----
 
 func TestReadLine_Backspace(t *testing.T) {
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
+	ed, _ := testLineEditor()
 
 	rch := readLineAsync(ed)
-	writeBytes(ch, "abc")
-	ch <- backspaceByte // abc → ab
-	writeBytes(ch, "x")
-	ch <- enterByte
+	typeString(ed, "abc")
+	typeKey(ed, key(KeyBackspace)) // abc → ab
+	typeString(ed, "x")
+	typeKey(ed, key(KeyEnter))
 
 	select {
 	case r := <-rch:
@@ -165,8 +178,7 @@ func TestReadLine_Backspace(t *testing.T) {
 // ---- 上下键历史 ----
 
 func TestReadLine_HistoryUpDown(t *testing.T) {
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
+	ed, _ := testLineEditor()
 
 	// 先在历史里放两条记录
 	ed.addHistory("first cmd")
@@ -174,19 +186,11 @@ func TestReadLine_HistoryUpDown(t *testing.T) {
 
 	rch := readLineAsync(ed)
 
-	// ↑ 两次: second → first（CSI 序列: ESC [ A）
-	ch <- escByte
-	ch <- '['
-	ch <- 'A'
-	ch <- escByte
-	ch <- '['
-	ch <- 'A'
-	// ↓ 一次: 回到 second（ESC [ B）
-	ch <- escByte
-	ch <- '['
-	ch <- 'B'
-	// 回车
-	ch <- enterByte
+	// ↑ 两次: second → first，↓ 一次: 回到 second
+	typeKey(ed, key(KeyArrowUp))
+	typeKey(ed, key(KeyArrowUp))
+	typeKey(ed, key(KeyArrowDown))
+	typeKey(ed, key(KeyEnter))
 
 	select {
 	case r := <-rch:
@@ -199,16 +203,13 @@ func TestReadLine_HistoryUpDown(t *testing.T) {
 }
 
 func TestReadLine_HistoryEmpty(t *testing.T) {
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
+	ed, _ := testLineEditor()
 
 	// 没历史时 ↑ 应该无效果
 	rch := readLineAsync(ed)
-	ch <- escByte
-	ch <- '['
-	ch <- 'A' // CSI Up — 历史为空，什么都不发生
-	writeBytes(ch, "new")
-	ch <- enterByte
+	typeKey(ed, key(KeyArrowUp))
+	typeString(ed, "new")
+	typeKey(ed, key(KeyEnter))
 
 	select {
 	case r := <-rch:
@@ -220,15 +221,37 @@ func TestReadLine_HistoryEmpty(t *testing.T) {
 	}
 }
 
+// ---- Delete 与左右光标 ----
+
+func TestReadLine_DeleteAndArrows(t *testing.T) {
+	ed, _ := testLineEditor()
+
+	rch := readLineAsync(ed)
+	typeString(ed, "abc")
+	// 光标回到 b 前，Delete 删掉 b
+	typeKey(ed, key(KeyArrowLeft))
+	typeKey(ed, key(KeyArrowLeft))
+	typeKey(ed, key(KeyDelete))
+	typeKey(ed, key(KeyEnter))
+
+	select {
+	case r := <-rch:
+		if r.line != "ac" {
+			t.Fatalf("got %q, want %q", r.line, "ac")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
 // ---- 中文输入 ----
 
 func TestReadLine_Chinese(t *testing.T) {
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
+	ed, _ := testLineEditor()
 
 	rch := readLineAsync(ed)
-	writeBytes(ch, "你好世界")
-	ch <- enterByte
+	typeString(ed, "你好世界")
+	typeKey(ed, key(KeyEnter))
 
 	select {
 	case r := <-rch:
@@ -243,14 +266,13 @@ func TestReadLine_Chinese(t *testing.T) {
 // ---- 混合中文和退格 ----
 
 func TestReadLine_ChineseBackspace(t *testing.T) {
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
+	ed, _ := testLineEditor()
 
 	rch := readLineAsync(ed)
-	writeBytes(ch, "你好吗")
-	ch <- backspaceByte // 删除"吗"
-	writeBytes(ch, "的")
-	ch <- enterByte
+	typeString(ed, "你好吗")
+	typeKey(ed, key(KeyBackspace)) // 删除"吗"
+	typeString(ed, "的")
+	typeKey(ed, key(KeyEnter))
 
 	select {
 	case r := <-rch:
@@ -262,54 +284,42 @@ func TestReadLine_ChineseBackspace(t *testing.T) {
 	}
 }
 
-// ---- drainChannel ----
+// ---- DrainInput ----
 
-func TestDrainChannel_Empty(t *testing.T) {
-	ch := make(chan byte, 64)
-	drainChannel(ch)
+func TestDrainInput_Empty(t *testing.T) {
+	ed, _ := testLineEditor()
+	ed.DrainInput()
 	// 不 panic 就通过
 }
 
-func TestDrainChannel_ClearsBytes(t *testing.T) {
-	ch := make(chan byte, 64)
-	ch <- 'a'
-	ch <- 'b'
-	ch <- '\r'
+func TestDrainInput_ClearsEvents(t *testing.T) {
+	ed, _ := testLineEditor()
+	ed.keyCh <- char('a')
+	ed.keyCh <- char('b')
+	ed.keyCh <- key(KeyEnter)
 
-	drainChannel(ch)
+	ed.DrainInput()
 
-	if len(ch) != 0 {
-		t.Fatalf("channel has %d bytes after drain, want 0", len(ch))
+	if len(ed.keyCh) != 0 {
+		t.Fatalf("keyCh has %d events after drain, want 0", len(ed.keyCh))
 	}
 }
 
-// ---- drain + ReadLine 模拟 HITL 场景 ----
+// ---- 残留事件场景 ----
 
-func TestDrainThenReadLine_StaleBytesCleared(t *testing.T) {
-	// 模拟 HITL 前积压的字节（agent 运行期间用户乱敲的）
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
+func TestInactiveStaleDropped(t *testing.T) {
+	// agent 运行期（无活跃 ReadLine）用户乱敲：Consume 全被拒绝，不积压
+	ed, _ := testLineEditor()
 
-	stale := "stale\r"
-	writeBytes(ch, stale)
-
-	// drain 清空
-	drainChannel(ch)
-
-	// ReadLine 应该等新输入，不消费残留
-	rch := readLineAsync(ed)
-
-	// 等一小段时间确保 ReadLine 阻塞了（如果它消费了残留，已经返回了）
-	time.Sleep(50 * time.Millisecond)
-	select {
-	case <-rch:
-		t.Fatal("ReadLine returned immediately after drain — stale bytes not cleared")
-	default:
+	typeString(ed, "stale")
+	if len(ed.keyCh) != 0 {
+		t.Fatalf("stale events should be dropped when inactive, keyCh=%d", len(ed.keyCh))
 	}
 
-	// 现在发正常输入
-	writeBytes(ch, "fresh input")
-	ch <- enterByte
+	// 之后 ReadLine 等的是全新输入
+	rch := readLineAsync(ed)
+	typeString(ed, "fresh input")
+	typeKey(ed, key(KeyEnter))
 
 	select {
 	case r := <-rch:
@@ -322,27 +332,17 @@ func TestDrainThenReadLine_StaleBytesCleared(t *testing.T) {
 }
 
 func TestDrainThenReadLine_MultipleEnter(t *testing.T) {
-	// HITL 场景：用户狂按 Enter，一堆 \r 积压
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
+	// HITL 场景：会话内积压的 Enter 先被清掉，ReadLine 等新输入
+	ed, _ := testLineEditor()
 
 	for i := 0; i < 10; i++ {
-		ch <- '\r'
+		ed.keyCh <- key(KeyEnter)
 	}
-
-	drainChannel(ch)
+	ed.DrainInput()
 
 	rch := readLineAsync(ed)
-
-	time.Sleep(50 * time.Millisecond)
-	select {
-	case <-rch:
-		t.Fatal("ReadLine immediately returned after drain of multiple enters")
-	default:
-	}
-
-	ch <- 'a'
-	ch <- enterByte
+	typeString(ed, "a")
+	typeKey(ed, key(KeyEnter))
 
 	select {
 	case r := <-rch:
@@ -354,40 +354,15 @@ func TestDrainThenReadLine_MultipleEnter(t *testing.T) {
 	}
 }
 
-// ---- Esc 在 drain + ReadLine 中正常生效 ----
-
-func TestDrainThenReadLine_EscCancels(t *testing.T) {
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
-
-	writeBytes(ch, "stale data")
-	drainChannel(ch)
-
-	rch := readLineAsync(ed)
-	time.Sleep(20 * time.Millisecond)
-
-	ch <- escByte
-
-	select {
-	case r := <-rch:
-		if !r.canceled {
-			t.Fatal("expected canceled after Esc")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout")
-	}
-}
-
-// ---- ReadLine 后 Esc 确认不遗留数据 ----
+// ---- 取消后干净状态 ----
 
 func TestReadLine_ReadLineCleanState(t *testing.T) {
 	// 两次连续的 ReadLine，确保状态不被污染
-	ch := make(chan byte, 64)
-	ed := testLineEditor(ch)
+	ed, cancelCh := testLineEditor()
 
-	// 第一次：Esc 取消
+	// 第一次：取消
 	rch1 := readLineAsync(ed)
-	ch <- escByte
+	cancelCh <- struct{}{}
 
 	select {
 	case r := <-rch1:
@@ -400,8 +375,8 @@ func TestReadLine_ReadLineCleanState(t *testing.T) {
 
 	// 第二次：正常输入
 	rch2 := readLineAsync(ed)
-	writeBytes(ch, "after esc")
-	ch <- enterByte
+	typeString(ed, "after esc")
+	typeKey(ed, key(KeyEnter))
 
 	select {
 	case r := <-rch2:

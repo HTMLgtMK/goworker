@@ -6,7 +6,6 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	term "github.com/charmbracelet/x/term"
 
@@ -21,19 +20,23 @@ const rawNL = "\r\n"
 
 // StdinFrontend 是一个基于标准输入/输出的用户界面。
 //
-// 字节从 os.Stdin 由 dispatchStdin goroutine 读取，投递到 stdinCh channel，
-// 各消费者（LineEditor、key watcher）从 channel 取字节，不存在 fd 竞争。
+// 字节从 os.Stdin 由 dispatchStdin goroutine 读取，经 KeyDecoder 解码为按键事件，
+// 再按 consumer stack 责任链路由：栈顶消费者优先，第一个消费的节点终止。
+// keyWatcher 常驻栈底，取消键穿透所有行消费者后由它统一处理。
 type StdinFrontend struct {
 	engine    *core.Engine
 	editor    *LineEditor
 	termWidth int // 终端列数，用于 markdown 渲染的 word wrap 和 HR 宽度
 
-	stdinCh chan byte // dispatcher → consumers
+	stack        *ConsumerStack
+	decoder      *KeyDecoder
+	keyWatcher   *keyWatcher   // 常驻栈底，处理取消键
+	hitlConsumer *HITLConsumer // HITL 会话消费者（decide 时压栈）
+	cancelCh     chan struct{} // keyWatcher → 阻塞的 ReadLine 的取消信号
 
 	agentCtx    context.Context
 	agentCancel context.CancelFunc
 
-	hitlActive      atomic.Bool // HITL 激活时 key watcher 休眠
 	cancelledByUser atomic.Bool // 用户按了 Esc/Ctrl+C
 
 	sb *statusbar.Bar
@@ -48,12 +51,14 @@ func NewStdinFrontend(engine *core.Engine, config *config.StdinConfig) *StdinFro
 	sb.Use(NewProgressAddon(), NewIterationAddon())
 
 	return &StdinFrontend{
-		engine: engine,
-		sb:     sb,
+		engine:   engine,
+		sb:       sb,
+		stack:    NewConsumerStack(),
+		cancelCh: make(chan struct{}, 1),
 	}
 }
 
-// dispatchStdin 是唯一的 os.Stdin 字节读取者，持续将字节投递到 stdinCh。
+// dispatchStdin 是唯一的 os.Stdin 字节读取者，投递给 KeyDecoder 解码。
 func (f *StdinFrontend) dispatchStdin() {
 	var b [1]byte
 	for {
@@ -61,8 +66,14 @@ func (f *StdinFrontend) dispatchStdin() {
 		if err != nil || n == 0 {
 			return
 		}
-		f.stdinCh <- b[0]
+		f.decoder.In() <- b[0]
 	}
+}
+
+// isHITL 返回当前是否处于 HITL 会话中（栈顶为 HITL 消费者）。
+// HITL 期间的输出独占一行，不重绘状态栏。
+func (f *StdinFrontend) isHITL() bool {
+	return f.stack.Top() == f.hitlConsumer
 }
 
 // Write 实现 spec.Context 的 Writer 回调。
@@ -71,11 +82,11 @@ func (f *StdinFrontend) dispatchStdin() {
 func (f *StdinFrontend) Write(s string) {
 	content := strings.ReplaceAll(strings.ReplaceAll(s, "\r", ""), "\n", rawNL)
 	f.sb.WithLock(func() {
-		if f.sb.Active() && !f.hitlActive.Load() {
+		if f.sb.Active() && !f.isHITL() {
 			f.sb.Clear()
 		}
 		fmt.Print(content)
-		if f.sb.Active() && !f.hitlActive.Load() {
+		if f.sb.Active() && !f.isHITL() {
 			fmt.Fprint(os.Stderr, "\r\n")
 			f.sb.Draw()
 		}
@@ -109,15 +120,19 @@ func (f *StdinFrontend) writeToolResult(content string) {
 	f.Write("\n\033[38;5;244m" + block(markerTool, content) + "\033[0m")
 }
 
-// readLine 供 HITL 确认使用。
-func (f *StdinFrontend) readLine() (string, error) {
-	f.hitlActive.Store(true)
-	defer f.hitlActive.Store(false)
+// decide 执行一次 HITL 决策会话，实现 spec.Context 的 Decide 契约。
+// 将 HITLConsumer 压栈（栈顶，HITL 期间独占输入），会话结束弹出。
+// 用户按 Esc/Ctrl+C 取消时，一并取消整个 agent 执行。
+func (f *StdinFrontend) decide(req *spec.InterruptRequest) spec.HITLDecision {
+	f.stack.Push(f.hitlConsumer)
+	defer func() {
+		f.stack.Pop()
+		// 清掉 HITL 会话内已敲未消费的残留，避免污染下次输入
+		f.editor.DrainInput()
+		f.hitlConsumer.DrainInput()
+	}()
 
-	// 清残留字节（agent 运行期间积压的 Enter/乱敲）
-	drainChannel(f.stdinCh)
-
-	// 清掉状态栏残留行并换行，给输入独占一行，避免和状态栏抢位置
+	// 清掉状态栏残留行并换行，给 HITL 提示独占一行，避免和状态栏抢位置
 	f.sb.WithLock(func() {
 		if f.sb.Active() {
 			f.sb.Clear()
@@ -125,38 +140,39 @@ func (f *StdinFrontend) readLine() (string, error) {
 		fmt.Fprint(os.Stderr, rawNL)
 	})
 
-	line, canceled, err := f.editor.ReadLine()
-	if err != nil {
-		return "", err
-	}
+	decision, canceled := f.hitlConsumer.Run(req)
 	if canceled {
-		// 用户在 HITL 时按 Esc/Ctrl+C → 取消整个 agent 执行
 		f.cancelledByUser.Store(true)
 		if f.agentCancel != nil {
 			f.agentCancel()
 		}
-		return "", fmt.Errorf("cancelled")
 	}
-	return strings.TrimRight(line, "\r\n"), nil
+	return decision
 }
 
 // Run 启动主事件循环。
 func (f *StdinFrontend) Run() error {
-	f.stdinCh = make(chan byte, 64)
-	go f.dispatchStdin()
-
-	editor, err := NewLineEditor(f.stdinCh)
+	editor, err := NewLineEditor(f.cancelCh)
 	if err != nil {
 		return fmt.Errorf("line editor: %w", err)
 	}
 	f.editor = editor
 	defer editor.Close()
 
+	f.hitlConsumer = NewHITLConsumer(f.cancelCh, f.Write)
+	f.keyWatcher = &keyWatcher{cancelCh: f.cancelCh}
+	f.decoder = NewKeyDecoder(func(ev KeyEvent) { f.stack.dispatch(ev) })
+
+	f.stack.Push(f.keyWatcher) // keyWatcher 常驻栈底，取消键统一归它
+	f.stack.Push(editor)       // 主输入行消费者
+
 	// 获取终端宽度，失败则用 80 列作为兜底
 	f.termWidth = 80
 	if w, _, err := term.GetSize(os.Stdin.Fd()); err == nil && w > 0 {
 		f.termWidth = w
 	}
+
+	go f.dispatchStdin()
 
 	for {
 		line, canceled, err := editor.ReadLine()
@@ -179,7 +195,7 @@ func (f *StdinFrontend) Run() error {
 			return nil
 		}
 
-		ctx := spec.NewContext(context.Background(), f.Write, f.readLine, nil)
+		ctx := spec.NewContext(context.Background(), f.Write, f.decide, nil)
 
 		// 注入 WriteToken — 所有渲染逻辑收敛至此
 		ctx.WriteToken = func(kind spec.RenderKind, content string) {
@@ -203,7 +219,43 @@ func (f *StdinFrontend) Run() error {
 	}
 }
 
-// runWithCancel 启动 agent 并监听 Esc/Ctrl+C 取消。
+// keyWatcher 常驻责任链栈底，统一处理取消键（Esc/Ctrl+C）。
+// 取消时通知当前阻塞的 ReadLine 放弃输入；若 agent 正在运行则一并取消 agent。
+// 不关注编辑键，一律放行（编辑键已被栈上行消费者吃掉，不会传到它这层）。
+type keyWatcher struct {
+	cancelCh    chan<- struct{}        // 通知 ReadLine/HITL 放弃当前输入
+	cancelAgent atomic.Pointer[func()] // 取消 agent 的回调（nil 表示无 agent 在运行）
+}
+
+// attach 挂载 agent 取消回调（runWithCancel 在 main goroutine 调用）。
+func (k *keyWatcher) attach(fn func()) {
+	k.cancelAgent.Store(&fn)
+}
+
+// detach 卸载取消回调（agent 结束后调用）。
+func (k *keyWatcher) detach() {
+	k.cancelAgent.Store(nil)
+}
+
+func (k *keyWatcher) Consume(ev KeyEvent) bool {
+	if ev.Type != KeyEsc && ev.Type != KeyCtrlC {
+		return false
+	}
+	// 通知当前阻塞的 ReadLine 放弃输入（非阻塞；无人接收则残留，下次读行前清理）
+	select {
+	case k.cancelCh <- struct{}{}:
+	default:
+	}
+	// atomic.Pointer 保证与 attach/detach 并发安全（Consume 在 decoder goroutine）
+	if ca := k.cancelAgent.Load(); ca != nil {
+		// 立即写反馈，不等 agent goroutine 退出（stderr raw mode 要 \r\n）
+		fmt.Fprint(os.Stderr, "\r\n  ⏹ cancelling...\r\n")
+		(*ca)()
+	}
+	return true
+}
+
+// runWithCancel 启动 agent：挂载取消回调到常驻 keyWatcher，agent 结束后卸载。
 func (f *StdinFrontend) runWithCancel(ctx *spec.Context, line string) {
 	f.cancelledByUser.Store(false)
 	f.agentCtx, f.agentCancel = context.WithCancel(context.Background())
@@ -212,9 +264,14 @@ func (f *StdinFrontend) runWithCancel(ctx *spec.Context, line string) {
 	ctx.Publish = f.sb.Publish
 	f.sb.Start()
 
+	// 包装取消回调：用户取消时置 cancelledByUser，避免 Eval 返回的取消错误被当异常打印
+	f.keyWatcher.attach(func() {
+		f.cancelledByUser.Store(true)
+		f.agentCancel()
+	})
 	defer func() {
+		f.keyWatcher.detach()
 		f.sb.Stop()
-
 		f.agentCancel()
 		f.agentCtx = nil
 		f.agentCancel = nil
@@ -224,72 +281,12 @@ func (f *StdinFrontend) runWithCancel(ctx *spec.Context, line string) {
 	// 注入可取消的 context（handleAgent 会 WithTimeout 派生，取消沿链传播）
 	ctx.Ctx = f.agentCtx
 
-	// 启动按键监听 goroutine + 状态栏
-	go f.runKeyWatcher(f.agentCtx)
-	go f.sb.Run(f.agentCtx, func() bool { return f.hitlActive.Load() })
+	// 状态栏刷新；HITL 激活（栈顶为 HITL consumer）时暂停
+	go f.sb.Run(f.agentCtx, func() bool { return f.stack.Top() == f.hitlConsumer })
 
 	err := f.engine.Eval(ctx, line)
 
 	if !f.cancelledByUser.Load() && err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\r\n", err)
-	}
-}
-
-// runKeyWatcher 在 agent 执行期间（非 HITL 阶段）监听 Esc/Ctrl+C。
-// 用 ticker + 非阻塞消费：HITL 激活或 ctx 取消时立刻让出 stdinCh，
-// 绝不阻塞在 channel 上，否则会和 LineEditor 抢字节——把 HITL 的第一个输入吃掉。
-func (f *StdinFrontend) runKeyWatcher(ctx context.Context) {
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if f.hitlActive.Load() {
-				continue
-			}
-			if f.drainKeys(ctx) {
-				return
-			}
-		}
-	}
-}
-
-// drainKeys 非阻塞消费当前积压的输入字节，监听 Esc/Ctrl+C。
-// 命中取消键返回 true；HITL 激活、ctx 取消或缓冲清空时返回 false。
-func (f *StdinFrontend) drainKeys(ctx context.Context) bool {
-	for {
-		if f.hitlActive.Load() {
-			return false
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case b := <-f.stdinCh:
-			if b == escByte || b == ctrlCByte {
-				f.cancelledByUser.Store(true)
-				if f.agentCancel != nil { // defer 可能已置 nil，避免 nil 调用 panic
-					f.agentCancel()
-				}
-				// 立即写反馈，不等 agent goroutine 退出（stderr raw mode 要 \r\n）
-				fmt.Fprint(os.Stderr, "\r\n  ⏹ cancelling...\r\n")
-				return true
-			}
-		default:
-			return false
-		}
-	}
-}
-
-// drainChannel 非阻塞清空 channel。
-func drainChannel(ch <-chan byte) {
-	for {
-		select {
-		case <-ch:
-		default:
-			return
-		}
 	}
 }

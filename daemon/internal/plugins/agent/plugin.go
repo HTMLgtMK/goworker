@@ -165,7 +165,11 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 			break
 		}
 		if tok.Type == core.TokenTypeInterrupt && tok.Interrupt != nil {
-			decision := p.promptForDecision(ctx, tok.Interrupt)
+			// HITL 决策由前端按 spec 契约完成，plugin 只负责转交
+			decision := spec.HITLDecision{InterruptID: tok.Interrupt.ID, Type: spec.DecisionReject}
+			if ctx.Decide != nil {
+				decision = ctx.Decide(tok.Interrupt)
+			}
 			select {
 			case decisions <- decision:
 			case <-agentCtx.Done():
@@ -193,68 +197,6 @@ func (p *AgentPlugin) renderKind(t core.Token) (spec.RenderKind, string) {
 	default:
 		// TokenTypeText 及未知类型一律按 markdown 渲染
 		return spec.KindText, t.Content
-	}
-}
-
-const (
-	hitlStyle = "\x1b[1;36m" // 加粗青色
-	hitlReset = "\x1b[0m"
-)
-
-// hitl 加粗青色：HITL 决策提示的统一样式，与普通 agent 输出区分。
-func hitl(s string) string { return hitlStyle + s + hitlReset }
-
-// promptForDecision 使用前端的 I/O 展示审批选项并获取用户决策。
-func (p *AgentPlugin) promptForDecision(ctx *spec.Context, req *spec.InterruptRequest) spec.HITLDecision {
-	ctx.Writer("\n" + hitl("⚠ "+req.Command+" ("+req.RiskReason+")") + "\n")
-	ctx.Writer(hitl("[a]pprove, [e]dit, [r]eject, res[p]ond [a]: ") + " ")
-
-	if ctx.ReadLine == nil {
-		return spec.HITLDecision{
-			InterruptID: req.ID,
-			Type:        spec.DecisionReject,
-		}
-	}
-
-	line, err := ctx.ReadLine()
-	if err != nil {
-		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}
-	}
-	line = strings.TrimSpace(line)
-
-	switch {
-	case line == "" || line == "a" || line == "approve":
-		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionApprove}
-
-	case line == "r" || line == "reject":
-		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}
-
-	case line == "e" || line == "edit":
-		ctx.Writer(hitl("  New command: "))
-		edited, err := ctx.ReadLine()
-		if err != nil {
-			return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}
-		}
-		return spec.HITLDecision{
-			InterruptID: req.ID,
-			Type:        spec.DecisionEdit,
-			Command:     strings.TrimSpace(edited),
-		}
-
-	case line == "p" || line == "respond":
-		ctx.Writer(hitl("  Your instruction: "))
-		msg, err := ctx.ReadLine()
-		if err != nil {
-			return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}
-		}
-		return spec.HITLDecision{
-			InterruptID: req.ID,
-			Type:        spec.DecisionRespond,
-			Message:     strings.TrimSpace(msg),
-		}
-
-	default:
-		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}
 	}
 }
 

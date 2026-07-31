@@ -3,50 +3,49 @@ package stdin
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/x/term"
 	"github.com/rivo/uniseg"
 )
 
-const (
-	escByte       = 0x1b
-	ctrlCByte     = 0x03
-	enterByte     = '\r'
-	backspaceByte = 0x7f
-	maxHistory    = 50
-)
+const maxHistory = 50
 
-// escTimeout 区分单独 Esc 和 CSI 序列的前导字节
-var escTimeout = 15 * time.Millisecond
-
-// LineEditor 是一个 raw mode 下的行编辑器，支持 ↑↓ 历史、Esc/Ctrl+C 取消。
-// 所有字节从 stdinCh 读取（由 dispatcher goroutine 投递），不从 os.Stdin 直接读。
+// LineEditor 是一个 raw mode 下的行编辑器，支持 ↑↓ 历史、←→ 光标、Delete。
+//
+// 字节解码（UTF-8 累积、CSI 解析、Esc 判定）由 KeyDecoder 完成，editor
+// 只消费语义清晰的按键事件。它是责任链栈上的行消费者：
+//   - 只关注编辑键（字符/Enter/Backspace/方向键），无活跃读行会话时放行
+//   - 取消键（KeyEsc/KeyCtrlC）放行给栈底 keyWatcher，keyWatcher 通过
+//     cancelCh 通知阻塞的 ReadLine 放弃输入
 type LineEditor struct {
-	stdinCh <-chan byte
-	state   *term.State
-	Prompt  string   // 输入提示符；HITL 输入独占一行，直接用默认 "> "
-	buf     []rune   // 以 rune 为单位跟踪输入（正确支持中文等 UTF-8）
-	pos     int      // rune 索引
-	history []string // 历史记录，最新在末尾
-	histIdx int      // -1 = 新输入，0 到 len-1 = 历史中的索引
-	ubuf    []byte   // UTF-8 多字节累积缓冲
+	keyCh    chan KeyEvent   // dispatch 投递的编辑按键
+	cancelCh <-chan struct{} // keyWatcher 触发的取消信号
+	active   atomic.Bool     // 是否有活跃的 ReadLine 会话
+	state    *term.State
+	Prompt   string   // 输入提示符；HITL 输入独占一行，直接用默认 "> "
+	buf      []rune   // 以 rune 为单位跟踪输入（正确支持中文等 UTF-8）
+	pos      int      // rune 索引
+	history  []string // 历史记录，最新在末尾
+	histIdx  int      // -1 = 新输入，0 到 len-1 = 历史中的索引
 }
 
 // NewLineEditor 创建并进入 raw mode。
-func NewLineEditor(stdinCh <-chan byte) (*LineEditor, error) {
+// cancelCh 由 keyWatcher 共享，取消键触发时 ReadLine 醒来返回 canceled。
+func NewLineEditor(cancelCh <-chan struct{}) (*LineEditor, error) {
 	fd := os.Stdin.Fd()
 	state, err := term.MakeRaw(fd)
 	if err != nil {
 		return nil, fmt.Errorf("make raw: %w", err)
 	}
 	return &LineEditor{
-		stdinCh: stdinCh,
-		state:   state,
-		Prompt:  "> ",
-		history: make([]string, 0, maxHistory),
-		histIdx: -1,
+		keyCh:    make(chan KeyEvent, 64),
+		cancelCh: cancelCh,
+		state:    state,
+		Prompt:   "> ",
+		history:  make([]string, 0, maxHistory),
+		histIdx:  -1,
 	}, nil
 }
 
@@ -55,114 +54,88 @@ func (e *LineEditor) Close() error {
 	return term.Restore(os.Stdin.Fd(), e.state)
 }
 
+// Consume 实现 Consumer：只关注编辑键，且仅在有活跃读行会话时消费。
+// 取消键（KeyEsc/KeyCtrlC）或非编辑键一律放行给栈底 keyWatcher；
+// 无活跃会话时的编辑键也放行（agent 运行期的误敲最终被 keyWatcher 丢弃）。
+func (e *LineEditor) Consume(ev KeyEvent) bool {
+	switch ev.Type {
+	case KeyChar, KeyEnter, KeyBackspace, KeyDelete, KeyArrowUp, KeyArrowDown, KeyArrowLeft, KeyArrowRight:
+		if e.active.Load() {
+			e.keyCh <- ev
+			return true
+		}
+	}
+	return false
+}
+
 // ReadLine 读取一行输入。
 //   - line: 输入的文本（不含换行符）
-//   - canceled: 用户按 Esc 或 Ctrl+C 取消了输入
+//   - canceled: 用户按 Esc/Ctrl+C 取消了输入（keyWatcher 经 cancelCh 通知）
 //   - err: 读取错误
 func (e *LineEditor) ReadLine() (line string, canceled bool, err error) {
+	e.active.Store(true)
+	defer e.active.Store(false)
+
+	// 清掉上次残留的取消信号（如 agent 运行期用户按过 Esc）
+	select {
+	case <-e.cancelCh:
+	default:
+	}
+
 	e.buf = e.buf[:0]
 	e.pos = 0
 	e.histIdx = -1
-	e.ubuf = e.ubuf[:0]
 	e.drawPrompt()
 
 	for {
-		b, ok := <-e.stdinCh
-		if !ok {
-			return "", false, fmt.Errorf("stdin channel closed")
-		}
+		select {
+		case ev := <-e.keyCh:
+			switch ev.Type {
+			case KeyEnter:
+				e.finishLine()
+				line = string(e.buf)
+				e.addHistory(line)
+				return line, false, nil
 
-		switch b {
-		case enterByte:
-			e.finishLine()
-			line = string(e.buf)
-			e.addHistory(line)
-			return line, false, nil
+			case KeyBackspace:
+				if e.pos > 0 {
+					e.pos--
+					e.buf = append(e.buf[:e.pos], e.buf[e.pos+1:]...)
+					e.redrawInput()
+				}
 
-		case escByte, ctrlCByte:
-			// 区分 Ctrl+C 和 Escape（Escape 可能有后续 CSI 序列）
-			if b == ctrlCByte {
-				e.clearInput()
-				return "", true, nil
-			}
-			canceled, err := e.handleEscape()
-			if err != nil {
-				return "", false, err
-			}
-			if canceled {
-				e.clearInput()
-				return "", true, nil
-			}
+			case KeyDelete:
+				if e.pos < len(e.buf) {
+					e.buf = append(e.buf[:e.pos], e.buf[e.pos+1:]...)
+					e.redrawInput()
+				}
 
-		case backspaceByte:
-			if e.pos > 0 {
-				e.pos--
-				e.buf = append(e.buf[:e.pos], e.buf[e.pos+1:]...)
-				e.redrawInput()
-			}
-
-		default:
-			if b >= 0x20 {
-				e.ubuf = append(e.ubuf, b)
-				if utf8.FullRune(e.ubuf) {
-					r, _ := utf8.DecodeRune(e.ubuf)
-					e.ubuf = e.ubuf[:0]
-					e.buf = append(e.buf[:e.pos], append([]rune{r}, e.buf[e.pos:]...)...)
+			case KeyArrowUp:
+				e.historyPrev()
+			case KeyArrowDown:
+				e.historyNext()
+			case KeyArrowLeft:
+				if e.pos > 0 {
+					e.pos--
+					e.redrawInput()
+				}
+			case KeyArrowRight:
+				if e.pos < len(e.buf) {
 					e.pos++
 					e.redrawInput()
 				}
+
+			case KeyChar:
+				e.buf = append(e.buf[:e.pos], append([]rune{ev.Rune}, e.buf[e.pos:]...)...)
+				e.pos++
+				e.redrawInput()
 			}
+
+		case <-e.cancelCh:
+			e.clearInput()
+			return "", true, nil
 		}
 	}
-}
-
-// handleEscape 处理 Escape 相关的输入序列。
-func (e *LineEditor) handleEscape() (canceled bool, err error) {
-	// 等待 15ms 看下一个字节：CSI 序列的 '[' 还是独立 Esc
-	select {
-	case next := <-e.stdinCh:
-		if next != '[' {
-			return true, nil
-		}
-	case <-time.After(escTimeout):
-		return true, nil
-	}
-
-	// CSI 序列（ESC [ ...），读方向字节（阻塞）
-	dir := <-e.stdinCh
-
-	peek := byte(0)
-	if dir == '3' {
-		select {
-		case p := <-e.stdinCh:
-			peek = p
-		case <-time.After(escTimeout):
-		}
-	}
-
-	switch dir {
-	case 'A':
-		e.historyPrev()
-	case 'B':
-		e.historyNext()
-	case 'C':
-		if e.pos < len(e.buf) {
-			e.pos++
-			e.redrawInput()
-		}
-	case 'D':
-		if e.pos > 0 {
-			e.pos--
-			e.redrawInput()
-		}
-	case '3':
-		if peek == '~' && e.pos < len(e.buf) {
-			e.buf = append(e.buf[:e.pos], e.buf[e.pos+1:]...)
-			e.redrawInput()
-		}
-	}
-
-	return false, nil
 }
 
 // historyPrev 上一条历史。
@@ -235,7 +208,6 @@ func (e *LineEditor) redrawInput() {
 func (e *LineEditor) clearInput() {
 	e.buf = e.buf[:0]
 	e.pos = 0
-	e.ubuf = e.ubuf[:0]
 	e.redrawInput()
 }
 
@@ -243,11 +215,13 @@ func (e *LineEditor) finishLine() {
 	fmt.Fprint(os.Stderr, "\r\n")
 }
 
-// DrainInput 清空 stdinCh 中积压的字节，超时 5ms 后退出。
+// DrainInput 清空 keyCh 与 cancelCh 中积压的事件，超时 5ms 后退出。
+// 用于 HITL 会话/agent 运行结束后清掉用户已敲但未消费的残留输入。
 func (e *LineEditor) DrainInput() {
 	for {
 		select {
-		case <-e.stdinCh:
+		case <-e.keyCh:
+		case <-e.cancelCh:
 		case <-time.After(5 * time.Millisecond):
 			return
 		}
