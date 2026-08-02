@@ -17,8 +17,8 @@ import (
 
 type AgentPlugin struct {
 	hub          *spec.Hub
-	conversation []core.Message      // 跨 /agent 调用的对话历史
-	usage        *core.UsageTracker  // 当前 /agent 会话的 token 统计
+	conversation []core.Message // 跨 /agent 调用的对话历史
+	usage        *core.UsageTracker // 当前 /agent 会话的 token 统计（纯数据，供 /usage 读取）
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }
@@ -146,9 +146,6 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 		return nil
 	}
 
-	// 新一轮会话，清零 token 统计
-	p.usage.Reset()
-
 	// 构建沙箱配置
 	sandboxCfg := p.sandboxConfig()
 
@@ -160,13 +157,9 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 	provider := NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
 	decisions := make(chan spec.HITLDecision, 1)
 	hitlMw := middlewares.NewHITLMiddleware(sandboxCfg, middlewares.NewChannelDecisionProvider(decisions))
-	agent := NewAgent(provider, tools, []core.Middleware{hitlMw}, p.usage)
-	agent.OnIteration = func() {
-		if ctx.Publish != nil {
-			ctx.Publish(statusbar.EventIteration, nil)
-		}
-	}
-	agent.OnUsage = func(u core.Usage) {
+	// 新一轮会话清零统计；usage middleware 动态注册，从注册时刻开始记账
+	p.usage.Reset()
+	usageMw := middlewares.NewUsageMiddleware(p.usage, func(u core.Usage) {
 		if ctx.Publish != nil {
 			ctx.Publish(statusbar.EventUsage, statusbar.Usage{
 				EstimateTokens:   u.EstimateTokens,
@@ -176,6 +169,12 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 				LastPromptTokens: u.LastPromptTokens,
 				ContextWindow:    cfg.LLM.ContextWindow,
 			})
+		}
+	})
+	agent := NewAgent(provider, tools, []core.Middleware{hitlMw, usageMw})
+	agent.OnIteration = func() {
+		if ctx.Publish != nil {
+			ctx.Publish(statusbar.EventIteration, nil)
 		}
 	}
 
