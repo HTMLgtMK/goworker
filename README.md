@@ -9,6 +9,8 @@ cmd/goworker/main.go        ← entry point
 internal/
 ├── spec/                   ← interfaces & types (Hub, Command, Plugin, Context)
 ├── core/                   ← Engine: middleware chain, plugin lifecycle, command routing
+├── mcp/                    ← MCP client (JSON-RPC 2.0 over stdio, mcp-go compatible shapes)
+├── skills/                 ← SKILL.md discovery & parsing
 ├── plugins/
 │   └── agent/              ← ReAct agent plugin (OpenAI-compatible LLM, tool calling)
 └── frontend/
@@ -51,6 +53,35 @@ History compaction:
 - `/compact` — LLM-rolls up old messages into a summary, keeps the recent tail
 - Auto — fires before a model call when estimated usage ≥ `compress_at` × window
 - `/history` — inspect the current conversation contents
+
+Skills:
+- Drop `SKILL.md` files in `~/.config/goworker/skills/<name>/` (user) or `.goworker/skills/<name>/` (project)
+- Each skill registers as a `skill_<name>` tool; the agent loads the instructions on demand (not resident in the system prompt)
+- `/skills` — list loaded skills
+
+SKILL.md format (frontmatter `name` is required, `description` guides when the agent loads it):
+
+```markdown
+---
+name: gofmt
+description: 用 gofmt 格式化 Go 代码
+---
+1. Run `gofmt -w .` on the target package
+2. ...
+```
+
+MCP servers:
+- Add stdio servers under `mcp.servers` in `config.yaml`:
+  ```yaml
+  mcp:
+    servers:
+      - name: filesystem
+        command: npx
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+  ```
+- Server tools register as `mcp_<server>_<tool>` and are available to the agent
+- `/mcp` — check server connection status
+- ⚠️ MCP tools run in external processes, **not gated by the local sandbox** — only connect servers you trust
 
 
 Config cascades: in-memory → `$LLM_*` env vars → `~/.config/goworker/.env`.

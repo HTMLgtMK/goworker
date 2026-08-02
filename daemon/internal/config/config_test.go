@@ -132,6 +132,37 @@ func TestSetField_CompressionRejectsBadValues(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesMCPSection(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	os.WriteFile(path, []byte(`
+mcp:
+  servers:
+    - name: filesystem
+      command: npx
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+`), 0644)
+
+	cfg := Load(path)
+	if len(cfg.MCP.Servers) != 1 {
+		t.Fatalf("MCP.Servers = %+v", cfg.MCP.Servers)
+	}
+	s := cfg.MCP.Servers[0]
+	if s.Name != "filesystem" || s.Command != "npx" || len(s.Args) != 3 {
+		t.Errorf("server = %+v", s)
+	}
+}
+
+func TestDefaultDir_EnvOverride(t *testing.T) {
+	t.Setenv("GOWORKER_CONFIG_DIR", "/tmp/gw-test")
+	if got := DefaultDir(); got != "/tmp/gw-test" {
+		t.Errorf("DefaultDir = %q, want /tmp/gw-test", got)
+	}
+	if got := DefaultPath(); got != filepath.Join("/tmp/gw-test", "config.yaml") {
+		t.Errorf("DefaultPath = %q", got)
+	}
+}
+
 func TestParseContextWindow(t *testing.T) {
 	cases := []struct {
 		in   string

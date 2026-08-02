@@ -22,6 +22,7 @@ type Config struct {
 	LLM      LLMConfig      `yaml:"llm"`
 	Sandbox  SandboxConfig  `yaml:"sandbox"`
 	Log      logger.Config  `yaml:"log"`
+	MCP      MCPConfig      `yaml:"mcp"`
 }
 
 type FrontendConfig struct {
@@ -69,6 +70,18 @@ type SandboxConfig struct {
 	RiskyPatterns  []RiskPatternConfig `yaml:"risky_patterns"`   // 空 = 使用 sandbox 默认
 }
 
+// MCPConfig 是 MCP server 连接配置。
+type MCPConfig struct {
+	Servers []MCPServer `yaml:"servers"` // 空 = 不连接任何 server
+}
+
+// MCPServer 描述一个 stdio MCP server 连接。
+type MCPServer struct {
+	Name    string   `yaml:"name"`           // 唯一标识，同时作工具名前缀
+	Command string   `yaml:"command"`        // 可执行文件路径或命令名
+	Args    []string `yaml:"args,omitempty"` // 传给进程的参数
+}
+
 // Default 返回带默认值的 Config。
 func Default() *Config {
 	logCfg := logger.Default()
@@ -103,16 +116,23 @@ func defaultLogPath() string {
 	return filepath.Join(base, "goworker.log")
 }
 
-// DefaultPath 返回默认的配置文件路径。
-func DefaultPath() string {
+// DefaultDir 返回配置目录。
+// 优先 GOWORKER_CONFIG_DIR，否则 ~/.config/goworker。
+// skill、日志等衍生路径都基于它，避免各包各自算路径。
+func DefaultDir() string {
 	if d := os.Getenv("GOWORKER_CONFIG_DIR"); d != "" {
-		return filepath.Join(d, "config.yaml")
+		return d
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "config.yaml"
+		return "."
 	}
-	return filepath.Join(home, ".config", "goworker", "config.yaml")
+	return filepath.Join(home, ".config", "goworker")
+}
+
+// DefaultPath 返回默认的配置文件路径。
+func DefaultPath() string {
+	return filepath.Join(DefaultDir(), "config.yaml")
 }
 
 // Display 返回 YAML 格式的配置文本（API Key 自动脱敏）。

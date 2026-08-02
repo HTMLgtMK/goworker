@@ -24,3 +24,12 @@ sandbox:
     #   - "rm\\s+"
     #   - pattern: ">\\s+\\S"
     #     desc: "输出重定向到文件"
+
+mcp:
+    # MCP 服务器连接（stdio 传输）
+    # 每个 server 暴露的工具以 mcp_<server>_<tool> 注册给 agent
+    # 注意：MCP 工具在外部进程运行，不受本地 sandbox 管控，只连接可信 server
+    servers:
+      # - name: filesystem
+      #   command: npx
+      #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
