@@ -56,6 +56,31 @@ func TestHITL_BashRiskyConfirmsAndApproves(t *testing.T) {
 	}
 }
 
+func TestHITL_BashReadonlyPassesWithoutConfirm(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&config.SandboxConfig{Mode: "normal"})
+	// 只读命令不应触发 HITL，channel 留空也安全
+	mw := NewHITLMiddleware(*cfg, NewChannelDecisionProvider(make(chan spec.HITLDecision)))
+
+	tokenCh := make(chan core.Token, 10)
+	ev := &core.BeforeToolEvent{
+		Ctx:     context.Background(),
+		Tool:    &core.ToolCall{ID: "t1", Type: "function", Function: core.ToolCallFunction{Name: "bash"}},
+		TokenCh: tokenCh,
+		Args:    map[string]any{"command": `curl -s "https://wttr.in/Changsha?format=3&lang=zh" || echo "failed"`},
+	}
+	mw.OnBeforeTool(ev)
+
+	if ev.Aborted || len(ev.ResponseMessages) != 0 {
+		t.Fatalf("readonly bash should pass through, got aborted=%v msgs=%v", ev.Aborted, ev.ResponseMessages)
+	}
+	toks := drainTokens(tokenCh)
+	for _, tok := range toks {
+		if tok.Type == core.TokenTypeInterrupt {
+			t.Fatalf("readonly bash should not trigger interrupt, got %+v", tok)
+		}
+	}
+}
+
 func TestHITL_MCPBlockedInStrictMode(t *testing.T) {
 	cfg := sandbox.NewFromConfig(&config.SandboxConfig{Mode: "strict"})
 	// strict 模式直接拒绝，不会调用 DecisionProvider，channel 留空也安全

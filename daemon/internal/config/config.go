@@ -68,6 +68,7 @@ type SandboxConfig struct {
 	AllowedWorkDir string              `yaml:"allowed_work_dir"` // 空 = 使用当前目录
 	DeniedPatterns []string            `yaml:"denied_patterns"`  // 空 = 使用 sandbox 默认
 	RiskyPatterns  []RiskPatternConfig `yaml:"risky_patterns"`   // 空 = 使用 sandbox 默认
+	SafeCommands   []string            `yaml:"safe_commands"`    // 追加的只读安全命令名（直接放行）
 }
 
 // MCPConfig 是 MCP server 连接配置。

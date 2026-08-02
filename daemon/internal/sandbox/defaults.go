@@ -66,6 +66,15 @@ func PatternDesc(pattern string) string {
 	return pattern
 }
 
+// builtinDevWritePattern 是内置的设备写保护规则。只有这一条规则享受伪设备豁免。
+const builtinDevWritePattern = `>\s*/dev/`
+
+// isBuiltinDevWritePattern 判断正则是否为内置的 `>\s*/dev/` 设备写保护规则。
+// 按正则源文本精确匹配，避免自定义的含 /dev/ deny 规则被误豁免。
+func isBuiltinDevWritePattern(p *regexp.Regexp) bool {
+	return p.String() == builtinDevWritePattern
+}
+
 // CompilePatterns 编译字符串模式列表为正则表达式列表。
 func CompilePatterns(patterns []string) ([]*regexp.Regexp, error) {
 	compiled := make([]*regexp.Regexp, 0, len(patterns))
