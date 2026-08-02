@@ -153,11 +153,13 @@ type Agent struct {
 	tools       []core.Tool
 	toolMap     map[string]core.Tool
 	middlewares []core.Middleware
+	tracker     *core.UsageTracker // 每次 Chat 调用的 token 统计，nil 则跳过
 
-	OnIteration func() // 可选：每次 ReAct 循环前调用，用于 UI 反馈（status bar 迭代计数）
+	OnIteration func()         // 可选：每次 ReAct 循环前调用，用于 UI 反馈（status bar 迭代计数）
+	OnUsage     func(core.Usage) // 可选：每次 Chat 调用后回调，传当前会话累计快照
 }
 
-func NewAgent(provider core.Provider, tools []core.Tool, mws []core.Middleware) *Agent {
+func NewAgent(provider core.Provider, tools []core.Tool, mws []core.Middleware, tracker *core.UsageTracker) *Agent {
 	tm := make(map[string]core.Tool, len(tools))
 	for _, t := range tools {
 		tm[t.Name] = t
@@ -167,6 +169,7 @@ func NewAgent(provider core.Provider, tools []core.Tool, mws []core.Middleware) 
 		tools:       tools,
 		toolMap:     tm,
 		middlewares: mws,
+		tracker:     tracker,
 	}
 }
 
@@ -184,7 +187,12 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 		var runErr error
 		defer close(ch)
 		defer func() {
-			a.fireMiddlewareEvent(&core.AfterAgentEvent{Ctx: ctx, History: messages, Err: runErr})
+			var total *core.Usage
+			if a.tracker != nil {
+				s := a.tracker.Snapshot()
+				total = &s
+			}
+			a.fireMiddlewareEvent(&core.AfterAgentEvent{Ctx: ctx, History: messages, Err: runErr, TotalUsage: total})
 			msgCh <- messages
 		}()
 
@@ -202,7 +210,25 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 
 			resp, err := a.provider.Chat(ctx, req)
 
-			a.fireMiddlewareEvent(&core.AfterModelEvent{Ctx: ctx, History: messages, Err: err})
+			var usage *core.UsageInfo
+			if resp != nil {
+				usage = resp.Usage
+			}
+			// 只在模型没返回 usage 时粗估一次（JSON 字节数 / 4）——常见路径零额外序列化
+			var estimate int
+			if err == nil && usage == nil && a.tracker != nil {
+				if b, merr := json.Marshal(req); merr == nil {
+					estimate = len(b) / 4
+				}
+			}
+			// 失败的调用不进账——统计只记真实发生的模型调用
+			if err == nil && a.tracker != nil {
+				a.tracker.Record(iter, estimate, usage)
+				if a.OnUsage != nil {
+					a.OnUsage(a.tracker.Snapshot())
+				}
+			}
+			a.fireMiddlewareEvent(&core.AfterModelEvent{Ctx: ctx, History: messages, Err: err, Usage: usage})
 
 			if err != nil {
 				runErr = err

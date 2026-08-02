@@ -42,6 +42,7 @@ Configure LLM endpoint via `/model`:
 /model set endpoint=http://localhost:8000/v1
 /model set model=gpt-4o
 /model set api_key=sk-xxx
+/model set context_window=32768   ← model context window (tokens), enables ctx % in status bar
 ```
 
 Config cascades: in-memory → `$LLM_*` env vars → `~/.config/goworker/.env`.

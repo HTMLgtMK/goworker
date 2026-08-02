@@ -48,7 +48,7 @@ func NewStdinFrontend(engine *core.Engine, config *config.StdinConfig) *StdinFro
 	}
 
 	sb := statusbar.New()
-	sb.Use(NewProgressAddon(), NewIterationAddon())
+	sb.Use(NewProgressAddon(), NewIterationAddon(), NewUsageAddon())
 
 	return &StdinFrontend{
 		engine:   engine,

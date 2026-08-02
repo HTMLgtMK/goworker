@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/frontend/statusbar"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/middlewares"
@@ -16,13 +17,15 @@ import (
 
 type AgentPlugin struct {
 	hub          *spec.Hub
-	conversation []core.Message // 跨 /agent 调用的对话历史
+	conversation []core.Message      // 跨 /agent 调用的对话历史
+	usage        *core.UsageTracker  // 当前 /agent 会话的 token 统计
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }
 
 func (p *AgentPlugin) Init(h *spec.Hub) error {
 	p.hub = h
+	p.usage = core.NewUsageTracker()
 
 	h.RegisterCommand(spec.Command{
 		Name:        "/agent",
@@ -35,6 +38,12 @@ func (p *AgentPlugin) Init(h *spec.Hub) error {
 		Name:        "/model",
 		Description: "查看/设置 LLM 配置，用法见 /model help",
 		Handler:     p.handleModel,
+	})
+
+	h.RegisterCommand(spec.Command{
+		Name:        "/usage",
+		Description: "查看当前会话的 token 用量明细",
+		Handler:     p.handleUsage,
 	})
 
 	// 未匹配的任何命令都转发给 agent 处理
@@ -61,7 +70,8 @@ func (p *AgentPlugin) handleModel(ctx *spec.Context) error {
 		ctx.Writer("用法:\n")
 		ctx.Writer("  /model            — 查看当前配置\n")
 		ctx.Writer("  /model set <k>=<v> — 设置配置\n")
-		ctx.Writer("  可用 key: endpoint, model, api_key, sandbox_mode\n")
+		ctx.Writer("  可用 key: endpoint, model, api_key, context_window, sandbox_mode\n")
+		ctx.Writer("  context_window: 模型上下文窗口，如 32768 / 32k / 128k\n")
 		ctx.Writer("  sandbox_mode: off, normal, strict, readonly\n")
 
 	case "set":
@@ -84,10 +94,17 @@ func (p *AgentPlugin) handleModel(ctx *spec.Context) error {
 			cfg.LLM.Model = val
 		case "api_key":
 			cfg.LLM.APIKey = val
+		case "context_window":
+			n, err := config.ParseContextWindow(val)
+			if err != nil {
+				ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+				return nil
+			}
+			cfg.LLM.ContextWindow = n
 		case "sandbox_mode":
 			cfg.Sandbox.Mode = val
 		default:
-			ctx.Writer(fmt.Sprintf("未知配置项: %s（可用: endpoint, model, api_key, sandbox_mode）\n", key))
+			ctx.Writer(fmt.Sprintf("未知配置项: %s（可用: endpoint, model, api_key, context_window, sandbox_mode）\n", key))
 			return nil
 		}
 
@@ -113,10 +130,11 @@ func (p *AgentPlugin) showConfig(ctx *spec.Context) {
 		keyDisplay = "(未设置)"
 	}
 
-	ctx.Writer(fmt.Sprintf("Endpoint:     %s\n", cfg.LLM.Endpoint))
-	ctx.Writer(fmt.Sprintf("Model:        %s\n", cfg.LLM.Model))
-	ctx.Writer(fmt.Sprintf("API Key:      %s\n", keyDisplay))
-	ctx.Writer(fmt.Sprintf("Sandbox Mode: %s\n", cfg.Sandbox.Mode))
+	ctx.Writer(fmt.Sprintf("Endpoint:      %s\n", cfg.LLM.Endpoint))
+	ctx.Writer(fmt.Sprintf("Model:         %s\n", cfg.LLM.Model))
+	ctx.Writer(fmt.Sprintf("API Key:       %s\n", keyDisplay))
+	ctx.Writer(fmt.Sprintf("Context Window: %d\n", cfg.LLM.ContextWindow))
+	ctx.Writer(fmt.Sprintf("Sandbox Mode:  %s\n", cfg.Sandbox.Mode))
 }
 
 // ---- /agent 命令 ----
@@ -127,6 +145,9 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 		ctx.Writer("用法: /agent <你的问题>\n")
 		return nil
 	}
+
+	// 新一轮会话，清零 token 统计
+	p.usage.Reset()
 
 	// 构建沙箱配置
 	sandboxCfg := p.sandboxConfig()
@@ -139,10 +160,22 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 	provider := NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
 	decisions := make(chan spec.HITLDecision, 1)
 	hitlMw := middlewares.NewHITLMiddleware(sandboxCfg, middlewares.NewChannelDecisionProvider(decisions))
-	agent := NewAgent(provider, tools, []core.Middleware{hitlMw})
+	agent := NewAgent(provider, tools, []core.Middleware{hitlMw}, p.usage)
 	agent.OnIteration = func() {
 		if ctx.Publish != nil {
 			ctx.Publish(statusbar.EventIteration, nil)
+		}
+	}
+	agent.OnUsage = func(u core.Usage) {
+		if ctx.Publish != nil {
+			ctx.Publish(statusbar.EventUsage, statusbar.Usage{
+				EstimateTokens:   u.EstimateTokens,
+				PromptTokens:     u.PromptTokens,
+				CompletionTokens: u.CompletionTokens,
+				TotalTokens:      u.TotalTokens,
+				LastPromptTokens: u.LastPromptTokens,
+				ContextWindow:    cfg.LLM.ContextWindow,
+			})
 		}
 	}
 
@@ -185,6 +218,48 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 	}
 
 	return nil
+}
+
+// ---- /usage 命令 ----
+
+func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
+	calls := p.usage.Calls()
+	if len(calls) == 0 {
+		ctx.Writer("(当前会话还没有 agent 调用，先跑一次 /agent)\n")
+		return nil
+	}
+	total := p.usage.Snapshot()
+
+	ctx.Writer(fmt.Sprintf("usage: %d model calls this session\n\n", len(calls)))
+	for i, c := range calls {
+		ctx.Writer(fmt.Sprintf("  #%-2d  in %-7s  out %-7s  (est %s)\n",
+			i+1, humanize(c.PromptTokens), humanize(c.CompletionTokens), humanize(c.EstimateTokens)))
+	}
+
+	ctx.Writer("\n")
+	ctx.Writer(fmt.Sprintf("  total: in %s  out %s  total %s\n",
+		humanize(total.PromptTokens), humanize(total.CompletionTokens), humanize(total.TotalTokens)))
+
+	// context usage uses "last prompt / window" — the final ReAct request already holds all history
+	if w := p.hub.Config.LLM.ContextWindow; w > 0 && total.LastPromptTokens > 0 {
+		pct := int(float64(total.LastPromptTokens) / float64(w) * 100)
+		ctx.Writer(fmt.Sprintf("  context: %d%% (last in %s / window %s)\n",
+			pct, humanize(total.LastPromptTokens), humanize(w)))
+	}
+	return nil
+}
+
+// humanize 把 token 数格式化为千分位缩写，12345 -> "12.3k"。
+// 与 frontend/stdin 的 humanize 保持同一套规则，避免跨包依赖。
+func humanize(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
 
 // renderKind 将 core.Token 类型映射为 spec.RenderKind，剥离渲染逻辑。

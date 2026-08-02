@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/tinguo/goworker/daemon/internal/logger"
 	"gopkg.in/yaml.v3"
@@ -31,9 +32,10 @@ type StdinConfig struct {
 }
 
 type LLMConfig struct {
-	Endpoint string `yaml:"endpoint"`
-	Model    string `yaml:"model"`
-	APIKey   string `yaml:"api_key"`
+	Endpoint      string `yaml:"endpoint"`
+	Model         string `yaml:"model"`
+	APIKey        string `yaml:"api_key"`
+	ContextWindow int    `yaml:"context_window"` // 模型上下文窗口（token），0 = 未知
 }
 
 // RiskPatternConfig 表示一个风险命令模式及其人类可读描述。
@@ -119,6 +121,40 @@ func (c *Config) Display() string {
 	return string(data)
 }
 
+// ParseContextWindow 解析上下文窗口值，支持 k/m 简写：
+//
+//	"32768"  → 32768
+//	"32k"    → 32768
+//	"128k"   → 131072
+//	"1.5m"   → 1572864
+//
+// k/m 按 1024 进制换算，贴合主流模型 2 的幂窗口（32768/65536/131072）。
+// 返回 token 数，非法输入返回错误。
+func ParseContextWindow(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("空值")
+	}
+	mult := 1
+	switch last := s[len(s)-1]; last {
+	case 'k', 'K':
+		mult = 1024
+		s = s[:len(s)-1]
+	case 'm', 'M':
+		mult = 1024 * 1024
+		s = s[:len(s)-1]
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || f <= 0 {
+		return 0, fmt.Errorf("无效上下文窗口 %q（应为正整数或带 k/m 后缀，如 32768 / 32k / 128k）", s)
+	}
+	n := int(f * float64(mult))
+	if n <= 0 {
+		return 0, fmt.Errorf("上下文窗口过小: %q", s)
+	}
+	return n, nil
+}
+
 // SetField 按点分 key 设置配置项（如 "llm.endpoint"、"sandbox.mode"）。
 func (c *Config) SetField(key, value string) error {
 	switch key {
@@ -130,6 +166,12 @@ func (c *Config) SetField(key, value string) error {
 		c.LLM.Model = value
 	case "llm.api_key":
 		c.LLM.APIKey = value
+	case "llm.context_window":
+		n, err := ParseContextWindow(value)
+		if err != nil {
+			return err
+		}
+		c.LLM.ContextWindow = n
 	case "sandbox.mode":
 		c.Sandbox.Mode = value
 	case "sandbox.allowed_work_dir":
@@ -154,7 +196,7 @@ func (c *Config) SetField(key, value string) error {
 		}
 		c.Log.MaxAgeDays = n
 	default:
-		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days"
+		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, llm.context_window, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days"
 		return fmt.Errorf("未知配置项: %s（可用: %s）", key, valid)
 	}
 	return nil

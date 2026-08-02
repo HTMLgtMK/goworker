@@ -25,7 +25,19 @@ import (
 // 内置事件名。
 const (
 	EventIteration = "iteration" // 迭代事件：agent 完成一轮 ReAct 循环
+	EventUsage     = "usage"     // 用量事件：agent 完成一次 Chat 调用，data 为最新累计快照（Usage）
 )
+
+// Usage 是 agent token 用量的累计快照，随 EventUsage 事件广播。
+// 独立于 plugin 的类型定义，避免 frontend 反向依赖插件内部实现。
+type Usage struct {
+	EstimateTokens   int
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	LastPromptTokens int // 最近一次 Chat 的输入 token，上下文占用百分比计算用
+	ContextWindow    int // 模型上下文窗口（token），0 = 未知（显示 fallback）
+}
 
 // Addon 定义状态栏的一个可插拔段。
 //

@@ -34,9 +34,10 @@ type BeforeAgentEvent struct {
 
 // AfterAgentEvent AfterAgent 点位的事件。
 type AfterAgentEvent struct {
-	Ctx     context.Context
-	History []Message
-	Err     error
+	Ctx        context.Context
+	History    []Message
+	Err        error
+	TotalUsage *Usage // 整次运行所有 Chat 调用的累计用量（tracker 快照），可为 nil
 }
 
 // BeforeModelEvent BeforeModel 点位的事件。
@@ -51,6 +52,7 @@ type AfterModelEvent struct {
 	Ctx     context.Context
 	History []Message
 	Err     error
+	Usage   *UsageInfo // 本次 Chat 调用的 token 用量，模型不返回时为 nil
 }
 
 // BeforeToolEvent BeforeTool 点位的事件。
