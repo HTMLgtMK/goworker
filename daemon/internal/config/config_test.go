@@ -97,6 +97,41 @@ func TestSetField_LogRejectsBadValues(t *testing.T) {
 	}
 }
 
+func TestSetField_Compression(t *testing.T) {
+	cfg := Default()
+	if cfg.LLM.CompressAt != 0.8 || cfg.LLM.CompactKeep != 10 {
+		t.Fatalf("defaults = %v/%d, want 0.8/10", cfg.LLM.CompressAt, cfg.LLM.CompactKeep)
+	}
+
+	if err := cfg.SetField("llm.compress_at", "0.5"); err != nil {
+		t.Fatalf("SetField compress_at: %v", err)
+	}
+	if cfg.LLM.CompressAt != 0.5 {
+		t.Errorf("CompressAt = %v, want 0.5", cfg.LLM.CompressAt)
+	}
+	if err := cfg.SetField("llm.compact_keep", "20"); err != nil {
+		t.Fatalf("SetField compact_keep: %v", err)
+	}
+	if cfg.LLM.CompactKeep != 20 {
+		t.Errorf("CompactKeep = %d, want 20", cfg.LLM.CompactKeep)
+	}
+}
+
+func TestSetField_CompressionRejectsBadValues(t *testing.T) {
+	cfg := Default()
+	// NaN 是特例：ParseFloat 不报错且比较恒 false，必须显式拦截
+	for _, v := range []string{"abc", "1.5", "-0.1", "NaN", "nan"} {
+		if err := cfg.SetField("llm.compress_at", v); err == nil {
+			t.Errorf("SetField(llm.compress_at, %q) should error", v)
+		}
+	}
+	for _, v := range []string{"abc", "0", "-3"} {
+		if err := cfg.SetField("llm.compact_keep", v); err == nil {
+			t.Errorf("SetField(llm.compact_keep, %q) should error", v)
+		}
+	}
+}
+
 func TestParseContextWindow(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -104,7 +139,7 @@ func TestParseContextWindow(t *testing.T) {
 		ok   bool
 	}{
 		{"32768", 32768, true},
-		{"32k", 32768, true},  // 1024 进制，命中主流模型窗口
+		{"32k", 32768, true}, // 1024 进制，命中主流模型窗口
 		{"32K", 32768, true},
 		{"128k", 131072, true},
 		{"1.5m", 1572864, true},

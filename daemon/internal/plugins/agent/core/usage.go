@@ -13,15 +13,24 @@ type Usage struct {
 	LastPromptTokens int // 仅快照有效：最近一次 Chat 的输入 token（上下文占用计算用）
 }
 
+// Compaction 记录一次历史压缩。
+// 压缩是 ReAct 循环外的模型调用（summarize），也必须进账，否则 /usage 是漏水的桶。
+type Compaction struct {
+	BeforeMsgs int // 压缩前消息条数
+	AfterMsgs  int // 压缩后消息条数
+	Tokens     int // summarize 调用消耗（模型返回 total，缺省用估算）
+}
+
 // UsageTracker 累加一次 /agent 会话内所有 Chat 调用的用量。
 //
 // 写入方是 agent 的 ReAct 循环（goroutine），读取方是 status bar addon
 // 与 /usage 命令（可能在不同 goroutine），故内部用 mutex 保护。
 // 只记当前会话，跨会话累计交给 slog 日志 + 未来的持久化。
 type UsageTracker struct {
-	mu    sync.Mutex
-	calls []Usage // 明细，/usage 命令展示用
-	total Usage   // 累计快照，status bar 用
+	mu          sync.Mutex
+	calls       []Usage      // 明细，/usage 命令展示用
+	total       Usage        // 累计快照，status bar 用
+	compactions []Compaction // 历史压缩记录，/usage 命令展示用
 }
 
 // NewUsageTracker 创建一个空 tracker。
@@ -73,10 +82,27 @@ func (t *UsageTracker) Calls() []Usage {
 	return out
 }
 
+// RecordCompaction 记录一次历史压缩（线程安全）。
+func (t *UsageTracker) RecordCompaction(c Compaction) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.compactions = append(t.compactions, c)
+}
+
+// Compactions 返回压缩记录的深拷贝（线程安全）。
+func (t *UsageTracker) Compactions() []Compaction {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]Compaction, len(t.compactions))
+	copy(out, t.compactions)
+	return out
+}
+
 // Reset 清空状态，准备新一轮 agent 运行。
 func (t *UsageTracker) Reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.calls = t.calls[:0]
 	t.total = Usage{}
+	t.compactions = t.compactions[:0]
 }

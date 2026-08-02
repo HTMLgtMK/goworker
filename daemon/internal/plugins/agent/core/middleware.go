@@ -44,6 +44,8 @@ type BeforeModelEvent struct {
 	Ctx     context.Context
 	History []Message
 	Input   string
+	// History 可被 middleware 整体替换（如压缩历史）：Agent 循环 fire 事件后回读它作为实际发送的历史。
+	// 约定：只能整体赋值，不要改元素 —— 切片共享底层数组，改元素会污染调用方持有的数据。
 }
 
 // AfterModelEvent AfterModel 点位的事件。

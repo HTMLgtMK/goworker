@@ -39,8 +39,7 @@ func TestUsageMiddleware_EstimatesWhenNoUsage(t *testing.T) {
 
 	mw.OnAfterModel(&core.AfterModelEvent{
 		Ctx:     context.Background(),
-		History: []core.Message{{Role: "user", Content: "hello world"},
-		},
+		History: []core.Message{{Role: "user", Content: "hello world"}},
 	})
 
 	s := tracker.Snapshot()

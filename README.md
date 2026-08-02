@@ -43,7 +43,15 @@ Configure LLM endpoint via `/model`:
 /model set model=gpt-4o
 /model set api_key=sk-xxx
 /model set context_window=32768   ← model context window (tokens), enables ctx % in status bar
+/model set compress_at=0.8        ← auto-compact threshold (0-1), 0 disables
+/model set compact_keep=10        ← keep last N messages verbatim when compacting
 ```
+
+History compaction:
+- `/compact` — LLM-rolls up old messages into a summary, keeps the recent tail
+- Auto — fires before a model call when estimated usage ≥ `compress_at` × window
+- `/history` — inspect the current conversation contents
+
 
 Config cascades: in-memory → `$LLM_*` env vars → `~/.config/goworker/.env`.
 

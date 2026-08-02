@@ -1,8 +1,6 @@
 package middlewares
 
 import (
-	"encoding/json"
-
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
 )
 
@@ -33,12 +31,10 @@ func (m *UsageMiddleware) OnAfterModel(ev *core.AfterModelEvent) *core.Middlewar
 	if ev.Err != nil {
 		return nil
 	}
-	// 模型没返回 usage 时用发送前 messages 粗估（JSON 字节数 / 4）
+	// 模型没返回 usage 时用发送前 messages 粗估（与压缩预检同一套估算）
 	var estimate int
 	if ev.Usage == nil {
-		if b, err := json.Marshal(ev.History); err == nil {
-			estimate = len(b) / 4
-		}
+		estimate = core.EstimateTokens(ev.History)
 	}
 	m.tracker.Record(m.iter, estimate, ev.Usage)
 	m.iter++

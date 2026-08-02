@@ -54,6 +54,31 @@ func TestUsageTracker_CallsDeepCopy(t *testing.T) {
 	}
 }
 
+func TestUsageTracker_RecordCompaction(t *testing.T) {
+	tracker := NewUsageTracker()
+	tracker.RecordCompaction(Compaction{BeforeMsgs: 42, AfterMsgs: 13, Tokens: 1200})
+	tracker.RecordCompaction(Compaction{BeforeMsgs: 30, AfterMsgs: 10, Tokens: 800})
+
+	comps := tracker.Compactions()
+	if len(comps) != 2 {
+		t.Fatalf("Compactions = %d, want 2", len(comps))
+	}
+	if comps[0].BeforeMsgs != 42 || comps[0].AfterMsgs != 13 || comps[0].Tokens != 1200 {
+		t.Errorf("comps[0] = %+v", comps[0])
+	}
+	// 深拷贝：改返回值不影响内部
+	comps[0].BeforeMsgs = 999
+	if got := tracker.Compactions()[0].BeforeMsgs; got != 42 {
+		t.Errorf("Compactions not a deep copy: internal mutated to %d", got)
+	}
+
+	// Reset 清空压缩记录
+	tracker.Reset()
+	if len(tracker.Compactions()) != 0 {
+		t.Error("Reset left compactions")
+	}
+}
+
 func TestUsageTracker_Reset(t *testing.T) {
 	tracker := NewUsageTracker()
 	tracker.Record(0, 100, &UsageInfo{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15})

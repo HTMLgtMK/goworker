@@ -192,13 +192,15 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 			if a.OnIteration != nil {
 				a.OnIteration()
 			}
+			bmEv := &core.BeforeModelEvent{Ctx: ctx, History: messages, Input: input}
+			a.fireMiddlewareEvent(bmEv)
+			// 压缩等 middleware 可能整体替换 History —— 发请求前回读，无替换时等价于原值
+			messages = bmEv.History
 			req := &core.ChatRequest{
 				Model:    a.provider.Model(),
 				Messages: messages,
 				Tools:    toolSpecs(a.tools),
 			}
-
-			a.fireMiddlewareEvent(&core.BeforeModelEvent{Ctx: ctx, History: messages, Input: input})
 
 			resp, err := a.provider.Chat(ctx, req)
 
