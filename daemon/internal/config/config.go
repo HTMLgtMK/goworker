@@ -40,6 +40,7 @@ type LLMConfig struct {
 	ContextWindow int     `yaml:"context_window"` // 模型上下文窗口（token），0 = 未知
 	CompressAt    float64 `yaml:"compress_at"`    // 历史压缩触发阈值（0-1）：估算用量达窗口该比例时自动压缩，0 = 关闭
 	CompactKeep   int     `yaml:"compact_keep"`   // 滚动压缩保留的最近消息条数（原文不压，只压更早的）
+	MaxIterations int     `yaml:"max_iterations"` // ReAct 循环最大迭代数（模型往返次数），0 = 默认 15
 }
 
 // RiskPatternConfig 表示一个风险命令模式及其人类可读描述。
@@ -97,8 +98,9 @@ func Default() *Config {
 			Endpoint:    "http://localhost:8000/v1",
 			Model:       "gpt-4o",
 			APIKey:      "",
-			CompressAt:  0.8, // 用量达窗口 80% 自动压缩，留余量给压缩调用和新输入
-			CompactKeep: 10,  // 最近 10 条原文保留，更早的才压缩
+			CompressAt:    0.8, // 用量达窗口 80% 自动压缩，留余量给压缩调用和新输入
+			CompactKeep:   10,  // 最近 10 条原文保留，更早的才压缩
+			MaxIterations: 15,  // ReAct 最大迭代数，模型连续调工具不至于无限烧 token
 		},
 		Sandbox: SandboxConfig{
 			Mode: "normal",
@@ -211,6 +213,12 @@ func (c *Config) SetField(key, value string) error {
 			return fmt.Errorf("无效 compact_keep: %s（应为正整数，如 10）", value)
 		}
 		c.LLM.CompactKeep = n
+	case "llm.max_iterations":
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("无效 max_iterations: %s（应为正整数，如 15）", value)
+		}
+		c.LLM.MaxIterations = n
 	case "sandbox.mode":
 		c.Sandbox.Mode = value
 	case "sandbox.allowed_work_dir":
@@ -235,7 +243,7 @@ func (c *Config) SetField(key, value string) error {
 		}
 		c.Log.MaxAgeDays = n
 	default:
-		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, llm.context_window, llm.compress_at, llm.compact_keep, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days"
+		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, llm.context_window, llm.compress_at, llm.compact_keep, llm.max_iterations, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days"
 		return fmt.Errorf("未知配置项: %s（可用: %s）", key, valid)
 	}
 	return nil

@@ -144,10 +144,11 @@ func (p *AgentPlugin) handleModel(ctx *spec.Context) error {
 		ctx.Writer("用法:\n")
 		ctx.Writer("  /model            — 查看当前配置\n")
 		ctx.Writer("  /model set <k>=<v> — 设置配置\n")
-		ctx.Writer("  可用 key: endpoint, model, api_key, context_window, compress_at, compact_keep, sandbox_mode\n")
+		ctx.Writer("  可用 key: endpoint, model, api_key, context_window, compress_at, compact_keep, max_iterations, sandbox_mode\n")
 		ctx.Writer("  context_window: 模型上下文窗口，如 32768 / 32k / 128k\n")
 		ctx.Writer("  compress_at: 历史压缩触发阈值（0-1），用量达窗口该比例自动压缩，0 关闭\n")
 		ctx.Writer("  compact_keep: 滚动压缩保留的最近消息条数\n")
+		ctx.Writer("  max_iterations: ReAct 循环最大迭代数（模型往返次数），0 = 默认 15\n")
 		ctx.Writer("  sandbox_mode: off, normal, strict, readonly\n")
 
 	case "set":
@@ -188,10 +189,15 @@ func (p *AgentPlugin) handleModel(ctx *spec.Context) error {
 				ctx.Writer(fmt.Sprintf("✘ %v\n", err))
 				return nil
 			}
+		case "max_iterations":
+			if err := cfg.SetField("llm.max_iterations", val); err != nil {
+				ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+				return nil
+			}
 		case "sandbox_mode":
 			cfg.Sandbox.Mode = val
 		default:
-			ctx.Writer(fmt.Sprintf("未知配置项: %s（可用: endpoint, model, api_key, context_window, compress_at, compact_keep, sandbox_mode）\n", key))
+			ctx.Writer(fmt.Sprintf("未知配置项: %s（可用: endpoint, model, api_key, context_window, compress_at, compact_keep, max_iterations, sandbox_mode）\n", key))
 			return nil
 		}
 
@@ -223,6 +229,7 @@ func (p *AgentPlugin) showConfig(ctx *spec.Context) {
 	ctx.Writer(fmt.Sprintf("Context Window: %d\n", cfg.LLM.ContextWindow))
 	ctx.Writer(fmt.Sprintf("Compress At:    %v\n", cfg.LLM.CompressAt))
 	ctx.Writer(fmt.Sprintf("Compact Keep:   %d\n", cfg.LLM.CompactKeep))
+	ctx.Writer(fmt.Sprintf("Max Iterations: %d\n", cfg.LLM.MaxIterations))
 	ctx.Writer(fmt.Sprintf("Sandbox Mode:  %s\n", cfg.Sandbox.Mode))
 }
 
@@ -269,14 +276,20 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 		cfg.LLM.ContextWindow,
 		cfg.LLM.CompressAt,
 	)
-	agent := NewAgent(provider, tools, []core.Middleware{hitlMw, usageMw, compressMw})
+	agent := NewAgent(provider, tools, []core.Middleware{hitlMw, usageMw, compressMw},
+		WithMaxIterations(cfg.LLM.MaxIterations))
 	agent.OnIteration = func() {
 		if ctx.Publish != nil {
 			ctx.Publish(statusbar.EventIteration, nil)
 		}
 	}
 
-	agentCtx, cancel := context.WithTimeout(ctx.Ctx, 5*time.Minute)
+	// agentCtx 不设硬超时：多轮 tool call 总耗时不可控，5 分钟硬超时只会在工具循环
+	// 中途切断会话，且超时瞬间 sendToken 会把唯一的错误提示吞掉，前端表现成"莫名停止"。
+	// 兜底交给单次请求自身：provider http 30s 超时；bash 类子进程工具受 60s 限制
+	// （CommandContext + 进程组 kill），read_file/write_file 的同步 syscall 不认 ctx，
+	// 用 goroutine + select 包装让取消能提前返回，真正挂死的 OS 层仍依赖系统恢复。
+	agentCtx, cancel := context.WithCancel(ctx.Ctx)
 	defer cancel()
 
 	// 快照历史给本轮的 Run（工具重入触发的 /compact 不会污染本次运行的输入）

@@ -139,8 +139,11 @@ func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *spec.InterruptR
 		case <-ev.Ctx.Done():
 		}
 		ev.Aborted = true
+		// 必须用 tool 消息回填并带 ToolCallID：assistant 的每个 tool_call 都要有对应
+		// tool 响应，否则下一轮请求被 OpenAI 兼容后端以 400/空 choices 拒绝 —— 这正是
+		// 多轮 tool call"莫名停止"的诱因之一。模型借此得知工具没执行、用户说了什么。
 		ev.ResponseMessages = []core.Message{
-			{Role: "user", Content: msg},
+			{Role: "tool", Content: fmt.Sprintf("[tool not executed] user replied: %s", msg), ToolCallID: ev.Tool.ID},
 		}
 	}
 

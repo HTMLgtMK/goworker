@@ -120,7 +120,7 @@ func (c *Compressor) summarize(ctx context.Context, old []Message) (string, *Usa
 
 // summaryPrompt 构造压缩摘要的指令。
 //
-// TODO(human): 打磨这段提示词 —— 决定保留清单、输出格式和长度约束。
+// TODO: 打磨这段提示词 —— 决定保留清单、输出格式和长度约束。
 // 当前版本是能用的基线，重点想清楚：摘要要喂给"继续干活的 agent"，
 // 而不是给人看，所以宁可信息密度高，不要追求行文流畅。
 func summaryPrompt(old []Message) string {

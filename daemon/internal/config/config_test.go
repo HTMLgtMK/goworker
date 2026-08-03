@@ -99,8 +99,8 @@ func TestSetField_LogRejectsBadValues(t *testing.T) {
 
 func TestSetField_Compression(t *testing.T) {
 	cfg := Default()
-	if cfg.LLM.CompressAt != 0.8 || cfg.LLM.CompactKeep != 10 {
-		t.Fatalf("defaults = %v/%d, want 0.8/10", cfg.LLM.CompressAt, cfg.LLM.CompactKeep)
+	if cfg.LLM.CompressAt != 0.8 || cfg.LLM.CompactKeep != 10 || cfg.LLM.MaxIterations != 15 {
+		t.Fatalf("defaults = %v/%d/%d, want 0.8/10/15", cfg.LLM.CompressAt, cfg.LLM.CompactKeep, cfg.LLM.MaxIterations)
 	}
 
 	if err := cfg.SetField("llm.compress_at", "0.5"); err != nil {
@@ -115,6 +115,12 @@ func TestSetField_Compression(t *testing.T) {
 	if cfg.LLM.CompactKeep != 20 {
 		t.Errorf("CompactKeep = %d, want 20", cfg.LLM.CompactKeep)
 	}
+	if err := cfg.SetField("llm.max_iterations", "30"); err != nil {
+		t.Fatalf("SetField max_iterations: %v", err)
+	}
+	if cfg.LLM.MaxIterations != 30 {
+		t.Errorf("MaxIterations = %d, want 30", cfg.LLM.MaxIterations)
+	}
 }
 
 func TestSetField_CompressionRejectsBadValues(t *testing.T) {
@@ -128,6 +134,11 @@ func TestSetField_CompressionRejectsBadValues(t *testing.T) {
 	for _, v := range []string{"abc", "0", "-3"} {
 		if err := cfg.SetField("llm.compact_keep", v); err == nil {
 			t.Errorf("SetField(llm.compact_keep, %q) should error", v)
+		}
+	}
+	for _, v := range []string{"abc", "0", "-3"} {
+		if err := cfg.SetField("llm.max_iterations", v); err == nil {
+			t.Errorf("SetField(llm.max_iterations, %q) should error", v)
 		}
 	}
 }

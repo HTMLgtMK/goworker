@@ -26,7 +26,8 @@ type IterationAddon struct {
 }
 
 // NewIterationAddon 创建一个迭代计数 addon。
-// events channel 缓冲设为 maxIterations（15）以防积压。
+// events channel 是 Tick 两帧刷新（200ms）之间的平滑队列，不跟 max_iterations 绑定：
+// 排水速率远快于产水（每轮至少一次完整 LLM 往返），15 缓冲足够不丢事件。
 func NewIterationAddon() *IterationAddon {
 	return &IterationAddon{
 		events: make(chan struct{}, 15),

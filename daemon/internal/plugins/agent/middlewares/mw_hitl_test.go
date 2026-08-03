@@ -153,6 +153,41 @@ func TestHITL_MCPAllowedInOffMode(t *testing.T) {
 	}
 }
 
+func TestHITL_RespondBackfillsToolMessageWithCallID(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&config.SandboxConfig{Mode: "normal"})
+	decisions := make(chan spec.HITLDecision, 1)
+	mw := NewHITLMiddleware(*cfg, NewChannelDecisionProvider(decisions))
+
+	tokenCh := make(chan core.Token, 10)
+	ev := &core.BeforeToolEvent{
+		Ctx:     context.Background(),
+		Tool:    &core.ToolCall{ID: "t1", Type: "function", Function: core.ToolCallFunction{Name: "bash"}},
+		TokenCh: tokenCh,
+		Args:    map[string]any{"command": "rm -rf /tmp/goworker-test"},
+	}
+	go func() {
+		decisions <- spec.HITLDecision{InterruptID: "req-1", Type: spec.DecisionRespond, Message: "别删"}
+	}()
+	mw.OnBeforeTool(ev)
+
+	if !ev.Aborted {
+		t.Fatal("respond should abort the tool")
+	}
+	if len(ev.ResponseMessages) != 1 {
+		t.Fatalf("response msgs = %d, want 1", len(ev.ResponseMessages))
+	}
+	rm := ev.ResponseMessages[0]
+	if rm.Role != "tool" {
+		t.Errorf("role = %q, want tool (must pair with the assistant tool_call)", rm.Role)
+	}
+	if rm.ToolCallID != "t1" {
+		t.Errorf("tool_call_id = %q, want t1", rm.ToolCallID)
+	}
+	if !strings.Contains(rm.Content, "别删") {
+		t.Errorf("tool content should carry the user's reply, got %q", rm.Content)
+	}
+}
+
 func TestHITL_NonBashNonMCPNotTouched(t *testing.T) {
 	cfg := sandbox.NewFromConfig(&config.SandboxConfig{Mode: "normal"})
 	mw := NewHITLMiddleware(*cfg, NewChannelDecisionProvider(make(chan spec.HITLDecision)))
