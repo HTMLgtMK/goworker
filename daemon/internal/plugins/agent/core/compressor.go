@@ -43,8 +43,13 @@ func NewCompressor(provider Provider, keepLast int, protectSystem bool, onCompre
 // Compress 压缩 history。无可压缩内容（长度 <= keepLast 或找不到安全切点）时原样返回。
 func (c *Compressor) Compress(ctx context.Context, history []Message) ([]Message, error) {
 	keepHead := 0
-	if c.protectSystem && len(history) > 0 && history[0].Role == "system" {
-		keepHead = 1
+	// protectSystem 保护所有连续前导 system 消息（agent 提示词 + 注入的记忆块等），
+	// 不让他们被压进滚动摘要 —— 摘要没有 [记忆] 前缀，stripMemoryBlocks 剥不掉，
+	// 一旦进 STM 会被下次固化重新归档，形成自指污染。
+	if c.protectSystem {
+		for keepHead < len(history) && history[keepHead].Role == "system" {
+			keepHead++
+		}
 	}
 	body := history[keepHead:]
 

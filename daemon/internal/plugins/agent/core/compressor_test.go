@@ -162,6 +162,37 @@ func TestCompressor_KeepsSystemPromptVerbatim(t *testing.T) {
 	}
 }
 
+func TestCompressor_ProtectsAllLeadingSystemMessages(t *testing.T) {
+	// 自动压缩场景：前导 system 是 agent 提示 + memory middleware 注入的记忆块。
+	// 两者都必须原样保留、不进摘要 —— 摘要没有 [记忆] 前缀剥不掉，进 STM 会污染固化。
+	hist := []Message{
+		msg("system", "You are a coding assistant with tool access."),
+		msg("system", "[记忆] 来自之前的会话..."),
+		msg("user", "q1"), msg("assistant", "a1"),
+		msg("user", "q2"), msg("assistant", "a2"),
+		msg("user", "q3"), msg("assistant", "a3"),
+	}
+	stub := &stubProvider{resp: "SUMMARY"}
+	c := NewCompressor(stub, 2, true)
+	out, err := c.Compress(context.Background(), hist)
+	if err != nil {
+		t.Fatalf("Compress err = %v", err)
+	}
+	// 2 个前导 system 原样保留 + 摘要 + 最近 2 条
+	if len(out) != 5 {
+		t.Fatalf("out len = %d, want 5", len(out))
+	}
+	if out[0].Content != "You are a coding assistant with tool access." {
+		t.Errorf("agent prompt lost: out[0] = %+v", out[0])
+	}
+	if out[1].Content != "[记忆] 来自之前的会话..." {
+		t.Errorf("memory block lost: out[1] = %+v", out[1])
+	}
+	if out[2].Role != "system" || out[2].Content != "SUMMARY" {
+		t.Errorf("out[2] = %+v, want summary", out[2])
+	}
+}
+
 func TestCompressor_ReRollsLeadingSummaryWhenNotProtected(t *testing.T) {
 	// /compact 场景：p.conversation[0] 是上次压缩留下的摘要（system 角色），
 	// protectSystem=false 时它必须被再次滚动，不能原样冻结 —— 否则摘要一条条累积。
