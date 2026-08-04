@@ -9,7 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/mcp"
@@ -590,8 +592,39 @@ func TestHandleMemory_UnknownSubcommand(t *testing.T) {
 	}
 }
 
+// lockedBuf 是线程安全的字符串收集器：/new 的后台固化 goroutine 会并发写 writer，
+// strings.Builder 直接写会有 data race，测试统一走它。
+type lockedBuf struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuf) Write(s string) {
+	b.mu.Lock()
+	b.buf.WriteString(s)
+	b.mu.Unlock()
+}
+
+func (b *lockedBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitFor 轮询 b.String() 直到包含 want 或超时。
+func (b *lockedBuf) waitFor(t *testing.T, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !strings.Contains(b.String(), want) {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for %q, output = %q", want, b.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestHandleNew_EmptyConversationSkipsCheckpoint(t *testing.T) {
-	p := newMemoryPlugin(t) // conversation 为空，checkpoint 直接跳过，不碰 LLM
+	p := newMemoryPlugin(t) // conversation 为空，不启动后台固化，不碰 LLM
 
 	ctx, buf := newContext()
 	if err := p.handleNew(ctx); err != nil {
@@ -603,7 +636,7 @@ func TestHandleNew_EmptyConversationSkipsCheckpoint(t *testing.T) {
 	if !p.newSession {
 		t.Error("newSession should be set")
 	}
-	if !strings.Contains(buf.String(), "新会话") {
+	if !strings.Contains(buf.String(), "New session started") {
 		t.Errorf("output = %q", buf.String())
 	}
 }
@@ -631,12 +664,32 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	p.conversation = []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
 	p.usage.Record(0, 0, &core.UsageInfo{TotalTokens: 10})
 
-	ctx, buf := newContext()
+	// 固化是后台 goroutine 执行的，writer 必须线程安全
+	var out lockedBuf
+	ctx := &spec.Context{
+		Ctx:  context.Background(),
+		Args: nil,
+		FrontendContext: spec.FrontendContext{
+			Writer: out.Write,
+		},
+	}
 	if err := p.handleNew(ctx); err != nil {
 		t.Fatalf("handleNew: %v", err)
 	}
 
-	// 固化落库：task + fact
+	// STM 立即清空 + 会话边界标记（同步路径，不等后台）
+	if len(p.conversation) != 0 {
+		t.Errorf("conversation not cleared: %d", len(p.conversation))
+	}
+	if !p.newSession {
+		t.Error("newSession should be set")
+	}
+	if !strings.Contains(out.String(), "New session started") {
+		t.Errorf("output = %q", out.String())
+	}
+
+	// 等后台固化完成：提示回显 + 落库
+	out.waitFor(t, "Consolidated previous session", 3*time.Second)
 	tasks, _ := ms.ListTasks(10)
 	if len(tasks) != 1 || tasks[0].Title != "fix config" {
 		t.Errorf("task not checkpointed: %+v", tasks)
@@ -644,16 +697,6 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	facts, _ := ms.ListFacts(10)
 	if len(facts) != 1 || facts[0].Topic != "config" {
 		t.Errorf("fact not extracted: %+v", facts)
-	}
-	// STM 清空 + 会话边界标记
-	if len(p.conversation) != 0 {
-		t.Errorf("conversation not cleared: %d", len(p.conversation))
-	}
-	if !p.newSession {
-		t.Error("newSession should be set")
-	}
-	if !strings.Contains(buf.String(), "✔ 已固化") {
-		t.Errorf("output = %q", buf.String())
 	}
 }
 
@@ -770,10 +813,18 @@ func TestHandleNew_LtmExtractDisabledSkipsFacts(t *testing.T) {
 	p.memory = ms
 	p.conversation = []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
 
-	ctx, _ := newContext()
+	var out lockedBuf
+	ctx := &spec.Context{
+		Ctx:  context.Background(),
+		Args: nil,
+		FrontendContext: spec.FrontendContext{
+			Writer: out.Write,
+		},
+	}
 	if err := p.handleNew(ctx); err != nil {
 		t.Fatalf("handleNew: %v", err)
 	}
+	out.waitFor(t, "Consolidated previous session", 3*time.Second)
 	tasks, _ := ms.ListTasks(10)
 	if len(tasks) != 1 {
 		t.Errorf("tasks = %d, want 1 (task extraction stays on)", len(tasks))

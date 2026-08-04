@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -111,7 +112,7 @@ func (p *AgentPlugin) Init(h *spec.Hub) error {
 
 	h.RegisterCommand(spec.Command{
 		Name:        "/new",
-		Description: "结束当前会话：固化记忆 → 清空 STM → 新会话开场注入提醒",
+		Description: "End current session: consolidate memory → clear STM → inject reminders next run",
 		Handler:     p.handleNew,
 	})
 
@@ -474,7 +475,7 @@ func (p *AgentPlugin) handleCompact(ctx *spec.Context) error {
 	// 压缩会丢原文，先固化到任务档案 —— 这是原文丢失前的最后一次机会。
 	if p.memory != nil {
 		if err := p.checkpointMemory(ctx.Ctx); err != nil {
-			ctx.Writer(fmt.Sprintf("⚠ 记忆固化失败（压缩后原文将丢失）: %v\n", err))
+			ctx.Writer(fmt.Sprintf("⚠ Memory consolidation failed (original text lost after compression): %v\n", err))
 		}
 	}
 
@@ -804,19 +805,29 @@ func (p *AgentPlugin) memoryHelp(ctx *spec.Context) {
 // ---- 固化检查点 ----
 
 // checkpointMemory 把当前 conversation 固化进任务档案（Task + LTM）。
-// 一次 LLM 调用（Checkpointer）输出 task 归属/新建/关闭 + 事实决策。
-// 触发点都是低频事件：/compact、进程退出、/new、/task checkpoint。
+// 同步入口：锁内快照 conversation 后调 checkpointSnapshot。
+// 触发点都是低频事件：/compact、进程退出、/task checkpoint —— 这些调用方
+// 语义上必须等固化完成（压缩前、退出前），故保持同步。
 func (p *AgentPlugin) checkpointMemory(ctx context.Context) error {
-	// 读快照→LLM 推理→写回是整个周期，store 的 mutex 只串行化单次写。
-	// 并发检查点（如 /compact 与退出 Stop 重叠）会基于过期快照互相覆盖，必须整体互斥。
+	p.mu.Lock()
+	conv := slices.Clone(p.conversation)
+	p.mu.Unlock()
+	_, err := p.checkpointSnapshot(ctx, conv)
+	return err
+}
+
+// checkpointSnapshot 把给定 conversation 快照固化进任务档案。
+// 一次 LLM 调用（Checkpointer）输出 task 归属/新建/关闭 + 事实决策。
+// 读快照→LLM 推理→写回是整个周期，store 的 mutex 只串行化单次写。
+// 并发检查点（如 /compact 与退出 Stop、后台固化重叠）会基于过期快照互相覆盖，
+// 必须整体互斥。返回本次固化应用的总条目数（task 更新 + fact 决策）。
+// 快照必须由调用方在锁内克隆 —— /new 的后台固化依赖此保证清 STM 后仍能固化旧历史。
+func (p *AgentPlugin) checkpointSnapshot(ctx context.Context, conv []core.Message) (int, error) {
 	p.checkpointMu.Lock()
 	defer p.checkpointMu.Unlock()
 
-	p.mu.Lock()
-	conv := p.conversation
-	p.mu.Unlock()
 	if p.memory == nil || len(conv) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	cfg := p.hub.Config
@@ -826,17 +837,17 @@ func (p *AgentPlugin) checkpointMemory(ctx context.Context) error {
 
 	openTasks, err := p.memory.OpenTasks(50)
 	if err != nil {
-		return fmt.Errorf("open tasks: %w", err)
+		return 0, fmt.Errorf("open tasks: %w", err)
 	}
 	facts, err := p.memory.ListFacts(50)
 	if err != nil {
-		return fmt.Errorf("list facts: %w", err)
+		return 0, fmt.Errorf("list facts: %w", err)
 	}
 	// 检查点 id：也是 Task.Runs 与 Fact.Source 的标记
 	cpID := fmt.Sprintf("cp-%d", time.Now().UnixNano())
 	res, err := cp.Run(ctx, conv, openTasks, facts)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	// ltm_extract=false：tasks/decisions 是同一 LLM 调用输出的，无法只跳过调用，
 	// 但应用层不落库事实 —— 配置开关生效。
@@ -849,30 +860,53 @@ func (p *AgentPlugin) checkpointMemory(ctx context.Context) error {
 	}
 	n, err := memory.ApplyCheckpoint(p.memory, res, openTasks, facts, cpID, tokens, cwd)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if n > 0 {
 		slog.Info("memory: checkpoint applied", "cp", cpID, "applied", n)
 	}
-	return nil
+	return n, nil
+}
+
+// checkpointAsync 后台固化旧会话：/new 不阻塞用户输入，固化结果完成后回显。
+// writer 是捕获的命令 Writer（stdin 实现线程安全），固化期间用户可立即输入下一行。
+// 注意：若 /new 后立刻退出进程，后台固化可能未跑完，这段历史只留 STM 会丢 ——
+// 这是异步固化的代价，Stop 的同步固化兜底下一段对话。
+func (p *AgentPlugin) checkpointAsync(conv []core.Message, writer func(string)) {
+	// 独立 ctx：命令 ctx 已随请求返回被释放，后台固化不能继承它。
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	n, err := p.checkpointSnapshot(ctx, conv)
+	if err != nil {
+		writer(fmt.Sprintf("⚠ Consolidation failed (history kept only in STM, lost on exit): %v\n", err))
+		return
+	}
+	writer(fmt.Sprintf("✔ Consolidated previous session: %d entries\n", n))
 }
 
 // ---- /new 命令 ----
 
 func (p *AgentPlugin) handleNew(ctx *spec.Context) error {
-	// 结束当前会话：先固化，再清 STM，置会话边界标记（下一个 run 注入提醒）。
+	// 结束当前会话：固化异步后台执行（不阻塞输入），立即清 STM，置会话边界标记。
 	if p.memory != nil {
-		if err := p.checkpointMemory(ctx.Ctx); err != nil {
-			ctx.Writer(fmt.Sprintf("⚠ 固化失败（历史将仅存于 STM，进程退出即丢）: %v\n", err))
+		p.mu.Lock()
+		conv := slices.Clone(p.conversation)
+		p.mu.Unlock()
+		if len(conv) > 0 {
+			// writer 在后台 goroutine 里回显，stdin 的 Write 线程安全
+			go p.checkpointAsync(conv, ctx.Writer)
+			ctx.Writer("✔ New session started, consolidating previous session in background…\n")
 		} else {
-			ctx.Writer("✔ 已固化当前会话\n")
+			ctx.Writer("✔ New session started\n")
 		}
+	} else {
+		ctx.Writer("✔ New session started (memory disabled)\n")
 	}
 	p.mu.Lock()
 	p.conversation = nil
 	p.mu.Unlock()
 	p.newSession = true
-	ctx.Writer("✔ 新会话开始，STM 已清空，开场会注入未完成任务提醒\n")
+	ctx.Writer("✔ STM cleared, task reminders will be injected on next run\n")
 	return nil
 }
 
@@ -945,10 +979,10 @@ func (p *AgentPlugin) handleTask(ctx *spec.Context) error {
 
 	case "checkpoint":
 		if err := p.checkpointMemory(ctx.Ctx); err != nil {
-			ctx.Writer(fmt.Sprintf("✘ 固化失败: %v\n", err))
+			ctx.Writer(fmt.Sprintf("✘ Consolidation failed: %v\n", err))
 			return nil
 		}
-		ctx.Writer("✔ 已固化当前会话\n")
+		ctx.Writer("✔ Session consolidated\n")
 
 	default:
 		ctx.Writer(fmt.Sprintf("未知子命令: %s（使用 /task help 查看用法）\n", args[0]))
