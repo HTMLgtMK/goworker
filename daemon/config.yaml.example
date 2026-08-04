@@ -35,6 +35,29 @@ sandbox:
     #   - "kubectl get"
     #   - "terraform plan"
 
+memory:
+    # agent 记忆模块：MTM（跨会话任务档案）+ LTM（长期事实条目）
+    # 生命周期：STM 管会话内，固化检查点（/compact、退出、/new、/task checkpoint）
+    # 才把任务写入 MTM，新会话开场（/new 后首个 run）注入提醒。
+    enabled: true
+    # 存储目录（默认 ~/.config/goworker/memory，含 ltm/ 与 mtm/ 两个子目录）
+    # dir: ""
+
+    # 保留的任务档案数（0 = 不裁剪）
+    # task_keep: 50
+
+    # 会话边界时注入最近 N 个未完成任务
+    # task_inject_n: 3
+
+    # 会话边界时注入的相关长期事实条数
+    # ltm_inject_top_k: 8
+
+    # 检查点固化时是否用 LLM 抽取长期事实（每条打 add/update/delete 决策）
+    # ltm_extract: true
+
+    # 注入块占上下文窗口的比例上限（0-1），防止记忆把窗口撑爆
+    # inject_budget_ratio: 0.15
+
 mcp:
     # MCP 服务器连接（stdio 传输）
     # 每个 server 暴露的工具以 mcp_<server>_<tool> 注册给 agent

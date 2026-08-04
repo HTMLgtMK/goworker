@@ -23,6 +23,7 @@ type Config struct {
 	Sandbox  SandboxConfig  `yaml:"sandbox"`
 	Log      logger.Config  `yaml:"log"`
 	MCP      MCPConfig      `yaml:"mcp"`
+	Memory   MemoryConfig   `yaml:"memory"`
 }
 
 type FrontendConfig struct {
@@ -41,6 +42,17 @@ type LLMConfig struct {
 	CompressAt    float64 `yaml:"compress_at"`    // 历史压缩触发阈值（0-1）：估算用量达窗口该比例时自动压缩，0 = 关闭
 	CompactKeep   int     `yaml:"compact_keep"`   // 滚动压缩保留的最近消息条数（原文不压，只压更早的）
 	MaxIterations int     `yaml:"max_iterations"` // ReAct 循环最大迭代数（模型往返次数），0 = 默认 15
+}
+
+// MemoryConfig 是 agent 记忆模块（MTM 任务档案 + LTM 事实条目）的配置。
+type MemoryConfig struct {
+	Dir               string  `yaml:"dir"`                 // 存储目录，默认 <DefaultDir>/memory
+	Enabled           bool    `yaml:"enabled"`             // false = 整个记忆模块关闭
+	TaskKeep          int     `yaml:"task_keep"`           // 保留任务档案数，0 = 不裁剪
+	TaskInjectN       int     `yaml:"task_inject_n"`       // 会话边界时注入最近 N 个未完成任务
+	LtmInjectTopK     int     `yaml:"ltm_inject_top_k"`    // 会话边界时注入相关事实条数
+	LtmExtract        bool    `yaml:"ltm_extract"`         // 检查点固化时是否 LLM 抽取 LTM
+	InjectBudgetRatio float64 `yaml:"inject_budget_ratio"` // 注入块占 context 窗口的比例上限（0-1）
 }
 
 // RiskPatternConfig 表示一个风险命令模式及其人类可读描述。
@@ -95,9 +107,9 @@ func Default() *Config {
 			},
 		},
 		LLM: LLMConfig{
-			Endpoint:    "http://localhost:8000/v1",
-			Model:       "gpt-4o",
-			APIKey:      "",
+			Endpoint:      "http://localhost:8000/v1",
+			Model:         "gpt-4o",
+			APIKey:        "",
 			CompressAt:    0.8, // 用量达窗口 80% 自动压缩，留余量给压缩调用和新输入
 			CompactKeep:   10,  // 最近 10 条原文保留，更早的才压缩
 			MaxIterations: 15,  // ReAct 最大迭代数，模型连续调工具不至于无限烧 token
@@ -106,6 +118,15 @@ func Default() *Config {
 			Mode: "normal",
 		},
 		Log: logCfg,
+		Memory: MemoryConfig{
+			Dir:               filepath.Join(DefaultDir(), "memory"),
+			Enabled:           true,
+			TaskKeep:          50,
+			TaskInjectN:       3,
+			LtmInjectTopK:     8,
+			LtmExtract:        true,
+			InjectBudgetRatio: 0.15,
+		},
 	}
 }
 
@@ -242,8 +263,46 @@ func (c *Config) SetField(key, value string) error {
 			return fmt.Errorf("无效 max_age_days: %s", value)
 		}
 		c.Log.MaxAgeDays = n
+	case "memory.dir":
+		c.Memory.Dir = value
+	case "memory.enabled":
+		b, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("无效 memory.enabled: %s（应为 true/false）", value)
+		}
+		c.Memory.Enabled = b
+	case "memory.task_keep":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 {
+			return fmt.Errorf("无效 task_keep: %s（应为非负整数，0=不裁剪）", value)
+		}
+		c.Memory.TaskKeep = n
+	case "memory.task_inject_n":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 {
+			return fmt.Errorf("无效 task_inject_n: %s（应为非负整数）", value)
+		}
+		c.Memory.TaskInjectN = n
+	case "memory.ltm_inject_top_k":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 {
+			return fmt.Errorf("无效 ltm_inject_top_k: %s（应为非负整数）", value)
+		}
+		c.Memory.LtmInjectTopK = n
+	case "memory.ltm_extract":
+		b, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("无效 memory.ltm_extract: %s（应为 true/false）", value)
+		}
+		c.Memory.LtmExtract = b
+	case "memory.inject_budget_ratio":
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil || math.IsNaN(f) || f <= 0 || f > 1 {
+			return fmt.Errorf("无效 inject_budget_ratio: %s（应为 0-1 的比例，如 0.15）", value)
+		}
+		c.Memory.InjectBudgetRatio = f
 	default:
-		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, llm.context_window, llm.compress_at, llm.compact_keep, llm.max_iterations, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days"
+		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, llm.context_window, llm.compress_at, llm.compact_keep, llm.max_iterations, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days, memory.dir, memory.enabled, memory.task_keep, memory.task_inject_n, memory.ltm_inject_top_k, memory.ltm_extract, memory.inject_budget_ratio"
 		return fmt.Errorf("未知配置项: %s（可用: %s）", key, valid)
 	}
 	return nil

@@ -14,6 +14,8 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/mcp"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
+	"github.com/tinguo/goworker/daemon/internal/plugins/agent/memory"
+	"github.com/tinguo/goworker/daemon/internal/plugins/agent/middlewares"
 	"github.com/tinguo/goworker/daemon/internal/skills"
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
@@ -493,5 +495,291 @@ func TestHandleMCP_ShowsServers(t *testing.T) {
 	}
 	if !strings.Contains(out, "tools: 1 loaded") {
 		t.Errorf("missing tool count: %q", out)
+	}
+}
+
+// newMemoryPlugin 构造带真实 FileStore 的插件，供 /memory 命令测试。
+func newMemoryPlugin(t *testing.T) *AgentPlugin {
+	t.Helper()
+	cfg := config.Default()
+	hub, _ := testHub(cfg)
+	p := newAgentPlugin(hub)
+	ms, err := memory.NewFileStore(t.TempDir(), 10)
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	t.Cleanup(func() { ms.Close() })
+	p.memory = ms
+	return p
+}
+
+func TestHandleMemory_AddListSearch(t *testing.T) {
+	p := newMemoryPlugin(t)
+
+	ctx, _ := newContext("add", "记住：编译命令是 go build ./...")
+	if err := p.handleMemory(ctx); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	ctx, buf := newContext("list")
+	if err := p.handleMemory(ctx); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !strings.Contains(buf.String(), "go build ./...") {
+		t.Errorf("list output missing fact: %q", buf.String())
+	}
+
+	ctx, buf = newContext("search", "build")
+	if err := p.handleMemory(ctx); err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if !strings.Contains(buf.String(), "go build ./...") {
+		t.Errorf("search output missing match: %q", buf.String())
+	}
+
+	ctx, buf = newContext("search", "kafka")
+	if err := p.handleMemory(ctx); err != nil {
+		t.Fatalf("search no-match: %v", err)
+	}
+	if !strings.Contains(buf.String(), "no matching") {
+		t.Errorf("search no-match output: %q", buf.String())
+	}
+}
+
+func TestHandleMemory_Forget(t *testing.T) {
+	p := newMemoryPlugin(t)
+	p.memory.AddFact(&memory.Fact{Content: "manual fact", Source: "user"})
+	facts, _ := p.memory.ListFacts(10)
+	id := facts[0].ID
+
+	ctx, buf := newContext("forget", id)
+	if err := p.handleMemory(ctx); err != nil {
+		t.Fatalf("forget: %v", err)
+	}
+	if !strings.Contains(buf.String(), "✔ forgot 1") {
+		t.Errorf("forget output: %q", buf.String())
+	}
+	left, _ := p.memory.ListFacts(10)
+	if len(left) != 0 {
+		t.Errorf("fact survived forget: %+v", left)
+	}
+}
+
+func TestHandleMemory_DisabledShowsHint(t *testing.T) {
+	cfg := config.Default()
+	hub, _ := testHub(cfg)
+	p := newAgentPlugin(hub) // p.memory 为 nil
+
+	ctx, buf := newContext("list")
+	if err := p.handleMemory(ctx); err != nil {
+		t.Fatalf("handleMemory: %v", err)
+	}
+	if !strings.Contains(buf.String(), "未启用") {
+		t.Errorf("output = %q, want disabled hint", buf.String())
+	}
+}
+
+func TestHandleMemory_UnknownSubcommand(t *testing.T) {
+	p := newMemoryPlugin(t)
+	ctx, buf := newContext("bogus")
+	if err := p.handleMemory(ctx); err != nil {
+		t.Fatalf("handleMemory: %v", err)
+	}
+	if !strings.Contains(buf.String(), "未知子命令") {
+		t.Errorf("output = %q, want unknown-subcommand hint", buf.String())
+	}
+}
+
+func TestHandleNew_EmptyConversationSkipsCheckpoint(t *testing.T) {
+	p := newMemoryPlugin(t) // conversation 为空，checkpoint 直接跳过，不碰 LLM
+
+	ctx, buf := newContext()
+	if err := p.handleNew(ctx); err != nil {
+		t.Fatalf("handleNew: %v", err)
+	}
+	if len(p.conversation) != 0 {
+		t.Errorf("conversation not cleared: %d", len(p.conversation))
+	}
+	if !p.newSession {
+		t.Error("newSession should be set")
+	}
+	if !strings.Contains(buf.String(), "新会话") {
+		t.Errorf("output = %q", buf.String())
+	}
+}
+
+func TestHandleNew_CheckpointsConversation(t *testing.T) {
+	// mock LLM 固化：返回一条 task + 一条 fact
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(core.ChatResponse{
+			Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: `{
+				"tasks":[{"title":"fix config","summary_delta":"moved to yaml"}],
+				"decisions":[{"action":"add","content":"project uses yaml config","topic":"config"}]}`}}},
+		})
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.LLM.Endpoint = srv.URL
+	hub, _ := testHub(cfg)
+	p := newAgentPlugin(hub)
+	ms, _ := memory.NewFileStore(t.TempDir(), 10)
+	p.memory = ms
+	p.conversation = []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
+	p.usage.Record(0, 0, &core.UsageInfo{TotalTokens: 10})
+
+	ctx, buf := newContext()
+	if err := p.handleNew(ctx); err != nil {
+		t.Fatalf("handleNew: %v", err)
+	}
+
+	// 固化落库：task + fact
+	tasks, _ := ms.ListTasks(10)
+	if len(tasks) != 1 || tasks[0].Title != "fix config" {
+		t.Errorf("task not checkpointed: %+v", tasks)
+	}
+	facts, _ := ms.ListFacts(10)
+	if len(facts) != 1 || facts[0].Topic != "config" {
+		t.Errorf("fact not extracted: %+v", facts)
+	}
+	// STM 清空 + 会话边界标记
+	if len(p.conversation) != 0 {
+		t.Errorf("conversation not cleared: %d", len(p.conversation))
+	}
+	if !p.newSession {
+		t.Error("newSession should be set")
+	}
+	if !strings.Contains(buf.String(), "✔ 已固化") {
+		t.Errorf("output = %q", buf.String())
+	}
+}
+
+func TestHandleTask_StartListEnd(t *testing.T) {
+	p := newMemoryPlugin(t)
+
+	ctx, buf := newContext("start", "write", "docs")
+	if err := p.handleTask(ctx); err != nil {
+		t.Fatalf("task start: %v", err)
+	}
+	if !strings.Contains(buf.String(), "已创建 task") {
+		t.Errorf("start output: %q", buf.String())
+	}
+	if !p.newSession {
+		t.Error("task start should mark session boundary")
+	}
+
+	ctx, buf = newContext("list")
+	if err := p.handleTask(ctx); err != nil {
+		t.Fatalf("task list: %v", err)
+	}
+	if !strings.Contains(buf.String(), "write docs") {
+		t.Errorf("list output missing task: %q", buf.String())
+	}
+
+	ctx, buf = newContext("end")
+	if err := p.handleTask(ctx); err != nil {
+		t.Fatalf("task end: %v", err)
+	}
+	if !strings.Contains(buf.String(), "✔ 已关闭") {
+		t.Errorf("end output: %q", buf.String())
+	}
+
+	ctx, buf = newContext("list")
+	if err := p.handleTask(ctx); err != nil {
+		t.Fatalf("task list after end: %v", err)
+	}
+	if !strings.Contains(buf.String(), "no open tasks") {
+		t.Errorf("list after end should be empty: %q", buf.String())
+	}
+}
+
+func TestHandleTask_DisabledShowsHint(t *testing.T) {
+	cfg := config.Default()
+	hub, _ := testHub(cfg)
+	p := newAgentPlugin(hub) // p.memory 为 nil
+
+	ctx, buf := newContext("list")
+	if err := p.handleTask(ctx); err != nil {
+		t.Fatalf("handleTask: %v", err)
+	}
+	if !strings.Contains(buf.String(), "未启用") {
+		t.Errorf("output = %q, want disabled hint", buf.String())
+	}
+}
+
+// ---- 修复回归测试 ----
+
+func TestStripMemoryBlocks(t *testing.T) {
+	msgs := []core.Message{
+		{Role: "system", Content: middlewares.MemoryBlockPrefix + " 来自之前的会话，仅供参考"},
+		{Role: "user", Content: "hi"},
+		{Role: "system", Content: "压缩摘要：上次任务状态"}, // 普通 system 消息不受影响
+	}
+	got := stripMemoryBlocks(msgs)
+	if len(got) != 2 {
+		t.Fatalf("got %d messages, want 2 (%+v)", len(got), got)
+	}
+	if got[0].Role != "user" || got[0].Content != "hi" {
+		t.Errorf("user message lost: %+v", got[0])
+	}
+	if got[1].Content != "压缩摘要：上次任务状态" {
+		t.Errorf("non-memory system message should survive: %+v", got[1])
+	}
+}
+
+func TestInit_SetsNewSessionWhenMemoryEnabled(t *testing.T) {
+	cfg := config.Default()
+	cfg.Memory.Dir = t.TempDir()
+	hub := &spec.Hub{
+		Config:             cfg,
+		RegisterCommand:    func(spec.Command) error { return nil },
+		SetFallbackHandler: func(func(*spec.Context) error) {},
+		Tools:              func() []spec.Tool { return nil },
+	}
+	p := &AgentPlugin{}
+	if err := p.Init(hub); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if p.memory == nil {
+		t.Fatal("memory should be opened")
+	}
+	if !p.newSession {
+		t.Error("Init with memory enabled should set newSession (进程重启 = 会话边界)")
+	}
+}
+
+func TestHandleNew_LtmExtractDisabledSkipsFacts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(core.ChatResponse{
+			Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: `{
+				"tasks":[{"title":"fix config","summary_delta":"moved to yaml"}],
+				"decisions":[{"action":"add","content":"should not land","topic":"config"}]}`}}},
+		})
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.LLM.Endpoint = srv.URL
+	cfg.Memory.LtmExtract = false
+	hub, _ := testHub(cfg)
+	p := newAgentPlugin(hub)
+	ms, _ := memory.NewFileStore(t.TempDir(), 10)
+	p.memory = ms
+	p.conversation = []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
+
+	ctx, _ := newContext()
+	if err := p.handleNew(ctx); err != nil {
+		t.Fatalf("handleNew: %v", err)
+	}
+	tasks, _ := ms.ListTasks(10)
+	if len(tasks) != 1 {
+		t.Errorf("tasks = %d, want 1 (task extraction stays on)", len(tasks))
+	}
+	facts, _ := ms.ListFacts(10)
+	if len(facts) != 0 {
+		t.Errorf("facts = %d, want 0 when ltm_extract=false", len(facts))
 	}
 }

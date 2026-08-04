@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/frontend/statusbar"
 	"github.com/tinguo/goworker/daemon/internal/mcp"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
+	"github.com/tinguo/goworker/daemon/internal/plugins/agent/memory"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/middlewares"
 	"github.com/tinguo/goworker/daemon/internal/sandbox"
 	"github.com/tinguo/goworker/daemon/internal/skills"
@@ -31,6 +34,9 @@ type AgentPlugin struct {
 	skills       []skills.Skill        // Init 时加载的 skill 清单，注册为 skill_* 工具
 	mcpClients   map[string]mcp.Client // server name → 连接，Stop 时统一关闭
 	mcpTools     []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
+	memory       *memory.FileStore     // 记忆模块（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
+	newSession   bool                  // /new 后置位：下一个 run 是会话边界，注入记忆提醒
+	checkpointMu sync.Mutex            // 串行化检查点固化：读快照→LLM→应用的整个周期
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }
@@ -91,6 +97,37 @@ func (p *AgentPlugin) Init(h *spec.Hub) error {
 		Handler:     p.handleMCP,
 	})
 
+	h.RegisterCommand(spec.Command{
+		Name:        "/memory",
+		Description: "管理长期记忆（LTM）与任务档案（MTM），用法见 /memory help",
+		Handler:     p.handleMemory,
+	})
+
+	h.RegisterCommand(spec.Command{
+		Name:        "/task",
+		Description: "管理任务档案：固化/查看/开合 task，用法见 /task help",
+		Handler:     p.handleTask,
+	})
+
+	h.RegisterCommand(spec.Command{
+		Name:        "/new",
+		Description: "结束当前会话：固化记忆 → 清空 STM → 新会话开场注入提醒",
+		Handler:     p.handleNew,
+	})
+
+	// 打开记忆存储。坏目录只降级为无记忆，不阻塞插件启动
+	if p.hub.Config.Memory.Enabled {
+		ms, err := memory.NewFileStore(p.hub.Config.Memory.Dir, p.hub.Config.Memory.TaskKeep)
+		if err != nil {
+			slog.Warn("memory store init failed, memory disabled", "err", err)
+		} else {
+			p.memory = ms
+			// 进程重启后首个 /agent 是典型会话边界：Stop 固化正是为跨进程续接，
+			// 开场应注入持久化的未完成任务提醒（记忆为空时 middleware 自动跳过）。
+			p.newSession = true
+		}
+	}
+
 	// 加载 skill：用户级 + 项目级（后者覆盖前者）。坏 skill 跳过并记录，不拖垮其他的
 	discovered, skillErrs := skills.Discover(
 		filepath.Join(config.DefaultDir(), "skills"),
@@ -116,6 +153,18 @@ func (p *AgentPlugin) Start() error { return nil }
 func (p *AgentPlugin) Stop() error {
 	// MCP server 是外部进程，退出时统一回收，避免残留孤儿进程
 	p.closeMCP()
+	if p.memory != nil {
+		// 进程退出 = 会话结束，把当前 conversation 固化进任务档案，供下次会话恢复。
+		// 同步等一次 LLM（带超时），否则后台 goroutine 会被进程退出杀掉，固化直接丢。
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		if err := p.checkpointMemory(ctx); err != nil {
+			slog.Warn("memory: stop checkpoint failed", "err", err)
+		}
+		cancel()
+		if err := p.memory.Close(); err != nil {
+			slog.Warn("memory close error", "err", err)
+		}
+	}
 	return nil
 }
 
@@ -276,7 +325,16 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 		cfg.LLM.ContextWindow,
 		cfg.LLM.CompressAt,
 	)
-	agent := NewAgent(provider, tools, []core.Middleware{hitlMw, usageMw, compressMw},
+	// memory middleware：只在会话边界（/new 后首个 run）注入记忆提醒。
+	// 必须在 compressMw 之前，让压缩器测量的是注入后的完整 history。
+	mws := []core.Middleware{hitlMw, usageMw, compressMw}
+	if p.memory != nil {
+		inject := p.newSession
+		p.newSession = false
+		memMw := middlewares.NewMemoryMiddleware(p.memory, cfg.Memory, cfg.LLM.ContextWindow, inject)
+		mws = []core.Middleware{hitlMw, usageMw, memMw, compressMw}
+	}
+	agent := NewAgent(provider, tools, mws,
 		WithMaxIterations(cfg.LLM.MaxIterations))
 	agent.OnIteration = func() {
 		if ctx.Publish != nil {
@@ -326,15 +384,31 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 		}
 	}
 	ctx.Writer("\n")
-	// 保存对话历史（剔除首条 system prompt）
+	// 保存对话历史（剔除首条 system prompt + memory 注入的记忆提醒块）。
+	// 记忆块只服务本次 run 的注入，若漏进 STM：下次 run 会重发它、检查点会把
+	// 它当对话内容固化（自指污染）—— 必须过滤掉。
 	messages := <-msgCh
 	if len(messages) > 1 {
+		conv := stripMemoryBlocks(messages[1:])
 		p.mu.Lock()
-		p.conversation = messages[1:]
+		p.conversation = conv
 		p.mu.Unlock()
 	}
 
 	return nil
+}
+
+// stripMemoryBlocks 剔除 memory middleware 注入的记忆提醒块（system 消息）。
+// 普通 system 消息（如压缩摘要）不受影响 —— 只匹配 MemoryBlockPrefix 前缀。
+func stripMemoryBlocks(msgs []core.Message) []core.Message {
+	var out []core.Message
+	for _, m := range msgs {
+		if m.Role == "system" && strings.HasPrefix(m.Content, middlewares.MemoryBlockPrefix) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // ---- /usage 命令 ----
@@ -397,6 +471,13 @@ func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
 // ---- /compact 命令 ----
 
 func (p *AgentPlugin) handleCompact(ctx *spec.Context) error {
+	// 压缩会丢原文，先固化到任务档案 —— 这是原文丢失前的最后一次机会。
+	if p.memory != nil {
+		if err := p.checkpointMemory(ctx.Ctx); err != nil {
+			ctx.Writer(fmt.Sprintf("⚠ 记忆固化失败（压缩后原文将丢失）: %v\n", err))
+		}
+	}
+
 	// 一次性锁内快照，空检查与后续压缩共用同一份数据
 	p.mu.Lock()
 	history := p.conversation
@@ -582,6 +663,306 @@ func (p *AgentPlugin) handleHistory(ctx *spec.Context) error {
 		ctx.Writer(fmt.Sprintf("  #%-2d [%-9s] %s\n", i+1, m.Role, describeMessage(m)))
 	}
 	return nil
+}
+
+// ---- /memory 命令 ----
+
+func (p *AgentPlugin) handleMemory(ctx *spec.Context) error {
+	if p.memory == nil {
+		ctx.Writer("memory 未启用（检查 config.yaml 的 memory.enabled 与存储目录权限）\n")
+		return nil
+	}
+	args := ctx.Args
+	if len(args) == 0 {
+		p.memoryHelp(ctx)
+		return nil
+	}
+
+	switch args[0] {
+	case "help":
+		p.memoryHelp(ctx)
+
+	case "add":
+		if len(args) < 2 {
+			ctx.Writer("用法: /memory add <要记住的事实>\n")
+			return nil
+		}
+		content := strings.TrimSpace(strings.Join(args[1:], " "))
+		f := &memory.Fact{Content: content, Topic: "manual", Source: "user"}
+		if err := p.memory.AddFact(f); err != nil {
+			ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+			return nil
+		}
+		ctx.Writer(fmt.Sprintf("✔ added %s\n", f.ID))
+
+	case "search":
+		if len(args) < 2 {
+			ctx.Writer("用法: /memory search <关键词> [条数]\n")
+			return nil
+		}
+		n := 8
+		q := strings.Join(args[1:], " ")
+		if len(args) >= 3 {
+			if v, err := strconv.Atoi(args[len(args)-1]); err == nil && v > 0 {
+				n = v
+				q = strings.Join(args[1:len(args)-1], " ")
+			}
+		}
+		facts, err := p.memory.SearchFacts(q, n)
+		if err != nil {
+			ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+			return nil
+		}
+		if len(facts) == 0 {
+			ctx.Writer("(no matching facts)\n")
+			return nil
+		}
+		ctx.Writer(fmt.Sprintf("facts: %d matched\n\n", len(facts)))
+		for i, f := range facts {
+			ctx.Writer(fmt.Sprintf("  #%d [%s|%s] %s (%s)\n",
+				i+1, f.ID, f.Topic, truncate(oneLine(f.Content), 160), f.UpdatedAt.Format("01-02 15:04")))
+		}
+
+	case "list":
+		n := 20
+		if len(args) >= 2 {
+			if v, err := strconv.Atoi(args[1]); err == nil && v > 0 {
+				n = v
+			}
+		}
+		facts, err := p.memory.ListFacts(n)
+		if err != nil {
+			ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+			return nil
+		}
+		if len(facts) == 0 {
+			ctx.Writer("(no facts yet — run /agent to auto-extract, or /memory add <text>)\n")
+			return nil
+		}
+		ctx.Writer(fmt.Sprintf("facts: %d\n\n", len(facts)))
+		for i, f := range facts {
+			ctx.Writer(fmt.Sprintf("  #%d [%s|%s] %s (%s)\n",
+				i+1, f.ID, f.Topic, truncate(oneLine(f.Content), 160), f.UpdatedAt.Format("01-02 15:04")))
+		}
+
+	case "tasks":
+		n := 10
+		if len(args) >= 2 {
+			if v, err := strconv.Atoi(args[1]); err == nil && v > 0 {
+				n = v
+			}
+		}
+		tasks, err := p.memory.ListTasks(n)
+		if err != nil {
+			ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+			return nil
+		}
+		if len(tasks) == 0 {
+			ctx.Writer("(no tasks yet — run /agent then /compact or /new to checkpoint)\n")
+			return nil
+		}
+		ctx.Writer(fmt.Sprintf("tasks: %d\n\n", len(tasks)))
+		for i, t := range tasks {
+			ctx.Writer(fmt.Sprintf("  #%d [%s|%s] %s\n     %s\n",
+				i+1, t.ID, t.Status, truncate(oneLine(t.Title), 80), truncate(oneLine(t.Summary), 160)))
+			if len(t.NextSteps) > 0 {
+				ctx.Writer("     下一步: " + strings.Join(t.NextSteps, "；") + "\n")
+			}
+		}
+
+	case "forget":
+		if len(args) < 2 {
+			ctx.Writer("用法: /memory forget <id> [id...]\n")
+			return nil
+		}
+		for _, id := range args[1:] {
+			if err := p.memory.DeleteFact(id); err != nil {
+				ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+				return nil
+			}
+		}
+		ctx.Writer(fmt.Sprintf("✔ forgot %d\n", len(args)-1))
+
+	default:
+		ctx.Writer(fmt.Sprintf("未知子命令: %s（使用 /memory help 查看用法）\n", args[0]))
+	}
+	return nil
+}
+
+func (p *AgentPlugin) memoryHelp(ctx *spec.Context) {
+	ctx.Writer("用法:\n")
+	ctx.Writer("  /memory                 — 显示本帮助\n")
+	ctx.Writer("  /memory add <文本>      — 手动记住一条事实\n")
+	ctx.Writer("  /memory search <关键词> [n] — 检索相关事实\n")
+	ctx.Writer("  /memory list [n]        — 列出最近事实（默认 20）\n")
+	ctx.Writer("  /memory tasks [n]       — 查看任务档案（含已关闭）\n")
+	ctx.Writer("  /memory forget <id>...  — 删除指定事实\n")
+	ctx.Writer("  /task list|start|end    — 管理未完成任务\n")
+	ctx.Writer("  /new                    — 结束会话：固化+清 STM+注入提醒\n")
+}
+
+// ---- 固化检查点 ----
+
+// checkpointMemory 把当前 conversation 固化进任务档案（Task + LTM）。
+// 一次 LLM 调用（Checkpointer）输出 task 归属/新建/关闭 + 事实决策。
+// 触发点都是低频事件：/compact、进程退出、/new、/task checkpoint。
+func (p *AgentPlugin) checkpointMemory(ctx context.Context) error {
+	// 读快照→LLM 推理→写回是整个周期，store 的 mutex 只串行化单次写。
+	// 并发检查点（如 /compact 与退出 Stop 重叠）会基于过期快照互相覆盖，必须整体互斥。
+	p.checkpointMu.Lock()
+	defer p.checkpointMu.Unlock()
+
+	p.mu.Lock()
+	conv := p.conversation
+	p.mu.Unlock()
+	if p.memory == nil || len(conv) == 0 {
+		return nil
+	}
+
+	cfg := p.hub.Config
+	provider := NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
+	cwd, _ := os.Getwd()
+	cp := memory.NewCheckpointer(provider, cwd)
+
+	openTasks, err := p.memory.OpenTasks(50)
+	if err != nil {
+		return fmt.Errorf("open tasks: %w", err)
+	}
+	facts, err := p.memory.ListFacts(50)
+	if err != nil {
+		return fmt.Errorf("list facts: %w", err)
+	}
+	// 检查点 id：也是 Task.Runs 与 Fact.Source 的标记
+	cpID := fmt.Sprintf("cp-%d", time.Now().UnixNano())
+	res, err := cp.Run(ctx, conv, openTasks, facts)
+	if err != nil {
+		return err
+	}
+	// ltm_extract=false：tasks/decisions 是同一 LLM 调用输出的，无法只跳过调用，
+	// 但应用层不落库事实 —— 配置开关生效。
+	if !cfg.Memory.LtmExtract {
+		res.Decisions = nil
+	}
+	tokens := 0
+	if p.usage != nil {
+		tokens = p.usage.Snapshot().TotalTokens
+	}
+	n, err := memory.ApplyCheckpoint(p.memory, res, openTasks, facts, cpID, tokens, cwd)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		slog.Info("memory: checkpoint applied", "cp", cpID, "applied", n)
+	}
+	return nil
+}
+
+// ---- /new 命令 ----
+
+func (p *AgentPlugin) handleNew(ctx *spec.Context) error {
+	// 结束当前会话：先固化，再清 STM，置会话边界标记（下一个 run 注入提醒）。
+	if p.memory != nil {
+		if err := p.checkpointMemory(ctx.Ctx); err != nil {
+			ctx.Writer(fmt.Sprintf("⚠ 固化失败（历史将仅存于 STM，进程退出即丢）: %v\n", err))
+		} else {
+			ctx.Writer("✔ 已固化当前会话\n")
+		}
+	}
+	p.mu.Lock()
+	p.conversation = nil
+	p.mu.Unlock()
+	p.newSession = true
+	ctx.Writer("✔ 新会话开始，STM 已清空，开场会注入未完成任务提醒\n")
+	return nil
+}
+
+// ---- /task 命令 ----
+
+func (p *AgentPlugin) handleTask(ctx *spec.Context) error {
+	if p.memory == nil {
+		ctx.Writer("memory 未启用（检查 config.yaml 的 memory.enabled 与存储目录权限）\n")
+		return nil
+	}
+	args := ctx.Args
+	if len(args) == 0 {
+		p.taskHelp(ctx)
+		return nil
+	}
+
+	switch args[0] {
+	case "help":
+		p.taskHelp(ctx)
+
+	case "list":
+		tasks, err := p.memory.OpenTasks(20)
+		if err != nil {
+			ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+			return nil
+		}
+		if len(tasks) == 0 {
+			ctx.Writer("(no open tasks — run /agent then checkpoint via /compact or /new)\n")
+			return nil
+		}
+		ctx.Writer(fmt.Sprintf("tasks: %d open\n\n", len(tasks)))
+		for i, t := range tasks {
+			ctx.Writer(fmt.Sprintf("  #%d [%s] %s\n     %s\n",
+				i+1, t.ID, truncate(oneLine(t.Title), 80), truncate(oneLine(t.Summary), 160)))
+			if len(t.NextSteps) > 0 {
+				ctx.Writer("     下一步: " + strings.Join(t.NextSteps, "；") + "\n")
+			}
+		}
+
+	case "start":
+		if len(args) < 2 {
+			ctx.Writer("用法: /task start <任务标题>\n")
+			return nil
+		}
+		title := strings.TrimSpace(strings.Join(args[1:], " "))
+		t := &memory.Task{Title: title, Status: "open"}
+		if err := p.memory.UpsertTask(t); err != nil {
+			ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+			return nil
+		}
+		p.newSession = true // 下一个 run 注入提醒（含刚建的 task 锚点）
+		ctx.Writer(fmt.Sprintf("✔ 已创建 task %s，后续对话将在检查点时归入\n", t.ID))
+
+	case "end":
+		id := ""
+		if len(args) >= 2 {
+			id = args[1]
+		} else if tasks, err := p.memory.OpenTasks(1); err == nil && len(tasks) > 0 {
+			id = tasks[0].ID // 默认关最近活跃的 open task
+		}
+		if id == "" {
+			ctx.Writer("(no open task to close)\n")
+			return nil
+		}
+		if err := p.memory.CloseTask(id); err != nil {
+			ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+			return nil
+		}
+		ctx.Writer(fmt.Sprintf("✔ 已关闭 task %s\n", id))
+
+	case "checkpoint":
+		if err := p.checkpointMemory(ctx.Ctx); err != nil {
+			ctx.Writer(fmt.Sprintf("✘ 固化失败: %v\n", err))
+			return nil
+		}
+		ctx.Writer("✔ 已固化当前会话\n")
+
+	default:
+		ctx.Writer(fmt.Sprintf("未知子命令: %s（使用 /task help 查看用法）\n", args[0]))
+	}
+	return nil
+}
+
+func (p *AgentPlugin) taskHelp(ctx *spec.Context) {
+	ctx.Writer("用法:\n")
+	ctx.Writer("  /task               — 显示本帮助\n")
+	ctx.Writer("  /task list          — 列出未完成任务\n")
+	ctx.Writer("  /task start <标题>   — 手动开始一个新任务（LLM 判定不准时干预）\n")
+	ctx.Writer("  /task end [id]      — 关闭任务（默认最近活跃的）\n")
+	ctx.Writer("  /task checkpoint    — 立即把当前会话固化进任务档案\n")
 }
 
 // describeMessage 把一条消息压成单行描述，供 /history 逐条展示。

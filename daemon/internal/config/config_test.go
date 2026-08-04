@@ -174,6 +174,99 @@ func TestDefaultDir_EnvOverride(t *testing.T) {
 	}
 }
 
+func TestDefault_IncludesMemory(t *testing.T) {
+	cfg := Default()
+	if !cfg.Memory.Enabled {
+		t.Error("Memory.Enabled should default true")
+	}
+	if cfg.Memory.TaskKeep != 50 || cfg.Memory.TaskInjectN != 3 ||
+		cfg.Memory.LtmInjectTopK != 8 || !cfg.Memory.LtmExtract {
+		t.Errorf("memory defaults wrong: %+v", cfg.Memory)
+	}
+	if cfg.Memory.InjectBudgetRatio != 0.15 {
+		t.Errorf("InjectBudgetRatio = %v, want 0.15", cfg.Memory.InjectBudgetRatio)
+	}
+	if cfg.Memory.Dir != filepath.Join(DefaultDir(), "memory") {
+		t.Errorf("Memory.Dir = %q, want under DefaultDir/memory", cfg.Memory.Dir)
+	}
+}
+
+func TestSetField_Memory(t *testing.T) {
+	cfg := Default()
+	tests := []struct {
+		key, val string
+		check    func(*Config) bool
+	}{
+		{"memory.dir", "/tmp/gwmem", func(c *Config) bool { return c.Memory.Dir == "/tmp/gwmem" }},
+		{"memory.enabled", "false", func(c *Config) bool { return !c.Memory.Enabled }},
+		{"memory.task_keep", "0", func(c *Config) bool { return c.Memory.TaskKeep == 0 }},
+		{"memory.task_inject_n", "5", func(c *Config) bool { return c.Memory.TaskInjectN == 5 }},
+		{"memory.ltm_inject_top_k", "12", func(c *Config) bool { return c.Memory.LtmInjectTopK == 12 }},
+		{"memory.ltm_extract", "false", func(c *Config) bool { return !c.Memory.LtmExtract }},
+		{"memory.inject_budget_ratio", "0.3", func(c *Config) bool { return c.Memory.InjectBudgetRatio == 0.3 }},
+	}
+	for _, tt := range tests {
+		if err := cfg.SetField(tt.key, tt.val); err != nil {
+			t.Fatalf("SetField(%q): %v", tt.key, err)
+		}
+		if !tt.check(cfg) {
+			t.Errorf("SetField(%q, %q) not applied", tt.key, tt.val)
+		}
+	}
+}
+
+func TestSetField_MemoryRejectsBadValues(t *testing.T) {
+	cfg := Default()
+	for _, tt := range []struct{ key, val string }{
+		{"memory.enabled", "notabool"},
+		{"memory.task_keep", "abc"},
+		{"memory.task_keep", "-1"},
+		{"memory.task_inject_n", "-2"},
+		{"memory.ltm_inject_top_k", "abc"},
+		{"memory.ltm_extract", "yes"},
+		{"memory.inject_budget_ratio", "0"},
+		{"memory.inject_budget_ratio", "1.5"},
+		{"memory.inject_budget_ratio", "abc"},
+	} {
+		if err := cfg.SetField(tt.key, tt.val); err == nil {
+			t.Errorf("SetField(%q, %q) should error", tt.key, tt.val)
+		}
+	}
+}
+
+func TestLoad_ParsesMemorySection(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	os.WriteFile(path, []byte(`
+memory:
+  enabled: true
+  task_keep: 100
+  task_inject_n: 2
+  ltm_inject_top_k: 5
+  ltm_extract: false
+  inject_budget_ratio: 0.2
+  dir: /custom/mem
+`), 0644)
+
+	cfg := Load(path)
+	if !cfg.Memory.Enabled || cfg.Memory.TaskKeep != 100 || cfg.Memory.TaskInjectN != 2 ||
+		cfg.Memory.LtmInjectTopK != 5 || cfg.Memory.LtmExtract || cfg.Memory.InjectBudgetRatio != 0.2 ||
+		cfg.Memory.Dir != "/custom/mem" {
+		t.Errorf("memory section not parsed: %+v", cfg.Memory)
+	}
+}
+
+func TestLoad_MissingMemoryKeepsDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	os.WriteFile(path, []byte("llm:\n  model: gpt-4o\n"), 0644)
+
+	cfg := Load(path)
+	if !cfg.Memory.Enabled {
+		t.Error("missing memory section should keep default enabled=true")
+	}
+}
+
 func TestParseContextWindow(t *testing.T) {
 	cases := []struct {
 		in   string
