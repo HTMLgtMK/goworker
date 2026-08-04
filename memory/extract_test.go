@@ -2,30 +2,23 @@ package memory
 
 import (
 	"context"
-	"errors"
 	"testing"
-
-	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
 )
 
-// stubProvider 记录请求并返回固定响应，供抽取/检查点测试复用。
+// stubProvider 记录请求并返回固定响应，供抽取/检查点测试复用。实现本地 LLM 接口。
 type stubProvider struct {
-	lastReq *core.ChatRequest
+	lastReq *ChatRequest
 	resp    string
 	err     error
 }
 
-func (p *stubProvider) Name() string  { return "stub" }
 func (p *stubProvider) Model() string { return "stub-model" }
-func (p *stubProvider) Chat(_ context.Context, req *core.ChatRequest) (*core.ChatResponse, error) {
+func (p *stubProvider) Chat(_ context.Context, req *ChatRequest) (*ChatResponse, error) {
 	p.lastReq = req
 	if p.err != nil {
 		return nil, p.err
 	}
-	return &core.ChatResponse{Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: p.resp}}}}, nil
-}
-func (p *stubProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
-	return nil, errors.New("not implemented")
+	return &ChatResponse{Choices: []ResponseChoice{{Message: Message{Role: "assistant", Content: p.resp}}}}, nil
 }
 
 func TestApplyDecisions_FullFlow(t *testing.T) {

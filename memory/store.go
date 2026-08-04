@@ -1,13 +1,15 @@
-// Package memory 提供 agent 的中期记忆（MTM，任务档案）与长期记忆（LTM，事实条目）。
+// Package memory 提供可独立发布引入的 agent 记忆组件：
+// MTM（任务档案，Task）与 LTM（事实条目，Fact）双层存储，配 mem0-like 的
+// 统一检索入口（Client.Search）与 LLM 固化抽取（Checkpointer）。
 //
 // 设计取舍：LTM 存的是 LLM 已提炼的短事实，文件名/命令/API 名都是强 token，
 // 关键词检索命中率够用，故起步零存储依赖 —— 两个 JSONL 文件 + 内存缓存，
 // 写时全量原子重写（tmp + rename）。Store 接口拆成 FactStore/TaskStore，
-// 将来想上 embedding 只换实现，中间件与命令不感知。
+// 将来想上 embedding/RAG 只换 Retriever 实现，调用方不感知。
 //
-// 生命周期模型：STM（conversation）是会话内工作记忆；MTM 的 Task 是跨会话的
-// 任务档案，只在"固化检查点"（/compact、退出、/new、/task checkpoint）时
-// 写入，并在新会话开场被注入提醒 —— 平时不打扰 STM。
+// 生命周期模型：STM（conversation）是会话内工作记忆，由调用方维护；MTM 的
+// Task 是跨会话的任务档案，在"固化检查点"写入；LTM 的 Fact 由检查点抽取
+// 或调用方手动写入。检索面（Retriever）抽象成接口，默认 KeywordRetriever。
 package memory
 
 import (
@@ -340,6 +342,24 @@ func (s *FileStore) OpenTasks(limit int) ([]Task, error) {
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// SearchTasks 关键词检索 task（打分见 search.go 的 scoreTask），分数降序取 topK。
+// includeClosed=false 只检索 open（注入提醒）；true 连 closed 一起（历史档案，
+// 供 memory_search 工具主动回顾 —— 工具是 agent 主动查档，过期快照不构成误导）。
+func (s *FileStore) SearchTasks(query string, topK int, includeClosed bool) ([]Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if includeClosed {
+		return SearchTasksScored(query, s.tasks, topK), nil
+	}
+	open := make([]Task, 0, len(s.tasks))
+	for _, t := range s.tasks {
+		if t.Status == "open" {
+			open = append(open, t)
+		}
+	}
+	return SearchTasksScored(query, open, topK), nil
 }
 
 // ListTasks 返回最近的 limit 个 task（含 closed），UpdatedAt 降序。

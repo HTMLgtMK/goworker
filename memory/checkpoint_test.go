@@ -5,8 +5,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-
-	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
 )
 
 func TestParseCheckpoint(t *testing.T) {
@@ -51,7 +49,7 @@ func TestParseCheckpoint(t *testing.T) {
 func TestCheckpointer_PrependsSystemPromptAndConversation(t *testing.T) {
 	stub := &stubProvider{resp: `{"tasks":[],"decisions":[]}`}
 	cp := NewCheckpointer(stub, "/work")
-	conv := []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
+	conv := []Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
 	openTasks := []Task{{ID: "t_9", Title: "existing", Summary: "s"}}
 	facts := []Fact{{ID: "f_9", Content: "fact"}}
 

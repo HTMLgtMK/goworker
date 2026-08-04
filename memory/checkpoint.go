@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
 )
 
 // Checkpointer 在"固化检查点"时把当前 conversation 沉淀为 task 更新 + LTM 事实。
@@ -18,11 +16,11 @@ import (
 // 触发点都是低频事件：/compact、进程退出、/new、/task checkpoint。
 // 平时（每 run）不做，会话内连续性由 STM 提供。
 type Checkpointer struct {
-	provider core.Provider
+	provider LLM // 本包定义的极简 LLM 面（llm.go），调用方用适配器注入
 	cwd      string
 }
 
-func NewCheckpointer(provider core.Provider, cwd string) *Checkpointer {
+func NewCheckpointer(provider LLM, cwd string) *Checkpointer {
 	return &Checkpointer{provider: provider, cwd: cwd}
 }
 
@@ -45,11 +43,11 @@ type CheckpointResult struct {
 
 // Run 处理全量 conversation，返回 task 更新 + LTM 决策。
 // openTasks 与 facts 必须与后续 ApplyCheckpoint 传入的是同一份（id 定位一致）。
-func (c *Checkpointer) Run(ctx context.Context, conversation []core.Message, openTasks []Task, facts []Fact) (*CheckpointResult, error) {
-	req := &core.ChatRequest{
+func (c *Checkpointer) Run(ctx context.Context, conversation []Message, openTasks []Task, facts []Fact) (*CheckpointResult, error) {
+	req := &ChatRequest{
 		Model: c.provider.Model(),
 		Messages: append(
-			[]core.Message{{Role: "system", Content: checkpointPrompt(openTasks, facts)}},
+			[]Message{{Role: "system", Content: checkpointPrompt(openTasks, facts)}},
 			conversation...,
 		),
 	}

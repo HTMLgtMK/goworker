@@ -16,10 +16,10 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/mcp"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
-	"github.com/tinguo/goworker/daemon/internal/plugins/agent/memory"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/middlewares"
 	"github.com/tinguo/goworker/daemon/internal/skills"
 	"github.com/tinguo/goworker/daemon/internal/spec"
+	"github.com/tinguo/goworker/memory"
 )
 
 // testHub 构造一个最小可用的 spec.Hub，只暴露测试需要的字段。
@@ -500,18 +500,18 @@ func TestHandleMCP_ShowsServers(t *testing.T) {
 	}
 }
 
-// newMemoryPlugin 构造带真实 FileStore 的插件，供 /memory 命令测试。
+// newMemoryPlugin 构造带真实 memory Client 的插件，供 /memory 命令测试。
 func newMemoryPlugin(t *testing.T) *AgentPlugin {
 	t.Helper()
 	cfg := config.Default()
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
-	ms, err := memory.NewFileStore(t.TempDir(), 10)
+	c, err := memory.NewClient(t.TempDir(), 10)
 	if err != nil {
-		t.Fatalf("NewFileStore: %v", err)
+		t.Fatalf("NewClient: %v", err)
 	}
-	t.Cleanup(func() { ms.Close() })
-	p.memory = ms
+	t.Cleanup(func() { c.Close() })
+	p.memory = c
 	return p
 }
 
@@ -633,9 +633,6 @@ func TestHandleNew_EmptyConversationSkipsCheckpoint(t *testing.T) {
 	if len(p.conversation) != 0 {
 		t.Errorf("conversation not cleared: %d", len(p.conversation))
 	}
-	if !p.newSession {
-		t.Error("newSession should be set")
-	}
 	if !strings.Contains(buf.String(), "New session started") {
 		t.Errorf("output = %q", buf.String())
 	}
@@ -659,7 +656,7 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	cfg.LLM.Endpoint = srv.URL
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
-	ms, _ := memory.NewFileStore(t.TempDir(), 10)
+	ms, _ := memory.NewClient(t.TempDir(), 10)
 	p.memory = ms
 	p.conversation = []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
 	p.usage.Record(0, 0, &core.UsageInfo{TotalTokens: 10})
@@ -677,12 +674,9 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 		t.Fatalf("handleNew: %v", err)
 	}
 
-	// STM 立即清空 + 会话边界标记（同步路径，不等后台）
+	// STM 立即清空（同步路径，不等后台）
 	if len(p.conversation) != 0 {
 		t.Errorf("conversation not cleared: %d", len(p.conversation))
-	}
-	if !p.newSession {
-		t.Error("newSession should be set")
 	}
 	if !strings.Contains(out.String(), "New session started") {
 		t.Errorf("output = %q", out.String())
@@ -709,9 +703,6 @@ func TestHandleTask_StartListEnd(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "已创建 task") {
 		t.Errorf("start output: %q", buf.String())
-	}
-	if !p.newSession {
-		t.Error("task start should mark session boundary")
 	}
 
 	ctx, buf = newContext("list")
@@ -773,7 +764,7 @@ func TestStripMemoryBlocks(t *testing.T) {
 	}
 }
 
-func TestInit_SetsNewSessionWhenMemoryEnabled(t *testing.T) {
+func TestInit_OpensMemory(t *testing.T) {
 	cfg := config.Default()
 	cfg.Memory.Dir = t.TempDir()
 	hub := &spec.Hub{
@@ -789,8 +780,85 @@ func TestInit_SetsNewSessionWhenMemoryEnabled(t *testing.T) {
 	if p.memory == nil {
 		t.Fatal("memory should be opened")
 	}
-	if !p.newSession {
-		t.Error("Init with memory enabled should set newSession (进程重启 = 会话边界)")
+}
+
+func TestCollectTools_RegistersMemorySearch(t *testing.T) {
+	p := newMemoryPlugin(t)
+	// 历史事件存在 closed task 里 —— memory_search 必须能捞出来
+	p.memory.UpsertTask(&memory.Task{Title: "查询长沙天气", Status: "closed", Summary: "昨天查的"})
+
+	cfg := p.sandboxConfig()
+	tools := p.collectTools(&cfg)
+	var ms *core.Tool
+	for i := range tools {
+		if tools[i].Name == "memory_search" {
+			ms = &tools[i]
+		}
+	}
+	if ms == nil {
+		t.Fatal("memory_search tool not registered when memory enabled")
+	}
+
+	out, err := ms.Execute(context.Background(), map[string]any{"query": "长沙"})
+	if err != nil {
+		t.Fatalf("execute memory_search: %v", err)
+	}
+	if !strings.Contains(out, "查询长沙天气") {
+		t.Errorf("memory_search output missing closed task: %q", out)
+	}
+	if !strings.Contains(out, "closed") {
+		t.Errorf("memory_search output missing task status: %q", out)
+	}
+
+	// memory disabled：工具不注册
+	hub2, _ := testHub(config.Default())
+	p2 := newAgentPlugin(hub2)
+	p2.memory = nil
+	cfg2 := p2.sandboxConfig()
+	for _, tl := range p2.collectTools(&cfg2) {
+		if tl.Name == "memory_search" {
+			t.Fatal("memory_search should not register when memory disabled")
+		}
+	}
+}
+
+// TestCheckpoint_FiltersToolMessages 回归测试：conversation 含 tool 消息时，
+// 固化请求体不得泄漏 role="tool"（否则 OpenAI 400 missing field tool_call_id）。
+func TestCheckpoint_FiltersToolMessages(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Role string `json:"role"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		for _, m := range body.Messages {
+			if m.Role == "tool" {
+				t.Errorf("checkpoint request leaked tool message: %+v", body.Messages)
+			}
+		}
+		json.NewEncoder(w).Encode(core.ChatResponse{
+			Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: `{"tasks":[],"decisions":[]}`}}},
+		})
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.LLM.Endpoint = srv.URL
+	hub, _ := testHub(cfg)
+	p := newAgentPlugin(hub)
+	ms, _ := memory.NewClient(t.TempDir(), 10)
+	p.memory = ms
+	p.conversation = []core.Message{
+		{Role: "user", Content: "查下磁盘"},
+		{Role: "assistant", Content: "", ToolCalls: []core.ToolCall{{ID: "call_1", Type: "function", Function: core.ToolCallFunction{Name: "bash", Arguments: `{"command":"df -h"}`}}}},
+		{Role: "tool", ToolCallID: "call_1", Content: "Filesystem 1.9T 60% used"},
+		{Role: "assistant", Content: "磁盘用了 60%"},
+	}
+	if err := p.checkpointMemory(context.Background()); err != nil {
+		t.Fatalf("checkpointMemory: %v", err)
 	}
 }
 
@@ -809,7 +877,7 @@ func TestHandleNew_LtmExtractDisabledSkipsFacts(t *testing.T) {
 	cfg.Memory.LtmExtract = false
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
-	ms, _ := memory.NewFileStore(t.TempDir(), 10)
+	ms, _ := memory.NewClient(t.TempDir(), 10)
 	p.memory = ms
 	p.conversation = []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
 

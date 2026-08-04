@@ -7,49 +7,49 @@ import (
 
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
-	"github.com/tinguo/goworker/daemon/internal/plugins/agent/memory"
+	"github.com/tinguo/goworker/memory"
 )
 
 func memoryCfg() config.MemoryConfig {
 	return config.Default().Memory
 }
 
-func seededStore(t *testing.T) *memory.FileStore {
+func seededClient(t *testing.T) *memory.Client {
 	t.Helper()
-	s, err := memory.NewFileStore(t.TempDir(), 10)
+	c, err := memory.NewClient(t.TempDir(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.Close() })
-	s.UpsertTask(&memory.Task{Title: "fix config parser", Status: "open", Summary: "yaml unmarshal errors"})
-	s.AddFact(&memory.Fact{Content: "project uses yaml config", Topic: "config", Source: "user"})
-	return s
+	t.Cleanup(func() { c.Close() })
+	c.UpsertTask(&memory.Task{Title: "fix config parser", Status: "open", Summary: "yaml unmarshal errors"})
+	c.AddFact(&memory.Fact{Content: "project uses yaml config", Topic: "config", Source: "user"})
+	return c
 }
 
-func TestMemoryMiddleware_InjectsOnlyOnSessionBoundary(t *testing.T) {
-	store := seededStore(t)
-	// 会话边界（inject=true）：注入
-	mw := NewMemoryMiddleware(store, memoryCfg(), 32768, true)
+func TestMemoryMiddleware_InjectsOnEveryQuery(t *testing.T) {
+	// 每次新实例（= 每次用户 query）都注入，不再有会话边界概念
+	client := seededClient(t)
 	history := []core.Message{{Role: "system", Content: "agent prompt"}, {Role: "user", Content: "how config works?"}}
 	ev := &core.BeforeModelEvent{Ctx: context.Background(), Input: "config", History: history}
-	mw.OnBeforeModel(ev)
+
+	mw1 := NewMemoryMiddleware(client, memoryCfg(), 32768)
+	mw1.OnBeforeModel(ev)
 	if len(ev.History) != len(history)+1 {
-		t.Fatalf("session boundary: history = %d, want %d", len(ev.History), len(history)+1)
+		t.Fatalf("first query: history = %d, want %d", len(ev.History), len(history)+1)
 	}
 
-	// 非边界（inject=false）：不注入
-	mw2 := NewMemoryMiddleware(store, memoryCfg(), 32768, false)
-	history2 := []core.Message{{Role: "system", Content: "agent prompt"}, {Role: "user", Content: "hi"}}
-	ev2 := &core.BeforeModelEvent{Ctx: context.Background(), Input: "hi", History: history2}
+	// 另一个 query（新实例）：仍然注入
+	ev2 := &core.BeforeModelEvent{Ctx: context.Background(), Input: "config", History: history}
+	mw2 := NewMemoryMiddleware(client, memoryCfg(), 32768)
 	mw2.OnBeforeModel(ev2)
-	if len(ev2.History) != len(history2) {
-		t.Errorf("non-boundary run should not inject: %d", len(ev2.History))
+	if len(ev2.History) != len(history)+1 {
+		t.Errorf("second query should inject too: %d", len(ev2.History))
 	}
 }
 
 func TestMemoryMiddleware_InjectsOncePerRun(t *testing.T) {
-	store := seededStore(t)
-	mw := NewMemoryMiddleware(store, memoryCfg(), 32768, true)
+	client := seededClient(t)
+	mw := NewMemoryMiddleware(client, memoryCfg(), 32768)
 	history := []core.Message{{Role: "system", Content: "agent prompt"}, {Role: "user", Content: "config"}}
 	ev := &core.BeforeModelEvent{Ctx: context.Background(), Input: "config", History: history}
 	mw.OnBeforeModel(ev)
@@ -61,8 +61,8 @@ func TestMemoryMiddleware_InjectsOncePerRun(t *testing.T) {
 }
 
 func TestMemoryMiddleware_InsertsAfterSystemPrompt(t *testing.T) {
-	store := seededStore(t)
-	mw := NewMemoryMiddleware(store, memoryCfg(), 32768, true)
+	client := seededClient(t)
+	mw := NewMemoryMiddleware(client, memoryCfg(), 32768)
 	history := []core.Message{
 		{Role: "system", Content: "agent prompt"},
 		{Role: "system", Content: "another system block"},
@@ -90,11 +90,11 @@ func TestMemoryMiddleware_InsertsAfterSystemPrompt(t *testing.T) {
 }
 
 func TestMemoryMiddleware_DisabledOrNilStore(t *testing.T) {
-	store := seededStore(t)
+	client := seededClient(t)
 
 	cfg := memoryCfg()
 	cfg.Enabled = false
-	mw := NewMemoryMiddleware(store, cfg, 32768, true)
+	mw := NewMemoryMiddleware(client, cfg, 32768)
 	history := []core.Message{{Role: "system", Content: "agent prompt"}, {Role: "user", Content: "config"}}
 	ev := &core.BeforeModelEvent{Ctx: context.Background(), Input: "config", History: history}
 	mw.OnBeforeModel(ev)
@@ -102,17 +102,17 @@ func TestMemoryMiddleware_DisabledOrNilStore(t *testing.T) {
 		t.Error("disabled should not inject")
 	}
 
-	mw = NewMemoryMiddleware(nil, memoryCfg(), 32768, true)
+	mw = NewMemoryMiddleware(nil, memoryCfg(), 32768)
 	mw.OnBeforeModel(ev)
 	if len(ev.History) != len(history) {
-		t.Error("nil store should not inject")
+		t.Error("nil client should not inject")
 	}
 }
 
 func TestMemoryMiddleware_EmptyStoreNoInject(t *testing.T) {
-	store, _ := memory.NewFileStore(t.TempDir(), 10)
-	defer store.Close()
-	mw := NewMemoryMiddleware(store, memoryCfg(), 32768, true)
+	client, _ := memory.NewClient(t.TempDir(), 10)
+	defer client.Close()
+	mw := NewMemoryMiddleware(client, memoryCfg(), 32768)
 	history := []core.Message{{Role: "system", Content: "agent prompt"}, {Role: "user", Content: "anything"}}
 	ev := &core.BeforeModelEvent{Ctx: context.Background(), Input: "anything", History: history}
 	mw.OnBeforeModel(ev)
@@ -122,9 +122,9 @@ func TestMemoryMiddleware_EmptyStoreNoInject(t *testing.T) {
 }
 
 func TestMemoryMiddleware_TinyBudgetDoesNotPanic(t *testing.T) {
-	store := seededStore(t)
+	client := seededClient(t)
 	// window=100 → budget=15，注入块必然超预算，走裁剪链直到放弃
-	mw := NewMemoryMiddleware(store, memoryCfg(), 100, true)
+	mw := NewMemoryMiddleware(client, memoryCfg(), 100)
 	history := []core.Message{{Role: "system", Content: "agent prompt"}, {Role: "user", Content: "config"}}
 	ev := &core.BeforeModelEvent{Ctx: context.Background(), Input: "config", History: history}
 	mw.OnBeforeModel(ev) // 不 panic 即可；放弃注入或尽力注入都算通过

@@ -4,8 +4,11 @@ A modular REPL agent terminal in Go — plugin-based, middleware-driven, LLM-rea
 
 ## Architecture
 
+Two Go modules in one workspace (`go.work`): `daemon/` (the REPL daemon) and `memory/` (standalone, independently-releasable memory component).
+
 ```
-cmd/goworker/main.go        ← entry point
+memory/                         ← standalone module: MTM task archive + LTM facts (mem0-like API)
+cmd/goworker/main.go            ← entry point
 internal/
 ├── spec/                   ← interfaces & types (Hub, Command, Plugin, Context)
 ├── core/                   ← Engine: middleware chain, plugin lifecycle, command routing
@@ -84,13 +87,19 @@ MCP servers:
 - ⚠️ MCP tools run in external processes, **not gated by the local sandbox** — only connect servers you trust
 
 
+Memory (`memory/`):
+- Two-layer model: MTM (task archive, open/closed, cross-session summary) + LTM (distilled facts)
+- Every query retrieves top-K relevant memory (open tasks + facts) and injects it into the prompt
+- Standalone module with zero external deps — `Retriever` interface leaves room for RAG/embedding backends
+- `/memory` manage facts, `/task` manage task archive, `/new` / `/compact` consolidate the session
+
 Config cascades: in-memory → `$LLM_*` env vars → `~/.config/goworker/.env`.
 
 ## Getting Started
 
 ```bash
 cd daemon
-go run cmd/goworker/main.go
+go run cmd/goworker/main.go     # go.work resolves ../memory; standalone builds use the replace in daemon/go.mod
 ```
 
 ## Why goworker?

@@ -6,6 +6,7 @@ require (
 	github.com/charmbracelet/glamour v1.0.0
 	github.com/charmbracelet/x/term v0.2.2
 	github.com/rivo/uniseg v0.4.7
+	github.com/tinguo/goworker/memory v0.0.0-00010101000000-000000000000
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -35,3 +36,5 @@ require (
 	golang.org/x/term v0.36.0 // indirect
 	golang.org/x/text v0.30.0 // indirect
 )
+
+replace github.com/tinguo/goworker/memory => ../memory

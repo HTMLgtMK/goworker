@@ -179,11 +179,11 @@ func DefaultTools(cfg *sandbox.Config) []core.Tool {
 
 // Agent 是一个可使用工具的 ReAct Agent。
 type Agent struct {
-	provider       core.Provider
-	tools          []core.Tool
-	toolMap        map[string]core.Tool
-	middlewares    []core.Middleware
-	maxIterations  int
+	provider      core.Provider
+	tools         []core.Tool
+	toolMap       map[string]core.Tool
+	middlewares   []core.Middleware
+	maxIterations int
 
 	OnIteration func() // 可选：每次 ReAct 循环前调用，用于 UI 反馈（status bar 迭代计数）
 }
