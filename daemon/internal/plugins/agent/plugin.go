@@ -155,7 +155,8 @@ func (p *AgentPlugin) Stop() error {
 		// 同步等一次 LLM（带超时），否则后台 goroutine 会被进程退出杀掉，固化直接丢。
 		// LLM 网关慢时 20s 容易超时丢历史，放宽到 45s 给足时间。
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-		if err := p.checkpointMemory(ctx); err != nil {
+		// checkpointSnapshot 内部已打 applied 日志，这里不重复
+		if _, err := p.checkpointMemory(ctx); err != nil {
 			slog.Warn("memory: stop checkpoint failed", "err", err)
 		}
 		cancel()
@@ -469,8 +470,11 @@ func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
 func (p *AgentPlugin) handleCompact(ctx *spec.Context) error {
 	// 压缩会丢原文，先固化到任务档案 —— 这是原文丢失前的最后一次机会。
 	if p.memory != nil {
-		if err := p.checkpointMemory(ctx.Ctx); err != nil {
+		sum, err := p.checkpointMemory(ctx.Ctx)
+		if err != nil {
 			ctx.Writer(fmt.Sprintf("⚠ Memory consolidation failed (original text lost after compression): %v\n", err))
+		} else if notice := renderCheckpointNotice(sum); notice != "" {
+			ctx.Writer(notice)
 		}
 	}
 
@@ -803,21 +807,21 @@ func (p *AgentPlugin) memoryHelp(ctx *spec.Context) {
 // 同步入口：锁内快照 conversation 后调 checkpointSnapshot。
 // 触发点都是低频事件：/compact、进程退出、/task checkpoint —— 这些调用方
 // 语义上必须等固化完成（压缩前、退出前），故保持同步。
-func (p *AgentPlugin) checkpointMemory(ctx context.Context) error {
+// 返回本次固化的实际结果明细（nil = 无可固化内容），供调用方回显/留痕。
+func (p *AgentPlugin) checkpointMemory(ctx context.Context) (*memory.AppliedSummary, error) {
 	p.mu.Lock()
 	conv := slices.Clone(p.conversation)
 	p.mu.Unlock()
-	_, err := p.checkpointSnapshot(ctx, conv)
-	return err
+	return p.checkpointSnapshot(ctx, conv)
 }
 
 // checkpointSnapshot 把给定 conversation 快照固化进任务档案。
 // 一次 LLM 调用（Checkpointer）输出 task 归属/新建/关闭 + 事实决策。
 // 读快照→LLM 推理→写回是整个周期，store 的 mutex 只串行化单次写。
 // 并发检查点（如 /compact 与退出 Stop、后台固化重叠）会基于过期快照互相覆盖，
-// 必须整体互斥。返回本次固化应用的总条目数（task 更新 + fact 决策）。
+// 必须整体互斥。返回本次固化实际应用的明细（AppliedSummary，nil = 无可固化内容）。
 // 快照必须由调用方在锁内克隆 —— /new 的后台固化依赖此保证清 STM 后仍能固化旧历史。
-func (p *AgentPlugin) checkpointSnapshot(ctx context.Context, conv []core.Message) (int, error) {
+func (p *AgentPlugin) checkpointSnapshot(ctx context.Context, conv []core.Message) (*memory.AppliedSummary, error) {
 	// checkpointMu 可能被后台固化（/new 异步，最长 120s）持有 —— 拿锁不能无界阻塞，
 	// 否则 Stop 的 45s 超时形同虚设：等拿到锁时 ctx 已取消，固化静默失败。
 	acquired := make(chan struct{})
@@ -834,11 +838,11 @@ func (p *AgentPlugin) checkpointSnapshot(ctx context.Context, conv []core.Messag
 			<-acquired
 			p.checkpointMu.Unlock()
 		}()
-		return 0, ctx.Err()
+		return nil, ctx.Err()
 	}
 
 	if p.memory == nil || len(conv) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 
 	cfg := p.hub.Config
@@ -848,17 +852,17 @@ func (p *AgentPlugin) checkpointSnapshot(ctx context.Context, conv []core.Messag
 
 	openTasks, err := p.memory.OpenTasks(50)
 	if err != nil {
-		return 0, fmt.Errorf("open tasks: %w", err)
+		return nil, fmt.Errorf("open tasks: %w", err)
 	}
 	facts, err := p.memory.ListFacts(50)
 	if err != nil {
-		return 0, fmt.Errorf("list facts: %w", err)
+		return nil, fmt.Errorf("list facts: %w", err)
 	}
 	// 检查点 id：也是 Task.Runs 与 Fact.Source 的标记
 	cpID := fmt.Sprintf("cp-%d", time.Now().UnixNano())
 	res, err := cp.Run(ctx, toMemoryMessages(conv), openTasks, facts)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	// ltm_extract=false：tasks/decisions 是同一 LLM 调用输出的，无法只跳过调用，
 	// 但应用层不落库事实 —— 配置开关生效。
@@ -869,14 +873,18 @@ func (p *AgentPlugin) checkpointSnapshot(ctx context.Context, conv []core.Messag
 	if p.usage != nil {
 		tokens = p.usage.Snapshot().TotalTokens
 	}
-	n, err := memory.ApplyCheckpoint(p.memory, res, openTasks, facts, cpID, tokens, cwd)
+	sum, err := memory.ApplyCheckpoint(p.memory, res, openTasks, facts, cpID, tokens, cwd)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	if n > 0 {
-		slog.Info("memory: checkpoint applied", "cp", cpID, "applied", n)
+	if sum.Count() > 0 {
+		// 明细全文已落库，日志只打条数防巨行；要看内容走 /memory 命令
+		slog.Info("memory: checkpoint applied",
+			"cp", cpID,
+			"tasks", len(sum.UpdatedTasks)+len(sum.ClosedTasks),
+			"facts", len(sum.Facts)+len(sum.DeletedFacts))
 	}
-	return n, nil
+	return sum, nil
 }
 
 // checkpointAsync 后台固化旧会话：/new 不阻塞用户输入，固化结果完成后回显。
@@ -887,12 +895,42 @@ func (p *AgentPlugin) checkpointAsync(conv []core.Message, writer func(string)) 
 	// 独立 ctx：命令 ctx 已随请求返回被释放，后台固化不能继承它。
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	n, err := p.checkpointSnapshot(ctx, conv)
+	sum, err := p.checkpointSnapshot(ctx, conv)
 	if err != nil {
 		writer(fmt.Sprintf("⚠ Consolidation failed (history kept only in STM, lost on exit): %v\n", err))
 		return
 	}
-	writer(fmt.Sprintf("✔ Consolidated previous session: %d entries\n", n))
+	if notice := renderCheckpointNotice(sum); notice != "" {
+		writer(notice)
+	} else {
+		// 有内容但 LLM 判定无可存 —— 仍要回一个完成信号，否则用户
+		// 无法区分"还在跑"vs"跑完没存"（旧行为无条件回显 N entries）。
+		writer("✔ Previous session consolidated (nothing new)\n")
+	}
+}
+
+// renderCheckpointNotice 把一次固化的实际结果渲染成用户可见提示：概括 + 每条标题。
+// 空/零结果返回空串，调用方自行决定是否静默。
+func renderCheckpointNotice(sum *memory.AppliedSummary) string {
+	if sum == nil || sum.Count() == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "✔ Memory updated: %d task(s), %d fact(s)\n",
+		len(sum.UpdatedTasks)+len(sum.ClosedTasks), len(sum.Facts)+len(sum.DeletedFacts))
+	for _, t := range sum.UpdatedTasks {
+		b.WriteString("  - task: " + truncate(oneLine(t), 160) + "\n")
+	}
+	for _, t := range sum.ClosedTasks {
+		b.WriteString("  - task (closed): " + truncate(oneLine(t), 160) + "\n")
+	}
+	for _, f := range sum.Facts {
+		b.WriteString("  - fact: " + truncate(oneLine(f), 160) + "\n")
+	}
+	for _, f := range sum.DeletedFacts {
+		b.WriteString("  - fact (deleted): " + truncate(oneLine(f), 160) + "\n")
+	}
+	return b.String()
 }
 
 // ---- /new 命令 ----
@@ -987,11 +1025,16 @@ func (p *AgentPlugin) handleTask(ctx *spec.Context) error {
 		ctx.Writer(fmt.Sprintf("✔ 已关闭 task %s\n", id))
 
 	case "checkpoint":
-		if err := p.checkpointMemory(ctx.Ctx); err != nil {
+		sum, err := p.checkpointMemory(ctx.Ctx)
+		if err != nil {
 			ctx.Writer(fmt.Sprintf("✘ Consolidation failed: %v\n", err))
 			return nil
 		}
-		ctx.Writer("✔ Session consolidated\n")
+		if notice := renderCheckpointNotice(sum); notice != "" {
+			ctx.Writer(notice)
+		} else {
+			ctx.Writer("✔ Session consolidated (no new memory)\n")
+		}
 
 	default:
 		ctx.Writer(fmt.Sprintf("未知子命令: %s（使用 /task help 查看用法）\n", args[0]))

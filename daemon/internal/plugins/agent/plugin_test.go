@@ -683,7 +683,7 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	}
 
 	// 等后台固化完成：提示回显 + 落库
-	out.waitFor(t, "Consolidated previous session", 3*time.Second)
+	out.waitFor(t, "Memory updated", 3*time.Second)
 	tasks, _ := ms.ListTasks(10)
 	if len(tasks) != 1 || tasks[0].Title != "fix config" {
 		t.Errorf("task not checkpointed: %+v", tasks)
@@ -857,7 +857,7 @@ func TestCheckpoint_FiltersToolMessages(t *testing.T) {
 		{Role: "tool", ToolCallID: "call_1", Content: "Filesystem 1.9T 60% used"},
 		{Role: "assistant", Content: "磁盘用了 60%"},
 	}
-	if err := p.checkpointMemory(context.Background()); err != nil {
+	if _, err := p.checkpointMemory(context.Background()); err != nil {
 		t.Fatalf("checkpointMemory: %v", err)
 	}
 }
@@ -892,7 +892,7 @@ func TestHandleNew_LtmExtractDisabledSkipsFacts(t *testing.T) {
 	if err := p.handleNew(ctx); err != nil {
 		t.Fatalf("handleNew: %v", err)
 	}
-	out.waitFor(t, "Consolidated previous session", 3*time.Second)
+	out.waitFor(t, "Memory updated", 3*time.Second)
 	tasks, _ := ms.ListTasks(10)
 	if len(tasks) != 1 {
 		t.Errorf("tasks = %d, want 1 (task extraction stays on)", len(tasks))
