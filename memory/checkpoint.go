@@ -142,14 +142,36 @@ func parseCheckpoint(s string) (*CheckpointResult, error) {
 	return &out, nil
 }
 
+// AppliedSummary 是一次检查点应用的实际结果明细，供调用方回显/留痕。
+// 只含真正落库的条目：被过滤的坏 action、空内容、重复 fact、未知 task id 都不算。
+type AppliedSummary struct {
+	UpdatedTasks []string // 本次新建或归入已有 task 的标题
+	ClosedTasks  []string // 本次被标记完成（done）的 task 标题
+	Facts        []string // 已 add/update 的事实，格式 "topic: content"（topic 空则纯 content）
+	DeletedFacts []string // 已删除的事实，格式同 Facts
+}
+
+// Count 返回应用条目总数（task 更新 + task 关闭 + fact 增删）。
+func (s *AppliedSummary) Count() int {
+	return len(s.UpdatedTasks) + len(s.ClosedTasks) + len(s.Facts) + len(s.DeletedFacts)
+}
+
 // ApplyCheckpoint 把检查点结果落到 store：更新/新建 task、应用 LTM 决策。
-// openTasks 与 facts 必须与 Run 传入的是同一份。返回 task 更新数。
-func ApplyCheckpoint(store Store, res *CheckpointResult, openTasks []Task, facts []Fact, runID string, tokens int, cwd string) (int, error) {
+// openTasks 与 facts 必须与 Run 传入的是同一份。返回实际应用的明细。
+func ApplyCheckpoint(store Store, res *CheckpointResult, openTasks []Task, facts []Fact, runID string, tokens int, cwd string) (*AppliedSummary, error) {
 	byID := make(map[string]Task, len(openTasks))
 	for _, t := range openTasks {
 		byID[t.ID] = t
 	}
-	applied := 0
+	sum := &AppliedSummary{}
+	// 同 id 多条 TaskUpdate（LLM 输出异常）只按最终 done 状态记一条明细，
+	// 否则同一 task 会同时进 Updated/Closed 重复渲染、计数虚高。
+	type taskRec struct {
+		title  string
+		closed bool
+	}
+	existing := make(map[string]taskRec)
+	var existingOrder []string
 	for _, u := range res.Tasks {
 		if u.ID != "" {
 			merged, ok := byID[u.ID]
@@ -171,9 +193,12 @@ func ApplyCheckpoint(store Store, res *CheckpointResult, openTasks []Task, facts
 			// 合并结果增量叠加，而不是回到初始快照覆盖（否则前一条更新丢失）。
 			byID[u.ID] = merged
 			if err := store.UpsertTask(&merged); err != nil {
-				return applied, err
+				return sum, err
 			}
-			applied++
+			if _, ok := existing[u.ID]; !ok {
+				existingOrder = append(existingOrder, u.ID)
+			}
+			existing[u.ID] = taskRec{title: merged.Title, closed: u.Done}
 			continue
 		}
 		// 新建 task
@@ -189,16 +214,28 @@ func ApplyCheckpoint(store Store, res *CheckpointResult, openTasks []Task, facts
 			nt.Status = "closed"
 		}
 		if err := store.UpsertTask(nt); err != nil {
-			return applied, err
+			return sum, err
 		}
-		applied++
+		if u.Done {
+			sum.ClosedTasks = append(sum.ClosedTasks, nt.Title)
+		} else {
+			sum.UpdatedTasks = append(sum.UpdatedTasks, nt.Title)
+		}
 	}
-	if n, err := ApplyDecisions(store, res.Decisions, facts, "checkpoint:"+runID); err != nil {
-		return applied, err
+	for _, id := range existingOrder {
+		if r := existing[id]; r.closed {
+			sum.ClosedTasks = append(sum.ClosedTasks, r.title)
+		} else {
+			sum.UpdatedTasks = append(sum.UpdatedTasks, r.title)
+		}
+	}
+	if _, appliedFacts, deletedFacts, err := ApplyDecisions(store, res.Decisions, facts, "checkpoint:"+runID); err != nil {
+		return sum, err
 	} else {
-		applied += n
+		sum.Facts = appliedFacts
+		sum.DeletedFacts = deletedFacts
 	}
-	return applied, nil
+	return sum, nil
 }
 
 // mergeText 把增量拼到已有摘要后，避免重复拼接空内容。

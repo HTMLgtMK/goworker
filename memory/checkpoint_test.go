@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -97,12 +98,25 @@ func TestApplyCheckpoint_NewTaskAndClose(t *testing.T) {
 		Decisions: []Decision{{Action: DecisionAdd, Content: "project uses yaml", Topic: "config"}},
 	}
 
-	applied, err := ApplyCheckpoint(s, res, openTasks, nil, "cp-9", 123, "/work")
+	sum, err := ApplyCheckpoint(s, res, openTasks, nil, "cp-9", 123, "/work")
 	if err != nil {
 		t.Fatalf("ApplyCheckpoint: %v", err)
 	}
-	if applied != 3 { // 新建 + 关闭更新 + add fact
-		t.Errorf("applied = %d, want 3", applied)
+	if sum.Count() != 3 { // 新建 + 关闭更新 + add fact
+		t.Errorf("Count = %d, want 3", sum.Count())
+	}
+	// 明细：新建归入 UpdatedTasks、done 归入 ClosedTasks、fact 带 topic 前缀
+	if !slices.Equal(sum.UpdatedTasks, []string{"fix config parser"}) {
+		t.Errorf("UpdatedTasks = %v, want [fix config parser]", sum.UpdatedTasks)
+	}
+	if !slices.Equal(sum.ClosedTasks, []string{"old task"}) {
+		t.Errorf("ClosedTasks = %v, want [old task]", sum.ClosedTasks)
+	}
+	if !slices.Equal(sum.Facts, []string{"config: project uses yaml"}) {
+		t.Errorf("Facts = %v, want [config: project uses yaml]", sum.Facts)
+	}
+	if len(sum.DeletedFacts) != 0 {
+		t.Errorf("DeletedFacts = %v, want empty", sum.DeletedFacts)
 	}
 
 	all, _ := s.ListTasks(10)
@@ -140,15 +154,68 @@ func TestApplyCheckpoint_ReferencesUnknownTaskIgnored(t *testing.T) {
 	s, _ := NewFileStore(t.TempDir(), 0)
 	defer s.Close()
 	res := &CheckpointResult{Tasks: []TaskUpdate{{ID: "ghost", SummaryDelta: "x"}}}
-	applied, err := ApplyCheckpoint(s, res, nil, nil, "cp-1", 0, "")
+	sum, err := ApplyCheckpoint(s, res, nil, nil, "cp-1", 0, "")
 	if err != nil {
 		t.Fatalf("ApplyCheckpoint: %v", err)
 	}
-	if applied != 0 {
-		t.Errorf("applied = %d, want 0", applied)
+	if sum.Count() != 0 {
+		t.Errorf("Count = %d, want 0", sum.Count())
 	}
 	tasks, _ := s.ListTasks(10)
 	if len(tasks) != 0 {
 		t.Fatalf("tasks = %d, want 0", len(tasks))
+	}
+}
+
+func TestApplyCheckpoint_DeleteOnlyCounts(t *testing.T) {
+	s, _ := NewFileStore(t.TempDir(), 0)
+	defer s.Close()
+	// 已有 fact，固化时模型判定删除 —— delete 也必须计入明细，否则误报"无新记忆"
+	s.AddFact(&Fact{ID: "f_stale", Content: "outdated info", Topic: "t"})
+	current, _ := s.ListFacts(10)
+
+	res := &CheckpointResult{
+		Decisions: []Decision{{Action: DecisionDelete, ID: "f_stale"}},
+	}
+	sum, err := ApplyCheckpoint(s, res, nil, current, "cp-del", 0, "")
+	if err != nil {
+		t.Fatalf("ApplyCheckpoint: %v", err)
+	}
+	if sum.Count() != 1 {
+		t.Errorf("Count = %d, want 1 (delete must count)", sum.Count())
+	}
+	if !slices.Equal(sum.DeletedFacts, []string{"t: outdated info"}) {
+		t.Errorf("DeletedFacts = %v, want [t: outdated info]", sum.DeletedFacts)
+	}
+	facts, _ := s.ListFacts(10)
+	if len(facts) != 0 {
+		t.Errorf("facts = %d, want 0 (deleted)", len(facts))
+	}
+}
+
+func TestApplyCheckpoint_DuplicateTaskIDDedup(t *testing.T) {
+	s, _ := NewFileStore(t.TempDir(), 0)
+	defer s.Close()
+	// 同 id 两条 TaskUpdate：只按最终 done 状态记一条明细，不重复渲染、不虚高计数
+	s.UpsertTask(&Task{Title: "dup task", Status: "open"})
+	openTasks, _ := s.OpenTasks(10)
+	id := openTasks[0].ID
+
+	res := &CheckpointResult{Tasks: []TaskUpdate{
+		{ID: id, SummaryDelta: "phase 1"},
+		{ID: id, SummaryDelta: "phase 2", Done: true},
+	}}
+	sum, err := ApplyCheckpoint(s, res, openTasks, nil, "cp-d", 0, "")
+	if err != nil {
+		t.Fatalf("ApplyCheckpoint: %v", err)
+	}
+	if len(sum.UpdatedTasks) != 0 {
+		t.Errorf("UpdatedTasks = %v, want empty (final done)", sum.UpdatedTasks)
+	}
+	if !slices.Equal(sum.ClosedTasks, []string{"dup task"}) {
+		t.Errorf("ClosedTasks = %v, want [dup task]", sum.ClosedTasks)
+	}
+	if sum.Count() != 1 {
+		t.Errorf("Count = %d, want 1", sum.Count())
 	}
 }

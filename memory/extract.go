@@ -38,28 +38,35 @@ const maxFactContentRunes = 2000
 // ApplyDecisions 把抽取决策落到 store。
 // current 必须与检查点传入的是同一份，保证 update/delete 的 id 定位一致。
 // source 是事实来源前缀（如 "checkpoint:"），调用方拼接本次 runID。
-// 返回实际执行（add+update+delete）的条数。
-func ApplyDecisions(store Store, decisions []Decision, current []Fact, source string) (int, error) {
+// 返回实际执行（add+update+delete）的条数 + add/update 的明细行 + delete 的明细行。
+// 明细只含真正落库的条目（被过滤的坏 action/空内容/重复项不在其中）。
+func ApplyDecisions(store Store, decisions []Decision, current []Fact, source string) (int, []string, []string, error) {
 	byID := make(map[string]Fact, len(current))
 	for _, f := range current {
 		byID[f.ID] = f
 	}
 	now := time.Now()
 	applied := 0
+	var appliedFacts, deletedFacts []string
+	// 同批去重：duplicateContent(current) 只比对固化前快照，不含本批次内已 add 的 ——
+	// 不补这个集合，同批两条相同 content 的 add 会在明细里虚报（store 侧 AddFact 静默去重）。
+	added := make(map[string]bool)
 	for _, d := range decisions {
 		switch d.Action {
 		case DecisionAdd:
-			// 空内容、或与已有完全重复（LLM 可能反复抽同一条）都跳过
-			if strings.TrimSpace(d.Content) == "" || duplicateContent(current, d.Content) {
+			key := strings.ToLower(strings.TrimSpace(d.Content))
+			if key == "" || duplicateContent(current, d.Content) || added[key] {
 				continue
 			}
 			if err := store.AddFact(&Fact{
 				Content: d.Content, Topic: d.Topic, Source: source,
 				CreatedAt: now, UpdatedAt: now,
 			}); err != nil {
-				return applied, err
+				return applied, appliedFacts, deletedFacts, err
 			}
 			applied++
+			added[key] = true
+			appliedFacts = append(appliedFacts, factLine(d.Topic, d.Content))
 		case DecisionUpdate:
 			old, ok := byID[d.ID]
 			if !ok || strings.TrimSpace(d.Content) == "" {
@@ -75,18 +82,30 @@ func ApplyDecisions(store Store, decisions []Decision, current []Fact, source st
 				ID: old.ID, Content: d.Content, Topic: topic,
 				Source: old.Source, CreatedAt: old.CreatedAt,
 			}); err != nil {
-				return applied, err
+				return applied, appliedFacts, deletedFacts, err
 			}
 			applied++
+			appliedFacts = append(appliedFacts, factLine(topic, d.Content))
 		case DecisionDelete:
-			if _, ok := byID[d.ID]; !ok {
+			old, ok := byID[d.ID]
+			if !ok {
 				continue
 			}
 			if err := store.DeleteFact(d.ID); err != nil {
-				return applied, err
+				return applied, appliedFacts, deletedFacts, err
 			}
 			applied++
+			deletedFacts = append(deletedFacts, factLine(old.Topic, old.Content))
 		}
 	}
-	return applied, nil
+	return applied, appliedFacts, deletedFacts, nil
+}
+
+// factLine 把一条已应用的事实压成单行摘要供回显："topic: content"（topic 空则纯 content）。
+func factLine(topic, content string) string {
+	c := singleLine(content)
+	if topic != "" {
+		return topic + ": " + c
+	}
+	return c
 }

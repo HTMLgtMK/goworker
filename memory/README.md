@@ -108,8 +108,11 @@ var llm memory.LLM          // Model() + Chat(ctx, *ChatRequest) (*ChatResponse,
 
 cp := memory.NewCheckpointer(llm, cwd)
 res, err := cp.Run(ctx, conversation /* []memory.Message */, openTasks, facts)
-// 2. apply to the store
-n, err := memory.ApplyCheckpoint(client, res, openTasks, facts, runID, tokens, cwd)
+// 2. apply to the store; the summary carries what was actually persisted,
+//    so callers can echo it back to the user (e.g. "Memory updated: N task(s), M fact(s)")
+sum, err := memory.ApplyCheckpoint(client, res, openTasks, facts, runID, tokens, cwd)
+// sum.UpdatedTasks / sum.ClosedTasks / sum.Facts / sum.DeletedFacts —
+//   persisted task titles, added/updated fact lines, and deleted fact lines
 ```
 
 Fact writes are decision-based (mem0-style): the model emits `add` / `update` /

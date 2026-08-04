@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"slices"
 	"testing"
 )
 
@@ -31,6 +32,7 @@ func TestApplyDecisions_FullFlow(t *testing.T) {
 
 	decs := []Decision{
 		{Action: DecisionAdd, Content: "new fact", Topic: "n"},
+		{Action: DecisionAdd, Content: "new fact", Topic: "n"}, // 同批重复 → 跳过（store 静默去重，明细不虚报）
 		{Action: DecisionAdd, Content: "old fact", Topic: "t"}, // 与已有重复 → 跳过
 		{Action: DecisionAdd, Content: "   ", Topic: "t"},      // 空内容 → 跳过
 		{Action: DecisionUpdate, ID: "f_old", Content: "refined fact", Topic: "t2"},
@@ -38,12 +40,19 @@ func TestApplyDecisions_FullFlow(t *testing.T) {
 		{Action: DecisionDelete, ID: "f_gone"},
 		{Action: DecisionNoop, Content: "nothing"},
 	}
-	applied, err := ApplyDecisions(s, decs, current, "checkpoint:cp-1")
+	applied, appliedFacts, deletedFacts, err := ApplyDecisions(s, decs, current, "checkpoint:cp-1")
 	if err != nil {
 		t.Fatalf("ApplyDecisions: %v", err)
 	}
-	if applied != 3 { // add + update + delete
+	if applied != 3 { // add + update + delete（同批重复 add 被跳过）
 		t.Errorf("applied = %d, want 3", applied)
+	}
+	// 明细：add/update 只含真正落库的，delete 单独列出；noop/重复/空/未知 id 不出现
+	if !slices.Equal(appliedFacts, []string{"n: new fact", "t2: refined fact"}) {
+		t.Errorf("appliedFacts = %v, want [n: new fact t2: refined fact]", appliedFacts)
+	}
+	if !slices.Equal(deletedFacts, []string{"t: to be deleted"}) {
+		t.Errorf("deletedFacts = %v, want [t: to be deleted]", deletedFacts)
 	}
 	facts, _ := s.ListFacts(10)
 	if len(facts) != 2 { // f_old 更新后仍在，f_gone 删了，new fact 加入
