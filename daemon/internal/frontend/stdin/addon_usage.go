@@ -57,8 +57,10 @@ func (a *UsageAddon) Render() string {
 	}
 	// 配置了窗口就用上下文占用百分比（最近一次请求的输入 / 窗口）。
 	// 不 clamp 到 100%——超了正好当"快爆窗口"的告警信号。
+	// 保留两位小数：低占用（如 3.47%）时整数直接抹成 0%，看不出量级。
 	if w := a.usage.ContextWindow; w > 0 && a.usage.LastPromptTokens > 0 {
-		return fmt.Sprintf("ctx %d%%", int(float64(a.usage.LastPromptTokens)/float64(w)*100))
+		pct := float64(a.usage.LastPromptTokens) / float64(w) * 100
+		return fmt.Sprintf("ctx %.2f%%", pct)
 	}
 	// 模型不返回 usage（TotalTokens 为 0）时退回估算值，~ 前缀标记"非精确"
 	if a.usage.TotalTokens > 0 {
