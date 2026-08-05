@@ -20,6 +20,11 @@ func (a *llmAdapter) Chat(ctx context.Context, req *memory.ChatRequest) (*memory
 		Model:    req.Model,
 		Messages: toCoreMessages(req.Messages),
 	}
+	if req.JSONMode {
+		// DeepSeek/OpenAI 兼容的 JSON 模式：配合 system 提示词里的 JSON 指示，
+		// 保证固化输出是合法 JSON，而不是靠解析器事后擦屁股。
+		coreReq.ResponseFormat = map[string]any{"type": "json_object"}
+	}
 	resp, err := a.inner.Chat(ctx, coreReq)
 	if err != nil {
 		return nil, err

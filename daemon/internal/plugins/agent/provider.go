@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -22,6 +23,11 @@ type OpenAIProvider struct {
 	client   *http.Client
 }
 
+// defaultHTTPTimeout 是 HTTP 客户端总超时。检查点/压缩是非流式全量调用，
+// 上下文一大（用户 config 里 compress_at 没开，会话无界累积）响应可能很慢，
+// 30s 太紧，2min 起步。
+const defaultHTTPTimeout = 2 * time.Minute
+
 func NewOpenAIProvider(endpoint, apiKey, model string) *OpenAIProvider {
 	if endpoint == "" {
 		endpoint = "http://localhost:8000/v1"
@@ -33,7 +39,7 @@ func NewOpenAIProvider(endpoint, apiKey, model string) *OpenAIProvider {
 		endpoint: strings.TrimRight(endpoint, "/"),
 		apiKey:   apiKey,
 		model:    model,
-		client:   &http.Client{Timeout: 30 * time.Second},
+		client:   &http.Client{Timeout: defaultHTTPTimeout},
 	}
 }
 
@@ -49,6 +55,11 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req *core.ChatRequest) (*core
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	// 调试观测：log.level=debug 时打印请求/响应全量 body。别打 Authorization 头（含密钥）。
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		slog.Debug("llm.chat request", "url", p.endpoint+"/chat/completions",
+			"model", req.Model, "messages", len(req.Messages), "body", string(body))
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -66,12 +77,27 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req *core.ChatRequest) (*core
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// 错误 body 只取前 1KB 兜底 —— 网关的 HTML 错误页/堆栈可能几 KB 起，
+		// 全量读进内存再塞进错误消息，既占内存又刷用户终端。
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if slog.Default().Enabled(ctx, slog.LevelDebug) {
+			slog.Debug("llm.chat response", "status", resp.StatusCode,
+				"model", req.Model, "body", string(b))
+		}
 		return nil, fmt.Errorf("API %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		slog.Debug("llm.chat response", "status", resp.StatusCode,
+			"model", req.Model, "body", string(raw))
+	}
+
 	var chatResp core.ChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+	if err := json.Unmarshal(raw, &chatResp); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	return &chatResp, nil

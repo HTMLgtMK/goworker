@@ -68,6 +68,11 @@ func (w *RotatingWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.file == nil {
+		// Close 之后的迟到写入（后台 goroutine 在关机窗口还在打日志）直接丢弃。
+		// 日志系统不能因为关闭时序把整个进程干崩。
+		return 0, nil
+	}
 	if w.size >= w.maxSize {
 		if err := w.rotate(); err != nil {
 			return 0, err

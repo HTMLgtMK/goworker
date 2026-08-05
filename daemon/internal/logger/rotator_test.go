@@ -120,6 +120,19 @@ func TestRotatingWriter_ConcurrentWrites(t *testing.T) {
 	}
 }
 
+func TestRotatingWriter_WriteAfterCloseDrops(t *testing.T) {
+	// 后台 goroutine 可能赶在进程退出窗口打最后一笔日志（rotator 已 Close）——
+	// 必须静默丢弃而非 nil 指针 panic 把进程干崩。
+	w, err := NewRotatingWriter(filepath.Join(t.TempDir(), "app.log"), 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	if n, err := w.Write([]byte("late")); err != nil || n != 0 {
+		t.Fatalf("Write after Close = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
 // joinAllFiles 按文件名排序拼接目录下所有日志文件。
 func joinAllFiles(t *testing.T, dir string) string {
 	t.Helper()

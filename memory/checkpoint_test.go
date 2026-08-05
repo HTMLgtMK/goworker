@@ -21,6 +21,8 @@ func TestParseCheckpoint(t *testing.T) {
 		{name: "noise around", in: "ok here: {\"tasks\":[{\"id\":\"t_1\"}],\"decisions\":[]} done", wantT: 1, wantD: 0},
 		{name: "empty", in: `{"tasks":[],"decisions":[]}`, wantT: 0, wantD: 0},
 		{name: "no title no id dropped", in: `{"tasks":[{"summary_delta":"x"},{"id":"t_1"}],"decisions":[]}`, wantT: 1},
+		{name: "empty array means nothing", in: "[]", wantT: 0, wantD: 0},
+		{name: "null means nothing", in: "null", wantT: 0, wantD: 0},
 		{name: "bad decision action dropped", in: `{"tasks":[],"decisions":[{"action":"explode"},{"action":"add","content":"ok"}]}`, wantD: 1},
 		{name: "no json", in: "the model said no", wantErr: true},
 		{name: "invalid json", in: `{"tasks": [}`, wantErr: true},
@@ -72,6 +74,19 @@ func TestCheckpointer_PrependsSystemPromptAndConversation(t *testing.T) {
 	// prompt 带上 open task id 与 fact id，供模型引用
 	if !strings.Contains(req.Messages[0].Content, "t_9") || !strings.Contains(req.Messages[0].Content, "f_9") {
 		t.Errorf("prompt should list open task ids and fact ids")
+	}
+}
+
+func TestCheckpointer_RequestsJSONMode(t *testing.T) {
+	// 固化必须要求后端以 JSON 模式输出（DeepSeek response_format=json_object），
+	// 否则模型可能吐散文/截断内容，靠解析器兜底是治标不治本。
+	stub := &stubProvider{resp: `{"tasks":[],"decisions":[]}`}
+	cp := NewCheckpointer(stub, "/work")
+	if _, err := cp.Run(context.Background(), nil, nil, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !stub.lastReq.JSONMode {
+		t.Errorf("JSONMode = false, want true")
 	}
 }
 

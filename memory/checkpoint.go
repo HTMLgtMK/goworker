@@ -45,7 +45,8 @@ type CheckpointResult struct {
 // openTasks 与 facts 必须与后续 ApplyCheckpoint 传入的是同一份（id 定位一致）。
 func (c *Checkpointer) Run(ctx context.Context, conversation []Message, openTasks []Task, facts []Fact) (*CheckpointResult, error) {
 	req := &ChatRequest{
-		Model: c.provider.Model(),
+		Model:    c.provider.Model(),
+		JSONMode: true, // DeepSeek JSON 模式（response_format=json_object），保证输出合法 JSON
 		Messages: append(
 			[]Message{{Role: "system", Content: checkpointPrompt(openTasks, facts)}},
 			conversation...,
@@ -106,6 +107,12 @@ If nothing is worth saving, output {"tasks":[],"decisions":[]}.`)
 
 // parseCheckpoint 容错解析模型输出：剥围栏、取 JSON 窗口、逐条校验。
 func parseCheckpoint(s string) (*CheckpointResult, error) {
+	s = strings.TrimSpace(s)
+	// [] / null 是模型表达"无可固化"的合法答案，按空结果处理而不是当格式错误
+	switch s {
+	case "[]", "null":
+		return &CheckpointResult{}, nil
+	}
 	start := strings.Index(s, "{")
 	end := strings.LastIndex(s, "}")
 	if start < 0 || end <= start {

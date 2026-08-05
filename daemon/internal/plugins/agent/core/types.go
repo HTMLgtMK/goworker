@@ -50,11 +50,12 @@ type ToolCallFunction struct {
 
 // ChatRequest /v1/chat/completions 请求体。
 type ChatRequest struct {
-	Model      string           `json:"model"`
-	Messages   []Message        `json:"messages"`
-	Stream     bool             `json:"stream"`
-	Tools      []map[string]any `json:"tools,omitempty"`
-	ToolChoice any              `json:"tool_choice,omitempty"`
+	Model          string           `json:"model"`
+	Messages       []Message        `json:"messages"`
+	Stream         bool             `json:"stream"`
+	Tools          []map[string]any `json:"tools,omitempty"`
+	ToolChoice     any              `json:"tool_choice,omitempty"`
+	ResponseFormat any              `json:"response_format,omitempty"`
 }
 
 // ChatResponse 非流式响应。

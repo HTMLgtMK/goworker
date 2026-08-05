@@ -13,6 +13,7 @@ type Message struct {
 type ChatRequest struct {
 	Model    string
 	Messages []Message
+	JSONMode bool // 要求后端以 JSON 模式输出（response_format=json_object），仅检查点使用
 }
 
 // ChatResponse 是 LLM 非流式响应的最小面。固化只消费 choices[0].message.content。

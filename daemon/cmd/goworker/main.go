@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -27,6 +28,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "init logger: %v\n", err)
 		os.Exit(1)
 	}
+	// 插件/provider 用全局 slog 打日志（agent 插件没有自己的 logger 句柄），
+	// 默认它只进 stderr、忽略 config 的 log.level/log.file —— 接上配置的 handler 后，
+	// log.level: debug 才能看到 llm.chat request/response 这类调试日志。
+	slog.SetDefault(log.Logger)
 	defer log.Close()
 	log.Info("config loaded", "path", cfgPath)
 	if cfg.Log.File != "" {
