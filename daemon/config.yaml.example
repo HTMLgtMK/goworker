@@ -58,6 +58,13 @@ memory:
     # 注入块占上下文窗口的比例上限（0-1），防止记忆把窗口撑爆
     # inject_budget_ratio: 0.15
 
+    # 声明式指令层（与生成式记忆线互补，同受 enabled 开关控制）：
+    # - USER.md  用户画像，~/.config/goworker/USER.md，agent 经 profile 工具写入
+    # - AGENTS.md 项目指令，全局 ~/.config/goworker/AGENTS.md + 项目根 AGENTS.md
+    #   两层，会话启动时冻结注入 system prompt，/new 重载
+    # user_max_chars: 1500       # USER.md 容量上限（rune），超限 profile 工具报错
+    # agents_max_chars: 4096     # AGENTS.md（全局+项目合并）注入上限，超出截断
+
 mcp:
     # MCP 服务器连接（stdio 传输）
     # 每个 server 暴露的工具以 mcp_<server>_<tool> 注册给 agent

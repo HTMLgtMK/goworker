@@ -36,7 +36,9 @@ type AgentPlugin struct {
 	mcpClients   map[string]mcp.Client // server name → 连接，Stop 时统一关闭
 	mcpTools     []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
 	memory       *memory.Client        // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
-	checkpointMu sync.Mutex            // 串行化检查点固化：读快照→LLM→应用的整个周期
+	// instructions 是声明式指令快照（USER.md + AGENTS.md），冻结于会话启动。
+	instructions *memory.InstructionSet
+	checkpointMu sync.Mutex // 串行化检查点固化：读快照→LLM→应用的整个周期
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }
@@ -115,6 +117,12 @@ func (p *AgentPlugin) Init(h *spec.Hub) error {
 		Handler:     p.handleNew,
 	})
 
+	h.RegisterCommand(spec.Command{
+		Name:        "/rules",
+		Description: "Show the effective declarative instructions (AGENTS.md + USER.md injection snapshot)",
+		Handler:     p.handleRules,
+	})
+
 	// 打开记忆存储。坏目录只降级为无记忆，不阻塞插件启动
 	if p.hub.Config.Memory.Enabled {
 		ms, err := memory.NewClient(p.hub.Config.Memory.Dir, p.hub.Config.Memory.TaskKeep)
@@ -123,6 +131,12 @@ func (p *AgentPlugin) Init(h *spec.Hub) error {
 		} else {
 			p.memory = ms
 		}
+	}
+
+	// 声明式指令层（USER.md + AGENTS.md），与记忆组件同开关。独立于 JSONL 存储：
+	// 记忆 store 打不开时指令仍可加载（纯文件读取）。
+	if p.hub.Config.Memory.Enabled {
+		p.instructions = p.loadInstructions()
 	}
 
 	// 加载 skill：用户级 + 项目级（后者覆盖前者）。坏 skill 跳过并记录，不拖垮其他的
@@ -331,8 +345,11 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 		memMw := middlewares.NewMemoryMiddleware(p.memory, cfg.Memory, cfg.LLM.ContextWindow)
 		mws = []core.Middleware{hitlMw, usageMw, memMw, compressMw}
 	}
-	agent := NewAgent(provider, tools, mws,
-		WithMaxIterations(cfg.LLM.MaxIterations))
+	opts := []Option{WithMaxIterations(cfg.LLM.MaxIterations)}
+	if p.instructions != nil {
+		opts = append(opts, WithSystemExtra(p.instructions.Snapshot()))
+	}
+	agent := NewAgent(provider, tools, mws, opts...)
 	agent.OnIteration = func() {
 		if ctx.Publish != nil {
 			ctx.Publish(statusbar.EventIteration, nil)
@@ -783,6 +800,20 @@ func (p *AgentPlugin) handleMemory(ctx *spec.Context) error {
 		}
 		ctx.Writer(fmt.Sprintf("✔ forgot %d\n", len(args)-1))
 
+	case "profile":
+		if p.instructions == nil || p.instructions.Profile() == nil {
+			ctx.Writer("declarative instructions disabled (memory.enabled=false or load failed)\n")
+			return nil
+		}
+		prof := p.instructions.Profile()
+		used, max := prof.Capacity()
+		ctx.Writer(fmt.Sprintf("USER.md capacity: %d/%d chars\n", used, max))
+		if strings.TrimSpace(prof.Content()) == "" {
+			ctx.Writer("(empty — have the agent write via the profile tool, or edit ~/.config/goworker/USER.md by hand)\n")
+			return nil
+		}
+		ctx.Writer(prof.Content() + "\n")
+
 	default:
 		ctx.Writer(fmt.Sprintf("未知子命令: %s（使用 /memory help 查看用法）\n", args[0]))
 	}
@@ -790,15 +821,17 @@ func (p *AgentPlugin) handleMemory(ctx *spec.Context) error {
 }
 
 func (p *AgentPlugin) memoryHelp(ctx *spec.Context) {
-	ctx.Writer("用法:\n")
-	ctx.Writer("  /memory                 — 显示本帮助\n")
-	ctx.Writer("  /memory add <文本>      — 手动记住一条事实\n")
-	ctx.Writer("  /memory search <关键词> [n] — 检索相关事实\n")
-	ctx.Writer("  /memory list [n]        — 列出最近事实（默认 20）\n")
-	ctx.Writer("  /memory tasks [n]       — 查看任务档案（含已关闭）\n")
-	ctx.Writer("  /memory forget <id>...  — 删除指定事实\n")
-	ctx.Writer("  /task list|start|end    — 管理未完成任务\n")
-	ctx.Writer("  /new                    — 结束会话：固化+清 STM+注入提醒\n")
+	ctx.Writer("Usage:\n")
+	ctx.Writer("  /memory                 — show this help\n")
+	ctx.Writer("  /memory add <text>      — manually remember a fact\n")
+	ctx.Writer("  /memory search <keyword> [n] — search related facts\n")
+	ctx.Writer("  /memory list [n]        — list recent facts (default 20)\n")
+	ctx.Writer("  /memory tasks [n]       — list task archive (incl. closed)\n")
+	ctx.Writer("  /memory forget <id>...  — delete facts\n")
+	ctx.Writer("  /memory profile         — show user profile USER.md (capacity/content)\n")
+	ctx.Writer("  /task list|start|end    — manage open tasks\n")
+	ctx.Writer("  /rules                  — show effective declarative instructions (AGENTS.md + USER.md)\n")
+	ctx.Writer("  /new                    — end session: consolidate + clear STM + reload instructions + inject reminders\n")
 }
 
 // ---- 固化检查点 ----
@@ -954,6 +987,14 @@ func (p *AgentPlugin) handleNew(ctx *spec.Context) error {
 	p.mu.Lock()
 	p.conversation = nil
 	p.mu.Unlock()
+	// 会话边界：重新构造声明式指令快照，会话内手改的 AGENTS.md/USER.md 从此生效
+	if p.instructions != nil {
+		if inst := p.loadInstructions(); inst != nil {
+			p.instructions = inst
+		} else {
+			slog.Warn("instructions reload failed, keeping stale snapshot")
+		}
+	}
 	ctx.Writer("✔ STM cleared, memory will be retrieved on every query\n")
 	return nil
 }
@@ -1204,10 +1245,132 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 		})
 	}
 
+	// profile：agent 写入用户画像 USER.md 的结构化入口。声明式指令层在，
+	// 才给 agent 写自己档案的能力 —— 写入即持久化，语义与 memory_search 的只读相对。
+	if p.instructions != nil {
+		tools = append(tools, p.profileTool())
+	}
+
 	// MCP 工具：Init 时已从 server 拉取定义，这里是静态复用。
 	// 工具是外部进程执行，不受本地 sandbox 管控，信任由"用户显式配置了哪个 server"建立。
 	tools = append(tools, p.mcpTools...)
 	return tools
+}
+
+// ---- profile 工具（agent 写 USER.md） ----
+
+// profileTool 返回 agent 更新用户画像的工具。画像条目必须短、信息密度高；
+// replace/remove 用唯一子串定位（Hermes 式），写多命中直接报错防误伤。
+// 写入语义：落盘持久化，但注入快照冻结 —— 本次会话不生效，/new 或重启后可见。
+func (p *AgentPlugin) profileTool() core.Tool {
+	return core.Tool{
+		Name: "profile",
+		Description: "Update the user profile (USER.md): durable facts about the user's " +
+			"preferences, communication style, identity, and corrections. Entries are compact, " +
+			"one line each. action=add appends a new entry; action=replace swaps the entry " +
+			"uniquely matching old_text; action=remove deletes it. Returns the result and current " +
+			"capacity. Changes are saved to disk and take effect next session (/new or restart).",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"action":   map[string]any{"type": "string", "description": "add | replace | remove"},
+				"content":  map[string]any{"type": "string", "description": "new entry text (for add/replace)"},
+				"old_text": map[string]any{"type": "string", "description": "unique substring matching the entry to replace/remove"},
+			},
+			"required": []string{"action"},
+		},
+		Execute: func(ctx context.Context, args map[string]any) (string, error) {
+			return p.execProfileTool(args)
+		},
+	}
+}
+
+func (p *AgentPlugin) execProfileTool(args map[string]any) (string, error) {
+	action, _ := args["action"].(string)
+	content, _ := args["content"].(string)
+	oldText, _ := args["old_text"].(string)
+	if p.instructions == nil || p.instructions.Profile() == nil {
+		return "", fmt.Errorf("profile: instructions not loaded")
+	}
+	switch action {
+	case "add":
+		if strings.TrimSpace(content) == "" {
+			return "", fmt.Errorf("profile: content required for add")
+		}
+	case "replace":
+		if strings.TrimSpace(content) == "" {
+			return "", fmt.Errorf("profile: content required for replace")
+		}
+		fallthrough
+	case "remove":
+		if strings.TrimSpace(oldText) == "" {
+			return "", fmt.Errorf("profile: old_text required for %s", action)
+		}
+	default:
+		return "", fmt.Errorf("profile: unknown action %q (add|replace|remove)", action)
+	}
+
+	res, err := p.applyProfileAction(action, content, oldText)
+	if err != nil {
+		return "", err
+	}
+	used, max := p.instructions.Profile().Capacity()
+	return fmt.Sprintf("%s (USER.md %d/%d chars). Saved to disk; takes effect next session (/new or restart).", res, used, max), nil
+}
+
+// applyProfileAction 把一次画像写操作落到 Profile。add/replace/remove 的参数约定：
+// add/replace 用 content，replace/remove 用 oldText 定位。
+func (p *AgentPlugin) applyProfileAction(action, content, oldText string) (string, error) {
+	prof := p.instructions.Profile()
+	switch action {
+	case "add":
+		return prof.AddEntry(content)
+	case "replace":
+		return prof.ReplaceEntry(oldText, content)
+	case "remove":
+		return prof.RemoveEntry(oldText)
+	default:
+		return "", fmt.Errorf("profile: unknown action %q", action)
+	}
+}
+
+// ---- /rules 命令 ----
+
+// handleRules 只读展示当前生效的指令快照 —— 与注入 system prompt 的内容一致，
+// 方便核对"agent 到底被灌了什么规矩"。
+func (p *AgentPlugin) handleRules(ctx *spec.Context) error {
+	if p.instructions == nil {
+		ctx.Writer("declarative instructions disabled (memory.enabled=false or load failed)\n")
+		return nil
+	}
+	snap := p.instructions.Snapshot()
+	if snap == "" {
+		ctx.Writer("(no active instructions — global AGENTS.md/USER.md go in ~/.config/goworker/, project AGENTS.md in the project root)\n")
+		return nil
+	}
+	ctx.Writer(snap + "\n")
+	return nil
+}
+
+// loadInstructions 构造声明式指令快照。失败降级为 nil（指令禁用，不阻塞）。
+func (p *AgentPlugin) loadInstructions() *memory.InstructionSet {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
+	}
+	inst, err := memory.LoadInstructions(
+		config.DefaultDir(),
+		cwd,
+		memory.Cap{
+			UserMaxChars:   p.hub.Config.Memory.UserMaxChars,
+			AgentsMaxChars: p.hub.Config.Memory.AgentsMaxChars,
+		},
+	)
+	if err != nil {
+		slog.Warn("instructions load failed, instructions disabled", "err", err)
+		return nil
+	}
+	return inst
 }
 
 // ---- Util ----

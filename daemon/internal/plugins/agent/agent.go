@@ -184,6 +184,7 @@ type Agent struct {
 	toolMap       map[string]core.Tool
 	middlewares   []core.Middleware
 	maxIterations int
+	systemExtra   string // 追加进 system prompt 首条的静态上下文（声明式指令快照）
 
 	OnIteration func() // 可选：每次 ReAct 循环前调用，用于 UI 反馈（status bar 迭代计数）
 }
@@ -196,6 +197,17 @@ func WithMaxIterations(n int) Option {
 	return func(a *Agent) {
 		if n > 0 {
 			a.maxIterations = n
+		}
+	}
+}
+
+// WithSystemExtra 追加静态上下文到 system prompt 首条末尾（如声明式指令快照）。
+// 空串忽略。注意：注入内容是 index 0 的一部分，天然被 strip 整条剥掉、受
+// 压缩器 protectSystem 保护 —— 不要用独立 system 消息注入，那会漏进 STM。
+func WithSystemExtra(content string) Option {
+	return func(a *Agent) {
+		if content != "" {
+			a.systemExtra = content
 		}
 	}
 }
@@ -410,7 +422,11 @@ func (a *Agent) fireMiddlewareEvent(event any) {
 
 func (a *Agent) buildMessages(history []core.Message, input string) []core.Message {
 	msgs := make([]core.Message, 0, len(history)+2)
-	msgs = append(msgs, core.Message{Role: "system", Content: systemPrompt(a.tools)})
+	sp := systemPrompt(a.tools)
+	if a.systemExtra != "" {
+		sp += a.systemExtra
+	}
+	msgs = append(msgs, core.Message{Role: "system", Content: sp})
 	msgs = append(msgs, history...)
 	msgs = append(msgs, core.Message{Role: "user", Content: input})
 	return msgs

@@ -45,6 +45,7 @@ type LLMConfig struct {
 }
 
 // MemoryConfig 是 agent 记忆模块（MTM 任务档案 + LTM 事实条目）的配置。
+// 声明式指令层（USER.md + AGENTS.md）与记忆组件同开关：Enabled=false 时两者都关。
 type MemoryConfig struct {
 	Dir               string  `yaml:"dir"`                 // 存储目录，默认 <DefaultDir>/memory
 	Enabled           bool    `yaml:"enabled"`             // false = 整个记忆模块关闭
@@ -53,6 +54,8 @@ type MemoryConfig struct {
 	LtmInjectTopK     int     `yaml:"ltm_inject_top_k"`    // 会话边界时注入相关事实条数
 	LtmExtract        bool    `yaml:"ltm_extract"`         // 检查点固化时是否 LLM 抽取 LTM
 	InjectBudgetRatio float64 `yaml:"inject_budget_ratio"` // 注入块占 context 窗口的比例上限（0-1）
+	UserMaxChars      int     `yaml:"user_max_chars"`      // USER.md 画像容量上限（rune），超限 profile 工具报错
+	AgentsMaxChars    int     `yaml:"agents_max_chars"`    // AGENTS.md（全局+项目合并）注入上限，超出截断
 }
 
 // RiskPatternConfig 表示一个风险命令模式及其人类可读描述。
@@ -126,6 +129,8 @@ func Default() *Config {
 			LtmInjectTopK:     8,
 			LtmExtract:        true,
 			InjectBudgetRatio: 0.15,
+			UserMaxChars:      1500, // Hermes 参考值，够写几十条画像
+			AgentsMaxChars:    4096, // 全局+项目 AGENTS.md 合并注入上限
 		},
 	}
 }

@@ -87,7 +87,7 @@ func (m *MemoryMiddleware) buildMemoryBlock(results []memory.Result) string {
 		case len(results) > 1:
 			results = results[:len(results)-1] // 丢最低分
 		case len(results) == 1 && !trimmed && results[0].Fact != nil:
-			results[0].Fact.Content = truncateRunes(results[0].Fact.Content, 300)
+			results[0].Fact.Content = memory.TruncateRunes(results[0].Fact.Content, 300)
 			trimmed = true
 		default:
 			slog.Warn("memory: injection over budget and nothing left to trim, skipping", "budget", budget)
@@ -160,12 +160,4 @@ func renderMemoryBlock(results []memory.Result) string {
 
 func oneLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
-}
-
-func truncateRunes(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n]) + "…"
 }
