@@ -246,7 +246,9 @@ func TestDefaultToolsReadWriteStillWork(t *testing.T) {
 }
 
 func TestAgent_MaxIterationsExhaustedStillFinishes(t *testing.T) {
-	a := NewAgent(&toolLoopProvider{count: 999}, DefaultTools(nil), nil)
+	// 显式给个小上限触发耗尽：defaultMaxIterations 已是 MaxInt，靠默认值跑不出耗尽。
+	const exhaustedIters = 5
+	a := NewAgent(&toolLoopProvider{count: 999}, DefaultTools(nil), nil, WithMaxIterations(exhaustedIters))
 	tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")
 	if err != nil {
 		t.Fatalf("Run err = %v", err)
@@ -269,8 +271,8 @@ func TestAgent_MaxIterationsExhaustedStillFinishes(t *testing.T) {
 		t.Error("iteration exhaustion should emit a visible hint, not end silently")
 	}
 	msgs := <-msgCh
-	// system + user(input) + maxIterations×(assistant tool_call + tool result) + assistant(unfinished)
-	if want := 3 + 2*defaultMaxIterations; len(msgs) != want {
+	// system + user(input) + exhaustedIters×(assistant tool_call + tool result) + assistant(unfinished note)
+	if want := 3 + 2*exhaustedIters; len(msgs) != want {
 		t.Errorf("history msgs = %d, want %d", len(msgs), want)
 	}
 	if last := msgs[len(msgs)-1]; !strings.Contains(last.Content, "已达最大迭代次数") {

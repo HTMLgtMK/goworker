@@ -14,7 +14,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/sandbox"
 )
 
-const defaultMaxIterations = 15
+const defaultMaxIterations = int(^uint(0) >> 1) // math.MaxInt
 
 // DefaultTools 返回 Agent 的默认工具集。
 // cfg 为沙箱配置，nil 表示不启用沙箱。
@@ -191,7 +191,7 @@ type Agent struct {
 // Option 可配置 Agent 的可选行为。
 type Option func(*Agent)
 
-// WithMaxIterations 覆盖 ReAct 循环最大迭代数（0 或省略 = 默认 15）。
+// WithMaxIterations 覆盖 ReAct 循环最大迭代数（0 或省略 = 默认 MaxInt，即无上限）。
 func WithMaxIterations(n int) Option {
 	return func(a *Agent) {
 		if n > 0 {
