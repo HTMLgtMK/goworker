@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/charmbracelet/glamour"
+	"github.com/muesli/termenv"
 )
 
 var minimalStyleJSON []byte // 当前活跃主题的 JSON 样式，由 SetTheme 在启动时设置
@@ -29,6 +30,10 @@ func getRenderer(width int) *glamour.TermRenderer {
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStylesFromJSONBytes(minimalStyleJSON),
 		glamour.WithWordWrap(width),
+		// glamour v1.0.0 默认硬编码 TrueColor，不管终端支不支持 24 位色。
+		// 改成按终端实际能力走，macOS Terminal.app（ANSI256）不再收到一堆
+		// 无法解析的 RGB 序列导致颜色乱掉。
+		glamour.WithColorProfile(colorProfile()),
 	)
 	if err != nil {
 		return nil
@@ -38,13 +43,25 @@ func getRenderer(width int) *glamour.TermRenderer {
 	return r
 }
 
+// colorProfile 返回终端实际支持的颜色深度，供 glamour 渲染器使用。
+// 探测失败（非 TTY / TERM 未知，termenv 返回 Ascii）时退回 TrueColor，
+// 保证输出永远带颜色——否则用户把输出管道重定向到文件时颜色会被整段剥掉。
+func colorProfile() termenv.Profile {
+	if p := termenv.ColorProfile(); p != termenv.Ascii {
+		return p
+	}
+	return termenv.TrueColor
+}
+
 // hrPattern 匹配 glamour 渲染后的水平分割线（纯文本 `─{4}` + 尾部空格，无 ANSI 封装）。
 var hrPattern = regexp.MustCompile(`(?m)^─{3,} *$`)
 
-// postProcessAnsi 后处理 glamour 的 ANSI 输出：修复 HR 宽度 + 表头 cell 间距 + 去除前导空白行。
+// postProcessAnsi 后处理 glamour 的 ANSI 输出：修复 HR 宽度 + 去除前导空白行。
+//
+// 注意：表格不做任何 cell 归一化。glamour v1.0.0 的表格原生输出就是对齐的——
+// 之前 normalizeTableCells 把数据行前导 margin 剥掉却放过了分隔行，反而让 ┼ 与 │ 错位。
 func postProcessAnsi(s string, width int) string {
 	s = hrPattern.ReplaceAllString(s, "\x1b[2m"+strings.Repeat("─", width)+"\x1b[0m")
-	s = normalizeTableCells(s)
 	s = trimBlankLines(s)
 	return s
 }
@@ -62,42 +79,6 @@ func trimBlankLines(s string) string {
 		end--
 	}
 	return strings.Join(lines[start:end], "\n")
-}
-
-// normalizeTableCells 统一表格每列 cell 的前导空格数，修复 glamour lipgloss
-// 对表头与数据行的 margin 不一致问题——有的 cell 1 个空格，有的 2 个。
-// 策略：每列 cell 统一 strip 前导空格（保留 cell 内容），然后靠 │ 分隔。
-func normalizeTableCells(s string) string {
-	lines := strings.Split(s, "\n")
-	i := 0
-	for i < len(lines) {
-		if !strings.Contains(lines[i], "│") {
-			i++
-			continue
-		}
-		start := i
-		for i < len(lines) && strings.Contains(lines[i], "│") {
-			i++
-		}
-		table := lines[start:i]
-		for j, line := range table {
-			if strings.Contains(line, "─") || strings.Contains(line, "┼") {
-				continue // 分隔线不改
-			}
-			cells := strings.Split(line, "│")
-			for k := range cells {
-				if k == 0 {
-					// 首列：去掉 glamour margin 加的前导空格
-					cells[k] = strings.TrimLeft(cells[k], " ")
-				} else {
-					// 后续列：保留 "│ " 分隔格式，去掉多余前导空格
-					cells[k] = " " + strings.TrimLeft(cells[k], " ")
-				}
-			}
-			table[j] = strings.Join(cells, "│")
-		}
-	}
-	return strings.Join(lines, "\n")
 }
 
 // RenderMarkdown 渲染 markdown 为带简约 ANSI 风格的终端输出。

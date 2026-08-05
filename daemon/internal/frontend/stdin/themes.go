@@ -13,30 +13,36 @@ var (
 	lightStyleJSON = mustMarshalJSON(ansi.StyleConfig{
 		Document: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
-				BlockPrefix: "",
-				BlockSuffix: "",
+				// 正文色放 Document 而不是 Text：glamour 的 Text 样式会覆盖所有内联文字
+				//（包括标题内容），放 Document 才能在标题里用 Heading 自己的颜色。
+				Color: strPtr("#141413"),
 			},
 			Margin: uintPtr(2),
 		},
-		Text: ansi.StylePrimitive{
-			Color: strPtr("#141413"),
-		},
+		// Text 必须留空，否则标题内容会被强制染成正文色，Heading.Color 形同虚设。
+		Text: ansi.StylePrimitive{},
 		Strong: ansi.StylePrimitive{
-			Bold:  boolPtr(false),
+			Bold:  boolPtr(true),
 			Color: strPtr("#000000"),
 		},
 		Emph: ansi.StylePrimitive{
 			Italic: boolPtr(true),
 			Color:  strPtr("#3A3A38"),
 		},
+		// 标题：深色 + 加粗，浅色终端上足够醒目。前缀按级别放 H1~H6，
+		// 避免 base Heading 的 block_prefix 让所有级别都显示 "## "。
 		Heading: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
-				Bold:        boolPtr(false),
-				Color:       strPtr("#D97757"),
-				BlockPrefix: "## ",
-				BlockSuffix: "",
+				Bold:  boolPtr(true),
+				Color: strPtr("#9C4A24"),
 			},
 		},
+		H1: ansi.StyleBlock{StylePrimitive: ansi.StylePrimitive{Prefix: "# "}},
+		H2: ansi.StyleBlock{StylePrimitive: ansi.StylePrimitive{Prefix: "## "}},
+		H3: ansi.StyleBlock{StylePrimitive: ansi.StylePrimitive{Prefix: "### "}},
+		H4: ansi.StyleBlock{StylePrimitive: ansi.StylePrimitive{Prefix: "#### "}},
+		H5: ansi.StyleBlock{StylePrimitive: ansi.StylePrimitive{Prefix: "##### "}},
+		H6: ansi.StyleBlock{StylePrimitive: ansi.StylePrimitive{Prefix: "###### "}},
 		Link: ansi.StylePrimitive{
 			Color:     strPtr("#3668A0"),
 			Underline: boolPtr(true),
@@ -122,8 +128,14 @@ var (
 			StylePrimitive: ansi.StylePrimitive{
 				Bold:      boolPtr(true),
 				Underline: boolPtr(true),
+				Prefix:    "# ",
 			},
 		},
+		H2: ansi.StyleBlock{StylePrimitive: ansi.StylePrimitive{Prefix: "## "}},
+		H3: ansi.StyleBlock{StylePrimitive: ansi.StylePrimitive{Prefix: "### "}},
+		H4: ansi.StyleBlock{StylePrimitive: ansi.StylePrimitive{Prefix: "#### "}},
+		H5: ansi.StyleBlock{StylePrimitive: ansi.StylePrimitive{Prefix: "##### "}},
+		H6: ansi.StyleBlock{StylePrimitive: ansi.StylePrimitive{Prefix: "###### "}},
 		Strong: ansi.StylePrimitive{
 			Bold: boolPtr(true),
 		},
