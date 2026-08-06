@@ -40,12 +40,14 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 	usageMw := middlewares.NewUsageMiddleware(p.usage, func(u core.Usage) {
 		if ctx.Publish != nil {
 			ctx.Publish(statusbar.EventUsage, statusbar.Usage{
-				EstimateTokens:   u.EstimateTokens,
-				PromptTokens:     u.PromptTokens,
-				CompletionTokens: u.CompletionTokens,
-				TotalTokens:      u.TotalTokens,
-				LastPromptTokens: u.LastPromptTokens,
-				ContextWindow:    cfg.LLM.ContextWindow,
+				EstimateTokens:        u.EstimateTokens,
+				PromptTokens:          u.PromptTokens,
+				PromptCacheHitTokens:  u.PromptCacheHitTokens,
+				PromptCacheMissTokens: u.PromptCacheMissTokens,
+				CompletionTokens:      u.CompletionTokens,
+				TotalTokens:           u.TotalTokens,
+				LastPromptTokens:      u.LastPromptTokens,
+				ContextWindow:         cfg.LLM.ContextWindow,
 			})
 		}
 	})

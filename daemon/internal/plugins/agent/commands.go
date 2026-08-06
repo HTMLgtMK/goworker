@@ -134,12 +134,23 @@ func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
 	if len(calls) > 0 {
 		ctx.Writer(fmt.Sprintf("usage: %d model calls this session\n\n", len(calls)))
 		for i, c := range calls {
-			ctx.Writer(fmt.Sprintf("  #%-2d  in %-7s  out %-7s  (est %s)\n",
-				i+1, humanize(c.PromptTokens), humanize(c.CompletionTokens), humanize(c.EstimateTokens)))
+			line := fmt.Sprintf("  #%-2d  in %-7s  out %-7s  (est %s)",
+				i+1, humanize(c.PromptTokens), humanize(c.CompletionTokens), humanize(c.EstimateTokens))
+			// 模型没返回 cache 字段时明细保持简洁，不挂一串 0
+			if c.PromptCacheHitTokens+c.PromptCacheMissTokens > 0 {
+				line += fmt.Sprintf("  hit: %-7s miss: %-7s / %s",
+					humanize(c.PromptCacheHitTokens), humanize(c.PromptCacheMissTokens), humanize(c.PromptCacheHitTokens+c.PromptCacheMissTokens))
+			}
+			ctx.Writer(line + "\n")
 		}
 		ctx.Writer("\n")
-		ctx.Writer(fmt.Sprintf("  total: in %s  out %s  total %s\n",
-			humanize(total.PromptTokens), humanize(total.CompletionTokens), humanize(total.TotalTokens)))
+		totalLine := fmt.Sprintf("  total: in %s  out %s  total %s",
+			humanize(total.PromptTokens), humanize(total.CompletionTokens), humanize(total.TotalTokens))
+		if rate, ok := total.CacheHitRate(); ok {
+			totalLine += fmt.Sprintf("  cache %.1f%% (%s hit / %s miss)",
+				rate, humanize(total.PromptCacheHitTokens), humanize(total.PromptCacheMissTokens))
+		}
+		ctx.Writer(totalLine + "\n")
 
 		// context usage uses "last prompt / window" — the final ReAct request already holds all history
 		if w := p.hub.Config.LLM.ContextWindow; w > 0 && total.LastPromptTokens > 0 {

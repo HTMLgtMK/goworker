@@ -49,5 +49,26 @@ func (a *ProgressAddon) Render() string {
 		icon = "✓"
 	}
 	elapsed := time.Since(a.start).Round(100 * time.Millisecond)
-	return fmt.Sprintf("%s ⏱ %-8s", icon, elapsed)
+	return fmt.Sprintf("%s ⏱ %s", icon, a.formatDuration(elapsed))
+}
+
+func (a *ProgressAddon) formatDuration(d time.Duration) string {
+	d = d.Round(time.Millisecond)
+
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+	millis := int(d.Milliseconds()) % 1000
+
+	// 根据不同时间长度返回不同格式
+	if hours > 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%02d:%02d", minutes, seconds)
+	}
+	if seconds > 0 {
+		return fmt.Sprintf("%.1fs", float64(seconds)+float64(millis)/1000)
+	}
+	return fmt.Sprintf("%dms", millis)
 }

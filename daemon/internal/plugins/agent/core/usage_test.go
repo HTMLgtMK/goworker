@@ -54,6 +54,59 @@ func TestUsageTracker_CallsDeepCopy(t *testing.T) {
 	}
 }
 
+func TestUsageTracker_CacheTokensAccumulate(t *testing.T) {
+	// 回归：Record 曾漏拷 UsageInfo 的 cache 字段，导致总计里 hit/miss 恒为 0。
+	tracker := NewUsageTracker()
+	tracker.Record(0, 0, &UsageInfo{PromptTokens: 1000, PromptCacheHitTokens: 600, PromptCacheMissTokens: 400, TotalTokens: 1000})
+	tracker.Record(1, 0, &UsageInfo{PromptTokens: 2000, PromptCacheHitTokens: 1500, PromptCacheMissTokens: 500, TotalTokens: 2000})
+
+	s := tracker.Snapshot()
+	if s.PromptCacheHitTokens != 2100 {
+		t.Errorf("PromptCacheHitTokens = %d, want 2100", s.PromptCacheHitTokens)
+	}
+	if s.PromptCacheMissTokens != 900 {
+		t.Errorf("PromptCacheMissTokens = %d, want 900", s.PromptCacheMissTokens)
+	}
+	// 明细同样带上 cache 字段
+	calls := tracker.Calls()
+	if calls[0].PromptCacheHitTokens != 600 || calls[1].PromptCacheMissTokens != 500 {
+		t.Errorf("calls missing cache fields: %+v", calls)
+	}
+}
+
+func TestUsage_CacheHitRate(t *testing.T) {
+	tests := []struct {
+		name   string
+		hit    int
+		miss   int
+		want   float64
+		hasVal bool
+	}{
+		{name: "model omits cache fields", hit: 0, miss: 0, want: 0, hasVal: false},
+		{name: "fully cached", hit: 1000, miss: 0, want: 100, hasVal: true},
+		{name: "mixed", hit: 600, miss: 400, want: 60, hasVal: true},
+		{name: "low rate not rounded", hit: 1, miss: 999, want: 0.1, hasVal: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rate, ok := (Usage{PromptCacheHitTokens: tt.hit, PromptCacheMissTokens: tt.miss}).CacheHitRate()
+			if ok != tt.hasVal {
+				t.Fatalf("ok = %v, want %v", ok, tt.hasVal)
+			}
+			if ok && absDiff(rate, tt.want) > 1e-9 {
+				t.Errorf("rate = %v, want %v", rate, tt.want)
+			}
+		})
+	}
+}
+
+func absDiff(a, b float64) float64 {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
 func TestUsageTracker_RecordCompaction(t *testing.T) {
 	tracker := NewUsageTracker()
 	tracker.RecordCompaction(Compaction{BeforeMsgs: 42, AfterMsgs: 13, Tokens: 1200})

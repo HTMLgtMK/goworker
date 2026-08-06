@@ -58,15 +58,22 @@ func (a *UsageAddon) Render() string {
 	// 配置了窗口就用上下文占用百分比（最近一次请求的输入 / 窗口）。
 	// 不 clamp 到 100%——超了正好当"快爆窗口"的告警信号。
 	// 保留两位小数：低占用（如 3.47%）时整数直接抹成 0%，看不出量级。
+	var s string
 	if w := a.usage.ContextWindow; w > 0 && a.usage.LastPromptTokens > 0 {
 		pct := float64(a.usage.LastPromptTokens) / float64(w) * 100
-		return fmt.Sprintf("ctx %.2f%%", pct)
+		s = fmt.Sprintf("ctx %.2f%%", pct)
+	} else if a.usage.TotalTokens > 0 {
+		// 模型不返回 usage（TotalTokens 为 0）时退回估算值，~ 前缀标记"非精确"
+		s = fmt.Sprintf("tok %s", humanize(a.usage.TotalTokens))
+	} else {
+		s = fmt.Sprintf("tok ~%s", humanize(a.usage.EstimateTokens))
 	}
-	// 模型不返回 usage（TotalTokens 为 0）时退回估算值，~ 前缀标记"非精确"
-	if a.usage.TotalTokens > 0 {
-		return fmt.Sprintf("tok %s", humanize(a.usage.TotalTokens))
+	// 上下文缓存命中率，模型没返回 cache 字段时不显示。
+	// 保留一位小数：命中率 0.4% 时整数会抹成 0%，看不出"几乎没命中"。
+	if rate, ok := a.usage.CacheHitRate(); ok {
+		s += fmt.Sprintf(" cache %.1f%%", rate)
 	}
-	return fmt.Sprintf("tok ~%s", humanize(a.usage.EstimateTokens))
+	return s
 }
 
 // humanize 把大数格式化为千分位缩写，12345 -> "12.3k"。

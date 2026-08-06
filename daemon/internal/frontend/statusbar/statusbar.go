@@ -31,12 +31,24 @@ const (
 // Usage 是 agent token 用量的累计快照，随 EventUsage 事件广播。
 // 独立于 plugin 的类型定义，避免 frontend 反向依赖插件内部实现。
 type Usage struct {
-	EstimateTokens   int
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-	LastPromptTokens int // 最近一次 Chat 的输入 token，上下文占用百分比计算用
-	ContextWindow    int // 模型上下文窗口（token），0 = 未知（显示 fallback）
+	EstimateTokens        int
+	PromptTokens          int
+	PromptCacheHitTokens  int
+	PromptCacheMissTokens int
+	CompletionTokens      int
+	TotalTokens           int
+	LastPromptTokens      int // 最近一次 Chat 的输入 token，上下文占用百分比计算用
+	ContextWindow         int // 模型上下文窗口（token），0 = 未知（显示 fallback）
+}
+
+// CacheHitRate 返回上下文缓存命中率百分比（0-100），模型没返回 cache 字段时返回 (0, false)。
+// 与 core.Usage.CacheHitRate 保持同一公式——frontend 不反向依赖 plugin 内部实现，
+// 跨包重复这一个 3 行公式，是架构隔离的代价。
+func (u Usage) CacheHitRate() (float64, bool) {
+	if u.PromptCacheHitTokens+u.PromptCacheMissTokens == 0 {
+		return 0, false
+	}
+	return float64(u.PromptCacheHitTokens) / float64(u.PromptCacheHitTokens+u.PromptCacheMissTokens) * 100, true
 }
 
 // Addon 定义状态栏的一个可插拔段。

@@ -4,13 +4,24 @@ import "sync"
 
 // Usage 单次 Chat 调用的 token 账本。
 type Usage struct {
-	Iteration        int // ReAct 第几轮（从 0 开始）
-	PromptTokens     int // 模型返回的输入 token
-	CompletionTokens int // 模型返回的输出 token
-	TotalTokens      int // 模型返回的总计
-	EstimateTokens   int // 发送前粗估（JSON 字节数 / 4），对照模型返回值
+	Iteration             int // ReAct 第几轮（从 0 开始）
+	PromptTokens          int // 模型返回的输入 token
+	CompletionTokens      int // 模型返回的输出 token
+	TotalTokens           int // 模型返回的总计
+	EstimateTokens        int // 发送前粗估（JSON 字节数 / 4），对照模型返回值
+	PromptCacheHitTokens  int // 用户 prompt 中，命中上下文缓存的 token 数
+	PromptCacheMissTokens int // 用户 prompt 中，未命中上下文缓存的 token 数
 
 	LastPromptTokens int // 仅快照有效：最近一次 Chat 的输入 token（上下文占用计算用）
+}
+
+// CacheHitRate 返回上下文缓存命中率百分比（0-100）。
+// 模型没返回 cache 字段（hit+miss 为 0）时返回 (0, false)，调用方据此跳过显示。
+func (u Usage) CacheHitRate() (float64, bool) {
+	if u.PromptCacheHitTokens+u.PromptCacheMissTokens == 0 {
+		return 0, false
+	}
+	return float64(u.PromptCacheHitTokens) / float64(u.PromptCacheHitTokens+u.PromptCacheMissTokens) * 100, true
 }
 
 // Compaction 记录一次历史压缩。
@@ -48,10 +59,14 @@ func (t *UsageTracker) Record(iter, estimate int, u *UsageInfo) {
 		call.PromptTokens = u.PromptTokens
 		call.CompletionTokens = u.CompletionTokens
 		call.TotalTokens = u.TotalTokens
+		call.PromptCacheHitTokens = u.PromptCacheHitTokens
+		call.PromptCacheMissTokens = u.PromptCacheMissTokens
 	}
 	t.calls = append(t.calls, call)
 
 	t.total.PromptTokens += call.PromptTokens
+	t.total.PromptCacheHitTokens += call.PromptCacheHitTokens
+	t.total.PromptCacheMissTokens += call.PromptCacheMissTokens
 	t.total.CompletionTokens += call.CompletionTokens
 	t.total.TotalTokens += call.TotalTokens
 	t.total.EstimateTokens += estimate
