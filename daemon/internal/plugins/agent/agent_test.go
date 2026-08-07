@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
+	"github.com/tinguo/goworker/daemon/internal/plugins/agent/middlewares"
 )
 
 // captureProvider 记录最后一次请求并返回最终答复。
@@ -106,7 +107,7 @@ func (p *toolLoopProvider) ChatStream(context.Context, *core.ChatRequest) (<-cha
 }
 
 func TestAgent_CustomMaxIterationsRespected(t *testing.T) {
-	a := NewAgent(&toolLoopProvider{count: 999}, DefaultTools(nil), nil, WithMaxIterations(3))
+	a := NewAgent(&toolLoopProvider{count: 999}, "", DefaultTools(nil), nil, WithMaxIterations(3))
 	tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")
 	if err != nil {
 		t.Fatalf("Run err = %v", err)
@@ -136,8 +137,28 @@ func TestAgent_CustomMaxIterationsRespected(t *testing.T) {
 	}
 }
 
+func TestAgent_IterationMiddlewareFiresPerIteration(t *testing.T) {
+	fired := 0
+	iterMw := middlewares.NewIterationMiddleware(func() { fired++ })
+	// count=2：两轮 tool call + 一轮 final = 3 次迭代，每轮 OnBeforeModel fire 一次
+	a := NewAgent(&toolLoopProvider{count: 2}, "", DefaultTools(nil), []core.Middleware{iterMw})
+	tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")
+	if err != nil {
+		t.Fatalf("Run err = %v", err)
+	}
+	for tok := range tokenCh {
+		if tok.Done {
+			break
+		}
+	}
+	if fired != 3 {
+		t.Errorf("iteration events = %d, want 3", fired)
+	}
+	<-msgCh
+}
+
 func TestAgent_ProviderErrorIsVisible(t *testing.T) {
-	a := NewAgent(errProvider{}, nil, nil)
+	a := NewAgent(errProvider{}, "", nil, nil)
 	tokenCh, msgCh, err := a.Run(context.Background(), nil, "hi")
 	if err != nil {
 		t.Fatalf("Run err = %v", err)
@@ -164,7 +185,7 @@ func TestAgent_ProviderErrorIsVisible(t *testing.T) {
 }
 
 func TestAgent_EmptyChoicesIsVisible(t *testing.T) {
-	a := NewAgent(emptyProvider{}, nil, nil)
+	a := NewAgent(emptyProvider{}, "", nil, nil)
 	tokenCh, msgCh, err := a.Run(context.Background(), nil, "hi")
 	if err != nil {
 		t.Fatalf("Run err = %v", err)
@@ -185,7 +206,7 @@ func TestAgent_EmptyChoicesIsVisible(t *testing.T) {
 }
 
 func TestAgent_EmptyContentIsVisible(t *testing.T) {
-	a := NewAgent(emptyContentProvider{}, nil, nil)
+	a := NewAgent(emptyContentProvider{}, "", nil, nil)
 	tokenCh, msgCh, err := a.Run(context.Background(), nil, "hi")
 	if err != nil {
 		t.Fatalf("Run err = %v", err)
@@ -206,7 +227,7 @@ func TestAgent_EmptyContentIsVisible(t *testing.T) {
 }
 
 func TestAgent_NilResponseIsVisible(t *testing.T) {
-	a := NewAgent(nilRespProvider{}, nil, nil)
+	a := NewAgent(nilRespProvider{}, "", nil, nil)
 	tokenCh, msgCh, err := a.Run(context.Background(), nil, "hi")
 	if err != nil {
 		t.Fatalf("Run err = %v", err)
@@ -248,7 +269,7 @@ func TestDefaultToolsReadWriteStillWork(t *testing.T) {
 func TestAgent_MaxIterationsExhaustedStillFinishes(t *testing.T) {
 	// 显式给个小上限触发耗尽：defaultMaxIterations 已是 MaxInt，靠默认值跑不出耗尽。
 	const exhaustedIters = 5
-	a := NewAgent(&toolLoopProvider{count: 999}, DefaultTools(nil), nil, WithMaxIterations(exhaustedIters))
+	a := NewAgent(&toolLoopProvider{count: 999}, "", DefaultTools(nil), nil, WithMaxIterations(exhaustedIters))
 	tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")
 	if err != nil {
 		t.Fatalf("Run err = %v", err)
@@ -291,7 +312,7 @@ func (replaceMW) OnBeforeModel(ev *core.BeforeModelEvent) *core.MiddlewareRespon
 
 func TestAgent_SendsReplacedHistoryToChat(t *testing.T) {
 	provider := &captureProvider{}
-	a := NewAgent(provider, nil, []core.Middleware{replaceMW{}})
+	a := NewAgent(provider, "", nil, []core.Middleware{replaceMW{}})
 
 	tokenCh, msgCh, err := a.Run(context.Background(), nil, "hello")
 	if err != nil {

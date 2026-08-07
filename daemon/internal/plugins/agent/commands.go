@@ -1,12 +1,10 @@
 package agent
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
@@ -123,13 +121,11 @@ func (p *AgentPlugin) showConfig(ctx *spec.Context) {
 // ---- /usage 命令 ----
 
 func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
-	calls := p.usage.Calls()
-	comps := p.usage.Compactions()
+	calls, comps, total := p.session.UsageSnapshot()
 	if len(calls) == 0 && len(comps) == 0 {
 		ctx.Writer("(no agent calls yet — run /agent first)\n")
 		return nil
 	}
-	total := p.usage.Snapshot()
 
 	if len(calls) > 0 {
 		ctx.Writer(fmt.Sprintf("usage: %d model calls this session\n\n", len(calls)))
@@ -173,10 +169,7 @@ func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
 	}
 
 	// 当前历史占用：压缩后的直观体现，不必等下一次模型调用。
-	// 锁内只拷引用，估算（JSON 序列化）放到锁外，别把大对象拖进临界区。
-	p.mu.Lock()
-	conv := p.conversation
-	p.mu.Unlock()
+	conv := p.session.Conversation()
 	if convLen := len(conv); convLen > 0 {
 		convEst := core.EstimateTokens(conv)
 		line := fmt.Sprintf("  history: %s est (%d msgs)", humanize(convEst), convLen)
@@ -191,50 +184,7 @@ func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
 // ---- /compact 命令 ----
 
 func (p *AgentPlugin) handleCompact(ctx *spec.Context) error {
-	// 压缩会丢原文，先固化到任务档案 —— 这是原文丢失前的最后一次机会。
-	if p.memory != nil {
-		sum, err := p.checkpointMemory(ctx.Ctx)
-		if err != nil {
-			ctx.Writer(fmt.Sprintf("⚠ Memory consolidation failed (original text lost after compression): %v\n", err))
-		} else if notice := renderCheckpointNotice(sum); notice != "" {
-			ctx.Writer(notice)
-		}
-	}
-
-	// 一次性锁内快照，空检查与后续压缩共用同一份数据
-	p.mu.Lock()
-	history := p.conversation
-	before := len(history)
-	p.mu.Unlock()
-	if before == 0 {
-		ctx.Writer("(no conversation history yet — run /agent first)\n")
-		return nil
-	}
-
-	cfg := p.hub.Config
-	provider := NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
-	// protectSystem=false：p.conversation 不含系统提示，首位可能是上次的摘要，允许被再次滚动
-	compressor := core.NewCompressor(provider, cfg.LLM.CompactKeep, false, func(r core.CompressReport) {
-		p.usage.RecordCompaction(core.Compaction{BeforeMsgs: r.BeforeMsgs, AfterMsgs: r.AfterMsgs, Tokens: r.Tokens})
-	})
-
-	cctx, cancel := context.WithTimeout(ctx.Ctx, 2*time.Minute)
-	defer cancel()
-	compacted, err := compressor.Compress(cctx, history)
-	if err != nil {
-		ctx.Writer(fmt.Sprintf("✘ 压缩失败: %v\n", err))
-		return nil
-	}
-	if len(compacted) >= before {
-		ctx.Writer("(history too short or no safe split point; not compacted)\n")
-		return nil
-	}
-
-	p.mu.Lock()
-	p.conversation = compacted
-	p.mu.Unlock()
-	ctx.Writer(fmt.Sprintf("✔ 已压缩: %d 条 → %d 条\n", before, len(compacted)))
-	return nil
+	return p.session.Compact(ctx)
 }
 
 // ---- /skills 命令 ----
@@ -254,9 +204,7 @@ func (p *AgentPlugin) handleSkills(ctx *spec.Context) error {
 // ---- /history 命令 ----
 
 func (p *AgentPlugin) handleHistory(ctx *spec.Context) error {
-	p.mu.Lock()
-	conv := p.conversation
-	p.mu.Unlock()
+	conv := p.session.Conversation()
 	if len(conv) == 0 {
 		ctx.Writer("(no conversation history yet — run /agent first)\n")
 		return nil
@@ -274,11 +222,11 @@ func (p *AgentPlugin) handleHistory(ctx *spec.Context) error {
 // handleRules 只读展示当前生效的指令快照 —— 与注入 system prompt 的内容一致，
 // 方便核对"agent 到底被灌了什么规矩"。
 func (p *AgentPlugin) handleRules(ctx *spec.Context) error {
-	if p.instructions == nil {
+	if p.deps.Instruction == nil {
 		ctx.Writer("declarative instructions disabled (memory.enabled=false or load failed)\n")
 		return nil
 	}
-	snap := p.instructions.Snapshot()
+	snap := p.deps.Instruction.Snapshot()
 	if snap == "" {
 		ctx.Writer("(no active instructions — global AGENTS.md/USER.md go in ~/.config/goworker/, project AGENTS.md in the project root)\n")
 		return nil

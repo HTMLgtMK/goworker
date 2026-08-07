@@ -55,7 +55,8 @@ func humanize(n int) string {
 }
 
 // renderKind 将 core.Token 类型映射为 spec.RenderKind，剥离渲染逻辑。
-func (p *AgentPlugin) renderKind(t core.Token) (spec.RenderKind, string) {
+// 接收者已去掉（函数体不依赖插件状态），供 Session.Run 直接调用。
+func renderKind(t core.Token) (spec.RenderKind, string) {
 	switch t.Type {
 	case core.TokenTypeToolCall:
 		return spec.KindToolCall, t.Content

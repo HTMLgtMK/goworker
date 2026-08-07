@@ -3,111 +3,117 @@ package agent
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/frontend/statusbar"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/middlewares"
+	"github.com/tinguo/goworker/daemon/internal/sandbox"
 	"github.com/tinguo/goworker/daemon/internal/spec"
+	"github.com/tinguo/goworker/memory"
 )
 
-// 本文件是会话运行与控制命令：/agent（对话）与 /new（结束会话）。
+// 本文件是会话层：Session 收敛会话状态（conversation/usage）与核心操作，
+// 命令 /agent 与 /new 经薄壳调用。AgentPlugin 只保留资源装载与命令注册。
 
-// ---- /agent 命令 ----
+// ---- Session：会话状态与核心操作 ----
 
-func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
+// Session 是一段会话：收敛会话状态（conversation/usage）与核心操作（Run/Compact/…）。
+// NewSession 创建会话（Init / /new 各一次）；/new 用新实例替换旧实例，旧会话状态随对象回收。
+// AgentPlugin 只保留资源装载（memory/mcp/skills/instructions）与命令注册。
+// store 留待 A（会话持久化）落地后接入 —— 骨架阶段不碰。
+type Session struct {
+	mu           sync.Mutex
+	conversation []core.Message
+	usage        *core.UsageTracker
+	checkpointMu sync.Mutex // 检查点固化串行化（从 plugin 挪入）
+
+	deps SessionDeps
+}
+
+// SessionDeps 是会话构造输入包：插件级资源 + 本会话参数，Init 组装后每次 NewSession 复用。
+// 其余字段跨会话不变。可变资源（instructions）的装载在 plugin 层，这里只收最终值。
+type SessionDeps struct {
+	Hub          *spec.Hub
+	Memory       *memory.Client                         // nil = 禁用
+	CollectTools func(cfg *sandbox.Config) []core.Tool  // 方法值捕获 p，按需收集工具
+	NewProvider  func(cfg *config.Config) core.Provider // 默认 NewOpenAIProvider，测试注入 fake
+	Instruction  *memory.InstructionSet                 // 会话边界刷新（Init / /new 经 startSession 重载）
+}
+
+// NewSession 创建一个会话。usage 初始清零，conversation 从空开始。
+func NewSession(deps SessionDeps) *Session {
+	return &Session{usage: core.NewUsageTracker(), deps: deps}
+}
+
+// Run 执行一轮 /agent 对话：组装 agent → 跑 ReAct 循环 → 流式输出 → 写回 conversation。
+func (s *Session) Run(ctx *spec.Context) error {
 	input := strings.Join(ctx.Args, " ")
 	if input == "" {
 		ctx.Writer("用法: /agent <你的问题>\n")
 		return nil
 	}
 
-	// 构建沙箱配置
-	sandboxCfg := p.sandboxConfig()
-
-	// 收集工具
-	tools := p.collectTools(&sandboxCfg)
-
-	// 创建 Provider、Middleware 和 Agent
-	cfg := p.hub.Config
-	provider := NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
+	// usage 是会话累计账本：跨多次 /agent 累计，直到 /new 用新对象替换当前会话才清零。
+	sandboxCfg := *sandbox.NewFromConfig(&s.deps.Hub.Config.Sandbox)
+	tools := s.deps.CollectTools(&sandboxCfg)
+	cfg := s.deps.Hub.Config
+	provider := s.deps.NewProvider(cfg)
 	decisions := make(chan spec.HITLDecision, 1)
-	hitlMw := middlewares.NewHITLMiddleware(sandboxCfg, middlewares.NewChannelDecisionProvider(decisions))
-	// 新一轮会话清零统计；usage middleware 动态注册，从注册时刻开始记账
-	p.usage.Reset()
-	usageMw := middlewares.NewUsageMiddleware(p.usage, func(u core.Usage) {
-		if ctx.Publish != nil {
-			ctx.Publish(statusbar.EventUsage, statusbar.Usage{
-				EstimateTokens:        u.EstimateTokens,
-				PromptTokens:          u.PromptTokens,
-				PromptCacheHitTokens:  u.PromptCacheHitTokens,
-				PromptCacheMissTokens: u.PromptCacheMissTokens,
-				CompletionTokens:      u.CompletionTokens,
-				TotalTokens:           u.TotalTokens,
-				LastPromptTokens:      u.LastPromptTokens,
-				ContextWindow:         cfg.LLM.ContextWindow,
-			})
-		}
-	})
-	// 自动压缩：BeforeModel 预检，估算用量超阈值就滚动压缩历史。
-	// protectSystem=true：history[0] 是本轮注入的系统提示，不能被压进摘要。
-	compressMw := middlewares.NewCompressionMiddleware(
-		core.NewCompressor(provider, cfg.LLM.CompactKeep, true, func(r core.CompressReport) {
-			p.usage.RecordCompaction(core.Compaction{BeforeMsgs: r.BeforeMsgs, AfterMsgs: r.AfterMsgs, Tokens: r.Tokens})
-		}),
-		cfg.LLM.ContextWindow,
-		cfg.LLM.CompressAt,
-	)
-	// memory middleware：每次 query 都从记忆组件检索相关条目注入提醒。
-	// 必须在 compressMw 之前，让压缩器测量的是注入后的完整 history。
-	mws := []core.Middleware{hitlMw, usageMw, compressMw}
-	if p.memory != nil {
-		memMw := middlewares.NewMemoryMiddleware(p.memory, cfg.Memory, cfg.LLM.ContextWindow)
-		mws = []core.Middleware{hitlMw, usageMw, memMw, compressMw}
-	}
+	mws := s.buildMiddlewareChain(ctx, provider, &sandboxCfg, cfg, decisions)
+	systemPrompt := s.buildSystemPrompt(cfg, tools)
+
 	opts := []Option{WithMaxIterations(cfg.LLM.MaxIterations)}
-	if p.instructions != nil {
-		opts = append(opts, WithSystemExtra(p.instructions.Snapshot()))
-	}
-	agent := NewAgent(provider, tools, mws, opts...)
-	agent.OnIteration = func() {
-		if ctx.Publish != nil {
-			ctx.Publish(statusbar.EventIteration, nil)
-		}
-	}
+	agent := NewAgent(provider, systemPrompt, tools, mws, opts...)
 
 	// agentCtx 不设硬超时：多轮 tool call 总耗时不可控，5 分钟硬超时只会在工具循环
 	// 中途切断会话，且超时瞬间 sendToken 会把唯一的错误提示吞掉，前端表现成"莫名停止"。
-	// 兜底交给单次请求自身：provider http 30s 超时；bash 类子进程工具受 60s 限制
-	// （CommandContext + 进程组 kill），read_file/write_file 的同步 syscall 不认 ctx，
-	// 用 goroutine + select 包装让取消能提前返回，真正挂死的 OS 层仍依赖系统恢复。
+	// 兜底交给单次请求自身：provider http 30s 超时；bash 类子进程工具受 60s 限制。
 	agentCtx, cancel := context.WithCancel(ctx.Ctx)
 	defer cancel()
 
 	// 快照历史给本轮的 Run（工具重入触发的 /compact 不会污染本次运行的输入）
-	p.mu.Lock()
-	conv := p.conversation
-	p.mu.Unlock()
+	s.mu.Lock()
+	conv := s.conversation
+	s.mu.Unlock()
 
 	tokenCh, msgCh, err := agent.Run(agentCtx, conv, input)
 	if err != nil {
 		ctx.Writer(fmt.Sprintf("✘ %v\n", err))
 		return nil
 	}
+	s.streamTokens(ctx, agentCtx, tokenCh, decisions)
 
+	// 保存对话历史（剔除首条 system prompt + memory 注入的记忆提醒块）。
+	// 记忆块只服务本次 run 的注入，若漏进 STM：下次 run 会重发它、检查点会把
+	// 它当对话内容固化（自指污染）—— 必须过滤掉。
+	messages := <-msgCh
+	if len(messages) > 1 {
+		conv := stripMemoryBlocks(messages[1:])
+		s.mu.Lock()
+		s.conversation = conv
+		s.mu.Unlock()
+	}
+	return nil
+}
+
+// streamTokens 消费 agent 的流式输出：渲染 token、转发 HITL 决策。
+// HITL 决策由前端按 spec 契约完成，plugin 只负责转交；agentCtx 取消时决策投递放弃。
+func (s *Session) streamTokens(ctx *spec.Context, agentCtx context.Context, tokenCh <-chan core.Token, decisions chan spec.HITLDecision) {
 	for tok := range tokenCh {
 		// 先输出内容再检查 Done — Done token 也可能带内容（如错误信息）
 		if tok.Content != "" {
-			kind, c := p.renderKind(tok)
+			kind, c := renderKind(tok)
 			ctx.WriteToken(kind, c)
 		}
 		if tok.Done {
 			break
 		}
 		if tok.Type == core.TokenTypeInterrupt && tok.Interrupt != nil {
-			// HITL 决策由前端按 spec 契约完成，plugin 只负责转交
 			decision := spec.HITLDecision{InterruptID: tok.Interrupt.ID, Type: spec.DecisionReject}
 			if ctx.Decide != nil {
 				decision = ctx.Decide(tok.Interrupt)
@@ -120,18 +126,120 @@ func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
 		}
 	}
 	ctx.Writer("\n")
-	// 保存对话历史（剔除首条 system prompt + memory 注入的记忆提醒块）。
-	// 记忆块只服务本次 run 的注入，若漏进 STM：下次 run 会重发它、检查点会把
-	// 它当对话内容固化（自指污染）—— 必须过滤掉。
-	messages := <-msgCh
-	if len(messages) > 1 {
-		conv := stripMemoryBlocks(messages[1:])
-		p.mu.Lock()
-		p.conversation = conv
-		p.mu.Unlock()
+}
+
+// buildMiddlewareChain 组装本轮 Run 的中间件链。
+// 顺序：hitl → usage → iteration →（memory 启用时插入）→ compress。
+// memory 必须在 compress 前：压缩器测量的是注入记忆后的完整 history。
+func (s *Session) buildMiddlewareChain(ctx *spec.Context, provider core.Provider, sandboxCfg *sandbox.Config, cfg *config.Config, decisions chan spec.HITLDecision) []core.Middleware {
+	// 发布能力收拢：spec.Context 的 Publish 是通用广播（event string, data any），
+	// middleware 只认专用签名，在这里做适配。nil 保护集中在收拢点。
+	publish := func(event string, data any) {
+		if ctx.Publish != nil {
+			ctx.Publish(event, data)
+		}
 	}
 
+	hitlMw := middlewares.NewHITLMiddleware(*sandboxCfg, middlewares.NewChannelDecisionProvider(decisions))
+	// usage：观察 AfterModel 记账（累计到会话边界才清零），publish 把 core.Usage 转成 statusbar.Usage 事件
+	usageMw := middlewares.NewUsageMiddleware(s.usage, func(u core.Usage) {
+		publish(statusbar.EventUsage, statusbar.Usage{
+			EstimateTokens:        u.EstimateTokens,
+			PromptTokens:          u.PromptTokens,
+			PromptCacheHitTokens:  u.PromptCacheHitTokens,
+			PromptCacheMissTokens: u.PromptCacheMissTokens,
+			CompletionTokens:      u.CompletionTokens,
+			TotalTokens:           u.TotalTokens,
+			LastPromptTokens:      u.LastPromptTokens,
+			ContextWindow:         cfg.LLM.ContextWindow,
+		})
+	})
+	// iteration：每轮迭代发一个计数事件
+	iterationMw := middlewares.NewIterationMiddleware(func() {
+		publish(statusbar.EventIteration, nil)
+	})
+	// compress：自动压缩，protectSystem=true —— 保护本轮注入的系统提示
+	compressMw := middlewares.NewCompressionMiddleware(
+		s.newCompressor(provider, true),
+		cfg.LLM.ContextWindow,
+		cfg.LLM.CompressAt,
+	)
+
+	mws := []core.Middleware{hitlMw, usageMw, iterationMw}
+	if s.deps.Memory != nil {
+		memMw := middlewares.NewMemoryMiddleware(s.deps.Memory, cfg.Memory, cfg.LLM.ContextWindow)
+		mws = append(mws, memMw)
+	}
+	return append(mws, compressMw)
+}
+
+// newCompressor 构造压缩器，onCompress 统一记进 token 账本（/usage 能看到压缩）。
+// protectSystem=true：history[0] 是本轮注入的系统提示，压掉模型就忘了怎么用工具；
+// /compact 场景 conversation 不含系统提示，首位可能是上次的摘要，允许被再次滚动，传 false。
+func (s *Session) newCompressor(provider core.Provider, protectSystem bool) *core.Compressor {
+	cfg := s.deps.Hub.Config
+	return core.NewCompressor(provider, cfg.LLM.CompactKeep, protectSystem, func(r core.CompressReport) {
+		s.usage.RecordCompaction(core.Compaction{BeforeMsgs: r.BeforeMsgs, AfterMsgs: r.AfterMsgs, Tokens: r.Tokens})
+	})
+}
+
+// Compact 执行 /compact：压缩会丢原文，先固化到任务档案，再压缩当前 conversation。
+func (s *Session) Compact(ctx *spec.Context) error {
+	// 压缩会丢原文，先固化到任务档案 —— 这是原文丢失前的最后一次机会。
+	if s.deps.Memory != nil {
+		sum, err := s.checkpointMemory(ctx.Ctx)
+		if err != nil {
+			ctx.Writer(fmt.Sprintf("⚠ Memory consolidation failed (original text lost after compression): %v\n", err))
+		} else if notice := renderCheckpointNotice(sum); notice != "" {
+			ctx.Writer(notice)
+		}
+	}
+
+	// 一次性锁内快照，空检查与后续压缩共用同一份数据
+	s.mu.Lock()
+	history := s.conversation
+	before := len(history)
+	s.mu.Unlock()
+	if before == 0 {
+		ctx.Writer("(no conversation history yet — run /agent first)\n")
+		return nil
+	}
+
+	cfg := s.deps.Hub.Config
+	provider := s.deps.NewProvider(cfg)
+	// protectSystem=false：conversation 不含系统提示，首位可能是上次的摘要，允许被再次滚动
+	compressor := s.newCompressor(provider, false)
+
+	cctx, cancel := context.WithTimeout(ctx.Ctx, 2*time.Minute)
+	defer cancel()
+	compacted, err := compressor.Compress(cctx, history)
+	if err != nil {
+		ctx.Writer(fmt.Sprintf("✘ 压缩失败: %v\n", err))
+		return nil
+	}
+	if len(compacted) >= before {
+		ctx.Writer("(history too short or no safe split point; not compacted)\n")
+		return nil
+	}
+
+	s.mu.Lock()
+	s.conversation = compacted
+	s.mu.Unlock()
+	ctx.Writer(fmt.Sprintf("✔ 已压缩: %d 条 → %d 条\n", before, len(compacted)))
 	return nil
+}
+
+// Conversation 返回当前 conversation 的锁内快照。只读用途统一走这里：
+// /history 展示、/usage 估算、checkpoint 固化、/new 归档共用。
+func (s *Session) Conversation() []core.Message {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conversation
+}
+
+// UsageSnapshot 返回当前会话的用量数据（/usage 展示用，渲染留 Plugin 层）。
+func (s *Session) UsageSnapshot() ([]core.Usage, []core.Compaction, core.Usage) {
+	return s.usage.Calls(), s.usage.Compactions(), s.usage.Snapshot()
 }
 
 // stripMemoryBlocks 剔除 memory middleware 注入的记忆提醒块（system 消息）。
@@ -147,17 +255,22 @@ func stripMemoryBlocks(msgs []core.Message) []core.Message {
 	return out
 }
 
+// ---- /agent 命令（薄壳，全部逻辑在 Session） ----
+
+func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
+	return p.session.Run(ctx)
+}
+
 // ---- /new 命令 ----
 
 func (p *AgentPlugin) handleNew(ctx *spec.Context) error {
-	// 结束当前会话：固化异步后台执行（不阻塞输入），立即清 STM，置会话边界标记。
+	// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
+	// 后台固化旧会话，不阻塞输入；快照走只读，新会话创建不影响这份引用。
+	old := p.session
 	if p.memory != nil {
-		p.mu.Lock()
-		conv := slices.Clone(p.conversation)
-		p.mu.Unlock()
-		if len(conv) > 0 {
+		if conv := slices.Clone(old.Conversation()); len(conv) > 0 {
 			// writer 在后台 goroutine 里回显，stdin 的 Write 线程安全
-			go p.checkpointAsync(conv, ctx.Writer)
+			go old.checkpointAsync(conv, ctx.Writer)
 			ctx.Writer("✔ New session started, consolidating previous session in background…\n")
 		} else {
 			ctx.Writer("✔ New session started\n")
@@ -165,17 +278,32 @@ func (p *AgentPlugin) handleNew(ctx *spec.Context) error {
 	} else {
 		ctx.Writer("✔ New session started (memory disabled)\n")
 	}
-	p.mu.Lock()
-	p.conversation = nil
-	p.mu.Unlock()
-	// 会话边界：重新构造声明式指令快照，会话内手改的 AGENTS.md/USER.md 从此生效
-	if p.instructions != nil {
-		if inst := p.loadInstructions(); inst != nil {
-			p.instructions = inst
-		} else {
-			slog.Warn("instructions reload failed, keeping stale snapshot")
-		}
-	}
+
+	// 创建新会话（新对象 = 新会话，旧状态随对象回收）
+	p.startSession()
+
 	ctx.Writer("✔ STM cleared, memory will be retrieved on every query\n")
 	return nil
+}
+
+// 生成系统提示词
+func (s *Session) buildSystemPrompt(cfg *config.Config, tools []core.Tool) string {
+	var b strings.Builder
+	b.WriteString("You are a coding assistant with tool access.\n")
+	b.WriteString("Use tools when you need to explore, run commands, or modify files.\n")
+	b.WriteString("Think step by step. After getting tool results, continue reasoning.\n")
+	b.WriteString("When you have enough info, provide a complete answer.\n\n")
+
+	// 注入 AGENT.md + USER.md（memory disabled 或装载失败时 Instruction 为 nil，跳过指令段）
+	if s.deps.Instruction != nil {
+		b.WriteString(s.deps.Instruction.Snapshot())
+	}
+
+	// 注入 tools 清单
+	b.WriteString("Available tools:\n")
+	for _, t := range tools {
+		b.WriteString(fmt.Sprintf("- %s: %s\n", t.Name, t.Description))
+	}
+	b.WriteString("\nRespond naturally. Use tools when needed.")
+	return b.String()
 }

@@ -130,11 +130,11 @@ func (p *AgentPlugin) handleMemory(ctx *spec.Context) error {
 		ctx.Writer(fmt.Sprintf("✔ forgot %d\n", len(args)-1))
 
 	case "profile":
-		if p.instructions == nil || p.instructions.Profile() == nil {
+		if p.deps.Instruction == nil || p.deps.Instruction.Profile() == nil {
 			ctx.Writer("declarative instructions disabled (memory.enabled=false or load failed)\n")
 			return nil
 		}
-		prof := p.instructions.Profile()
+		prof := p.deps.Instruction.Profile()
 		used, max := prof.Capacity()
 		ctx.Writer(fmt.Sprintf("USER.md capacity: %d/%d chars\n", used, max))
 		if strings.TrimSpace(prof.Content()) == "" {
@@ -230,7 +230,7 @@ func (p *AgentPlugin) handleTask(ctx *spec.Context) error {
 		ctx.Writer(fmt.Sprintf("✔ 已关闭 task %s\n", id))
 
 	case "checkpoint":
-		sum, err := p.checkpointMemory(ctx.Ctx)
+		sum, err := p.session.checkpointMemory(ctx.Ctx)
 		if err != nil {
 			ctx.Writer(fmt.Sprintf("✘ Consolidation failed: %v\n", err))
 			return nil

@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/tinguo/goworker/daemon/internal/config"
@@ -27,25 +26,22 @@ import (
 //	util.go       — 展示层小工具函数
 type AgentPlugin struct {
 	hub *spec.Hub
-	mu  sync.Mutex
-	// conversation 跨 /agent 调用累积，也被工具重入触发的 /compact 改写 ——
-	// 与 usage tracker 同理由，加锁保护（每次只是短暂快照/写回，不跨 Run 持锁）。
-	conversation []core.Message        // 跨 /agent 调用的对话历史
-	usage        *core.UsageTracker    // 当前 /agent 会话的 token 统计（纯数据，供 /usage 读取）
-	skills       []skills.Skill        // Init 时加载的 skill 清单，注册为 skill_* 工具
-	mcpClients   map[string]mcp.Client // server name → 连接，Stop 时统一关闭
-	mcpTools     []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
-	memory       *memory.Client        // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
-	// instructions 是声明式指令快照（USER.md + AGENTS.md），冻结于会话启动。
-	instructions *memory.InstructionSet
-	checkpointMu sync.Mutex // 串行化检查点固化：读快照→LLM→应用的整个周期
+	// deps 是 Session 的资源依赖，startSession 每次会话边界全量重建（含指令快照），
+	// /new 经同一路径刷新后以新 deps 创建新会话。
+	deps SessionDeps
+	// session 是当前会话。NewSession 创建（Init 一次 + /new 一次）；/new 用新实例替换，
+	// 旧会话状态（conversation/usage）随对象回收。
+	session    *Session
+	skills     []skills.Skill        // Init 时加载的 skill 清单，注册为 skill_* 工具
+	mcpClients map[string]mcp.Client // server name → 连接，Stop 时统一关闭
+	mcpTools   []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
+	memory     *memory.Client        // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }
 
 func (p *AgentPlugin) Init(h *spec.Hub) error {
 	p.hub = h
-	p.usage = core.NewUsageTracker()
 	p.mcpClients = make(map[string]mcp.Client)
 
 	// Init 中途失败要回收已连接的 MCP 进程 —— Engine.Register 在 Init 报错时不会调用 Stop
@@ -133,24 +129,8 @@ func (p *AgentPlugin) Init(h *spec.Hub) error {
 		}
 	}
 
-	// 声明式指令层（USER.md + AGENTS.md），与记忆组件同开关。独立于 JSONL 存储：
-	// 记忆 store 打不开时指令仍可加载（纯文件读取）。
-	if p.hub.Config.Memory.Enabled {
-		p.instructions = p.loadInstructions()
-	}
-
-	// 加载 skill：用户级 + 项目级（后者覆盖前者）。坏 skill 跳过并记录，不拖垮其他的
-	discovered, skillErrs := skills.Discover(
-		filepath.Join(config.DefaultDir(), "skills"),
-		filepath.Join(".goworker", "skills"),
-	)
-	for _, err := range skillErrs {
-		slog.Warn("skill load error, skipping", "err", err)
-	}
-	p.skills = discovered
-
-	// 连接 MCP server 并拉取工具清单。坏 server 只降级不阻塞插件启动
-	p.loadMCP()
+	// 开始session：加载 skill、连接 MCP server、拉取工具清单、构造声明式指令快照、创建首会话。
+	p.startSession()
 
 	// 未匹配的任何命令都转发给 agent 处理
 	h.SetFallbackHandler(p.handleAgent)
@@ -167,10 +147,10 @@ func (p *AgentPlugin) Stop() error {
 	if p.memory != nil {
 		// 进程退出 = 会话结束，把当前 conversation 固化进任务档案，供下次会话恢复。
 		// 同步等一次 LLM（带超时），否则后台 goroutine 会被进程退出杀掉，固化直接丢。
-		// LLM 网关慢时 20s 容易超时丢历史，放宽到 45s 给足时间。
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		// LLM 网关慢时 20s 容易超时丢历史，放宽到 120s 给足时间。
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		// checkpointSnapshot 内部已打 applied 日志，这里不重复
-		if _, err := p.checkpointMemory(ctx); err != nil {
+		if _, err := p.session.checkpointMemory(ctx); err != nil {
 			slog.Warn("memory: stop checkpoint failed", "err", err)
 		}
 		cancel()
@@ -189,4 +169,39 @@ func (p *AgentPlugin) closeMCP() {
 		}
 	}
 	p.mcpClients = make(map[string]mcp.Client)
+}
+
+func (p *AgentPlugin) startSession() {
+
+	// 加载 skill：用户级 + 项目级（后者覆盖前者）。坏 skill 跳过并记录，不拖垮其他的
+	discovered, skillErrs := skills.Discover(
+		filepath.Join(config.DefaultDir(), "skills"),
+		filepath.Join(".goworker", "skills"),
+	)
+	for _, err := range skillErrs {
+		slog.Warn("skill load error, skipping", "err", err)
+	}
+	p.skills = discovered
+
+	// 连接 MCP server 并拉取工具清单。坏 server 只降级不阻塞插件启动
+	p.loadMCP()
+
+	// 会话层组装：资源就绪后构造 deps 与首会话。
+
+	modelProvider := func(cfg *config.Config) core.Provider {
+		return NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
+	}
+
+	p.deps = SessionDeps{
+		Hub:          p.hub,
+		Memory:       p.memory,
+		CollectTools: p.collectTools,
+		NewProvider:  modelProvider,
+	}
+	// 指令快照与记忆组件同开关：memory disabled 时留 nil，buildSystemPrompt 跳过指令段。
+	// 会话边界（Init / /new）经 startSession 重载 —— system prompt 在会话创建前就绪。
+	if p.hub.Config.Memory.Enabled {
+		p.deps.Instruction = p.loadInstructions()
+	}
+	p.session = NewSession(p.deps)
 }

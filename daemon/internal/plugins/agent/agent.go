@@ -184,9 +184,7 @@ type Agent struct {
 	toolMap       map[string]core.Tool
 	middlewares   []core.Middleware
 	maxIterations int
-	systemExtra   string // 追加进 system prompt 首条的静态上下文（声明式指令快照）
-
-	OnIteration func() // 可选：每次 ReAct 循环前调用，用于 UI 反馈（status bar 迭代计数）
+	systemPrompt  string
 }
 
 // Option 可配置 Agent 的可选行为。
@@ -201,18 +199,7 @@ func WithMaxIterations(n int) Option {
 	}
 }
 
-// WithSystemExtra 追加静态上下文到 system prompt 首条末尾（如声明式指令快照）。
-// 空串忽略。注意：注入内容是 index 0 的一部分，天然被 strip 整条剥掉、受
-// 压缩器 protectSystem 保护 —— 不要用独立 system 消息注入，那会漏进 STM。
-func WithSystemExtra(content string) Option {
-	return func(a *Agent) {
-		if content != "" {
-			a.systemExtra = content
-		}
-	}
-}
-
-func NewAgent(provider core.Provider, tools []core.Tool, mws []core.Middleware, opts ...Option) *Agent {
+func NewAgent(provider core.Provider, systemPrompt string, tools []core.Tool, mws []core.Middleware, opts ...Option) *Agent {
 	tm := make(map[string]core.Tool, len(tools))
 	for _, t := range tools {
 		tm[t.Name] = t
@@ -223,6 +210,7 @@ func NewAgent(provider core.Provider, tools []core.Tool, mws []core.Middleware, 
 		toolMap:       tm,
 		middlewares:   mws,
 		maxIterations: defaultMaxIterations,
+		systemPrompt:  systemPrompt,
 	}
 	for _, o := range opts {
 		o(a)
@@ -250,9 +238,6 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 		}()
 
 		for iter := 0; iter < a.maxIterations; iter++ {
-			if a.OnIteration != nil {
-				a.OnIteration()
-			}
 			bmEv := &core.BeforeModelEvent{Ctx: ctx, History: messages, Input: input}
 			a.fireMiddlewareEvent(bmEv)
 			// 压缩等 middleware 可能整体替换 History —— 发请求前回读，无替换时等价于原值
@@ -422,28 +407,11 @@ func (a *Agent) fireMiddlewareEvent(event any) {
 
 func (a *Agent) buildMessages(history []core.Message, input string) []core.Message {
 	msgs := make([]core.Message, 0, len(history)+2)
-	sp := systemPrompt(a.tools)
-	if a.systemExtra != "" {
-		sp += a.systemExtra
-	}
+	sp := a.systemPrompt
 	msgs = append(msgs, core.Message{Role: "system", Content: sp})
 	msgs = append(msgs, history...)
 	msgs = append(msgs, core.Message{Role: "user", Content: input})
 	return msgs
-}
-
-func systemPrompt(tools []core.Tool) string {
-	var b strings.Builder
-	b.WriteString("You are a coding assistant with tool access.\n")
-	b.WriteString("Use tools when you need to explore, run commands, or modify files.\n")
-	b.WriteString("Think step by step. After getting tool results, continue reasoning.\n")
-	b.WriteString("When you have enough info, provide a complete answer.\n\n")
-	b.WriteString("Available tools:\n")
-	for _, t := range tools {
-		b.WriteString(fmt.Sprintf("- %s: %s\n", t.Name, t.Description))
-	}
-	b.WriteString("\nRespond naturally. Use tools when needed.")
-	return b.String()
 }
 
 func toolSpecs(tools []core.Tool) []map[string]any {

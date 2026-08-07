@@ -17,6 +17,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/mcp"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/middlewares"
+	"github.com/tinguo/goworker/daemon/internal/sandbox"
 	"github.com/tinguo/goworker/daemon/internal/skills"
 	"github.com/tinguo/goworker/daemon/internal/spec"
 	"github.com/tinguo/goworker/memory"
@@ -36,19 +37,46 @@ func testHub(cfg *config.Config) (*spec.Hub, *[]*config.Config) {
 	return hub, &saved
 }
 
-// newAgentPlugin 构造带完整依赖的插件（usage tracker 由 Init 初始化，测试里直接给上）。
+// newAgentPlugin 构造带完整依赖的插件：会话状态收敛在 Session，测试直接操作 p.session。
 func newAgentPlugin(hub *spec.Hub) *AgentPlugin {
-	return &AgentPlugin{hub: hub, usage: core.NewUsageTracker()}
+	p := &AgentPlugin{hub: hub}
+	// 与 Init 编排一致：资源确认后组装 deps + 创建会话
+	p.deps = SessionDeps{
+		Hub:          hub,
+		Memory:       p.memory,
+		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		NewProvider: func(cfg *config.Config) core.Provider {
+			return NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
+		},
+	}
+	p.refreshSession()
+	return p
+}
+
+// setMemory 设置插件 memory 并重建会话，模拟 Init 的编排顺序（资源就绪后创建会话）。
+// SessionDeps 是值拷贝：直接改 p.memory 不会传导到已创建会话的 deps，必须重建。
+func (p *AgentPlugin) setMemory(c *memory.Client) {
+	p.memory = c
+	p.deps.Memory = c
+	p.refreshSession()
+}
+
+// refreshSession 用当前 deps 重建会话，对齐 startSession 的会话边界构造
+// （测试不读真实文件 —— deps 由测试直接注入）。
+func (p *AgentPlugin) refreshSession() {
+	p.session = NewSession(p.deps)
 }
 
 // newContext 构造带输出捕获的 spec.Context。
+// WriteToken 与 Writer 都写进同一 buffer —— Session.Run 的流式输出测试需要它。
 func newContext(args ...string) (*spec.Context, *strings.Builder) {
 	var buf strings.Builder
 	return &spec.Context{
 		Ctx:  context.Background(),
 		Args: args,
 		FrontendContext: spec.FrontendContext{
-			Writer: func(s string) { buf.WriteString(s) },
+			Writer:     func(s string) { buf.WriteString(s) },
+			WriteToken: func(_ spec.RenderKind, s string) { buf.WriteString(s) },
 		},
 	}, &buf
 }
@@ -118,18 +146,18 @@ func TestHandleCompact_CompressesConversation(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		conv = append(conv, core.Message{Role: "user", Content: "q"}, core.Message{Role: "assistant", Content: "a"})
 	}
-	p.conversation = conv
+	p.session.conversation = conv
 
 	ctx, buf := newContext()
 	if err := p.handleCompact(ctx); err != nil {
 		t.Fatalf("handleCompact: %v", err)
 	}
 
-	if len(p.conversation) >= len(conv) {
-		t.Fatalf("conversation not shrunk: %d → %d", len(conv), len(p.conversation))
+	if len(p.session.conversation) >= len(conv) {
+		t.Fatalf("conversation not shrunk: %d → %d", len(conv), len(p.session.conversation))
 	}
-	if p.conversation[0].Role != "system" || p.conversation[0].Content != "COMPACTED" {
-		t.Errorf("conversation[0] = %+v, want COMPACTED summary", p.conversation[0])
+	if p.session.conversation[0].Role != "system" || p.session.conversation[0].Content != "COMPACTED" {
+		t.Errorf("conversation[0] = %+v, want COMPACTED summary", p.session.conversation[0])
 	}
 	if !strings.Contains(buf.String(), "✔ 已压缩") {
 		t.Errorf("output = %q, want success message", buf.String())
@@ -155,7 +183,7 @@ func TestHandleUsage_ShowsCompaction(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		conv = append(conv, core.Message{Role: "user", Content: "q"}, core.Message{Role: "assistant", Content: "a"})
 	}
-	p.conversation = conv
+	p.session.conversation = conv
 
 	compactCtx, _ := newContext()
 	if err := p.handleCompact(compactCtx); err != nil {
@@ -179,7 +207,7 @@ func TestHandleHistory_ShowsMessages(t *testing.T) {
 	cfg := config.Default()
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
-	p.conversation = []core.Message{
+	p.session.conversation = []core.Message{
 		{Role: "user", Content: "第一个问题"},
 		{Role: "assistant", Content: "第一个回答"},
 		{Role: "tool", Content: strings.Repeat("x", 300), ToolCallID: "c1"},
@@ -511,7 +539,7 @@ func newMemoryPlugin(t *testing.T) *AgentPlugin {
 		t.Fatalf("NewClient: %v", err)
 	}
 	t.Cleanup(func() { c.Close() })
-	p.memory = c
+	p.setMemory(c)
 	return p
 }
 
@@ -630,8 +658,8 @@ func TestHandleNew_EmptyConversationSkipsCheckpoint(t *testing.T) {
 	if err := p.handleNew(ctx); err != nil {
 		t.Fatalf("handleNew: %v", err)
 	}
-	if len(p.conversation) != 0 {
-		t.Errorf("conversation not cleared: %d", len(p.conversation))
+	if len(p.session.conversation) != 0 {
+		t.Errorf("conversation not cleared: %d", len(p.session.conversation))
 	}
 	if !strings.Contains(buf.String(), "New session started") {
 		t.Errorf("output = %q", buf.String())
@@ -657,9 +685,9 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
 	ms, _ := memory.NewClient(t.TempDir(), 10)
-	p.memory = ms
-	p.conversation = []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
-	p.usage.Record(0, 0, &core.UsageInfo{TotalTokens: 10})
+	p.setMemory(ms)
+	p.session.conversation = []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
+	p.session.usage.Record(0, 0, &core.UsageInfo{TotalTokens: 10})
 
 	// 固化是后台 goroutine 执行的，writer 必须线程安全
 	var out lockedBuf
@@ -675,8 +703,8 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	}
 
 	// STM 立即清空（同步路径，不等后台）
-	if len(p.conversation) != 0 {
-		t.Errorf("conversation not cleared: %d", len(p.conversation))
+	if len(p.session.conversation) != 0 {
+		t.Errorf("conversation not cleared: %d", len(p.session.conversation))
 	}
 	if !strings.Contains(out.String(), "New session started") {
 		t.Errorf("output = %q", out.String())
@@ -850,14 +878,14 @@ func TestCheckpoint_FiltersToolMessages(t *testing.T) {
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
 	ms, _ := memory.NewClient(t.TempDir(), 10)
-	p.memory = ms
-	p.conversation = []core.Message{
+	p.setMemory(ms)
+	p.session.conversation = []core.Message{
 		{Role: "user", Content: "查下磁盘"},
 		{Role: "assistant", Content: "", ToolCalls: []core.ToolCall{{ID: "call_1", Type: "function", Function: core.ToolCallFunction{Name: "bash", Arguments: `{"command":"df -h"}`}}}},
 		{Role: "tool", ToolCallID: "call_1", Content: "Filesystem 1.9T 60% used"},
 		{Role: "assistant", Content: "磁盘用了 60%"},
 	}
-	if _, err := p.checkpointMemory(context.Background()); err != nil {
+	if _, err := p.session.checkpointMemory(context.Background()); err != nil {
 		t.Fatalf("checkpointMemory: %v", err)
 	}
 }
@@ -878,8 +906,8 @@ func TestHandleNew_LtmExtractDisabledSkipsFacts(t *testing.T) {
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
 	ms, _ := memory.NewClient(t.TempDir(), 10)
-	p.memory = ms
-	p.conversation = []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
+	p.setMemory(ms)
+	p.session.conversation = []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
 
 	var out lockedBuf
 	ctx := &spec.Context{

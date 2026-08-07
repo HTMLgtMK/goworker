@@ -23,11 +23,11 @@ import (
 // 触发点都是低频事件：/compact、进程退出、/task checkpoint —— 这些调用方
 // 语义上必须等固化完成（压缩前、退出前），故保持同步。
 // 返回本次固化的实际结果明细（nil = 无可固化内容），供调用方回显/留痕。
-func (p *AgentPlugin) checkpointMemory(ctx context.Context) (*memory.AppliedSummary, error) {
-	p.mu.Lock()
-	conv := slices.Clone(p.conversation)
-	p.mu.Unlock()
-	return p.checkpointSnapshot(ctx, conv)
+func (s *Session) checkpointMemory(ctx context.Context) (*memory.AppliedSummary, error) {
+	s.mu.Lock()
+	conv := slices.Clone(s.conversation)
+	s.mu.Unlock()
+	return s.checkpointSnapshot(ctx, conv)
 }
 
 // checkpointSnapshot 把给定 conversation 快照固化进任务档案。
@@ -36,40 +36,40 @@ func (p *AgentPlugin) checkpointMemory(ctx context.Context) (*memory.AppliedSumm
 // 并发检查点（如 /compact 与退出 Stop、后台固化重叠）会基于过期快照互相覆盖，
 // 必须整体互斥。返回本次固化实际应用的明细（AppliedSummary，nil = 无可固化内容）。
 // 快照必须由调用方在锁内克隆 —— /new 的后台固化依赖此保证清 STM 后仍能固化旧历史。
-func (p *AgentPlugin) checkpointSnapshot(ctx context.Context, conv []core.Message) (*memory.AppliedSummary, error) {
+func (s *Session) checkpointSnapshot(ctx context.Context, conv []core.Message) (*memory.AppliedSummary, error) {
 	// checkpointMu 可能被后台固化（/new 异步，最长 120s）持有 —— 拿锁不能无界阻塞，
 	// 否则 Stop 的 45s 超时形同虚设：等拿到锁时 ctx 已取消，固化静默失败。
 	acquired := make(chan struct{})
 	go func() {
-		p.checkpointMu.Lock()
+		s.checkpointMu.Lock()
 		close(acquired)
 	}()
 	select {
 	case <-acquired:
-		defer p.checkpointMu.Unlock()
+		defer s.checkpointMu.Unlock()
 	case <-ctx.Done():
 		// 放弃固化，但拿锁的 goroutine 仍会拿到锁 —— 等它完成后自行释放，别让锁永久持有
 		go func() {
 			<-acquired
-			p.checkpointMu.Unlock()
+			s.checkpointMu.Unlock()
 		}()
 		return nil, ctx.Err()
 	}
 
-	if p.memory == nil || len(conv) == 0 {
+	if s.deps.Memory == nil || len(conv) == 0 {
 		return nil, nil
 	}
 
-	cfg := p.hub.Config
-	provider := NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
+	cfg := s.deps.Hub.Config
+	provider := s.deps.NewProvider(cfg)
 	cwd, _ := os.Getwd()
 	cp := memory.NewCheckpointer(&llmAdapter{inner: provider}, cwd)
 
-	openTasks, err := p.memory.OpenTasks(50)
+	openTasks, err := s.deps.Memory.OpenTasks(50)
 	if err != nil {
 		return nil, fmt.Errorf("open tasks: %w", err)
 	}
-	facts, err := p.memory.ListFacts(50)
+	facts, err := s.deps.Memory.ListFacts(50)
 	if err != nil {
 		return nil, fmt.Errorf("list facts: %w", err)
 	}
@@ -85,10 +85,10 @@ func (p *AgentPlugin) checkpointSnapshot(ctx context.Context, conv []core.Messag
 		res.Decisions = nil
 	}
 	tokens := 0
-	if p.usage != nil {
-		tokens = p.usage.Snapshot().TotalTokens
+	if s.usage != nil {
+		tokens = s.usage.Snapshot().TotalTokens
 	}
-	sum, err := memory.ApplyCheckpoint(p.memory, res, openTasks, facts, cpID, tokens, cwd)
+	sum, err := memory.ApplyCheckpoint(s.deps.Memory, res, openTasks, facts, cpID, tokens, cwd)
 	if err != nil {
 		return nil, err
 	}
@@ -106,11 +106,11 @@ func (p *AgentPlugin) checkpointSnapshot(ctx context.Context, conv []core.Messag
 // writer 是捕获的命令 Writer（stdin 实现线程安全），固化期间用户可立即输入下一行。
 // 注意：若 /new 后立刻退出进程，后台固化可能未跑完，这段历史只留 STM 会丢 ——
 // 这是异步固化的代价，Stop 的同步固化兜底下一段对话。
-func (p *AgentPlugin) checkpointAsync(conv []core.Message, writer func(string)) {
+func (s *Session) checkpointAsync(conv []core.Message, writer func(string)) {
 	// 独立 ctx：命令 ctx 已随请求返回被释放，后台固化不能继承它。
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	sum, err := p.checkpointSnapshot(ctx, conv)
+	sum, err := s.checkpointSnapshot(ctx, conv)
 	if err != nil {
 		writer(fmt.Sprintf("⚠ Consolidation failed (history kept only in STM, lost on exit): %v\n", err))
 		return

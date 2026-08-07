@@ -112,7 +112,7 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 
 	// profile：agent 写入用户画像 USER.md 的结构化入口。声明式指令层在，
 	// 才给 agent 写自己档案的能力 —— 写入即持久化，语义与 memory_search 的只读相对。
-	if p.instructions != nil {
+	if p.deps.Instruction != nil {
 		tools = append(tools, p.profileTool())
 	}
 
@@ -154,7 +154,7 @@ func (p *AgentPlugin) execProfileTool(args map[string]any) (string, error) {
 	action, _ := args["action"].(string)
 	content, _ := args["content"].(string)
 	oldText, _ := args["old_text"].(string)
-	if p.instructions == nil || p.instructions.Profile() == nil {
+	if p.deps.Instruction == nil || p.deps.Instruction.Profile() == nil {
 		return "", fmt.Errorf("profile: instructions not loaded")
 	}
 	switch action {
@@ -179,14 +179,14 @@ func (p *AgentPlugin) execProfileTool(args map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	used, max := p.instructions.Profile().Capacity()
+	used, max := p.deps.Instruction.Profile().Capacity()
 	return fmt.Sprintf("%s (USER.md %d/%d chars). Saved to disk; takes effect next session (/new or restart).", res, used, max), nil
 }
 
 // applyProfileAction 把一次画像写操作落到 Profile。add/replace/remove 的参数约定：
 // add/replace 用 content，replace/remove 用 oldText 定位。
 func (p *AgentPlugin) applyProfileAction(action, content, oldText string) (string, error) {
-	prof := p.instructions.Profile()
+	prof := p.deps.Instruction.Profile()
 	switch action {
 	case "add":
 		return prof.AddEntry(content)
