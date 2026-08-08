@@ -30,7 +30,6 @@ type Session struct {
 	mu           sync.Mutex
 	conversation []core.Message
 	usage        *core.UsageTracker
-	checkpointMu sync.Mutex // 检查点固化串行化（从 plugin 挪入）
 
 	deps SessionDeps
 }
@@ -185,9 +184,15 @@ func (s *Session) newCompressor(provider core.Provider, protectSystem bool) *cor
 
 // Compact 执行 /compact：压缩会丢原文，先固化到任务档案，再压缩当前 conversation。
 func (s *Session) Compact(ctx *spec.Context) error {
+	// 一次性锁内快照，固化与后续压缩共用同一份数据
+	s.mu.Lock()
+	history := s.conversation
+	before := len(history)
+	s.mu.Unlock()
+
 	// 压缩会丢原文，先固化到任务档案 —— 这是原文丢失前的最后一次机会。
 	if s.deps.Memory != nil {
-		sum, err := s.checkpointMemory(ctx.Ctx)
+		sum, err := s.checkpoint(ctx.Ctx, history)
 		if err != nil {
 			ctx.Writer(fmt.Sprintf("⚠ Memory consolidation failed (original text lost after compression): %v\n", err))
 		} else if notice := renderCheckpointNotice(sum); notice != "" {
@@ -195,11 +200,6 @@ func (s *Session) Compact(ctx *spec.Context) error {
 		}
 	}
 
-	// 一次性锁内快照，空检查与后续压缩共用同一份数据
-	s.mu.Lock()
-	history := s.conversation
-	before := len(history)
-	s.mu.Unlock()
 	if before == 0 {
 		ctx.Writer("(no conversation history yet — run /agent first)\n")
 		return nil

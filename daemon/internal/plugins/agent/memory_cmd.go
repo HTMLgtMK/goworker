@@ -230,7 +230,7 @@ func (p *AgentPlugin) handleTask(ctx *spec.Context) error {
 		ctx.Writer(fmt.Sprintf("✔ 已关闭 task %s\n", id))
 
 	case "checkpoint":
-		sum, err := p.session.checkpointMemory(ctx.Ctx)
+		sum, err := p.session.checkpoint(ctx.Ctx, p.session.Conversation())
 		if err != nil {
 			ctx.Writer(fmt.Sprintf("✘ Consolidation failed: %v\n", err))
 			return nil

@@ -44,6 +44,7 @@ vendor/
 .omc/
 omc/
 .specify/
+.codegraph
 
 # Claude local config (keep CLAUDE.md in repo, skip the rest)
 .claude/settings.local.json

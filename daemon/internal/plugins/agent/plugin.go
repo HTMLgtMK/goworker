@@ -149,8 +149,8 @@ func (p *AgentPlugin) Stop() error {
 		// 同步等一次 LLM（带超时），否则后台 goroutine 会被进程退出杀掉，固化直接丢。
 		// LLM 网关慢时 20s 容易超时丢历史，放宽到 120s 给足时间。
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		// checkpointSnapshot 内部已打 applied 日志，这里不重复
-		if _, err := p.session.checkpointMemory(ctx); err != nil {
+		// Client.Checkpoint 内部已打 applied 日志，这里不重复
+		if _, err := p.session.checkpoint(ctx, p.session.Conversation()); err != nil {
 			slog.Warn("memory: stop checkpoint failed", "err", err)
 		}
 		cancel()

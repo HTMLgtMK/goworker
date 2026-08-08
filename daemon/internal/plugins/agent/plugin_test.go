@@ -885,8 +885,8 @@ func TestCheckpoint_FiltersToolMessages(t *testing.T) {
 		{Role: "tool", ToolCallID: "call_1", Content: "Filesystem 1.9T 60% used"},
 		{Role: "assistant", Content: "磁盘用了 60%"},
 	}
-	if _, err := p.session.checkpointMemory(context.Background()); err != nil {
-		t.Fatalf("checkpointMemory: %v", err)
+	if _, err := p.session.checkpoint(context.Background(), p.session.Conversation()); err != nil {
+		t.Fatalf("checkpoint: %v", err)
 	}
 }
 

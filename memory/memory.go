@@ -6,12 +6,15 @@ import (
 	"sort"
 )
 
-// Client 是调用方的统一入口：组合存储（FileStore）与检索（Retriever）。
-// 它完整委托 Store 的全部读写方法 —— 使 *Client 自身满足 Store 接口，
-// 固化写入（ApplyCheckpoint/ApplyDecisions 收 Store）可直接传它。
+// Client 是调用方的统一入口：组合存储（FileStore）、检索（Retriever）与
+// 串行化固化（Checkpoint）。它完整委托 Store 的全部读写方法 —— 使 *Client
+// 自身满足 Store 接口，固化写入（ApplyCheckpoint/ApplyDecisions 收 Store）可直接传它。
 type Client struct {
 	store     *FileStore
 	retriever Retriever
+	// checkpointCh 是固化串行化信号量（容量 1）。所有会话/触发点的固化共用，
+	// 保证 read→LLM→write 整个周期不交错（见 consolidate.go）。
+	checkpointCh chan struct{}
 }
 
 // NewClient 打开（或创建）记忆存储，装配默认关键词检索（KeywordRetriever）。
@@ -30,7 +33,7 @@ func NewClientWithRetriever(dir string, taskKeep int, retriever Retriever) (*Cli
 	if retriever == nil {
 		retriever = NewKeywordRetriever(fs)
 	}
-	return &Client{store: fs, retriever: retriever}, nil
+	return &Client{store: fs, retriever: retriever, checkpointCh: make(chan struct{}, 1)}, nil
 }
 
 // Search 统一检索（注入用）：open task 命中 + LTM 事实命中，按分数降序。

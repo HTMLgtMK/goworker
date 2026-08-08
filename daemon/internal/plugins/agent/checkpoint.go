@@ -3,9 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
-	"slices"
 	"strings"
 	"time"
 
@@ -13,93 +11,29 @@ import (
 	"github.com/tinguo/goworker/memory"
 )
 
-// 本文件是检查点固化：把会话 conversation 固化进任务档案（Task + LTM），
-// 供 /compact /new /task checkpoint /进程退出 四个触发点共用。
+// 本文件是检查点固化入口：把会话 conversation 固化进任务档案（Task + LTM）。
+// 执行权在记忆系统（Client.Checkpoint 串行化 read→LLM→write 周期），
+// 这里只剩薄适配：快照 conversation → 构建 opts → 交给 Client。
+// 触发点 /compact /new /task checkpoint /进程退出 共享同一串行化点，
+// 后台固化（/new）与新会话固化互斥 —— 双锁分叉在构造上消失。
 
 // ---- 固化检查点 ----
 
-// checkpointMemory 把当前 conversation 固化进任务档案（Task + LTM）。
-// 同步入口：锁内快照 conversation 后调 checkpointSnapshot。
-// 触发点都是低频事件：/compact、进程退出、/task checkpoint —— 这些调用方
-// 语义上必须等固化完成（压缩前、退出前），故保持同步。
-// 返回本次固化的实际结果明细（nil = 无可固化内容），供调用方回显/留痕。
-func (s *Session) checkpointMemory(ctx context.Context) (*memory.AppliedSummary, error) {
-	s.mu.Lock()
-	conv := slices.Clone(s.conversation)
-	s.mu.Unlock()
-	return s.checkpointSnapshot(ctx, conv)
-}
-
-// checkpointSnapshot 把给定 conversation 快照固化进任务档案。
-// 一次 LLM 调用（Checkpointer）输出 task 归属/新建/关闭 + 事实决策。
-// 读快照→LLM 推理→写回是整个周期，store 的 mutex 只串行化单次写。
-// 并发检查点（如 /compact 与退出 Stop、后台固化重叠）会基于过期快照互相覆盖，
-// 必须整体互斥。返回本次固化实际应用的明细（AppliedSummary，nil = 无可固化内容）。
-// 快照必须由调用方在锁内克隆 —— /new 的后台固化依赖此保证清 STM 后仍能固化旧历史。
-func (s *Session) checkpointSnapshot(ctx context.Context, conv []core.Message) (*memory.AppliedSummary, error) {
-	// checkpointMu 可能被后台固化（/new 异步，最长 120s）持有 —— 拿锁不能无界阻塞，
-	// 否则 Stop 的 45s 超时形同虚设：等拿到锁时 ctx 已取消，固化静默失败。
-	acquired := make(chan struct{})
-	go func() {
-		s.checkpointMu.Lock()
-		close(acquired)
-	}()
-	select {
-	case <-acquired:
-		defer s.checkpointMu.Unlock()
-	case <-ctx.Done():
-		// 放弃固化，但拿锁的 goroutine 仍会拿到锁 —— 等它完成后自行释放，别让锁永久持有
-		go func() {
-			<-acquired
-			s.checkpointMu.Unlock()
-		}()
-		return nil, ctx.Err()
-	}
-
+// checkpoint 把给定 conversation 快照固化进任务档案。
+// 快照必须由调用方提供（/new 的后台固化在清 STM 前已取好旧会话快照）。
+// 串行化在 Client 内完成：后到的固化必然看到前一个已落库的结果。
+func (s *Session) checkpoint(ctx context.Context, conv []core.Message) (*memory.AppliedSummary, error) {
 	if s.deps.Memory == nil || len(conv) == 0 {
 		return nil, nil
 	}
-
 	cfg := s.deps.Hub.Config
-	provider := s.deps.NewProvider(cfg)
 	cwd, _ := os.Getwd()
-	cp := memory.NewCheckpointer(&llmAdapter{inner: provider}, cwd)
-
-	openTasks, err := s.deps.Memory.OpenTasks(50)
-	if err != nil {
-		return nil, fmt.Errorf("open tasks: %w", err)
-	}
-	facts, err := s.deps.Memory.ListFacts(50)
-	if err != nil {
-		return nil, fmt.Errorf("list facts: %w", err)
-	}
-	// 检查点 id：也是 Task.Runs 与 Fact.Source 的标记
-	cpID := fmt.Sprintf("cp-%d", time.Now().UnixNano())
-	res, err := cp.Run(ctx, toMemoryMessages(conv), openTasks, facts)
-	if err != nil {
-		return nil, err
-	}
-	// ltm_extract=false：tasks/decisions 是同一 LLM 调用输出的，无法只跳过调用，
-	// 但应用层不落库事实 —— 配置开关生效。
-	if !cfg.Memory.LtmExtract {
-		res.Decisions = nil
-	}
-	tokens := 0
-	if s.usage != nil {
-		tokens = s.usage.Snapshot().TotalTokens
-	}
-	sum, err := memory.ApplyCheckpoint(s.deps.Memory, res, openTasks, facts, cpID, tokens, cwd)
-	if err != nil {
-		return nil, err
-	}
-	if sum.Count() > 0 {
-		// 明细全文已落库，日志只打条数防巨行；要看内容走 /memory 命令
-		slog.Info("memory: checkpoint applied",
-			"cp", cpID,
-			"tasks", len(sum.UpdatedTasks)+len(sum.ClosedTasks),
-			"facts", len(sum.Facts)+len(sum.DeletedFacts))
-	}
-	return sum, nil
+	return s.deps.Memory.Checkpoint(ctx, toMemoryMessages(conv), memory.CheckpointOptions{
+		LLM:        &llmAdapter{inner: s.deps.NewProvider(cfg)},
+		LtmExtract: cfg.Memory.LtmExtract,
+		TokenUsage: s.usage.Snapshot().TotalTokens,
+		CWD:        cwd,
+	})
 }
 
 // checkpointAsync 后台固化旧会话：/new 不阻塞用户输入，固化结果完成后回显。
@@ -110,7 +44,7 @@ func (s *Session) checkpointAsync(conv []core.Message, writer func(string)) {
 	// 独立 ctx：命令 ctx 已随请求返回被释放，后台固化不能继承它。
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	sum, err := s.checkpointSnapshot(ctx, conv)
+	sum, err := s.checkpoint(ctx, conv)
 	if err != nil {
 		writer(fmt.Sprintf("⚠ Consolidation failed (history kept only in STM, lost on exit): %v\n", err))
 		return
