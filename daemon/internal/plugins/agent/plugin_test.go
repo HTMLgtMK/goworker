@@ -532,6 +532,9 @@ func TestHandleMCP_ShowsServers(t *testing.T) {
 func newMemoryPlugin(t *testing.T) *AgentPlugin {
 	t.Helper()
 	cfg := config.Default()
+	// 测试必须关会话持久化：handleNew 会走真实 startSession，若 Enabled 默认 true
+	// 会 Open 用户真实 sessions 目录并恢复 ActiveView，污染数据 + 断言错乱。
+	cfg.Session.Enabled = false
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
 	c, err := memory.NewClient(t.TempDir(), 10)
@@ -682,6 +685,7 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 
 	cfg := config.Default()
 	cfg.LLM.Endpoint = srv.URL
+	cfg.Session.Enabled = false // 避免 handleNew 走真实 store 路径，污染用户会话目录
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
 	ms, _ := memory.NewClient(t.TempDir(), 10)

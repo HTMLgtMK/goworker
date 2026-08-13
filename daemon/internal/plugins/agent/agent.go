@@ -234,6 +234,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 		defer close(ch)
 		defer func() {
 			a.fireMiddlewareEvent(&core.AfterAgentEvent{Ctx: ctx, History: messages, Err: runErr})
+			messages = stampMessageIDs(messages)
 			msgCh <- messages
 		}()
 

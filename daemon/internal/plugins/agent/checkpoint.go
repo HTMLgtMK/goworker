@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -56,6 +57,27 @@ func (s *Session) checkpointAsync(conv []core.Message, writer func(string)) {
 		// 无法区分"还在跑"vs"跑完没存"（旧行为无条件回显 N entries）。
 		writer("✔ Previous session consolidated (nothing new)\n")
 	}
+}
+
+// consolidate 增量固化：有 store 时只喂游标之后未固化的消息，无 store 回退全量。
+func (s *Session) consolidate(ctx context.Context) (*memory.AppliedSummary, error) {
+	if s.deps.Store == nil {
+		return s.checkpoint(ctx, s.Conversation()) // 回退全量
+	}
+	pending := s.deps.Store.PendingAfterCursor()
+	if len(pending) == 0 || len(toMemoryMessages(pending)) == 0 {
+		return nil, nil
+	}
+	sum, err := s.checkpoint(ctx, pending)
+	if err != nil {
+		return nil, err
+	}
+	if sum != nil {
+		if err := s.deps.Store.AdvanceCursor(pending[len(pending)-1].MsgID); err != nil {
+			slog.Warn("session: advance cursor failed", "err", err)
+		}
+	}
+	return sum, nil
 }
 
 // renderCheckpointNotice 把一次固化的实际结果渲染成用户可见提示：概括 + 每条标题。

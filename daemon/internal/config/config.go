@@ -24,6 +24,7 @@ type Config struct {
 	Log      logger.Config  `yaml:"log"`
 	MCP      MCPConfig      `yaml:"mcp"`
 	Memory   MemoryConfig   `yaml:"memory"`
+	Session  SessionConfig  `yaml:"session"`
 }
 
 type FrontendConfig struct {
@@ -42,6 +43,12 @@ type LLMConfig struct {
 	CompressAt    float64 `yaml:"compress_at"`    // 历史压缩触发阈值（0-1）：估算用量达窗口该比例时自动压缩，0 = 关闭
 	CompactKeep   int     `yaml:"compact_keep"`   // 滚动压缩保留的最近消息条数（原文不压，只压更早的）
 	MaxIterations int     `yaml:"max_iterations"` // ReAct 循环最大迭代数（模型往返次数），0 = 默认 15
+}
+
+// SessionConfig 是会话持久化模块的配置。
+type SessionConfig struct {
+	Dir     string `yaml:"dir"`     // 会话 jsonl 存储目录，默认 <DefaultDir>/sessions
+	Enabled bool   `yaml:"enabled"` // false = 会话持久化关闭，走旧纯内存逻辑
 }
 
 // MemoryConfig 是 agent 记忆模块（MTM 任务档案 + LTM 事实条目）的配置。
@@ -131,6 +138,10 @@ func Default() *Config {
 			InjectBudgetRatio: 0.15,
 			UserMaxChars:      1500, // Hermes 参考值，够写几十条画像
 			AgentsMaxChars:    4096, // 全局+项目 AGENTS.md 合并注入上限
+		},
+		Session: SessionConfig{
+			Dir:     filepath.Join(DefaultDir(), "sessions"),
+			Enabled: true,
 		},
 	}
 }
@@ -306,8 +317,16 @@ func (c *Config) SetField(key, value string) error {
 			return fmt.Errorf("无效 inject_budget_ratio: %s（应为 0-1 的比例，如 0.15）", value)
 		}
 		c.Memory.InjectBudgetRatio = f
+	case "session.dir":
+		c.Session.Dir = value
+	case "session.enabled":
+		b, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("无效 session.enabled: %s（应为 true/false）", value)
+		}
+		c.Session.Enabled = b
 	default:
-		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, llm.context_window, llm.compress_at, llm.compact_keep, llm.max_iterations, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days, memory.dir, memory.enabled, memory.task_keep, memory.task_inject_n, memory.ltm_inject_top_k, memory.ltm_extract, memory.inject_budget_ratio"
+		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, llm.context_window, llm.compress_at, llm.compact_keep, llm.max_iterations, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days, memory.dir, memory.enabled, memory.task_keep, memory.task_inject_n, memory.ltm_inject_top_k, memory.ltm_extract, session.dir, session.enabled, memory.inject_budget_ratio"
 		return fmt.Errorf("未知配置项: %s（可用: %s）", key, valid)
 	}
 	return nil

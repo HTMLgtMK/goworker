@@ -267,6 +267,42 @@ func TestLoad_MissingMemoryKeepsDefault(t *testing.T) {
 	}
 }
 
+func TestDefault_IncludesSession(t *testing.T) {
+	cfg := Default()
+	if cfg.Session.Dir == "" {
+		t.Error("Session.Dir should have a default path, got empty")
+	}
+	if !cfg.Session.Enabled {
+		t.Error("Session.Enabled should default true")
+	}
+}
+
+func TestSetField_Session(t *testing.T) {
+	cfg := Default()
+	tests := []struct {
+		key, val string
+		check    func(*Config) bool
+	}{
+		{"session.dir", "/tmp/foo", func(c *Config) bool { return c.Session.Dir == "/tmp/foo" }},
+		{"session.enabled", "false", func(c *Config) bool { return !c.Session.Enabled }},
+	}
+	for _, tt := range tests {
+		if err := cfg.SetField(tt.key, tt.val); err != nil {
+			t.Fatalf("SetField(%q): %v", tt.key, err)
+		}
+		if !tt.check(cfg) {
+			t.Errorf("SetField(%q, %q) not applied", tt.key, tt.val)
+		}
+	}
+}
+
+func TestSetField_SessionRejectsBadValues(t *testing.T) {
+	cfg := Default()
+	if err := cfg.SetField("session.enabled", "yes"); err == nil {
+		t.Error("SetField(session.enabled, yes) should error")
+	}
+}
+
 func TestParseContextWindow(t *testing.T) {
 	cases := []struct {
 		in   string

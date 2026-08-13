@@ -3,6 +3,7 @@ package core
 
 import (
 	"context"
+	"time"
 
 	"github.com/tinguo/goworker/daemon/internal/spec"
 )
@@ -33,6 +34,8 @@ type Message struct {
 	Content    string     `json:"content"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	MsgID      string     `json:"-"`
+	CreatedAt  time.Time  `json:"-"`
 }
 
 // ToolCall 是 LLM 请求的函数调用。

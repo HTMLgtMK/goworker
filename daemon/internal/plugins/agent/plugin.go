@@ -9,6 +9,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/mcp"
 	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
+	"github.com/tinguo/goworker/daemon/internal/session"
 	"github.com/tinguo/goworker/daemon/internal/skills"
 	"github.com/tinguo/goworker/daemon/internal/spec"
 	"github.com/tinguo/goworker/memory"
@@ -32,6 +33,7 @@ type AgentPlugin struct {
 	// session 是当前会话。NewSession 创建（Init 一次 + /new 一次）；/new 用新实例替换，
 	// 旧会话状态（conversation/usage）随对象回收。
 	session    *Session
+	store      *session.Store        // 会话持久化 store，nil = 禁用
 	skills     []skills.Skill        // Init 时加载的 skill 清单，注册为 skill_* 工具
 	mcpClients map[string]mcp.Client // server name → 连接，Stop 时统一关闭
 	mcpTools   []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
@@ -119,6 +121,9 @@ func (p *AgentPlugin) Init(h *spec.Hub) error {
 		Handler:     p.handleRules,
 	})
 
+	// /rewind 回溯到历史检查点（会话持久化 store 启用时可用）。定义在 rewind.go。
+	p.registerRewindCommand(h)
+
 	// 打开记忆存储。坏目录只降级为无记忆，不阻塞插件启动
 	if p.hub.Config.Memory.Enabled {
 		ms, err := memory.NewClient(p.hub.Config.Memory.Dir, p.hub.Config.Memory.TaskKeep)
@@ -150,12 +155,18 @@ func (p *AgentPlugin) Stop() error {
 		// LLM 网关慢时 20s 容易超时丢历史，放宽到 120s 给足时间。
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		// Client.Checkpoint 内部已打 applied 日志，这里不重复
-		if _, err := p.session.checkpoint(ctx, p.session.Conversation()); err != nil {
+		if _, err := p.session.consolidate(ctx); err != nil {
 			slog.Warn("memory: stop checkpoint failed", "err", err)
 		}
 		cancel()
 		if err := p.memory.Close(); err != nil {
 			slog.Warn("memory close error", "err", err)
+		}
+	}
+	// store 生命周期收尾：consolidate 后关闭
+	if p.store != nil {
+		if err := p.store.Close(); err != nil {
+			slog.Warn("session: store close failed", "err", err)
 		}
 	}
 	return nil
@@ -172,6 +183,16 @@ func (p *AgentPlugin) closeMCP() {
 }
 
 func (p *AgentPlugin) startSession() {
+	// 打开会话持久化 store。失败降级不阻塞插件启动。
+	p.store = nil
+	if p.hub.Config.Session.Enabled {
+		st, err := session.Open(p.hub.Config.Session.Dir)
+		if err != nil {
+			slog.Warn("session: store open failed, persistence disabled", "err", err)
+		} else {
+			p.store = st
+		}
+	}
 
 	// 加载 skill：用户级 + 项目级（后者覆盖前者）。坏 skill 跳过并记录，不拖垮其他的
 	discovered, skillErrs := skills.Discover(
@@ -197,6 +218,7 @@ func (p *AgentPlugin) startSession() {
 		Memory:       p.memory,
 		CollectTools: p.collectTools,
 		NewProvider:  modelProvider,
+		Store:        p.store,
 	}
 	// 指令快照与记忆组件同开关：memory disabled 时留 nil，buildSystemPrompt 跳过指令段。
 	// 会话边界（Init / /new）经 startSession 重载 —— system prompt 在会话创建前就绪。
