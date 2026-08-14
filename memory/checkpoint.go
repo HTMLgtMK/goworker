@@ -86,15 +86,15 @@ func checkpointPrompt(openTasks []Task, facts []Fact) string {
 `)
 	b.WriteString("Then extract durable cross-session facts into \"decisions\" (see below).\n")
 	if len(facts) > 0 {
-		b.WriteString("\nExisting facts (id | content):\n")
+		b.WriteString("\nExisting facts (id | topic | content) that may overlap this session — if one covers the same topic, UPDATE it instead of adding a duplicate:\n")
 		for _, f := range facts {
-			fmt.Fprintf(&b, "- %s | %s\n", f.ID, singleLine(f.Content))
+			fmt.Fprintf(&b, "- %s | %s | %s\n", f.ID, f.Topic, singleLine(f.Content))
 		}
 	}
 	b.WriteString(`
 Decision actions:
-- "add": new fact worth remembering. Provide content and topic.
-- "update": refines/contradicts an existing fact. Set id, give new content.
+- "add": new fact with NO existing fact covering the same topic. Provide content and topic.
+- "update": an existing fact is superseded/refined by new information (same topic or heavily overlapping content). Set id, give new content — do NOT add a second fact for the same topic.
 - "delete": an existing fact is now wrong. Set id.
 - "noop": trivial or already covered.
 

@@ -213,6 +213,67 @@ func TestClient_CheckpointEmptyConversationSkipsLLM(t *testing.T) {
 	}
 }
 
+func TestRecallFacts(t *testing.T) {
+	s, _ := NewFileStore(t.TempDir(), 0)
+	defer s.Close()
+	s.AddFact(&Fact{Content: "wttr.in 天气接口支持中文 lang=zh 与 JSON 格式", Topic: "天气"})
+	s.AddFact(&Fact{Content: "字节面试准备清单位于桌面，含 4 周冲刺计划", Topic: "面试"})
+
+	// 会话尾部提到天气检索词 → 召回天气 fact，不相关的面试 fact 不出现
+	conv := []Message{
+		{Role: "user", Content: "wttr.in 怎么传中文参数？"},
+		{Role: "assistant", Content: "用 lang=zh 查询中文天气，返回 JSON 格式"},
+	}
+	facts, err := recallFacts(s, conv, 10)
+	if err != nil {
+		t.Fatalf("recallFacts: %v", err)
+	}
+	if len(facts) != 1 || facts[0].Topic != "天气" {
+		t.Errorf("facts = %+v, want only the weather fact", facts)
+	}
+	// 空会话 → 无检索词，空召回（LLM 不该看到不相关旧 fact）
+	facts, err = recallFacts(s, nil, 10)
+	if err != nil || len(facts) != 0 {
+		t.Errorf("empty conversation: facts=%v err=%v, want empty", facts, err)
+	}
+	// system 消息（压缩摘要）被 lastRunes 跳过：摘要里的"字节面试"不得进检索词
+	sysConv := []Message{
+		{Role: "system", Content: "本次会话压缩摘要：继续讨论字节面试准备清单"},
+		{Role: "user", Content: "wttr.in 怎么传中文参数？"},
+		{Role: "assistant", Content: "用 lang=zh 查询中文天气"},
+	}
+	facts, err = recallFacts(s, sysConv, 10)
+	if err != nil {
+		t.Fatalf("recallFacts: %v", err)
+	}
+	if len(facts) != 1 || facts[0].Topic != "天气" {
+		t.Errorf("system summary leaked into recall query: %+v", facts)
+	}
+}
+
+// 检索词命不中任何 fact 时，Checkpoint 回退最近几条 —— 去重管线不能完全失明。
+func TestClient_CheckpointRecallFallback(t *testing.T) {
+	c, err := NewClient(t.TempDir(), 10)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer c.Close()
+	// 独特主题的 fact，与下面会话用词零重叠
+	c.AddFact(&Fact{Content: "量子纠缠退相干时间在氮空位中心约 0.1 秒", Topic: "量子"})
+
+	stub := &stubProvider{resp: `{"tasks":[],"decisions":[]}`}
+	// 会话完全无关 → recallFacts 召回空 → 回退 ListFacts(10)，fact 仍进 prompt
+	if _, err := c.Checkpoint(context.Background(),
+		[]Message{{Role: "user", Content: "帮我看看今天的天气怎么样"}},
+		CheckpointOptions{LLM: stub, CWD: "/work"}); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	prompt := stub.lastReq.Messages[0].Content
+	if !strings.Contains(prompt, "量子纠缠") {
+		t.Errorf("fallback facts missing from prompt: %q", prompt)
+	}
+}
+
 func TestClient_CheckpointFullFlow(t *testing.T) {
 	c, err := NewClient(t.TempDir(), 10)
 	if err != nil {

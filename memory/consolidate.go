@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -45,9 +47,20 @@ func (c *Client) Checkpoint(ctx context.Context, conversation []Message, opts Ch
 	if err != nil {
 		return nil, fmt.Errorf("open tasks: %w", err)
 	}
-	facts, err := c.store.ListFacts(50)
+	// 固化去重的关键是"能看到相关的旧 fact"：按时间截断（ListFacts）会让很久
+	// 没更新的旧版本滑出视野，模型无从判重只能 add。改为从会话尾部提检索词，
+	// 召回可能与本次会话冲突的旧 fact —— 检索式召回，Mem0 同款思路。
+	facts, err := recallFacts(c.store, conversation, checkpointFactRecall)
 	if err != nil {
-		return nil, fmt.Errorf("list facts: %w", err)
+		return nil, fmt.Errorf("recall facts: %w", err)
+	}
+	// 检索词命不中任何 fact 时（会话尾部用词与旧 fact 无重叠），去重管线会
+	// 完全失明 —— 模型看不到旧版本，findOverlapFact 也无从拦截。回退最近几条
+	// 兜底：宁可让模型看到可能无关的条目，也别让它对着空表判重。
+	if len(facts) == 0 {
+		if facts, err = c.store.ListFacts(10); err != nil {
+			return nil, fmt.Errorf("list facts: %w", err)
+		}
 	}
 
 	cp := NewCheckpointer(opts.LLM, opts.CWD)
@@ -74,4 +87,50 @@ func (c *Client) Checkpoint(ctx context.Context, conversation []Message, opts Ch
 			"facts", len(sum.Facts)+len(sum.DeletedFacts))
 	}
 	return sum, nil
+}
+
+// checkpointFactRecall 固化时从会话召回多少条可能冲突的旧 fact 喂给模型。
+const checkpointFactRecall = 20
+
+// recallFactQueryLen 从会话尾部取多少字符作为检索词。
+const recallFactQueryLen = 4000
+
+// recallFacts 从会话尾部提取检索词，召回可能与本次会话冲突的已有 fact。
+// 尾部最贴近本次会话在做的事；检索词越长召回越准但噪声越大，4000 字符平衡。
+func recallFacts(store Store, conversation []Message, topK int) ([]Fact, error) {
+	query := lastRunes(conversation, recallFactQueryLen)
+	if strings.TrimSpace(query) == "" {
+		return nil, nil
+	}
+	return store.SearchFacts(query, topK)
+}
+
+// lastRunes 从会话尾部向前收集非空 user/assistant 消息文本，拼到 limit runes
+// 为止（正序返回）。跳过 system 消息 —— 压缩摘要（compressor 注入）是旧会话
+// 的提炼，混进检索词会把固化引向已过时的主题。
+// 单条消息超限时保留其头部（主题词通常在开头），更早的消息让位给最新的。
+func lastRunes(msgs []Message, limit int) string {
+	var parts []string
+	var n int
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "system" {
+			continue
+		}
+		s := strings.TrimSpace(msgs[i].Content)
+		if s == "" {
+			continue
+		}
+		r := []rune(s)
+		if n+len(r) > limit {
+			r = r[:limit-n]
+			s = string(r)
+		}
+		parts = append(parts, s)
+		n += len(r)
+		if n >= limit {
+			break
+		}
+	}
+	slices.Reverse(parts)
+	return strings.Join(parts, " ")
 }
