@@ -40,6 +40,15 @@ The `/agent` command runs a ReAct agent with built-in tools:
 - `read_file` — read files with offset/limit
 - `write_file` — write files with auto-mkdir
 
+Command safety (`sandbox`): every `bash` call goes through a structured decision
+chain — `Assess` (risk level R0-R7 + side-effect dimensions) → `Policy` matrix →
+`allow / hitl / deny`. Unknown commands default to HITL confirmation (Unknown ≠
+Safe); regex rules stay deterministic, pre-approval rules (`allow_rules`) only
+soften normal-mode confirmations, and strict/readonly modes hard-deny. Injection
+vectors (subshell, interpreter `-c`, eval) and newline-joined commands are
+flagged. Set `audit_log: true` to append every decision (with the human verdict)
+to `audit/audit.jsonl`.
+
 Configure LLM endpoint via `/model`:
 
 ```

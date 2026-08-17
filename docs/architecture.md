@@ -100,6 +100,19 @@ User Input → system prompt + tools → LLM
 
 最大 15 轮迭代。工具集可扩展：默认内置 bash、read_file、write_file，插件可通过 Hub 注册额外工具。
 
+### 命令安全层（sandbox）
+
+bash 工具执行前经结构化决策链路（`daemon/internal/sandbox`）：
+
+```text
+命令 → Assess（风险分级 R0-R7 + 副作用 Effects）→ Policy 决策矩阵 → allow / hitl / deny
+```
+
+- **Rule ≠ Model**：正则规则引擎负责确定性判定；未知命令（R6）默认进入 HITL（Unknown ≠ Safe），不静默放行。
+- **deny > hitl > allow**：strict 拒全部风险、readonly 拒全部写；预批准规则（`allow_rules`，token 前缀匹配 + 副作用子集校验）只覆盖 normal 模式的确认，不越过模式硬拒。
+- 注入向量检测（命令替换/子shell/解释器 `-c`/eval/heredoc）与换行拆分封堵绕过。
+- 审计：`audit_log: true` 时每次决策（含用户最终选择）落 `audit/audit.jsonl`，是未来模型训练数据。
+
 ---
 
 ## 配置级联
