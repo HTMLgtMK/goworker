@@ -66,6 +66,42 @@ func PatternDesc(pattern string) string {
 	return pattern
 }
 
+// riskPatternLevel 是默认风险模式对应的风险等级，供 Assess 结构化推导（而非矩阵硬编码）。
+var riskPatternLevel = map[string]RiskLevel{
+	`rm\s+`:    RiskR3,
+	`mv\s+`:    RiskR3,
+	`dd\s+`:    RiskR3,
+	`>\s+\S`:   RiskR2,
+	`>>\s+\S`:  RiskR2,
+	`\|`:       RiskR2,
+	`sudo\s+`:  RiskR4,
+	`chmod\s+`: RiskR4,
+	`chown\s+`: RiskR4,
+	`kill\s+`:  RiskR4,
+	`shutdown`: RiskR4,
+	`reboot`:   RiskR4,
+	`init\s+0`: RiskR4,
+	`init\s+6`: RiskR4,
+}
+
+// riskPatternEffects 是默认风险模式对应的副作用（审计/floor 用）。0 = 无独立副作用。
+var riskPatternEffects = map[string]Effects{
+	`rm\s+`:    Effects(EffectDestructive),
+	`mv\s+`:    Effects(EffectFileWrite),
+	`dd\s+`:    Effects(EffectDestructive),
+	`>\s+\S`:   Effects(EffectFileWrite),
+	`>>\s+\S`:  Effects(EffectFileWrite),
+	`\|`:       0,
+	`sudo\s+`:  Effects(EffectPrivileged),
+	`chmod\s+`: Effects(EffectPrivileged),
+	`chown\s+`: Effects(EffectPrivileged),
+	`kill\s+`:  Effects(EffectProcessSpawn),
+	`shutdown`: Effects(EffectProcessSpawn),
+	`reboot`:   Effects(EffectProcessSpawn),
+	`init\s+0`: Effects(EffectProcessSpawn),
+	`init\s+6`: Effects(EffectProcessSpawn),
+}
+
 // builtinDevWritePattern 是内置的设备写保护规则。只有这一条规则享受伪设备豁免。
 const builtinDevWritePattern = `>\s*/dev/`
 

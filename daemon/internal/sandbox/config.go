@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 
 	"github.com/tinguo/goworker/daemon/internal/config"
 )
@@ -25,11 +26,11 @@ type Config struct {
 	RiskyPatterns  []*regexp.Regexp  // 需要用户确认的匹配
 	PatternDescs   map[string]string // pattern → 人类可读描述（来自配置或内置默认）
 	AllowedWorkDir string            // 限制工作目录，空 = 不限制
-	AllowList      []*regexp.Regexp  // 非空时只允许匹配的命令
 	ReadOnly       bool              // 只读模式
 	MaxOutputBytes int               // 最大输出字节数，0=不限制
 	Mode           Mode              // 沙箱模式
 	SafeCommands   map[string]bool   // 追加的只读安全命令名 → 直接放行，不触发 HITL
+	AllowRules     []AllowRule       // 用户预批准规则（normal 模式降级 hitl→allow）
 }
 
 // NewFromConfig 从全局配置构建 sandbox.Config，编译正则并填充默认值。
@@ -79,7 +80,57 @@ func NewFromConfig(cfg *config.SandboxConfig) *Config {
 		PatternDescs:   patternDescs,
 		ReadOnly:       Mode(cfg.Mode) == ModeReadOnly,
 		SafeCommands:   safeCmds,
+		AllowRules:     compileAllowRules(cfg.AllowRules),
 	}
+}
+
+// compileAllowRules 把 YAML 规则编译为内部 AllowRule。非法规则（解析不了等级/空匹配）跳过——
+// 配置错误不应让 daemon 崩，跳过并保持保守（该命令继续走常规评估）。
+func compileAllowRules(rules []config.AllowRuleConfig) []AllowRule {
+	out := make([]AllowRule, 0, len(rules))
+	for _, r := range rules {
+		lv, err := ParseRiskLevel(r.MaxRisk)
+		if err != nil {
+			continue
+		}
+		tokens := strings.Fields(r.Match)
+		if len(tokens) == 0 {
+			continue
+		}
+		out = append(out, AllowRule{
+			MatchTokens: tokens,
+			MaxRisk:     lv,
+			Effects:     parseEffects(r.Effects),
+			Desc:        r.Desc,
+		})
+	}
+	return out
+}
+
+// parseEffects 把副作用名列表解析为位集；未知名字静默忽略。
+func parseEffects(names []string) Effects {
+	var e Effects
+	for _, n := range names {
+		switch n {
+		case "file_read":
+			e = e.Add(EffectFileRead)
+		case "file_write":
+			e = e.Add(EffectFileWrite)
+		case "network":
+			e = e.Add(EffectNetwork)
+		case "privileged":
+			e = e.Add(EffectPrivileged)
+		case "destructive":
+			e = e.Add(EffectDestructive)
+		case "secret_access":
+			e = e.Add(EffectSecretAccess)
+		case "process_spawn":
+			e = e.Add(EffectProcessSpawn)
+		case "code_execution":
+			e = e.Add(EffectCodeExecution)
+		}
+	}
+	return e
 }
 
 // NeedsConfirmationError 由 Check 返回，表示命令匹配风险模式，调用方应请求用户确认。
@@ -94,89 +145,15 @@ func (e *NeedsConfirmationError) Error() string {
 	return fmt.Sprintf("risky command: %s (%q)", e.Reason, e.Pattern)
 }
 
-// Check 检查命令 cmd 是否符合沙箱规则。
+// Check 检查命令 cmd 是否符合沙箱规则（兼容 shim，新逻辑见 Assess + Evaluate）。
 //   - 返回 nil 表示放行
 //   - 返回 *NeedsConfirmationError 表示需要用户确认
 //   - 返回其他 error 表示被拒绝
 func Check(cmd string, cfg *Config) error {
-	if cfg == nil {
+	if cfg == nil || cfg.Mode == ModeOff {
 		return nil
 	}
-	if cfg.Mode == ModeOff {
-		return nil
-	}
-
-	// Denylist 检查
-	for _, p := range cfg.DeniedPatterns {
-		if !p.MatchString(cmd) {
-			continue
-		}
-		// 豁免：仅内置 `>\s*/dev/` 设备写保护规则，命中伪设备（/dev/null、/dev/stdout...）时放行。
-		// 真实设备（/dev/sda）仍拒绝。自定义含 /dev/ 的 deny 规则不豁免。
-		if isBuiltinDevWritePattern(p) && pseudoDevRedirectOnly(cmd) {
-			continue
-		}
-		return fmt.Errorf("sandbox: command denied by pattern %q", p.String())
-	}
-
-	// AllowList 检查（仅在非空时启用）
-	if len(cfg.AllowList) > 0 {
-		allowed := false
-		for _, p := range cfg.AllowList {
-			if p.MatchString(cmd) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return fmt.Errorf("sandbox: command not in allowlist")
-		}
-	}
-
-	// 只读安全命令：三态分类，放在 AllowList 之后、ReadOnly/Risk 之前。
-	// denylist/allowlist 优先；safe 直接放行，unsafe 明确写操作在 readonly/strict 下硬拒。
-	if verdict, reason := classifyCmd(cmd, cfg.SafeCommands); verdict == verdictSafe {
-		return nil
-	} else if verdict == verdictUnsafe {
-		if cfg.Mode == ModeStrict {
-			return fmt.Errorf("sandbox: risky command denied in strict mode: %s", reason)
-		}
-		if cfg.Mode == ModeReadOnly {
-			return fmt.Errorf("sandbox: write operations not allowed in readonly mode: %s", reason)
-		}
-		return &NeedsConfirmationError{Command: cmd, Reason: reason}
-	}
-
-	// 只读模式：检查是否有写操作特征（覆盖 verdictUnknown 的命令，如 cp/mv/touch）
-	if cfg.ReadOnly {
-		if hasWriteOps(cmd) {
-			return fmt.Errorf("sandbox: write operations not allowed in readonly mode")
-		}
-	}
-
-	// Risk 检测
-	if cfg.Mode == ModeStrict {
-		for _, p := range cfg.RiskyPatterns {
-			if p.MatchString(cmd) {
-				return fmt.Errorf("sandbox: risky command denied in strict mode")
-			}
-		}
-	} else if cfg.Mode == ModeNormal {
-		for _, p := range cfg.RiskyPatterns {
-			if p.MatchString(cmd) {
-				patStr := p.String()
-				reason := PatternDesc(patStr)
-				if cfg.PatternDescs != nil {
-					if d, ok := cfg.PatternDescs[patStr]; ok {
-						reason = d
-					}
-				}
-				return &NeedsConfirmationError{Command: cmd, Pattern: patStr, Reason: reason}
-			}
-		}
-	}
-
-	return nil
+	return Evaluate(CommandRequest{Command: cmd}, cfg).Error()
 }
 
 // hasWriteOps 判断命令是否包含写操作。
