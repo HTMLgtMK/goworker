@@ -88,10 +88,21 @@ func (r *RiskPatternConfig) UnmarshalYAML(value *yaml.Node) error {
 
 type SandboxConfig struct {
 	Mode           string              `yaml:"mode"`
-	AllowedWorkDir string              `yaml:"allowed_work_dir"` // 空 = 使用当前目录
-	DeniedPatterns []string            `yaml:"denied_patterns"`  // 空 = 使用 sandbox 默认
-	RiskyPatterns  []RiskPatternConfig `yaml:"risky_patterns"`   // 空 = 使用 sandbox 默认
-	SafeCommands   []string            `yaml:"safe_commands"`    // 追加的只读安全命令名（直接放行）
+	AllowedWorkDir string              `yaml:"allowed_work_dir"`      // 空 = 使用当前目录
+	DeniedPatterns []string            `yaml:"denied_patterns"`       // 空 = 使用 sandbox 默认
+	RiskyPatterns  []RiskPatternConfig `yaml:"risky_patterns"`        // 空 = 使用 sandbox 默认
+	SafeCommands   []string            `yaml:"safe_commands"`         // 追加的只读安全命令名（直接放行）
+	AllowRules     []AllowRuleConfig   `yaml:"allow_rules,omitempty"` // 用户预批准规则（normal 模式免确认）
+	AuditLog       bool                `yaml:"audit_log,omitempty"`   // 决策审计 jsonl 落盘（默认关）
+}
+
+// AllowRuleConfig 是一条用户预批准规则：命令 token 前缀 + 风险上限 + 允许副作用子集。
+// Match 用 token 前缀匹配（非正则，避免配置注入），如 "git push" 命中 `git push --force origin`。
+type AllowRuleConfig struct {
+	Match   string   `yaml:"match"`             // 归一化主命令 token 前缀："git push"
+	MaxRisk string   `yaml:"max_risk"`          // "R0".."R7"，超过该等级的命令不放行
+	Effects []string `yaml:"effects,omitempty"` // 允许的副作用子集，空 = 全部允许
+	Desc    string   `yaml:"desc,omitempty"`    // 人类可读描述
 }
 
 // MCPConfig 是 MCP server 连接配置。

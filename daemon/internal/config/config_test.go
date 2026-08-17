@@ -303,6 +303,48 @@ func TestSetField_SessionRejectsBadValues(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesSandboxAllowRules(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	os.WriteFile(path, []byte(`
+sandbox:
+  mode: normal
+  allow_rules:
+    - match: "git push"
+      max_risk: "R4"
+      effects: ["network", "file_write"]
+      desc: "git push 免确认"
+    - match: "pip install"
+      max_risk: "R2"
+  audit_log: true
+`), 0644)
+
+	cfg := Load(path)
+	if !cfg.Sandbox.AuditLog {
+		t.Error("AuditLog should be true after load")
+	}
+	if len(cfg.Sandbox.AllowRules) != 2 {
+		t.Fatalf("AllowRules len = %d, want 2", len(cfg.Sandbox.AllowRules))
+	}
+	r := cfg.Sandbox.AllowRules[0]
+	if r.Match != "git push" || r.MaxRisk != "R4" || r.Desc != "git push 免确认" {
+		t.Errorf("rule0 = %+v", r)
+	}
+	if len(r.Effects) != 2 || r.Effects[0] != "network" || r.Effects[1] != "file_write" {
+		t.Errorf("rule0 effects = %v, want [network file_write]", r.Effects)
+	}
+}
+
+func TestDefault_SandboxAuditLogOff(t *testing.T) {
+	cfg := Default()
+	if cfg.Sandbox.AuditLog {
+		t.Error("AuditLog should default false")
+	}
+	if len(cfg.Sandbox.AllowRules) != 0 {
+		t.Errorf("AllowRules should default empty, got %v", cfg.Sandbox.AllowRules)
+	}
+}
+
 func TestParseContextWindow(t *testing.T) {
 	cases := []struct {
 		in   string
