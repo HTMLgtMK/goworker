@@ -188,6 +188,10 @@ func splitShellSegments(cmd string) []string {
 		case r == '"' && !inSingle:
 			inDouble = !inDouble
 			cur.WriteRune(r)
+		// 换行也是命令分隔符：`echo hi\nsudo rm -rf /tmp` 若只按首段判安全会漏掉后段高危命令。
+		// 引号内的换行（多行字符串）不拆。
+		case (r == '\n' || r == '\r') && !inSingle && !inDouble:
+			flush()
 		case (r == '|' || r == ';') && !inSingle && !inDouble:
 			flush()
 		case r == '&' && !inSingle && !inDouble:
