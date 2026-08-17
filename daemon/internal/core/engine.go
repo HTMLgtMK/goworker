@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/tinguo/goworker/daemon/internal/config"
@@ -187,6 +188,9 @@ func (e *Engine) Tools() []spec.Tool {
 	for _, tool := range e.tools {
 		out = append(out, tool)
 	}
+	// map 迭代顺序随机 → 排序保证稳定。工具清单会进 system prompt 与请求 tools 字段，
+	// 顺序一旦抖动，整条前缀就变，LLM 前缀缓存全部击穿 —— 排序的代价远小于此。
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 

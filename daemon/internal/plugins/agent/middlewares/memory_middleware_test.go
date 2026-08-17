@@ -60,23 +60,26 @@ func TestMemoryMiddleware_InjectsOncePerRun(t *testing.T) {
 	}
 }
 
-func TestMemoryMiddleware_InsertsAfterSystemPrompt(t *testing.T) {
+func TestMemoryMiddleware_InsertsBeforeLastUser(t *testing.T) {
 	client := seededClient(t)
 	mw := NewMemoryMiddleware(client, memoryCfg(), 32768)
 	history := []core.Message{
 		{Role: "system", Content: "agent prompt"},
-		{Role: "system", Content: "another system block"},
 		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "hello!"},
+		{Role: "user", Content: "current input"}, // 本轮输入（buildMessages 追加的最后一条 user）
 	}
 	ev := &core.BeforeModelEvent{Ctx: context.Background(), Input: "config", History: history}
 	mw.OnBeforeModel(ev)
 
-	if ev.History[0].Content != "agent prompt" || ev.History[1].Content != "another system block" {
-		t.Errorf("leading system messages changed: %+v", ev.History[:2])
+	// 记忆块插在最后一个 user（本轮输入）之前：前面整段对话序列原样保留，
+	// 前缀缓存不被记忆块打断（记忆块每次检索结果都变，放末尾只 miss 自己）
+	if ev.History[0].Content != "agent prompt" || ev.History[1].Role != "user" || ev.History[2].Role != "assistant" {
+		t.Errorf("original message sequence changed: %+v", ev.History[:3])
 	}
-	block := ev.History[2]
+	block := ev.History[3]
 	if block.Role != "system" || !strings.Contains(block.Content, "[记忆]") {
-		t.Errorf("History[2] = %+v, want memory block", block)
+		t.Errorf("History[3] = %+v, want memory block", block)
 	}
 	if !strings.Contains(block.Content, "fix config parser") {
 		t.Errorf("memory block missing open task: %q", block.Content)
@@ -84,8 +87,8 @@ func TestMemoryMiddleware_InsertsAfterSystemPrompt(t *testing.T) {
 	if !strings.Contains(block.Content, "project uses yaml config") {
 		t.Errorf("memory block missing fact: %q", block.Content)
 	}
-	if ev.History[3].Role != "user" {
-		t.Errorf("History[3] = %+v, want original user msg", ev.History[3])
+	if ev.History[4].Role != "user" || ev.History[4].Content != "current input" {
+		t.Errorf("History[4] = %+v, want current input user msg", ev.History[4])
 	}
 }
 

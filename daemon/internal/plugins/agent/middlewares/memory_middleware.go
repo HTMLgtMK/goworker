@@ -96,18 +96,23 @@ func (m *MemoryMiddleware) buildMemoryBlock(results []memory.Result) string {
 	}
 }
 
-// insertSystemBlock 把记忆块作为 system 消息插在连续前导 system 之后。
-// 保证 history[0] 仍是 agent 提示词（CompressionMiddleware.protectSystem 语义不变），
-// 且不拆散任何 assistant/tool 配对。
+// insertSystemBlock 把记忆块作为 system 消息插在最后一个 user（本轮输入）之前。
+// 原来插在连续前导 system 之后 —— 记忆块每次检索结果都不同，它一变就把后面
+// 整段 history 的 LLM 前缀缓存击穿（history 每次请求重发却永远 miss）。
+// 挪到 history 之后、user 前：agent prompt + 全部历史保持前缀连续，只有记忆块
+// 自己 miss。从尾部找 user 保证不拆散 history 内的 assistant/tool 配对。
 func insertSystemBlock(h []core.Message, block string) []core.Message {
-	i := 0
-	for i < len(h) && h[i].Role == "system" {
-		i++
+	at := len(h) // 找不到 user（防御）时插末尾
+	for i := len(h) - 1; i >= 0; i-- {
+		if h[i].Role == "user" {
+			at = i
+			break
+		}
 	}
 	out := make([]core.Message, 0, len(h)+1)
-	out = append(out, h[:i]...)
+	out = append(out, h[:at]...)
 	out = append(out, core.Message{Role: "system", Content: block})
-	out = append(out, h[i:]...)
+	out = append(out, h[at:]...)
 	return out
 }
 
