@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -35,11 +38,35 @@ func NewOpenAIProvider(endpoint, apiKey, model string) *OpenAIProvider {
 	if model == "" {
 		model = "gpt-4o"
 	}
+
+	// GOWORKER_PROXY 显式指定抓包代理（如 whistle）时走它，否则回退
+	// http.ProxyFromEnvironment：尊重系统 HTTP(S)_PROXY，没配就直连，
+	// 行为跟不设置 Transport 的默认 http.Client 一致。
+	// 抓包代理是 MITM，证书链必然校验不过，所以代理一旦显式配置就跳过
+	// TLS 校验——只在这条调试路径生效，生产不设 GOWORKER_PROXY 保持严格校验。
+	proxyFn := http.ProxyFromEnvironment
+	tlsConfig := &tls.Config{}
+	if proxyURL := strings.TrimSpace(os.Getenv("GOWORKER_PROXY")); proxyURL != "" {
+		u, err := url.Parse(proxyURL)
+		if err != nil {
+			slog.Warn("GOWORKER_PROXY 解析失败，回退系统代理", "proxy", proxyURL, "err", err)
+		} else {
+			proxyFn = http.ProxyURL(u)
+			tlsConfig = &tls.Config{InsecureSkipVerify: true}
+		}
+	}
+
 	return &OpenAIProvider{
 		endpoint: strings.TrimRight(endpoint, "/"),
 		apiKey:   apiKey,
 		model:    model,
-		client:   &http.Client{Timeout: defaultHTTPTimeout},
+		client: &http.Client{
+			Timeout: defaultHTTPTimeout,
+			Transport: &http.Transport{
+				Proxy:           proxyFn,
+				TLSClientConfig: tlsConfig,
+			},
+		},
 	}
 }
 
