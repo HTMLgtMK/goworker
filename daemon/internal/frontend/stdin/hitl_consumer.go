@@ -67,7 +67,12 @@ func (c *HITLConsumer) Consume(ev KeyEvent) bool {
 // 调用方（前端 decide）据此取消整个 agent 执行。
 func (c *HITLConsumer) Run(req *spec.InterruptRequest) (decision spec.HITLDecision, canceled bool) {
 	c.phase = phaseDecision
-	c.writer("\n" + hitl("⚠ "+req.Command+" ("+req.RiskReason+")") + "\n")
+	// 结构化决策链路带出风险等级：有则渲染 [R4] 标签，老字段为空时不显示（兼容）。
+	riskTag := ""
+	if req.RiskLevel != "" {
+		riskTag = " [" + req.RiskLevel + "]"
+	}
+	c.writer("\n" + hitl("⚠ "+req.Command+riskTag+" ("+req.RiskReason+")") + "\n")
 	decisionPrompt := hitl("[a]pprove, [e]dit, [r]eject, res[p]ond [a]: ") + " "
 	c.writer(decisionPrompt)
 

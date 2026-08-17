@@ -2,7 +2,6 @@ package middlewares
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -22,10 +21,23 @@ var reqID atomic.Int64
 type HITLMiddleware struct {
 	sandboxCfg       sandbox.Config
 	decisionProvider core.DecisionProvider
+	audit            *sandbox.AuditLogger // nil = 不审计
 }
 
-func NewHITLMiddleware(cfg sandbox.Config, dp core.DecisionProvider) *HITLMiddleware {
-	return &HITLMiddleware{sandboxCfg: cfg, decisionProvider: dp}
+// HITLOption 中间件构造选项（变参，保持旧两参调用零改动）。
+type HITLOption func(*HITLMiddleware)
+
+// WithAudit 注入审计记录器；nil 时跳过审计（默认）。
+func WithAudit(a *sandbox.AuditLogger) HITLOption {
+	return func(mw *HITLMiddleware) { mw.audit = a }
+}
+
+func NewHITLMiddleware(cfg sandbox.Config, dp core.DecisionProvider, opts ...HITLOption) *HITLMiddleware {
+	mw := &HITLMiddleware{sandboxCfg: cfg, decisionProvider: dp}
+	for _, o := range opts {
+		o(mw)
+	}
+	return mw
 }
 
 func (mw *HITLMiddleware) Name() string { return "HITLMiddleware" }
@@ -55,28 +67,75 @@ func (mw *HITLMiddleware) checkBash(ev *core.BeforeToolEvent) *core.MiddlewareRe
 		return &core.MiddlewareResponse{}
 	}
 
-	err := sandbox.Check(cmdStr, &mw.sandboxCfg)
-	if err == nil {
+	// 走结构化决策链路：Assess（分级）→ Policy（allow/hitl/deny），
+	// 而不是直接对旧三态 error 分类。
+	out := sandbox.Evaluate(sandbox.CommandRequest{Command: cmdStr}, &mw.sandboxCfg)
+	switch out.Decision {
+	case sandbox.DecisionAllow, sandbox.DecisionSandbox:
+		mw.recordAudit(out, "", "executed")
 		return &core.MiddlewareResponse{}
-	}
-
-	var needsConf *sandbox.NeedsConfirmationError
-	if !errors.As(err, &needsConf) {
-		// Denied/strict/readonly — block outright
-		reason := err.Error()
+	case sandbox.DecisionDeny:
+		mw.recordAudit(out, "", "blocked")
+		reason := out.Error().Error()
 		return mw.block(ev, "⛔ "+reason, "⛔ "+reason)
+	default: // DecisionHitl
+		req := &spec.InterruptRequest{
+			ID:         fmt.Sprintf("req-%d", reqID.Add(1)),
+			ToolName:   "bash",
+			Command:    cmdStr,
+			RiskReason: riskReason(out),
+			RiskLevel:  out.Level.String(),
+			Effects:    out.Effects.Names(),
+			CreatedAt:  time.Now(),
+			ExpiresAt:  time.Now().Add(30 * time.Second),
+		}
+		return mw.confirm(ev, req, func(d spec.HITLDecision) {
+			outcome := "executed"
+			if d.Type == spec.DecisionReject {
+				outcome = "blocked"
+			}
+			if d.Type == spec.DecisionRespond {
+				outcome = "aborted"
+			}
+			mw.recordAudit(out, string(d.Type), outcome)
+		})
 	}
+}
 
-	// Normal mode: HITL via DecisionProvider
-	req := &spec.InterruptRequest{
-		ID:         fmt.Sprintf("req-%d", reqID.Add(1)),
-		ToolName:   "bash",
-		Command:    cmdStr,
-		RiskReason: needsConf.Reason,
-		CreatedAt:  time.Now(),
-		ExpiresAt:  time.Now().Add(30 * time.Second),
+// recordAudit 把一次命令决策写入审计（nil logger 时跳过）。
+// UserDecision 只在走 HITL 后有值——那是未来训练数据的标签（宪法 V）。
+func (mw *HITLMiddleware) recordAudit(out sandbox.Outcome, userDec, outcome string) {
+	if mw.audit == nil {
+		return
 	}
-	return mw.confirm(ev, req)
+	mw.audit.Record(sandbox.AuditEntry{
+		Timestamp:      time.Now(),
+		Command:        out.Command,
+		RiskLevel:      out.Level.String(),
+		Effects:        out.Effects.Names(),
+		Reasons:        out.Reasons,
+		Source:         out.Source.String(),
+		EngineDecision: out.Decision.String(),
+		UserDecision:   userDec,
+		Outcome:        outcome,
+	})
+}
+
+// riskReason 组装 HITL 展示用的风险原因：中文描述 + 风险等级 + 副作用。
+func riskReason(out sandbox.Outcome) string {
+	reason := ""
+	if len(out.Reasons) > 0 {
+		reason = out.Reasons[0].Detail
+	}
+	effs := out.Effects.Names()
+	switch {
+	case reason != "" && len(effs) > 0:
+		return fmt.Sprintf("%s (risk %s, %s)", reason, out.Level, strings.Join(effs, ","))
+	case reason != "":
+		return fmt.Sprintf("%s (risk %s)", reason, out.Level)
+	default:
+		return fmt.Sprintf("risk %s", out.Level)
+	}
 }
 
 // ---- MCP 工具：外部进程，sandbox 约束不到 ----
@@ -99,14 +158,15 @@ func (mw *HITLMiddleware) checkMCP(ev *core.BeforeToolEvent) *core.MiddlewareRes
 			CreatedAt:   time.Now(),
 			ExpiresAt:   time.Now().Add(30 * time.Second),
 		}
-		return mw.confirm(ev, req)
+		return mw.confirm(ev, req, nil)
 	}
 }
 
 // ---- 公共 HITL 流程 ----
 
 // confirm 走完整 HITL 决策流程：发 interrupt token → 等用户决策 → 处理。
-func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *spec.InterruptRequest) *core.MiddlewareResponse {
+// onDecide 在拿到用户决策后立即回调（审计用），nil 时跳过。
+func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *spec.InterruptRequest, onDecide func(d spec.HITLDecision)) *core.MiddlewareResponse {
 	// 发送 interrupt token，通知前端展示确认选项
 	select {
 	case ev.TokenCh <- core.Token{Type: core.TokenTypeInterrupt, Interrupt: req}:
@@ -116,6 +176,9 @@ func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *spec.InterruptR
 
 	// 通过 DecisionProvider 获取用户决策
 	d := mw.decisionProvider.GetDecision(ev.Ctx, req)
+	if onDecide != nil {
+		onDecide(d)
+	}
 
 	switch d.Type {
 	case spec.DecisionApprove:

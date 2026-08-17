@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,7 @@ type Session struct {
 	mu           sync.Mutex
 	conversation []core.Message
 	usage        *core.UsageTracker
+	audit        *sandbox.AuditLogger // 命令决策审计：配置开启 + 首次 Run 惰性打开，会话生命周期复用
 
 	deps SessionDeps
 }
@@ -66,6 +68,17 @@ func (s *Session) Run(ctx *spec.Context) error {
 	sandboxCfg := *sandbox.NewFromConfig(&s.deps.Hub.Config.Sandbox)
 	tools := s.deps.CollectTools(&sandboxCfg)
 	cfg := s.deps.Hub.Config
+
+	// 命令决策审计：配置开启时首次 Run 惰性打开，复用文件句柄（不每轮重开）。
+	if s.audit == nil && cfg.Sandbox.AuditLog {
+		lg, err := sandbox.OpenAudit(filepath.Join(config.DefaultDir(), "audit"))
+		if err != nil {
+			slog.Warn("sandbox: audit open failed, audit disabled", "err", err)
+		} else {
+			s.audit = lg
+		}
+	}
+
 	provider := s.deps.NewProvider(cfg)
 	decisions := make(chan spec.HITLDecision, 1)
 	mws := s.buildMiddlewareChain(ctx, provider, &sandboxCfg, cfg, decisions)
@@ -171,7 +184,7 @@ func (s *Session) buildMiddlewareChain(ctx *spec.Context, provider core.Provider
 		}
 	}
 
-	hitlMw := middlewares.NewHITLMiddleware(*sandboxCfg, middlewares.NewChannelDecisionProvider(decisions))
+	hitlMw := middlewares.NewHITLMiddleware(*sandboxCfg, middlewares.NewChannelDecisionProvider(decisions), middlewares.WithAudit(s.audit))
 	// usage：观察 AfterModel 记账（累计到会话边界才清零），publish 把 core.Usage 转成 statusbar.Usage 事件
 	usageMw := middlewares.NewUsageMiddleware(s.usage, func(u core.Usage) {
 		publish(statusbar.EventUsage, statusbar.Usage{

@@ -2,6 +2,8 @@ package middlewares
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -185,6 +187,76 @@ func TestHITL_RespondBackfillsToolMessageWithCallID(t *testing.T) {
 	}
 	if !strings.Contains(rm.Content, "别删") {
 		t.Errorf("tool content should carry the user's reply, got %q", rm.Content)
+	}
+}
+
+func TestHITL_BashInterruptCarriesRiskInfo(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&config.SandboxConfig{Mode: "normal"})
+	decisions := make(chan spec.HITLDecision, 1)
+	mw := NewHITLMiddleware(*cfg, NewChannelDecisionProvider(decisions))
+
+	tokenCh := make(chan core.Token, 10)
+	ev := &core.BeforeToolEvent{
+		Ctx:     context.Background(),
+		Tool:    &core.ToolCall{ID: "t1", Type: "function", Function: core.ToolCallFunction{Name: "bash"}},
+		TokenCh: tokenCh,
+		Args:    map[string]any{"command": "rm -rf /tmp/goworker-test"},
+	}
+	go func() {
+		decisions <- spec.HITLDecision{InterruptID: "req-1", Type: spec.DecisionApprove}
+	}()
+	mw.OnBeforeTool(ev)
+
+	if ev.Aborted {
+		t.Fatal("approved bash should not abort")
+	}
+	toks := drainTokens(tokenCh)
+	for _, tok := range toks {
+		if tok.Type != core.TokenTypeInterrupt || tok.Interrupt == nil || tok.Interrupt.ToolName != "bash" {
+			continue
+		}
+		if tok.Interrupt.RiskLevel != "R3" {
+			t.Errorf("RiskLevel = %q, want R3 (rm is destructive)", tok.Interrupt.RiskLevel)
+		}
+		if len(tok.Interrupt.Effects) == 0 || tok.Interrupt.Effects[0] != "destructive" {
+			t.Errorf("Effects = %v, want destructive first", tok.Interrupt.Effects)
+		}
+	}
+}
+
+func TestHITL_AuditRecordsUserDecision(t *testing.T) {
+	dir := t.TempDir()
+	audit, err := sandbox.OpenAudit(dir)
+	if err != nil {
+		t.Fatalf("OpenAudit: %v", err)
+	}
+	defer audit.Close()
+
+	cfg := sandbox.NewFromConfig(&config.SandboxConfig{Mode: "normal"})
+	decisions := make(chan spec.HITLDecision, 1)
+	mw := NewHITLMiddleware(*cfg, NewChannelDecisionProvider(decisions), WithAudit(audit))
+
+	tokenCh := make(chan core.Token, 10)
+	ev := &core.BeforeToolEvent{
+		Ctx:     context.Background(),
+		Tool:    &core.ToolCall{ID: "t1", Type: "function", Function: core.ToolCallFunction{Name: "bash"}},
+		TokenCh: tokenCh,
+		Args:    map[string]any{"command": "rm -rf /tmp/goworker-test"},
+	}
+	go func() {
+		decisions <- spec.HITLDecision{InterruptID: "req-1", Type: spec.DecisionApprove}
+	}()
+	mw.OnBeforeTool(ev)
+
+	b, err := os.ReadFile(filepath.Join(dir, "audit.jsonl"))
+	if err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	line := string(b)
+	for _, want := range []string{`"command":"rm -rf /tmp/goworker-test"`, `"risk_level":"R3"`, `"engine_decision":"hitl"`, `"user_decision":"approve"`, `"outcome":"executed"`} {
+		if !strings.Contains(line, want) {
+			t.Errorf("audit missing %s: %s", want, line)
+		}
 	}
 }
 
