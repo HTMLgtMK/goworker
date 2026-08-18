@@ -5,9 +5,9 @@ go 1.26.1
 require (
 	github.com/charmbracelet/glamour v1.0.0
 	github.com/charmbracelet/x/term v0.2.2
+	github.com/mattn/go-runewidth v0.0.19
 	github.com/muesli/termenv v0.16.0
 	github.com/rivo/uniseg v0.4.7
-	github.com/tinguo/goworker/memory v0.0.0-00010101000000-000000000000
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -25,7 +25,6 @@ require (
 	github.com/gorilla/css v1.0.1 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/mattn/go-runewidth v0.0.19 // indirect
 	github.com/microcosm-cc/bluemonday v1.0.27 // indirect
 	github.com/muesli/reflow v0.3.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
@@ -37,4 +36,9 @@ require (
 	golang.org/x/text v0.30.0 // indirect
 )
 
-replace github.com/tinguo/goworker/memory => ../memory
+replace (
+	github.com/tinguo/goworker/ai-core => ../ai-core
+	github.com/tinguo/goworker/ai-memory => ../ai-memory
+	github.com/tinguo/goworker/ai-runtime => ../ai-runtime
+	github.com/tinguo/goworker/ai-sandbox => ../ai-sandbox
+)

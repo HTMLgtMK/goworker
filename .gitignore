@@ -6,6 +6,7 @@
 *.dylib
 daemon/goworker
 daemon/goworker.exe
+ai-runtime/fakeserver
 
 # Test binary
 *.test

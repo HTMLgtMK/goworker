@@ -10,12 +10,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tinguo/goworker/ai-core/core"
+	"github.com/tinguo/goworker/ai-core/spec"
+	"github.com/tinguo/goworker/ai-runtime/agent"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/ai-runtime/session"
+	"github.com/tinguo/goworker/ai-sandbox"
 	"github.com/tinguo/goworker/daemon/internal/config"
-	"github.com/tinguo/goworker/daemon/internal/plugins/agent"
-	"github.com/tinguo/goworker/daemon/internal/plugins/agent/core"
-	"github.com/tinguo/goworker/daemon/internal/sandbox"
-	"github.com/tinguo/goworker/daemon/internal/session"
-	"github.com/tinguo/goworker/daemon/internal/spec"
 )
 
 // TestE2E_SessionPersistFullChain 端到端验证会话持久化完整链路：
@@ -40,10 +41,7 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 	cfg.Session.Dir = filepath.Join(dir, "sessions")
 	cfg.Memory.Enabled = false // 专注会话链路
 
-	hub := &spec.Hub{
-		Config: cfg,
-		Tools:  func() []spec.Tool { return nil },
-	}
+	runtimeCfg := cfg.ToRuntime()
 
 	// 真实构造：Open store → 建 Session（与 startSession 一致的路径）
 	st, err := session.Open(cfg.Session.Dir)
@@ -53,10 +51,11 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 
 	s := agent.NewSession(agent.SessionDeps{
-		Hub:          hub,
+		Config:       runtimeCfg,
+		AuditDir:     filepath.Join(dir, "audit"),
 		Memory:       nil,
 		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
-		NewProvider:  func(*config.Config) core.Provider { return agent.NewOpenAIProvider(srv.URL, "", "mock") },
+		NewProvider:  func(*runtimeconfig.Config) core.Provider { return agent.NewOpenAIProvider(srv.URL, "", "mock") },
 		Store:        st,
 	})
 

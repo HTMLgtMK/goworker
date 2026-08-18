@@ -4,23 +4,35 @@ A modular REPL agent terminal in Go — plugin-based, middleware-driven, LLM-rea
 
 ## Architecture
 
-Two Go modules in one workspace (`go.work`): `daemon/` (the REPL daemon) and `memory/` (standalone, independently-releasable memory component).
+Five Go modules in one workspace (`go.work`), layered as an SDK. `ai-core` / `ai-sandbox` / `ai-memory` are standalone, independently-releasable; `ai-runtime` aggregates them into an out-of-the-box agent for external projects; `daemon/` is the REPL shell consuming `ai-runtime`.
 
 ```
-memory/                         ← standalone module: MTM task archive + LTM facts (mem0-like API)
-cmd/goworker/main.go            ← entry point
-internal/
-├── spec/                   ← interfaces & types (Hub, Command, Plugin, Context)
-├── core/                   ← Engine: middleware chain, plugin lifecycle, command routing
-├── mcp/                    ← MCP client (JSON-RPC 2.0 over stdio, mcp-go compatible shapes)
-├── skills/                 ← SKILL.md discovery & parsing
-├── plugins/
-│   └── agent/              ← ReAct agent plugin (OpenAI-compatible LLM, tool calling)
-└── frontend/
-    ├── stdin/              ← stdin REPL frontend
-    ├── tui/                ← TUI frontend (placeholder)
-    └── web/                ← web frontend (placeholder)
-docs/architecture.md        ← detailed architecture doc
+ai-memory/                     ← standalone: MTM task archive + LTM facts (mem0-like), zero deps
+ai-sandbox/                    ← standalone: command safety layer (risk R0-R7 → policy → allow/hitl/deny), stdlib only
+ai-core/                       ← pure engine kernel: spec protocol + ReAct engine + core types + engine middlewares
+│  ├── spec/                   ← Hub, Command, Plugin, Context (pure protocol)
+│  ├── core/                   ← Tool, Message, Usage, Compressor, NewMsgID
+│  ├── config/                 ← LLMConfig/MemoryConfig + validators (engine needs)
+│  ├── agent/                  ← ReAct loop (zero sandbox/memory deps)
+│  └── middlewares/            ← usage/iteration/compression/memory (MemoryClient as local interface)
+ai-runtime/                    ← aggregation: out-of-the-box agent for external projects
+│  ├── config/                 ← aggregated Config{LLM,Memory,Sandbox,Session,MCP} + Paths + event contract
+│  ├── agent/                  ← AgentPlugin (NewPlugin(cfg, paths)), session, tools, commands, DefaultTools
+│  ├── middlewares/            ← HITL middleware (sandbox decision gating)
+│  ├── session/                ← conversation store (checkpoint/rewind)
+│  ├── mcp/ skills/ logger/    ← moved from daemon, reusable
+daemon/                        ← REPL shell: core.Engine + frontend + config parsing + path hub
+│  ├── cmd/goworker/           ← entry point
+│  ├── internal/config/        ← top-level flattened config.yaml + ToRuntime()/ApplyRuntime()
+│  ├── internal/core/          ← Engine: plugin lifecycle, command routing, middleware chain
+│  └── internal/frontend/      ← stdin REPL + statusbar (subscribes ai-runtime events)
+docs/architecture.md           ← detailed architecture doc
+```
+
+```
+daemon ──→ ai-runtime ──→ ai-core ──→ (zero goworker deps)
+                 ├──→ ai-memory
+                 └──→ ai-sandbox
 ```
 
 ### Core Concepts
@@ -96,7 +108,7 @@ MCP servers:
 - ⚠️ MCP tools run in external processes, **not gated by the local sandbox** — only connect servers you trust
 
 
-Memory (`memory/`):
+Memory (`ai-memory/`):
 - Two-layer model: MTM (task archive, open/closed, cross-session summary) + LTM (distilled facts)
 - Every query retrieves top-K relevant memory (open tasks + facts) and injects it into the prompt
 - Standalone module with zero external deps — `Retriever` interface leaves room for RAG/embedding backends
@@ -108,7 +120,7 @@ Config cascades: in-memory → `$LLM_*` env vars → `~/.config/goworker/.env`.
 
 ```bash
 cd daemon
-go run cmd/goworker/main.go     # go.work resolves ../memory; standalone builds use the replace in daemon/go.mod
+go run cmd/goworker/main.go     # go.work resolves the ai-* modules; standalone builds use the replaces in daemon/go.mod
 ```
 
 ## Why goworker?

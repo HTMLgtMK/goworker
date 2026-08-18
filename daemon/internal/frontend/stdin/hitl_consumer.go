@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/tinguo/goworker/daemon/internal/spec"
+	"github.com/tinguo/goworker/ai-core/spec"
 )
 
 const (

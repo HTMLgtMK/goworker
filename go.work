@@ -1,6 +1,9 @@
 go 1.26.1
 
 use (
+	./ai-core
+	./ai-memory
+	./ai-runtime
+	./ai-sandbox
 	./daemon
-	./memory
 )

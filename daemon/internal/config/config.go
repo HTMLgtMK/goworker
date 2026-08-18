@@ -2,29 +2,36 @@
 //
 // 配置从 YAML 文件加载，缺失字段由默认值兜底。
 // 文件路径：~/.config/goworker/config.yaml（可用 GOWORKER_CONFIG_DIR 覆盖目录）。
+//
+// 分层：本包是 YAML 解析层 + 路径中枢；engine 段(LLM/Memory)用 ai-core/config，
+// 装配段(Session/MCP)用 ai-runtime/config，Sandbox 保留本地解析层（risky_patterns
+// 字符串/结构体双格式兼容），经 ToRuntime() 转成 ai-runtime 的聚合配置注入插件。
 package config
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 
-	"github.com/tinguo/goworker/daemon/internal/logger"
+	coreconfig "github.com/tinguo/goworker/ai-core/config"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/ai-runtime/logger"
+	"github.com/tinguo/goworker/ai-sandbox"
 	"gopkg.in/yaml.v3"
 )
 
-// Config 是 goworker 的整体配置。
+// Config 是 goworker 的整体配置。所有段顶层平铺，旧 config.yaml 不缩进 → 兼容。
 type Config struct {
-	Frontend FrontendConfig `yaml:"frontend"`
-	LLM      LLMConfig      `yaml:"llm"`
-	Sandbox  SandboxConfig  `yaml:"sandbox"`
-	Log      logger.Config  `yaml:"log"`
-	MCP      MCPConfig      `yaml:"mcp"`
-	Memory   MemoryConfig   `yaml:"memory"`
-	Session  SessionConfig  `yaml:"session"`
+	Frontend FrontendConfig              `yaml:"frontend"`
+	LLM      coreconfig.LLMConfig        `yaml:"llm"`
+	Memory   coreconfig.MemoryConfig     `yaml:"memory"`
+	Sandbox  SandboxConfig               `yaml:"sandbox"`
+	Session  runtimeconfig.SessionConfig `yaml:"session"`
+	MCP      runtimeconfig.MCPConfig     `yaml:"mcp"`
+	Log      logger.Config               `yaml:"log"`
 }
 
 type FrontendConfig struct {
@@ -35,35 +42,7 @@ type StdinConfig struct {
 	Theme string `yaml:"theme"` // "default" 或主题 JSON 文件路径
 }
 
-type LLMConfig struct {
-	Endpoint      string  `yaml:"endpoint"`
-	Model         string  `yaml:"model"`
-	APIKey        string  `yaml:"api_key"`
-	ContextWindow int     `yaml:"context_window"` // 模型上下文窗口（token），0 = 未知
-	CompressAt    float64 `yaml:"compress_at"`    // 历史压缩触发阈值（0-1）：估算用量达窗口该比例时自动压缩，0 = 关闭
-	CompactKeep   int     `yaml:"compact_keep"`   // 滚动压缩保留的最近消息条数（原文不压，只压更早的）
-	MaxIterations int     `yaml:"max_iterations"` // ReAct 循环最大迭代数（模型往返次数），0 = 默认 15
-}
-
-// SessionConfig 是会话持久化模块的配置。
-type SessionConfig struct {
-	Dir     string `yaml:"dir"`     // 会话 jsonl 存储目录，默认 <DefaultDir>/sessions
-	Enabled bool   `yaml:"enabled"` // false = 会话持久化关闭，走旧纯内存逻辑
-}
-
-// MemoryConfig 是 agent 记忆模块（MTM 任务档案 + LTM 事实条目）的配置。
-// 声明式指令层（USER.md + AGENTS.md）与记忆组件同开关：Enabled=false 时两者都关。
-type MemoryConfig struct {
-	Dir               string  `yaml:"dir"`                 // 存储目录，默认 <DefaultDir>/memory
-	Enabled           bool    `yaml:"enabled"`             // false = 整个记忆模块关闭
-	TaskKeep          int     `yaml:"task_keep"`           // 保留任务档案数，0 = 不裁剪
-	TaskInjectN       int     `yaml:"task_inject_n"`       // 会话边界时注入最近 N 个未完成任务
-	LtmInjectTopK     int     `yaml:"ltm_inject_top_k"`    // 会话边界时注入相关事实条数
-	LtmExtract        bool    `yaml:"ltm_extract"`         // 检查点固化时是否 LLM 抽取 LTM
-	InjectBudgetRatio float64 `yaml:"inject_budget_ratio"` // 注入块占 context 窗口的比例上限（0-1）
-	UserMaxChars      int     `yaml:"user_max_chars"`      // USER.md 画像容量上限（rune），超限 profile 工具报错
-	AgentsMaxChars    int     `yaml:"agents_max_chars"`    // AGENTS.md（全局+项目合并）注入上限，超出截断
-}
+// ---- sandbox 解析层（保留双格式兼容，运行时转 ai-sandbox）----
 
 // RiskPatternConfig 表示一个风险命令模式及其人类可读描述。
 type RiskPatternConfig struct {
@@ -105,55 +84,86 @@ type AllowRuleConfig struct {
 	Desc    string   `yaml:"desc,omitempty"`    // 人类可读描述
 }
 
-// MCPConfig 是 MCP server 连接配置。
-type MCPConfig struct {
-	Servers []MCPServer `yaml:"servers"` // 空 = 不连接任何 server
+// ToSandbox 把解析层（含双格式兼容）转成 ai-sandbox 的运行时 DTO。
+func (s SandboxConfig) ToSandbox() sandbox.SandboxConfig {
+	out := sandbox.SandboxConfig{
+		Mode:           s.Mode,
+		AllowedWorkDir: s.AllowedWorkDir,
+		DeniedPatterns: s.DeniedPatterns,
+		SafeCommands:   s.SafeCommands,
+		AuditLog:       s.AuditLog,
+	}
+	for _, r := range s.RiskyPatterns {
+		out.RiskyPatterns = append(out.RiskyPatterns, sandbox.RiskPatternConfig{Pattern: r.Pattern, Desc: r.Desc})
+	}
+	for _, a := range s.AllowRules {
+		out.AllowRules = append(out.AllowRules, sandbox.AllowRuleConfig{Match: a.Match, MaxRisk: a.MaxRisk, Effects: a.Effects, Desc: a.Desc})
+	}
+	return out
 }
 
-// MCPServer 描述一个 stdio MCP server 连接。
-type MCPServer struct {
-	Name    string   `yaml:"name"`           // 唯一标识，同时作工具名前缀
-	Command string   `yaml:"command"`        // 可执行文件路径或命令名
-	Args    []string `yaml:"args,omitempty"` // 传给进程的参数
+// fromSandbox 把 ai-sandbox 的 DTO 转回解析层。
+func fromSandbox(s sandbox.SandboxConfig) SandboxConfig {
+	out := SandboxConfig{
+		Mode:           s.Mode,
+		AllowedWorkDir: s.AllowedWorkDir,
+		DeniedPatterns: s.DeniedPatterns,
+		SafeCommands:   s.SafeCommands,
+		AuditLog:       s.AuditLog,
+	}
+	for _, r := range s.RiskyPatterns {
+		out.RiskyPatterns = append(out.RiskyPatterns, RiskPatternConfig{Pattern: r.Pattern, Desc: r.Desc})
+	}
+	for _, a := range s.AllowRules {
+		out.AllowRules = append(out.AllowRules, AllowRuleConfig{Match: a.Match, MaxRisk: a.MaxRisk, Effects: a.Effects, Desc: a.Desc})
+	}
+	return out
 }
+
+// ---- 双视图同步 ----
+
+// ToRuntime 复制出 ai-runtime 的聚合配置，供插件消费。
+func (c *Config) ToRuntime() *runtimeconfig.Config {
+	return &runtimeconfig.Config{
+		LLM:     c.LLM,
+		Memory:  c.Memory,
+		Sandbox: c.Sandbox.ToSandbox(),
+		Session: c.Session,
+		MCP:     c.MCP,
+	}
+}
+
+// ApplyRuntime 把插件持有的 ai-runtime 配置回写到解析层（SaveConfig 双向同步）。
+func (c *Config) ApplyRuntime(r *runtimeconfig.Config) {
+	c.LLM = r.LLM
+	c.Memory = r.Memory
+	c.Session = r.Session
+	c.MCP = r.MCP
+	c.Sandbox = fromSandbox(r.Sandbox)
+}
+
+// ---- 默认值 ----
 
 // Default 返回带默认值的 Config。
 func Default() *Config {
 	logCfg := logger.Default()
 	logCfg.File = defaultLogPath()
+	mem := coreconfig.DefaultMemory()
+	mem.Dir = filepath.Join(DefaultDir(), "memory")
 	return &Config{
 		Frontend: FrontendConfig{
-			Stdin: StdinConfig{
-				Theme: "default",
-			},
+			Stdin: StdinConfig{Theme: "default"},
 		},
-		LLM: LLMConfig{
-			Endpoint:      "http://localhost:8000/v1",
-			Model:         "gpt-4o",
-			APIKey:        "",
-			CompressAt:    0.8, // 用量达窗口 80% 自动压缩，留余量给压缩调用和新输入
-			CompactKeep:   10,  // 最近 10 条原文保留，更早的才压缩
-			MaxIterations: 15,  // ReAct 最大迭代数，模型连续调工具不至于无限烧 token
-		},
+		LLM:    coreconfig.DefaultLLM(),
+		Memory: mem,
 		Sandbox: SandboxConfig{
 			Mode: "normal",
 		},
-		Log: logCfg,
-		Memory: MemoryConfig{
-			Dir:               filepath.Join(DefaultDir(), "memory"),
-			Enabled:           true,
-			TaskKeep:          50,
-			TaskInjectN:       3,
-			LtmInjectTopK:     8,
-			LtmExtract:        true,
-			InjectBudgetRatio: 0.15,
-			UserMaxChars:      1500, // Hermes 参考值，够写几十条画像
-			AgentsMaxChars:    4096, // 全局+项目 AGENTS.md 合并注入上限
-		},
-		Session: SessionConfig{
+		Session: runtimeconfig.SessionConfig{
 			Dir:     filepath.Join(DefaultDir(), "sessions"),
 			Enabled: true,
 		},
+		Log: logCfg,
 	}
 }
 
@@ -197,40 +207,6 @@ func (c *Config) Display() string {
 	return string(data)
 }
 
-// ParseContextWindow 解析上下文窗口值，支持 k/m 简写：
-//
-//	"32768"  → 32768
-//	"32k"    → 32768
-//	"128k"   → 131072
-//	"1.5m"   → 1572864
-//
-// k/m 按 1024 进制换算，贴合主流模型 2 的幂窗口（32768/65536/131072）。
-// 返回 token 数，非法输入返回错误。
-func ParseContextWindow(s string) (int, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0, fmt.Errorf("空值")
-	}
-	mult := 1
-	switch last := s[len(s)-1]; last {
-	case 'k', 'K':
-		mult = 1024
-		s = s[:len(s)-1]
-	case 'm', 'M':
-		mult = 1024 * 1024
-		s = s[:len(s)-1]
-	}
-	f, err := strconv.ParseFloat(s, 64)
-	if err != nil || f <= 0 {
-		return 0, fmt.Errorf("无效上下文窗口 %q（应为正整数或带 k/m 后缀，如 32768 / 32k / 128k）", s)
-	}
-	n := int(f * float64(mult))
-	if n <= 0 {
-		return 0, fmt.Errorf("上下文窗口过小: %q", s)
-	}
-	return n, nil
-}
-
 // SetField 按点分 key 设置配置项（如 "llm.endpoint"、"sandbox.mode"）。
 func (c *Config) SetField(key, value string) error {
 	switch key {
@@ -243,28 +219,27 @@ func (c *Config) SetField(key, value string) error {
 	case "llm.api_key":
 		c.LLM.APIKey = value
 	case "llm.context_window":
-		n, err := ParseContextWindow(value)
+		n, err := coreconfig.ParseContextWindow(value)
 		if err != nil {
 			return err
 		}
 		c.LLM.ContextWindow = n
 	case "llm.compress_at":
-		f, err := strconv.ParseFloat(value, 64)
-		// ParseFloat("NaN") 不报错且 NaN 比较恒 false，需显式排除
-		if err != nil || math.IsNaN(f) || f < 0 || f > 1 {
-			return fmt.Errorf("无效 compress_at: %s（应为 0-1 的比例，如 0.8）", value)
+		f, err := coreconfig.ParseCompressAt(value)
+		if err != nil {
+			return err
 		}
 		c.LLM.CompressAt = f
 	case "llm.compact_keep":
-		n, err := strconv.Atoi(value)
-		if err != nil || n <= 0 {
-			return fmt.Errorf("无效 compact_keep: %s（应为正整数，如 10）", value)
+		n, err := coreconfig.ParseCompactKeep(value)
+		if err != nil {
+			return err
 		}
 		c.LLM.CompactKeep = n
 	case "llm.max_iterations":
-		n, err := strconv.Atoi(value)
-		if err != nil || n <= 0 {
-			return fmt.Errorf("无效 max_iterations: %s（应为正整数，如 15）", value)
+		n, err := coreconfig.ParseMaxIterations(value)
+		if err != nil {
+			return err
 		}
 		c.LLM.MaxIterations = n
 	case "sandbox.mode":
@@ -351,7 +326,10 @@ func Load(path string) *Config {
 	if err != nil {
 		return cfg
 	}
-	yaml.Unmarshal(data, cfg) // 缺失字段保留默认值
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		// 解析失败别静默：坏配置 + 默认值混合跑起来最难排查
+		slog.Warn("config: parse failed, using defaults", "err", err)
+	}
 	return cfg
 }
 
@@ -365,9 +343,22 @@ func Save(cfg *Config, path string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	// 写入临时文件
-	tmpPath := filepath.Join(dir, ".config.yaml.tmp")
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	// 写入临时文件：CreateTemp 避免并发写互踩；0600 收窄权限（文件含 API key）
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // rename 失败时不留垃圾文件
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
 		return err
 	}
 	// rename 在 POSIX 上是原子的

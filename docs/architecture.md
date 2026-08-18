@@ -1,40 +1,44 @@
 # Architecture
 
 ```
-daemon/
-├── cmd/goworker/
-│   └── main.go                  # 入口：生命周期、信号管理
-│
-├── internal/
-│   ├── spec/                    # 纯类型定义
-│   │   ├── types.go             # Plugin, Command, Tool, Context, Session, Event, Middleware
-│   │   └── context.go           # NewContext 构造
-│   │
-│   ├── core/                    # Engine 实现
-│   │   ├── engine.go            # Engine：注册、路由、Eval、事件、生命周期
-│   │   └── middleware.go        # 内置中间件（Logging, Session）
-│   │
-│   ├── frontend/
-│   │   ├── stdin/               # headless REPL（当前唯一前端）
-│   │   │   └── stdin.go
-│   │   ├── tui/                 # Bubble Tea（占位）
-│   │   └── web/                 # WebSocket + REST（占位）
-│   │
-│   └── plugins/
-│       └── agent/               # ReAct agent 插件
-│           ├── plugin.go        # /agent, /model 命令 + 配置管理
-│           ├── agent.go         # ReAct 循环 + tool 执行
-│           ├── llm.go           # Message, ToolCall, Token 等类型
-│           └── provider.go      # OpenAI API 客户端（chat, stream, SSE）
-│
-├── docs/
-│   └── architecture.md
-│
-├── TODO.md                      # 生产就绪待办
-├── CLAUDE.md
-├── README.md
-└── go.mod
+ai-memory/                      [module github.com/tinguo/goworker/ai-memory] 零依赖
+  memory.go store.go retriever.go consolidate.go ...  # MTM + LTM，逻辑独立
+
+ai-sandbox/                     [module github.com/tinguo/goworker/ai-sandbox] stdlib only
+  spec.go config.go safe.go policy.go assess.go risk.go audit.go  # 命令安全层
+
+ai-core/                        [module github.com/tinguo/goworker/ai-core] 零 goworker 依赖
+  spec/             # 纯协议：Hub, Command, Plugin, Context（Hub.Config 已 any 化）
+  core/             # Tool, Message, Usage, Compressor, NewMsgID（spec.go 集中类型）
+  config/           # LLMConfig/MemoryConfig + Parse* 校验器
+  agent/            # ReAct 引擎本体（无 DefaultTools，sandbox 无关）
+  middlewares/      # usage/iteration/compression/memory（MemoryClient 本地接口）
+
+ai-runtime/                     [module github.com/tinguo/goworker/ai-runtime] 聚合层
+  config/           # 聚合 Config{LLM,Memory,Sandbox,Session,MCP} + Paths + 事件契约
+  agent/            # AgentPlugin(spec.go 定义) + session + tools + commands + DefaultTools
+  middlewares/      # HITL 中间件（依赖 sandbox，属装配层）
+  session/          # 会话持久化 store（checkpoint/rewind/compact）
+  mcp/ skills/ logger/ fakeserver/
+
+daemon/                         [module github.com/tinguo/goworker/daemon] REPL shell
+  cmd/goworker/main.go          # 入口：载入 config → ToRuntime → Register(NewPlugin)
+  internal/config/              # 顶层平铺 config.yaml 解析 + ToRuntime/ApplyRuntime
+  internal/core/                # Engine：插件生命周期、命令路由、中间件链、事件广播
+  internal/frontend/            # stdin REPL + statusbar（addon 订阅 ai-runtime 事件）
 ```
+
+依赖方向（禁止反向）：
+
+```
+daemon ──→ ai-runtime ──→ ai-core ──→ (zero goworker deps)
+                 ├──→ ai-memory
+                 └──→ ai-sandbox
+```
+
+- ai-core/agent 与 ai-memory、ai-sandbox 零耦合：DefaultTools 在 ai-runtime/agent，MemoryClient 为本地接口 + ai-runtime adapter。
+- 配置不跨层上溯：ai-core/config 只含引擎真需要的 LLM/Memory；Sandbox/Session/MCP 在 ai-runtime/config；daemon 负责 YAML 兼容（risky_patterns 双格式）。
+- 事件契约倒置：ai-runtime/config 定义 EventUsage/EventIteration + UsageEvent，daemon/statusbar 订阅渲染，statusbar 不进 SDK。
 
 ---
 
@@ -102,7 +106,7 @@ User Input → system prompt + tools → LLM
 
 ### 命令安全层（sandbox）
 
-bash 工具执行前经结构化决策链路（`daemon/internal/sandbox`）：
+bash 工具执行前经结构化决策链路（`ai-sandbox` 独立 module）：
 
 ```text
 命令 → Assess（风险分级 R0-R7 + 副作用 Effects）→ Policy 决策矩阵 → allow / hitl / deny

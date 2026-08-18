@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/tinguo/goworker/daemon/internal/spec"
+	"github.com/tinguo/goworker/ai-core/spec"
 )
 
 // RegisterBuiltinCommands 注册引擎内置命令（/help, /config 等）。

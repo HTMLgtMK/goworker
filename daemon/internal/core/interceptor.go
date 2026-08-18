@@ -1,8 +1,8 @@
 package core
 
 import (
-	"github.com/tinguo/goworker/daemon/internal/logger"
-	"github.com/tinguo/goworker/daemon/internal/spec"
+	"github.com/tinguo/goworker/ai-core/spec"
+	"github.com/tinguo/goworker/ai-runtime/logger"
 )
 
 // LoggingInterceptor 是命令级中间件的扩展点，后续的命令审计/统计逻辑挂在这里。

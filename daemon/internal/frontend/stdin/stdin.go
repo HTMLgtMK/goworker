@@ -9,10 +9,10 @@ import (
 
 	term "github.com/charmbracelet/x/term"
 
+	"github.com/tinguo/goworker/ai-core/spec"
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/core"
 	"github.com/tinguo/goworker/daemon/internal/frontend/statusbar"
-	"github.com/tinguo/goworker/daemon/internal/spec"
 )
 
 // rawNL 在 raw mode 下 \n 不会自动回车到行首，需要补 \r

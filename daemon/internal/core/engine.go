@@ -5,9 +5,10 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/tinguo/goworker/ai-core/spec"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/ai-runtime/logger"
 	"github.com/tinguo/goworker/daemon/internal/config"
-	"github.com/tinguo/goworker/daemon/internal/logger"
-	"github.com/tinguo/goworker/daemon/internal/spec"
 )
 
 // Engine 是 goworker 的核心引擎。
@@ -20,6 +21,7 @@ import (
 //   - 事件广播
 type Engine struct {
 	config          *config.Config
+	runtimeCfg      *runtimeconfig.Config
 	log             *logger.Logger
 	plugins         map[string]spec.Plugin
 	commands        map[string]spec.Command
@@ -31,12 +33,16 @@ type Engine struct {
 
 // NewEngine 创建一个引擎并关联全局配置与日志器。
 // l 为 nil 时回落到 stderr logger，避免调用方误传 nil 导致内部 panic。
-func NewEngine(cfg *config.Config, l *logger.Logger) *Engine {
+func NewEngine(cfg *config.Config, runtimeCfg *runtimeconfig.Config, l *logger.Logger) *Engine {
 	if l == nil {
 		l, _ = logger.Setup(logger.Default()) // 空 File 配置必然成功
 	}
+	if runtimeCfg == nil {
+		runtimeCfg = cfg.ToRuntime()
+	}
 	return &Engine{
 		config:       cfg,
+		runtimeCfg:   runtimeCfg,
 		log:          l,
 		plugins:      make(map[string]spec.Plugin),
 		commands:     make(map[string]spec.Command),
@@ -50,9 +56,16 @@ func NewEngine(cfg *config.Config, l *logger.Logger) *Engine {
 func (e *Engine) Config() *config.Config { return e.config }
 
 // SaveConfig 持久化配置到 YAML 文件并同步内存。
-func (e *Engine) SaveConfig(cfg *config.Config) error {
-	*e.config = *cfg
-	return config.Save(cfg, config.DefaultPath())
+// cfg 是插件注入的 ai-runtime 配置（spec.Hub.Config 已 any 化），
+// 回写解析层后整份落盘，保证 runtime→daemon→磁盘三处一致。
+func (e *Engine) SaveConfig(cfg any) error {
+	rc, ok := cfg.(*runtimeconfig.Config)
+	if !ok {
+		return fmt.Errorf("SaveConfig: unexpected config type %T", cfg)
+	}
+	*e.runtimeCfg = *rc
+	e.config.ApplyRuntime(rc)
+	return config.Save(e.config, config.DefaultPath())
 }
 
 // SetFallbackHandler 设置未匹配命令的兜底处理器。
@@ -130,7 +143,7 @@ func (e *Engine) pluginHub() *spec.Hub {
 		Eval: func(ctx *spec.Context, input string) error {
 			return e.Eval(ctx, input)
 		},
-		Config:     e.config,
+		Config:     e.runtimeCfg,
 		SaveConfig: e.SaveConfig,
 		SetFallbackHandler: func(fn func(ctx *spec.Context) error) {
 			e.SetFallbackHandler(fn)

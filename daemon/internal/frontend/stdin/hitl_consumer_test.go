@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tinguo/goworker/daemon/internal/spec"
+	"github.com/tinguo/goworker/ai-core/spec"
 )
 
 // syncBuffer 线程安全的字符串缓冲：HITL writer 在 Run goroutine 写，

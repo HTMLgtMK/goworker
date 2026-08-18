@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync/atomic"
 
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/daemon/internal/frontend/statusbar"
 )
 
@@ -16,8 +17,8 @@ var (
 
 // IterationAddon 显示 agent 的 ReAct 循环轮次。
 //
-// 通过事件总线订阅 statusbar.EventIteration 事件：
-// agent plugin 发 `Publish(statusbar.EventIteration, nil)`，
+// 通过事件总线订阅 ai-runtime 的 EventIteration 事件：
+// agent plugin 发 `Publish(runtimeconfig.EventIteration, nil)`，
 // addon 在 Tick 时从 channel 消费事件，更新计数。
 // frontend 不持有 addon 引用，完全解耦。
 type IterationAddon struct {
@@ -36,7 +37,7 @@ func NewIterationAddon() *IterationAddon {
 
 // OnRegister 实现 statusbar.Registerer，注册时订阅 iteration 事件。
 func (a *IterationAddon) OnRegister(b *statusbar.Bar) {
-	b.Subscribe(statusbar.EventIteration, func(any) {
+	b.Subscribe(runtimeconfig.EventIteration, func(any) {
 		select {
 		case a.events <- struct{}{}:
 		default:
