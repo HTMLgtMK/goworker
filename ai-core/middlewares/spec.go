@@ -6,7 +6,6 @@ package middlewares
 
 import (
 	"context"
-	"time"
 
 	"github.com/tinguo/goworker/ai-core/config"
 	"github.com/tinguo/goworker/ai-core/core"
@@ -69,9 +68,6 @@ type MemoryMiddleware struct {
 type ChannelDecisionProvider struct {
 	decisions <-chan spec.HITLDecision
 }
-
-// hitlTimeout 是 HITL 决策的等待上限，超时按拒绝处理（宪法：HITL 超时默认拒绝）。
-const hitlTimeout = 30 * time.Second
 
 // ---- 压缩 ----
 

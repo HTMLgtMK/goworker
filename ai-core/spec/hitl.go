@@ -13,6 +13,11 @@ const (
 	DecisionRespond DecisionType = "respond" // 回复指令，不执行工具
 )
 
+// DefaultHITLTimeout 是 HITL 请求的默认等待上限。
+// 创建 InterruptRequest 时用它填 ExpiresAt（唯一的超时事实来源）；
+// DecisionProvider 在 ExpiresAt 缺失时兜底使用它。超时按拒绝处理（宪法：HITL 超时默认拒绝）。
+const DefaultHITLTimeout = 2 * time.Minute
+
 // InterruptRequest 描述工具执行因等待用户确认而暂停的原因。
 // 由 agent goroutine 通过 token channel 发送给前端。
 type InterruptRequest struct {

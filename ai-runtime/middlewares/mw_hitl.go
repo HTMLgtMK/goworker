@@ -74,7 +74,7 @@ func (mw *HITLMiddleware) checkBash(ev *core.BeforeToolEvent) *core.MiddlewareRe
 			RiskLevel:  out.Level.String(),
 			Effects:    out.Effects.Names(),
 			CreatedAt:  time.Now(),
-			ExpiresAt:  time.Now().Add(30 * time.Second),
+			ExpiresAt:  time.Now().Add(spec.DefaultHITLTimeout),
 		}
 		return mw.confirm(ev, req, func(d spec.HITLDecision) {
 			outcome := "executed"
@@ -143,7 +143,7 @@ func (mw *HITLMiddleware) checkMCP(ev *core.BeforeToolEvent) *core.MiddlewareRes
 			RiskReason:  "MCP tool executes in an external process outside the sandbox",
 			Description: fmt.Sprintf("MCP tool %s with args %s", ev.Tool.Function.Name, string(args)),
 			CreatedAt:   time.Now(),
-			ExpiresAt:   time.Now().Add(30 * time.Second),
+			ExpiresAt:   time.Now().Add(spec.DefaultHITLTimeout),
 		}
 		return mw.confirm(ev, req, nil)
 	}
