@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-core/spec"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	"github.com/tinguo/goworker/ai-runtime/mcp"
+	spec "github.com/tinguo/goworker/ai-runtime/plugin"
 )
 
 // 本文件是 MCP 集成：server 连接（loadMCP）与工具桥接（mcpToolToCore），
@@ -101,7 +102,7 @@ func (p *AgentPlugin) mcpToolToCore(c mcp.Client, server string, t mcp.Tool) (co
 	return core.Tool{
 		Name:        name,
 		Description: t.Description,
-		Parameters:  normalizeSchema(t.InputSchema),
+		Parameters:  runtimeagent.NormalizeSchema(t.InputSchema),
 		Execute: func(ctx context.Context, args map[string]any) (string, error) {
 			ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()

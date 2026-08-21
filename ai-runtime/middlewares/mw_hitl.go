@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-core/spec"
+	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
@@ -19,7 +19,7 @@ func WithAudit(a *sandbox.AuditLogger) HITLOption {
 	return func(mw *HITLMiddleware) { mw.audit = a }
 }
 
-func NewHITLMiddleware(cfg sandbox.Config, dp core.DecisionProvider, opts ...HITLOption) *HITLMiddleware {
+func NewHITLMiddleware(cfg sandbox.Config, dp hitl.DecisionProvider, opts ...HITLOption) *HITLMiddleware {
 	mw := &HITLMiddleware{sandboxCfg: cfg, decisionProvider: dp}
 	for _, o := range opts {
 		o(mw)
@@ -54,8 +54,7 @@ func (mw *HITLMiddleware) checkBash(ev *core.BeforeToolEvent) *core.MiddlewareRe
 		return &core.MiddlewareResponse{}
 	}
 
-	// 走结构化决策链路：Assess（分级）→ Policy（allow/hitl/deny），
-	// 而不是直接对旧三态 error 分类。
+	// 走结构化决策链路：Assess（分级）→ Policy（allow/hitl/deny），而不是直接对旧三态 error 分类。
 	out := sandbox.Evaluate(sandbox.CommandRequest{Command: cmdStr}, &mw.sandboxCfg)
 	switch out.Decision {
 	case sandbox.DecisionAllow, sandbox.DecisionSandbox:
@@ -66,22 +65,23 @@ func (mw *HITLMiddleware) checkBash(ev *core.BeforeToolEvent) *core.MiddlewareRe
 		reason := out.Error().Error()
 		return mw.block(ev, "⛔ "+reason, "⛔ "+reason)
 	default: // DecisionHitl
-		req := &spec.InterruptRequest{
+		now := time.Now()
+		req := &hitl.InterruptRequest{
 			ID:         fmt.Sprintf("req-%d", reqID.Add(1)),
 			ToolName:   "bash",
 			Command:    cmdStr,
 			RiskReason: riskReason(out),
 			RiskLevel:  out.Level.String(),
 			Effects:    out.Effects.Names(),
-			CreatedAt:  time.Now(),
-			ExpiresAt:  time.Now().Add(spec.DefaultHITLTimeout),
+			CreatedAt:  now,
+			ExpiresAt:  now.Add(hitl.DefaultTimeout),
 		}
-		return mw.confirm(ev, req, func(d spec.HITLDecision) {
+		return mw.confirm(ev, req, func(d hitl.Decision) {
 			outcome := "executed"
-			if d.Type == spec.DecisionReject {
+			if d.Type == hitl.DecisionReject {
 				outcome = "blocked"
 			}
-			if d.Type == spec.DecisionRespond {
+			if d.Type == hitl.DecisionRespond {
 				outcome = "aborted"
 			}
 			mw.recordAudit(out, string(d.Type), outcome)
@@ -136,14 +136,15 @@ func (mw *HITLMiddleware) checkMCP(ev *core.BeforeToolEvent) *core.MiddlewareRes
 		return mw.block(ev, "⛔ "+reason, reason)
 	default: // ModeNormal：外部进程需用户确认
 		args, _ := json.Marshal(ev.Args)
-		req := &spec.InterruptRequest{
+		now := time.Now()
+		req := &hitl.InterruptRequest{
 			ID:          fmt.Sprintf("req-%d", reqID.Add(1)),
 			ToolName:    ev.Tool.Function.Name,
 			Command:     string(args),
 			RiskReason:  "MCP tool executes in an external process outside the sandbox",
 			Description: fmt.Sprintf("MCP tool %s with args %s", ev.Tool.Function.Name, string(args)),
-			CreatedAt:   time.Now(),
-			ExpiresAt:   time.Now().Add(spec.DefaultHITLTimeout),
+			CreatedAt:   now,
+			ExpiresAt:   now.Add(hitl.DefaultTimeout),
 		}
 		return mw.confirm(ev, req, nil)
 	}
@@ -153,30 +154,35 @@ func (mw *HITLMiddleware) checkMCP(ev *core.BeforeToolEvent) *core.MiddlewareRes
 
 // confirm 走完整 HITL 决策流程：发 interrupt token → 等用户决策 → 处理。
 // onDecide 在拿到用户决策后立即回调（审计用），nil 时跳过。
-func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *spec.InterruptRequest, onDecide func(d spec.HITLDecision)) *core.MiddlewareResponse {
-	// 发送 interrupt token，通知前端展示确认选项
-	select {
-	case ev.TokenCh <- core.Token{Type: core.TokenTypeInterrupt, Interrupt: req}:
-	case <-ev.Ctx.Done():
-		return &core.MiddlewareResponse{}
+func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *hitl.InterruptRequest, onDecide func(d hitl.Decision)) *core.MiddlewareResponse {
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return mw.reject(ev, "⛔ failed to encode interrupt request")
+	}
+	if ev.Emit != nil {
+		ev.Emit.Emit(ev.Ctx, core.Token{
+			Type: core.TokenTypeEvent,
+			Event: &core.RuntimeEvent{
+				Type: hitl.EventInterrupt,
+				ID:   req.ID,
+				Data: payload,
+			},
+		})
 	}
 
-	// 通过 DecisionProvider 获取用户决策
 	d := mw.decisionProvider.GetDecision(ev.Ctx, req)
 	if onDecide != nil {
 		onDecide(d)
 	}
 
 	switch d.Type {
-	case spec.DecisionApprove:
+	case hitl.DecisionApprove:
 		// execute as-is
-	case spec.DecisionEdit:
+	case hitl.DecisionEdit:
 		// 仅 bash 支持命令编辑；MCP 工具没有 command 字段，编辑视为批准
 		if req.ToolName == "bash" {
 			if edited := strings.TrimSpace(d.Command); edited != "" {
 				ev.Args["command"] = edited
-				// 编辑后的命令重新过 sandbox：用户编辑不是免检令牌，
-				// deny 级风险（strict/readonly 硬拒、deny_patterns）依然拦截
 				re := sandbox.Evaluate(sandbox.CommandRequest{Command: edited}, &mw.sandboxCfg)
 				if re.Decision == sandbox.DecisionDeny {
 					mw.recordAudit(re, string(d.Type), "blocked")
@@ -184,24 +190,19 @@ func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *spec.InterruptR
 				}
 			}
 		}
-	case spec.DecisionReject:
+	case hitl.DecisionReject:
 		return mw.reject(ev, "⛔ rejected by user")
-	case spec.DecisionRespond:
+	case hitl.DecisionRespond:
 		msg := strings.TrimSpace(d.Message)
 		if msg == "" {
 			msg = "user declined to answer"
 		}
-		select {
-		case ev.TokenCh <- core.Token{Type: core.TokenTypeToolResult, Content: "💬 " + msg}:
-		case <-ev.Ctx.Done():
+		if ev.Emit != nil {
+			ev.Emit.Emit(ev.Ctx, core.Token{Type: core.TokenTypeToolResult, Content: "💬 " + msg})
 		}
-		ev.Aborted = true
-		// 必须用 tool 消息回填并带 ToolCallID：assistant 的每个 tool_call 都要有对应
-		// tool 响应，否则下一轮请求被 OpenAI 兼容后端以 400/空 choices 拒绝 —— 这正是
-		// 多轮 tool call"莫名停止"的诱因之一。模型借此得知工具没执行、用户说了什么。
-		ev.ResponseMessages = []core.Message{
+		ev.Abort = &core.ToolAbort{Messages: []core.Message{
 			{Role: "tool", Content: fmt.Sprintf("[tool not executed] user replied: %s", msg), ToolCallID: ev.Tool.ID},
-		}
+		}}
 	}
 
 	return &core.MiddlewareResponse{}
@@ -209,26 +210,22 @@ func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *spec.InterruptR
 
 // block 直接拒绝工具执行并回填会话历史。
 func (mw *HITLMiddleware) block(ev *core.BeforeToolEvent, tokenMsg, toolMsg string) *core.MiddlewareResponse {
-	select {
-	case ev.TokenCh <- core.Token{Type: core.TokenTypeToolCall, Content: tokenMsg}:
-	case <-ev.Ctx.Done():
+	if ev.Emit != nil {
+		ev.Emit.Emit(ev.Ctx, core.Token{Type: core.TokenTypeToolCall, Content: tokenMsg})
 	}
-	ev.Aborted = true
-	ev.ResponseMessages = []core.Message{
+	ev.Abort = &core.ToolAbort{Messages: []core.Message{
 		{Role: "tool", Content: toolMsg, ToolCallID: ev.Tool.ID},
-	}
+	}}
 	return &core.MiddlewareResponse{}
 }
 
 // reject 拒绝执行并回填 tool 结果消息。
 func (mw *HITLMiddleware) reject(ev *core.BeforeToolEvent, msg string) *core.MiddlewareResponse {
-	select {
-	case ev.TokenCh <- core.Token{Type: core.TokenTypeToolResult, Content: msg}:
-	case <-ev.Ctx.Done():
+	if ev.Emit != nil {
+		ev.Emit.Emit(ev.Ctx, core.Token{Type: core.TokenTypeToolResult, Content: msg})
 	}
-	ev.Aborted = true
-	ev.ResponseMessages = []core.Message{
+	ev.Abort = &core.ToolAbort{Messages: []core.Message{
 		{Role: "tool", Content: msg, ToolCallID: ev.Tool.ID},
-	}
+	}}
 	return &core.MiddlewareResponse{}
 }

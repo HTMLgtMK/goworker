@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/tinguo/goworker/ai-core/config"
 	"github.com/tinguo/goworker/ai-core/core"
+	"github.com/tinguo/goworker/ai-runtime/config"
 )
 
 func NewMemoryMiddleware(client MemoryClient, cfg config.MemoryConfig, window int) *MemoryMiddleware {

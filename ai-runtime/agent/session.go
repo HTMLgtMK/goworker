@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -9,10 +10,9 @@ import (
 
 	coreagent "github.com/tinguo/goworker/ai-core/agent"
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-core/middlewares"
-	"github.com/tinguo/goworker/ai-core/spec"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
-	runtimemw "github.com/tinguo/goworker/ai-runtime/middlewares"
+	"github.com/tinguo/goworker/ai-runtime/hitl"
+	"github.com/tinguo/goworker/ai-runtime/middlewares"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-sandbox"
 )
@@ -33,10 +33,12 @@ func NewSession(deps SessionDeps) *Session {
 }
 
 // Run 执行一轮 /agent 对话：组装 agent → 跑 ReAct 循环 → 流式输出 → 写回 conversation。
-func (s *Session) Run(ctx *spec.Context) error {
-	input := strings.Join(ctx.Args, " ")
+func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) error {
+	input := strings.TrimSpace(req.Input)
 	if input == "" {
-		ctx.Writer("用法: /agent <你的问题>\n")
+		if cb.Write != nil {
+			cb.Write("用法: /agent <你的问题>\n")
+		}
 		return nil
 	}
 
@@ -56,8 +58,8 @@ func (s *Session) Run(ctx *spec.Context) error {
 	}
 
 	provider := s.deps.NewProvider(cfg)
-	decisions := make(chan spec.HITLDecision, 1)
-	mws := s.buildMiddlewareChain(ctx, provider, &sandboxCfg, cfg, decisions)
+	decisions := make(chan hitl.Decision, 1)
+	mws := s.buildMiddlewareChain(cb, provider, &sandboxCfg, cfg, decisions)
 	systemPrompt := s.buildSystemPrompt(cfg, tools)
 
 	opts := []coreagent.Option{coreagent.WithMaxIterations(cfg.LLM.MaxIterations)}
@@ -66,7 +68,7 @@ func (s *Session) Run(ctx *spec.Context) error {
 	// agentCtx 不设硬超时：多轮 tool call 总耗时不可控，5 分钟硬超时只会在工具循环
 	// 中途切断会话，且超时瞬间 sendToken 会把唯一的错误提示吞掉，前端表现成"莫名停止"。
 	// 兜底交给单次请求自身：provider http 30s 超时；bash 类子进程工具受 60s 限制。
-	agentCtx, cancel := context.WithCancel(ctx.Ctx)
+	agentCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// 快照历史给本轮的 Run（工具重入触发的 /compact 不会污染本次运行的输入）
@@ -76,10 +78,12 @@ func (s *Session) Run(ctx *spec.Context) error {
 
 	tokenCh, msgCh, err := agent.Run(agentCtx, conv, input)
 	if err != nil {
-		ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+		if cb.Write != nil {
+			cb.Write(fmt.Sprintf("✘ %v\n", err))
+		}
 		return nil
 	}
-	s.streamTokens(ctx, agentCtx, tokenCh, decisions)
+	s.streamTokens(cb, agentCtx, tokenCh, decisions)
 
 	// 保存对话历史（剔除首条 system prompt + memory 注入的记忆提醒块）。
 	// 记忆块只服务本次 run 的注入，若漏进 STM：下次 run 会重发它、检查点会把
@@ -110,7 +114,7 @@ func (s *Session) Run(ctx *spec.Context) error {
 				}
 			}
 			// 提交后自动打 checkpoint，作为 /rewind 回溯锚点（plan「核心模型」）
-			if err := s.deps.Store.Checkpoint(truncate(input, 80)); err != nil {
+			if err := s.deps.Store.Checkpoint(Truncate(input, 80)); err != nil {
 				slog.Warn("session: checkpoint after commit failed", "err", err)
 			}
 			if err := s.refreshConversation(); err != nil {
@@ -123,20 +127,25 @@ func (s *Session) Run(ctx *spec.Context) error {
 
 // streamTokens 消费 agent 的流式输出：渲染 token、转发 HITL 决策。
 // HITL 决策由前端按 spec 契约完成，plugin 只负责转交；agentCtx 取消时决策投递放弃。
-func (s *Session) streamTokens(ctx *spec.Context, agentCtx context.Context, tokenCh <-chan core.Token, decisions chan spec.HITLDecision) {
+func (s *Session) streamTokens(cb RunCallbacks, agentCtx context.Context, tokenCh <-chan core.Token, decisions chan hitl.Decision) {
 	for tok := range tokenCh {
 		// 先输出内容再检查 Done — Done token 也可能带内容（如错误信息）
-		if tok.Content != "" {
+		if tok.Content != "" && cb.WriteToken != nil {
 			kind, c := renderKind(tok)
-			ctx.WriteToken(kind, c)
+			cb.WriteToken(kind, c)
 		}
 		if tok.Done {
 			break
 		}
-		if tok.Type == core.TokenTypeInterrupt && tok.Interrupt != nil {
-			decision := spec.HITLDecision{InterruptID: tok.Interrupt.ID, Type: spec.DecisionReject}
-			if ctx.Decide != nil {
-				decision = ctx.Decide(tok.Interrupt)
+		if tok.Type == core.TokenTypeEvent && tok.Event != nil && tok.Event.Type == hitl.EventInterrupt {
+			var req hitl.InterruptRequest
+			if err := json.Unmarshal(tok.Event.Data, &req); err != nil {
+				slog.Warn("hitl: decode interrupt event failed", "err", err)
+				continue
+			}
+			decision := hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionReject}
+			if cb.Decide != nil {
+				decision = cb.Decide(&req)
 			}
 			select {
 			case decisions <- decision:
@@ -145,22 +154,22 @@ func (s *Session) streamTokens(ctx *spec.Context, agentCtx context.Context, toke
 			continue
 		}
 	}
-	ctx.Writer("\n")
+	if cb.Write != nil {
+		cb.Write("\n")
+	}
 }
 
 // buildMiddlewareChain 组装本轮 Run 的中间件链。
 // 顺序：hitl → usage → iteration →（memory 启用时插入）→ compress。
 // memory 必须在 compress 前：压缩器测量的是注入记忆后的完整 history。
-func (s *Session) buildMiddlewareChain(ctx *spec.Context, provider core.Provider, sandboxCfg *sandbox.Config, cfg *runtimeconfig.Config, decisions chan spec.HITLDecision) []core.Middleware {
-	// 发布能力收拢：spec.Context 的 Publish 是通用广播（event string, data any），
-	// middleware 只认专用签名，在这里做适配。nil 保护集中在收拢点。
+func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, sandboxCfg *sandbox.Config, cfg *runtimeconfig.Config, decisions chan hitl.Decision) []core.Middleware {
 	publish := func(event string, data any) {
-		if ctx.Publish != nil {
-			ctx.Publish(event, data)
+		if cb.Publish != nil {
+			cb.Publish(event, data)
 		}
 	}
 
-	hitlMw := runtimemw.NewHITLMiddleware(*sandboxCfg, middlewares.NewChannelDecisionProvider(decisions), runtimemw.WithAudit(s.audit))
+	hitlMw := middlewares.NewHITLMiddleware(*sandboxCfg, hitl.NewChannelDecisionProvider(decisions), middlewares.WithAudit(s.audit))
 	// usage：观察 AfterModel 记账（累计到会话边界才清零），publish 抛 core.Usage 快照。
 	// 事件契约在 ai-runtime/config（UsageEvent），前端 addon 订阅后自行渲染 —— statusbar 不进 SDK。
 	usageMw := middlewares.NewUsageMiddleware(s.usage, func(u core.Usage) {
@@ -199,16 +208,16 @@ func (s *Session) newCompressor(provider core.Provider, protectSystem bool) *cor
 }
 
 // Compact 执行 /compact：压缩会丢原文，先固化到任务档案，再压缩当前 conversation。
-func (s *Session) Compact(ctx *spec.Context) error {
+func (s *Session) Compact(ctx context.Context, cb RunCallbacks) error {
 	if s.deps.Store == nil {
 		// 纯内存模式：保持旧逻辑
-		return s.compactMemory(ctx)
+		return s.compactMemory(ctx, cb)
 	}
-	return s.compactStore(ctx)
+	return s.compactStore(ctx, cb)
 }
 
 // compactMemory 纯内存压缩（store 禁用时的回退路径）。
-func (s *Session) compactMemory(ctx *spec.Context) error {
+func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks) error {
 	s.mu.Lock()
 	history := s.conversation
 	before := len(history)
@@ -216,16 +225,20 @@ func (s *Session) compactMemory(ctx *spec.Context) error {
 
 	// 压缩会丢原文，先固化到任务档案 —— 这是原文丢失前的最后一次机会。
 	if s.deps.Memory != nil {
-		sum, err := s.checkpoint(ctx.Ctx, history)
+		sum, err := s.checkpoint(ctx, history, s.deps.Config)
 		if err != nil {
-			ctx.Writer(fmt.Sprintf("⚠ Memory consolidation failed (original text lost after compression): %v\n", err))
-		} else if notice := renderCheckpointNotice(sum); notice != "" {
-			ctx.Writer(notice)
+			if cb.Write != nil {
+				cb.Write(fmt.Sprintf("⚠ Memory consolidation failed (original text lost after compression): %v\n", err))
+			}
+		} else if notice := RenderCheckpointNotice(sum); notice != "" && cb.Write != nil {
+			cb.Write(notice)
 		}
 	}
 
 	if before == 0 {
-		ctx.Writer("(no conversation history yet — run /agent first)\n")
+		if cb.Write != nil {
+			cb.Write("(no conversation history yet — run /agent first)\n")
+		}
 		return nil
 	}
 
@@ -233,33 +246,41 @@ func (s *Session) compactMemory(ctx *spec.Context) error {
 	provider := s.deps.NewProvider(cfg)
 	compressor := s.newCompressor(provider, false)
 
-	cctx, cancel := context.WithTimeout(ctx.Ctx, 2*time.Minute)
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	compacted, err := compressor.Compress(cctx, history)
 	if err != nil {
-		ctx.Writer(fmt.Sprintf("✘ 压缩失败: %v\n", err))
+		if cb.Write != nil {
+			cb.Write(fmt.Sprintf("✘ 压缩失败: %v\n", err))
+		}
 		return nil
 	}
 	if len(compacted) >= before {
-		ctx.Writer("(history too short or no safe split point; not compacted)\n")
+		if cb.Write != nil {
+			cb.Write("(history too short or no safe split point; not compacted)\n")
+		}
 		return nil
 	}
 
 	s.mu.Lock()
 	s.conversation = compacted
 	s.mu.Unlock()
-	ctx.Writer(fmt.Sprintf("✔ 已压缩: %d 条 → %d 条\n", before, len(compacted)))
+	if cb.Write != nil {
+		cb.Write(fmt.Sprintf("✔ 已压缩: %d 条 → %d 条\n", before, len(compacted)))
+	}
 	return nil
 }
 
 // compactStore store 持久化模式压缩：ActiveView 先固化 → 压缩 → detectCompact → 落 compact。
-func (s *Session) compactStore(ctx *spec.Context) error {
+func (s *Session) compactStore(ctx context.Context, cb RunCallbacks) error {
 	// 先固化再折叠（原文丢失前最后一次机会）
-	_, _ = s.consolidate(ctx.Ctx)
+	_, _ = s.Consolidate(ctx)
 
 	view := s.deps.Store.ActiveView()
 	if len(view) == 0 {
-		ctx.Writer("(no conversation history yet — run /agent first)\n")
+		if cb.Write != nil {
+			cb.Write("(no conversation history yet — run /agent first)\n")
+		}
 		return nil
 	}
 	before := len(view)
@@ -269,32 +290,44 @@ func (s *Session) compactStore(ctx *spec.Context) error {
 	// protectSystem=false：conversation 不含系统提示，首位可能是上次的摘要，允许被再次滚动
 	compressor := s.newCompressor(provider, false)
 
-	cctx, cancel := context.WithTimeout(ctx.Ctx, 2*time.Minute)
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	compacted, err := compressor.Compress(cctx, view)
 	if err != nil {
-		ctx.Writer(fmt.Sprintf("✘ 压缩失败: %v\n", err))
+		if cb.Write != nil {
+			cb.Write(fmt.Sprintf("✘ 压缩失败: %v\n", err))
+		}
 		return nil
 	}
 	if len(compacted) >= before {
-		ctx.Writer("(history too short or no safe split point; not compacted)\n")
+		if cb.Write != nil {
+			cb.Write("(history too short or no safe split point; not compacted)\n")
+		}
 		return nil
 	}
 
 	// detectCompact 检测压缩前后变化，提取摘要 + 覆盖段
 	if from, to, summary, ok := session.DetectCompact(view, compacted); ok {
 		if err := s.deps.Store.Compact(from, to, summary); err != nil {
-			ctx.Writer(fmt.Sprintf("✘ 压缩失败: %v\n", err))
+			if cb.Write != nil {
+				cb.Write(fmt.Sprintf("✘ 压缩失败: %v\n", err))
+			}
 			return nil
 		}
 		if err := s.refreshConversation(); err != nil {
-			ctx.Writer(fmt.Sprintf("✘ 刷新会话失败: %v\n", err))
+			if cb.Write != nil {
+				cb.Write(fmt.Sprintf("✘ 刷新会话失败: %v\n", err))
+			}
 			return nil
 		}
-		ctx.Writer(fmt.Sprintf("✔ 已压缩: %d 条 → %d 条\n", before, len(s.conversation)))
+		if cb.Write != nil {
+			cb.Write(fmt.Sprintf("✔ 已压缩: %d 条 → %d 条\n", before, len(s.conversation)))
+		}
 	} else {
 		// 不可压缩（detectCompact 判断不满足条件），保持现状
-		ctx.Writer("(history too short or no safe split point; not compacted)\n")
+		if cb.Write != nil {
+			cb.Write("(history too short or no safe split point; not compacted)\n")
+		}
 	}
 	return nil
 }
@@ -342,55 +375,6 @@ func stripMemoryBlocks(msgs []core.Message) []core.Message {
 		out = append(out, m)
 	}
 	return out
-}
-
-// ---- /agent 命令（薄壳，全部逻辑在 Session） ----
-
-func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
-	return p.session.Run(ctx)
-}
-
-// ---- /new 命令 ----
-
-func (p *AgentPlugin) handleNew(ctx *spec.Context) error {
-	// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
-	// 后台固化旧会话，不阻塞输入；快照走只读，新会话创建不影响这份引用。
-	old := p.session
-
-	// pending 快照（store 生效时用游标后的增量，否则全量）
-	var pending []core.Message
-	if p.store != nil {
-		pending = p.store.PendingAfterCursor()
-		if len(pending) == 0 {
-			pending = old.Conversation() // 兜底全量
-		}
-	} else {
-		pending = old.Conversation()
-	}
-
-	if p.memory != nil && len(pending) > 0 {
-		// 后台固化旧会话，不阻塞输入
-		go old.checkpointAsync(pending, ctx.Writer)
-		ctx.Writer("✔ New session started, consolidating previous session in background…\n")
-	} else if p.memory == nil {
-		ctx.Writer("✔ New session started (memory disabled)\n")
-	} else {
-		ctx.Writer("✔ New session started\n")
-	}
-
-	// 先归档旧 store，再开新会话（新 store 写新文件）
-	// pending 快照已在 Archive 前取出，不受归档影响
-	if p.store != nil {
-		if err := p.store.Archive(); err != nil {
-			slog.Warn("session: archive failed", "err", err)
-		}
-	}
-
-	// 创建新会话（新对象 = 新会话，旧状态随对象回收）
-	p.startSession()
-
-	ctx.Writer("✔ STM cleared, memory will be retrieved on every query\n")
-	return nil
 }
 
 // 生成系统提示词

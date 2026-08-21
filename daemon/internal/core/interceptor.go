@@ -1,7 +1,7 @@
 package core
 
 import (
-	"github.com/tinguo/goworker/ai-core/spec"
+	spec "github.com/tinguo/goworker/ai-runtime/plugin"
 	"github.com/tinguo/goworker/ai-runtime/logger"
 )
 

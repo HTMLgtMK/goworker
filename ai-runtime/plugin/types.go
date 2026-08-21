@@ -1,10 +1,10 @@
-// Package spec 定义 goworker 引擎的核心类型。
-//
-// 这是纯协议层——只有接口和结构体，零实现。
-package spec
+// Package plugin 定义 goworker runtime 的插件、命令与前端上下文协议。
+package plugin
 
 import (
 	"context"
+
+	"github.com/tinguo/goworker/ai-runtime/hitl"
 )
 
 // Plugin 是每个插件必须实现的接口。
@@ -89,10 +89,10 @@ type Event struct {
 // ---- 执行上下文 ----
 
 type FrontendContext struct {
-	Decide     func(*InterruptRequest) HITLDecision  // 前端注入：执行一次 HITL 决策会话（nil 表示不支持交互式确认）
-	Writer     func(string)                          // 输出回调，由前端注入
-	WriteToken func(kind RenderKind, content string) // 前端注入：带类型的 token 渲染
-	Publish    func(event string, data any)          // 可选：广播事件（status bar 用），线程安全
+	Decide     func(*hitl.InterruptRequest) hitl.Decision // 前端注入：执行一次 HITL 决策会话（nil 表示不支持交互式确认）
+	Writer     func(string)                               // 输出回调，由前端注入
+	WriteToken func(kind RenderKind, content string)      // 前端注入：带类型的 token 渲染
+	Publish    func(event string, data any)               // 可选：广播事件（status bar 用），线程安全
 }
 
 // Context 是命令执行的上下文。

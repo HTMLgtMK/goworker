@@ -1,13 +1,13 @@
 package agent
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-core/spec"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-sandbox"
@@ -41,8 +41,8 @@ func testSessionWithStore(t *testing.T, pv core.Provider) (*Session, *session.St
 func TestSessionIntegration_RunPersistsToFile(t *testing.T) {
 	s, _, _, dir := testSessionWithStore(t, &captureProvider{})
 
-	ctx, _ := newContext("hello")
-	if err := s.Run(ctx); err != nil {
+	var buf strings.Builder
+	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -102,70 +102,6 @@ func TestSessionIntegration_CommitIdempotent(t *testing.T) {
 	}
 }
 
-// testPlugin 构造一个带安全 hub 字段的 AgentPlugin。
-// spec.Hub 是函数字段集（Tools/Eval/RegisterCommand…），真实路径由 Engine.Init 填充；
-// 测试手搓 hub 必须补齐这些字段，否则 Run 里 collectTools 调 hub.Tools() 崩 nil 函数。
-func testPlugin(t *testing.T, cfg *runtimeconfig.Config) *AgentPlugin {
-	t.Helper()
-	hub := &spec.Hub{
-		Config:             cfg,
-		Tools:              func() []spec.Tool { return nil },
-		RegisterCommand:    func(spec.Command) error { return nil },
-		RegisterTool:       func(spec.Tool) error { return nil },
-		Plugins:            func() []string { return nil },
-		Notify:             func(spec.Event) {},
-		SetFallbackHandler: func(func(*spec.Context) error) {},
-	}
-	p := &AgentPlugin{hub: hub, cfg: cfg}
-	return p
-}
-
-func TestSessionIntegration_HandleNewArchive(t *testing.T) {
-	dir := t.TempDir()
-	cfg := runtimeconfig.Default()
-	cfg.Session.Enabled = true
-	cfg.Session.Dir = dir
-
-	p := testPlugin(t, cfg)
-	p.startSession()
-
-	// 先跑一轮 agent，让 jsonl 有内容
-	ctx, _ := newContext("hello")
-	if err := p.session.Run(ctx); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-
-	// 确认 current.jsonl 有内容
-	data, _ := os.ReadFile(filepath.Join(dir, "current.jsonl"))
-	if len(data) == 0 {
-		t.Fatal("current.jsonl should not be empty after Run")
-	}
-
-	// /new 归档
-	ctx2, _ := newContext()
-	if err := p.handleNew(ctx2); err != nil {
-		t.Fatalf("handleNew: %v", err)
-	}
-
-	// current.jsonl 应为空（新会话）
-	data2, err := os.ReadFile(filepath.Join(dir, "current.jsonl"))
-	if err != nil {
-		t.Fatalf("read current.jsonl after /new: %v", err)
-	}
-	if len(data2) != 0 {
-		t.Errorf("current.jsonl should be empty after /new, got: %s", string(data2))
-	}
-
-	// archive/ 目录下应有旧文件
-	entries, err := os.ReadDir(filepath.Join(dir, "archive"))
-	if err != nil {
-		t.Fatalf("read archive dir: %v", err)
-	}
-	if len(entries) == 0 {
-		t.Error("archive/ should have old session file after /new")
-	}
-}
-
 func TestSessionIntegration_RestartRecovery(t *testing.T) {
 	dir := t.TempDir()
 
@@ -205,8 +141,8 @@ func TestSessionIntegration_StoreDisabledFallback(t *testing.T) {
 	// deps.Store=nil 时 Run 行为与旧版一致（纯内存）
 	s, _ := testSession(&captureProvider{})
 
-	ctx, _ := newContext("hello")
-	if err := s.Run(ctx); err != nil {
+	var buf strings.Builder
+	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -232,8 +168,8 @@ func TestSessionIntegration_StoreDisabledCompact(t *testing.T) {
 		{Role: "user", Content: "long chat 3"},
 		{Role: "assistant", Content: "long chat 4"},
 	}
-	ctx, _ := newContext()
-	if err := s.Compact(ctx); err != nil {
+	var buf strings.Builder
+	if err := s.Compact(context.Background(), testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Compact (store disabled): %v", err)
 	}
 	// 纯内存模式下 compact 无 provider 会走 compress 失败，但应回退
@@ -277,28 +213,5 @@ func TestSessionIntegration_NewSessionRestoresFromStore(t *testing.T) {
 	}
 	if conv[1].Content != "response" {
 		t.Errorf("second msg = %q, want 'response'", conv[1].Content)
-	}
-}
-
-func TestSessionIntegration_HandleNewStoreDisabledFallback(t *testing.T) {
-	cfg := runtimeconfig.Default()
-	p := testPlugin(t, cfg)
-	p.startSession() // store = nil（session.Enabled 默认 false 或 dir 为空）
-
-	// 先跑一轮
-	ctx, _ := newContext("hello")
-	if err := p.session.Run(ctx); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-
-	// /new 应正常运行（不 panic）
-	ctx2, _ := newContext()
-	if err := p.handleNew(ctx2); err != nil {
-		t.Fatalf("handleNew (store disabled): %v", err)
-	}
-	// 新会话应正常运行
-	ctx3, _ := newContext("hello again")
-	if err := p.session.Run(ctx3); err != nil {
-		t.Fatalf("Run after /new (store disabled): %v", err)
 	}
 }

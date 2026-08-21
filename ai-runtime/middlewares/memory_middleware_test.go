@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tinguo/goworker/ai-core/config"
 	"github.com/tinguo/goworker/ai-core/core"
+	"github.com/tinguo/goworker/ai-runtime/config"
 )
 
 func memoryCfg() config.MemoryConfig {

@@ -5,16 +5,14 @@ import (
 	"strconv"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-core/spec"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
+	spec "github.com/tinguo/goworker/ai-runtime/plugin"
 )
 
 // 本文件实现 /rewind 命令：回溯到历史检查点，恢复当时的完整对话视图。
-//
-// 并行依赖：p.store (*session.Store) 字段由 agent D 加到 AgentPlugin。
-// D 未落地前本文件编译报 p.store undefined，这是预期的——主 agent 最终把关编译。
 
 // registerRewindCommand 注册 /rewind 命令到 hub。
-// 由主 agent 在 plugin.go 的 Init 里调用 p.registerRewindCommand(h)。
+// 由插件 Init 里调用 p.registerRewindCommand(h)。
 func (p *AgentPlugin) registerRewindCommand(h *spec.Hub) error {
 	return h.RegisterCommand(spec.Command{
 		Name:        "/rewind",
@@ -51,7 +49,7 @@ func (p *AgentPlugin) listRewindPoints(ctx *spec.Context) error {
 	ctx.Writer("最近检查点:\n")
 	// Checkpoints 返回倒序（最新在前），#1 = 最新，向下递增到最旧
 	for i, ck := range cks {
-		preview := truncate(ck.Preview, 60)
+		preview := runtimeagent.Truncate(ck.Preview, 60)
 		ctx.Writer(fmt.Sprintf("  #%-2d  %s  %s\n", i+1, ck.CreatedAt.Format("15:04:05"), preview))
 	}
 	return nil
@@ -92,7 +90,7 @@ func (p *AgentPlugin) doRewind(ctx *spec.Context, arg string) error {
 		return nil
 	}
 
-	preview := truncate(ck.Preview, 80)
+	preview := runtimeagent.Truncate(ck.Preview, 80)
 	msg := fmt.Sprintf("✔ 已回溯到 %s: %s\n", ck.CreatedAt.Format("15:04:05"), preview)
 
 	// 检测是否恢复到 compact 折叠前的原文（详情分支）

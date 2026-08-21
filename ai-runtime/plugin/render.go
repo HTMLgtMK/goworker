@@ -1,4 +1,4 @@
-package spec
+package plugin
 
 // RenderKind 标记前端渲染类型，由 frontend 根据类型决定样式。
 type RenderKind string

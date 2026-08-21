@@ -9,7 +9,8 @@ import (
 
 	term "github.com/charmbracelet/x/term"
 
-	"github.com/tinguo/goworker/ai-core/spec"
+	"github.com/tinguo/goworker/ai-runtime/hitl"
+	"github.com/tinguo/goworker/ai-runtime/plugin"
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/core"
 	"github.com/tinguo/goworker/daemon/internal/frontend/statusbar"
@@ -76,7 +77,7 @@ func (f *StdinFrontend) isHITL() bool {
 	return f.stack.Top() == f.hitlConsumer
 }
 
-// Write 实现 spec.Context 的 Writer 回调。
+// Write 实现 plugin.Context 的 Writer 回调。
 // raw mode 下 \n 不回车，手动补 \r。先清掉已有的 \r 避免双倍。
 // 如果有 status bar 在底部，先清再写最后重绘，确保新内容在状态栏上方。
 func (f *StdinFrontend) Write(s string) {
@@ -120,10 +121,10 @@ func (f *StdinFrontend) writeToolResult(content string) {
 	f.Write("\n\033[38;5;244m" + block(markerTool, content) + "\033[0m")
 }
 
-// decide 执行一次 HITL 决策会话，实现 spec.Context 的 Decide 契约。
+// decide 执行一次 HITL 决策会话，实现 plugin.Context 的 Decide 契约。
 // 将 HITLConsumer 压栈（栈顶，HITL 期间独占输入），会话结束弹出。
 // 用户按 Esc/Ctrl+C 取消时，一并取消整个 agent 执行。
-func (f *StdinFrontend) decide(req *spec.InterruptRequest) spec.HITLDecision {
+func (f *StdinFrontend) decide(req *hitl.InterruptRequest) hitl.Decision {
 	f.stack.Push(f.hitlConsumer)
 	defer func() {
 		f.stack.Pop()
@@ -195,16 +196,16 @@ func (f *StdinFrontend) Run() error {
 			return nil
 		}
 
-		ctx := spec.NewContext(context.Background(), f.Write, f.decide, nil)
+		ctx := plugin.NewContext(context.Background(), f.Write, f.decide, nil)
 
 		// 注入 WriteToken — 所有渲染逻辑收敛至此
-		ctx.WriteToken = func(kind spec.RenderKind, content string) {
+		ctx.WriteToken = func(kind plugin.RenderKind, content string) {
 			switch kind {
-			case spec.KindText:
+			case plugin.KindText:
 				f.writeText(content)
-			case spec.KindToolCall:
+			case plugin.KindToolCall:
 				f.writeToolCall(content)
-			case spec.KindToolResult:
+			case plugin.KindToolResult:
 				f.writeToolResult(content)
 			}
 		}
@@ -256,7 +257,7 @@ func (k *keyWatcher) Consume(ev KeyEvent) bool {
 }
 
 // runWithCancel 启动 agent：挂载取消回调到常驻 keyWatcher，agent 结束后卸载。
-func (f *StdinFrontend) runWithCancel(ctx *spec.Context, line string) {
+func (f *StdinFrontend) runWithCancel(ctx *plugin.Context, line string) {
 	f.cancelledByUser.Store(false)
 	f.agentCtx, f.agentCancel = context.WithCancel(context.Background())
 

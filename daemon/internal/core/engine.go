@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/tinguo/goworker/ai-core/spec"
+	spec "github.com/tinguo/goworker/ai-runtime/plugin"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/logger"
 	"github.com/tinguo/goworker/daemon/internal/config"

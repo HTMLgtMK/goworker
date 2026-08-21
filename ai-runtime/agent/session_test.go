@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -24,11 +25,20 @@ func testSession(pv core.Provider) (*Session, *runtimeconfig.Config) {
 	return s, cfg
 }
 
+func testRunCallbacks(buf *strings.Builder) RunCallbacks {
+	return RunCallbacks{
+		Write: func(s string) { buf.WriteString(s) },
+		WriteToken: func(_ RenderKind, s string) {
+			buf.WriteString(s)
+		},
+	}
+}
+
 func TestSessionRun_WritesBackConversation(t *testing.T) {
 	s, _ := testSession(&captureProvider{})
 
-	ctx, _ := newContext("hello")
-	if err := s.Run(ctx); err != nil {
+	var buf strings.Builder
+	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -53,8 +63,8 @@ func TestSessionRun_AccumulatesUsageAcrossRuns(t *testing.T) {
 		t.Fatalf("precondition: calls = %d, want 1", n)
 	}
 
-	ctx, _ := newContext("hello")
-	if err := s.Run(ctx); err != nil {
+	var buf strings.Builder
+	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	// 本轮 captureProvider 记 1 次 → 累计 2 次
@@ -66,8 +76,8 @@ func TestSessionRun_AccumulatesUsageAcrossRuns(t *testing.T) {
 func TestSessionRun_EmptyInputShowsUsage(t *testing.T) {
 	s, _ := testSession(&captureProvider{})
 
-	ctx, buf := newContext()
-	if err := s.Run(ctx); err != nil {
+	var buf strings.Builder
+	if err := s.Run(context.Background(), RunRequest{}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if !strings.Contains(buf.String(), "用法: /agent") {

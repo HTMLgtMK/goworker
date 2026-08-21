@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-core/spec"
 	"github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/session"
@@ -62,8 +61,8 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 	jsonl := filepath.Join(cfg.Session.Dir, "current.jsonl")
 
 	// 1. 第一轮 /agent
-	ctx1, _ := newE2ECtx("question one")
-	if err := s.Run(ctx1); err != nil {
+	var out strings.Builder
+	if err := s.Run(context.Background(), agent.RunRequest{Input: "question one"}, e2eRunCallbacks(&out)); err != nil {
 		t.Fatalf("Run 1: %v", err)
 	}
 	// jsonl 应有消息行 + 自动 checkpoint
@@ -76,8 +75,7 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 	}
 
 	// 2. 第二轮（累积消息）
-	ctx2, _ := newE2ECtx("question two")
-	if err := s.Run(ctx2); err != nil {
+	if err := s.Run(context.Background(), agent.RunRequest{Input: "question two"}, e2eRunCallbacks(&out)); err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
 
@@ -96,8 +94,7 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 	}
 
 	// 4. /compact（mock 压缩可能无法安全切分，验证不 panic）
-	ctx3, _ := newE2ECtx()
-	if err := s.Compact(ctx3); err != nil {
+	if err := s.Compact(context.Background(), e2eRunCallbacks(&out)); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 
@@ -126,14 +123,11 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 	}
 }
 
-func newE2ECtx(args ...string) (*spec.Context, *strings.Builder) {
-	var buf strings.Builder
-	return &spec.Context{
-		Ctx:  context.Background(),
-		Args: args,
-		FrontendContext: spec.FrontendContext{
-			Writer:     func(s string) { buf.WriteString(s) },
-			WriteToken: func(kind spec.RenderKind, content string) { buf.WriteString(content) },
+func e2eRunCallbacks(buf *strings.Builder) agent.RunCallbacks {
+	return agent.RunCallbacks{
+		Write: func(s string) { buf.WriteString(s) },
+		WriteToken: func(_ agent.RenderKind, content string) {
+			buf.WriteString(content)
 		},
-	}, &buf
+	}
 }

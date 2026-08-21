@@ -1,21 +1,46 @@
+// Package agent 是 goworker 宿主侧的 /agent 插件适配器：把 ai-runtime 的 Session SDK
+// 装配成 spec.Plugin 接入 daemon Engine。Session 本体在 ai-runtime/agent（SDK），
+// 这里只做资源装载（skill/MCP/memory/store/指令快照）、命令注册与生命周期管理。
 package agent
 
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-core/spec"
 	"github.com/tinguo/goworker/ai-memory"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/mcp"
+	spec "github.com/tinguo/goworker/ai-runtime/plugin"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 )
 
-// AgentPlugin 类型定义见 spec.go。本文件是插件生命周期实现：
-// NewPlugin 构造 + Init/Start/Stop/startSession（资源装载与命令注册）。
+// AgentPlugin 是 /agent 插件入口，只负责三件事：持有会话状态、注册命令、管理生命周期。
+// 配置与路径由 NewPlugin 构造函数注入（spec.Hub.Config 已 any 化，插件不再从 hub 读配置）。
+type AgentPlugin struct {
+	cfg   *runtimeconfig.Config
+	paths runtimeconfig.Paths
+	hub   *spec.Hub
+	// deps 是 Session 的资源依赖，startSession 每次会话边界全量重建（含指令快照），
+	// /new 经同一路径刷新后以新 deps 创建新会话。
+	deps runtimeagent.SessionDeps
+	// session 是当前会话。NewSession 创建（Init 一次 + /new 一次）；/new 用新实例替换，
+	// 旧会话状态（conversation/usage）随对象回收。
+	session    *runtimeagent.Session
+	store      *session.Store        // 会话持久化 store，nil = 禁用
+	skills     []skills.Skill        // Init 时加载的 skill 清单，注册为 skill_* 工具
+	mcpClients map[string]mcp.Client // server name → 连接，Stop 时统一关闭
+	mcpTools   []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
+	memory     *memory.Client        // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
+	// bgWg 追踪 /new 后台固化 goroutine：Stop 关 memory 前必须等它结束，
+	// 否则后台固化往正在关闭的 badger 写（崩溃/部分写）。命令主 goroutine 串行派发，
+	// Add/Wait 无并发问题。
+	bgWg sync.WaitGroup
+}
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
 // 插件不再从 spec.Hub.Config 读配置（Hub.Config 已 any 化）——配置与路径全部构造函数注入。
@@ -138,10 +163,13 @@ func (p *AgentPlugin) Stop() error {
 		// LLM 网关慢时 20s 容易超时丢历史，放宽到 120s 给足时间。
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		// Client.Checkpoint 内部已打 applied 日志，这里不重复
-		if _, err := p.session.consolidate(ctx); err != nil {
+		if _, err := p.session.Consolidate(ctx); err != nil {
 			slog.Warn("memory: stop checkpoint failed", "err", err)
 		}
 		cancel()
+		// 等 /new 后台固化收尾：它可能还在写同一 badger，Close 会跟它抢（崩溃/部分写）。
+		// 后台固化自带 120s 超时，Wait 有界。
+		p.bgWg.Wait()
 		if err := p.memory.Close(); err != nil {
 			slog.Warn("memory close error", "err", err)
 		}
@@ -193,10 +221,10 @@ func (p *AgentPlugin) startSession() {
 	// 会话层组装：资源就绪后构造 deps 与首会话。
 
 	modelProvider := func(cfg *runtimeconfig.Config) core.Provider {
-		return NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
+		return runtimeagent.NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
 	}
 
-	p.deps = SessionDeps{
+	p.deps = runtimeagent.SessionDeps{
 		Config:       p.cfg,
 		AuditDir:     p.paths.AuditDir,
 		Memory:       p.memory,
@@ -209,5 +237,5 @@ func (p *AgentPlugin) startSession() {
 	if p.cfg.Memory.Enabled {
 		p.deps.Instruction = p.loadInstructions()
 	}
-	p.session = NewSession(p.deps)
+	p.session = runtimeagent.NewSession(p.deps)
 }

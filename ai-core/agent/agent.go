@@ -58,7 +58,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 		}()
 
 		for iter := 0; iter < a.maxIterations; iter++ {
-			bmEv := &core.BeforeModelEvent{Ctx: ctx, History: messages, Input: input}
+			bmEv := &core.BeforeModelEvent{Ctx: ctx, Iteration: iter, History: messages, Input: input}
 			a.fireMiddlewareEvent(bmEv)
 			// 压缩等 middleware 可能整体替换 History —— 发请求前回读，无替换时等价于原值
 			messages = bmEv.History
@@ -75,7 +75,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 				usage = resp.Usage
 			}
 			// 用量统计由 usage middleware 观察 AfterModel 事件完成，Agent 核心不感知
-			a.fireMiddlewareEvent(&core.AfterModelEvent{Ctx: ctx, History: messages, Err: err, Usage: usage})
+			a.fireMiddlewareEvent(&core.AfterModelEvent{Ctx: ctx, Iteration: iter, History: messages, Request: req, Response: resp, Err: err, Usage: usage})
 
 			if err != nil {
 				runErr = err
@@ -145,15 +145,18 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 					continue
 				}
 
-				// BeforeTool — middleware 可修改 args 或设置 Aborted
+				// BeforeTool — middleware 可修改 args 或设置 Abort
 				btEv := &core.BeforeToolEvent{
-					Ctx: ctx, History: messages, Tool: &tc,
-					TokenCh: ch,
-					Args:    args,
+					Ctx:       ctx,
+					Iteration: iter,
+					History:   messages,
+					Tool:      &tc,
+					Emit:      tokenEmitter{ch: ch},
+					Args:      args,
 				}
 				a.fireMiddlewareEvent(btEv)
-				if btEv.Aborted {
-					messages = append(messages, btEv.ResponseMessages...)
+				if btEv.Abort != nil {
+					messages = append(messages, btEv.Abort.Messages...)
 					continue
 				}
 
@@ -167,7 +170,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 				}
 
 				a.fireMiddlewareEvent(&core.AfterToolEvent{
-					Ctx: ctx, History: messages, Tool: &tc, Err: execErr,
+					Ctx: ctx, Iteration: iter, History: messages, Tool: &tc, Args: args, Result: result, Err: execErr,
 				})
 
 				sendToken(ctx, ch, core.Token{Type: core.TokenTypeToolResult, Content: result})
@@ -240,6 +243,14 @@ func toolSpecs(tools []core.Tool) []map[string]any {
 		specs = append(specs, t.ToolSpec())
 	}
 	return specs
+}
+
+type tokenEmitter struct {
+	ch chan<- core.Token
+}
+
+func (e tokenEmitter) Emit(ctx context.Context, tok core.Token) {
+	sendToken(ctx, e.ch, tok)
 }
 
 func sendToken(ctx context.Context, ch chan<- core.Token, tok core.Token) {

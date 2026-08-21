@@ -1,14 +1,38 @@
 // Package config 定义 ai-runtime 的运行配置聚合。
 //
-// 引擎段(LLM/Memory)来自 ai-core/config；装配段(Sandbox/Session/MCP)由本包聚合。
+// LLM/Memory 是 runtime 策略配置；Sandbox/Session/MCP 是装配配置。
 // YAML 解析与路径中枢由 daemon 负责，本包只做类型与默认值。
 package config
 
 import (
-	coreconfig "github.com/tinguo/goworker/ai-core/config"
 	"github.com/tinguo/goworker/ai-core/core"
 	"github.com/tinguo/goworker/ai-sandbox"
 )
+
+// LLMConfig 是 LLM 提供商连接配置。
+type LLMConfig struct {
+	Endpoint      string  `yaml:"endpoint"`
+	Model         string  `yaml:"model"`
+	APIKey        string  `yaml:"api_key"`
+	ContextWindow int     `yaml:"context_window"` // 模型上下文窗口（token），0 = 未知
+	CompressAt    float64 `yaml:"compress_at"`    // 历史压缩触发阈值（0-1）：估算用量达窗口该比例时自动压缩，0 = 关闭
+	CompactKeep   int     `yaml:"compact_keep"`   // 滚动压缩保留的最近消息条数（原文不压，只压更早的）
+	MaxIterations int     `yaml:"max_iterations"` // ReAct 循环最大迭代数（模型往返次数），0 = 默认 15
+}
+
+// MemoryConfig 是 agent 记忆模块（MTM 任务档案 + LTM 事实条目）的配置。
+// 声明式指令层（USER.md + AGENTS.md）与记忆组件同开关：Enabled=false 时两者都关。
+type MemoryConfig struct {
+	Dir               string  `yaml:"dir"`                 // 存储目录，默认 <DefaultDir>/memory
+	Enabled           bool    `yaml:"enabled"`             // false = 整个记忆模块关闭
+	TaskKeep          int     `yaml:"task_keep"`           // 保留任务档案数，0 = 不裁剪
+	TaskInjectN       int     `yaml:"task_inject_n"`       // 会话边界时注入最近 N 个未完成任务
+	LtmInjectTopK     int     `yaml:"ltm_inject_top_k"`    // 会话边界时注入相关事实条数
+	LtmExtract        bool    `yaml:"ltm_extract"`         // 检查点固化时是否 LLM 抽取 LTM
+	InjectBudgetRatio float64 `yaml:"inject_budget_ratio"` // 注入块占 context 窗口的比例上限（0-1）
+	UserMaxChars      int     `yaml:"user_max_chars"`      // USER.md 画像容量上限（rune），超限 profile 工具报错
+	AgentsMaxChars    int     `yaml:"agents_max_chars"`    // AGENTS.md（全局+项目合并）注入上限，超出截断
+}
 
 // SessionConfig 是会话持久化模块的配置。
 type SessionConfig struct {
@@ -30,11 +54,11 @@ type MCPServer struct {
 
 // Config 是 ai-runtime 的运行配置聚合。
 type Config struct {
-	LLM     coreconfig.LLMConfig    `yaml:"llm"`
-	Memory  coreconfig.MemoryConfig `yaml:"memory"`
-	Sandbox sandbox.SandboxConfig   `yaml:"sandbox"`
-	Session SessionConfig           `yaml:"session"`
-	MCP     MCPConfig               `yaml:"mcp"`
+	LLM     LLMConfig             `yaml:"llm"`
+	Memory  MemoryConfig          `yaml:"memory"`
+	Sandbox sandbox.SandboxConfig `yaml:"sandbox"`
+	Session SessionConfig         `yaml:"session"`
+	MCP     MCPConfig             `yaml:"mcp"`
 }
 
 // Paths 是宿主注入的目录路径，避免 ai-runtime 反向依赖 daemon 的 DefaultDir。

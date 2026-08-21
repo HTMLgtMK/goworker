@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/tinguo/goworker/ai-core/spec"
+	"github.com/tinguo/goworker/ai-runtime/hitl"
 )
 
 const (
@@ -15,7 +15,7 @@ const (
 )
 
 // hitl 加粗青色：HITL 决策提示的统一样式，与普通 agent 输出区分。
-func hitl(s string) string { return hitlStyle + s + hitlReset }
+func hitlText(s string) string { return hitlStyle + s + hitlReset }
 
 type hitlPhase int
 
@@ -65,60 +65,60 @@ func (c *HITLConsumer) Consume(ev KeyEvent) bool {
 // Run 执行完整 HITL 会话并返回决策。
 // 阻塞直到用户给出决策或取消输入。canceled=true 表示用户按 Esc/Ctrl+C 中止，
 // 调用方（前端 decide）据此取消整个 agent 执行。
-func (c *HITLConsumer) Run(req *spec.InterruptRequest) (decision spec.HITLDecision, canceled bool) {
+func (c *HITLConsumer) Run(req *hitl.InterruptRequest) (decision hitl.Decision, canceled bool) {
 	c.phase = phaseDecision
 	// 结构化决策链路带出风险等级：有则渲染 [R4] 标签，老字段为空时不显示（兼容）。
 	riskTag := ""
 	if req.RiskLevel != "" {
 		riskTag = " [" + req.RiskLevel + "]"
 	}
-	c.writer("\n" + hitl("⚠ "+req.Command+riskTag+" ("+req.RiskReason+")") + "\n")
-	decisionPrompt := hitl("[a]pprove, [e]dit, [r]eject, res[p]ond [a]: ") + " "
+	c.writer("\n" + hitlText("⚠ "+req.Command+riskTag+" ("+req.RiskReason+")") + "\n")
+	decisionPrompt := hitlText("[a]pprove, [e]dit, [r]eject, res[p]ond [a]: ") + " "
 	c.writer(decisionPrompt)
 
 	line, canceled := c.readLine(decisionPrompt)
 	if canceled {
-		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}, true
+		return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionReject}, true
 	}
 	line = strings.TrimSpace(line)
 
 	switch {
 	case line == "" || line == "a" || line == "approve":
-		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionApprove}, false
+		return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionApprove}, false
 
 	case line == "r" || line == "reject":
-		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}, false
+		return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionReject}, false
 
 	case line == "e" || line == "edit":
 		c.phase = phaseNewCmd
-		editPrompt := hitl("  New command: ")
+		editPrompt := hitlText("  New command: ")
 		c.writer(editPrompt)
 		edited, canceled := c.readLine(editPrompt)
 		if canceled {
-			return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}, true
+			return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionReject}, true
 		}
-		return spec.HITLDecision{
+		return hitl.Decision{
 			InterruptID: req.ID,
-			Type:        spec.DecisionEdit,
+			Type:        hitl.DecisionEdit,
 			Command:     strings.TrimSpace(edited),
 		}, false
 
 	case line == "p" || line == "respond":
 		c.phase = phaseInstruction
-		respPrompt := hitl("  Your instruction: ")
+		respPrompt := hitlText("  Your instruction: ")
 		c.writer(respPrompt)
 		msg, canceled := c.readLine(respPrompt)
 		if canceled {
-			return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}, true
+			return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionReject}, true
 		}
-		return spec.HITLDecision{
+		return hitl.Decision{
 			InterruptID: req.ID,
-			Type:        spec.DecisionRespond,
+			Type:        hitl.DecisionRespond,
 			Message:     strings.TrimSpace(msg),
 		}, false
 
 	default:
-		return spec.HITLDecision{InterruptID: req.ID, Type: spec.DecisionReject}, false
+		return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionReject}, false
 	}
 }
 

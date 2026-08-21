@@ -1,11 +1,12 @@
-// Package middlewares 提供依赖 ai-sandbox 的安全策略中间件。
-//
-// 引擎级中间件(usage/iteration/compression/memory)在 ai-core/middlewares；
-// 本包只放依赖 sandbox 的 HITL 中间件（命令安全决策，属装配层）。
+// Package middlewares 提供 runtime 级 agent middleware：安全策略、记忆注入、压缩、用量与迭代事件。
 package middlewares
 
 import (
+	"context"
+
 	"github.com/tinguo/goworker/ai-core/core"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
@@ -15,9 +16,56 @@ import (
 //   - mcp_*：外部进程，sandbox 约束不到 —— strict/readonly 直接拒绝，normal 走 HITL 确认
 type HITLMiddleware struct {
 	sandboxCfg       sandbox.Config
-	decisionProvider core.DecisionProvider
+	decisionProvider hitl.DecisionProvider
 	audit            *sandbox.AuditLogger // nil = 不审计
 }
 
-// HITLOption 中间件构造选项（变参，保持旧两参调用零改动）。
 type HITLOption func(*HITLMiddleware)
+
+const MemoryBlockPrefix = "[记忆]"
+
+type MemoryTask struct {
+	ID        string
+	Title     string
+	Summary   string
+	NextSteps []string
+}
+
+type MemoryFact struct {
+	Topic   string
+	Content string
+}
+
+type MemoryResult struct {
+	Task  *MemoryTask
+	Fact  *MemoryFact
+	Score float64
+}
+
+type MemoryClient interface {
+	Search(ctx context.Context, query string, taskTopK, factTopK int) ([]MemoryResult, error)
+}
+
+type MemoryMiddleware struct {
+	client   MemoryClient
+	cfg      runtimeconfig.MemoryConfig
+	window   int
+	injected bool
+}
+
+type CompressionMiddleware struct {
+	compressor *core.Compressor
+	window     int
+	compressAt float64
+	done       bool
+}
+
+type IterationMiddleware struct {
+	publish func()
+}
+
+type UsageMiddleware struct {
+	tracker *core.UsageTracker
+	iter    int
+	publish func(core.Usage)
+}

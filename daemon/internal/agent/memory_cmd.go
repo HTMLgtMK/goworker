@@ -5,8 +5,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/tinguo/goworker/ai-core/spec"
 	"github.com/tinguo/goworker/ai-memory"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
+	spec "github.com/tinguo/goworker/ai-runtime/plugin"
 )
 
 // 本文件是记忆与任务档案命令：/memory 与 /task。
@@ -66,7 +67,7 @@ func (p *AgentPlugin) handleMemory(ctx *spec.Context) error {
 		ctx.Writer(fmt.Sprintf("facts: %d matched\n\n", len(facts)))
 		for i, f := range facts {
 			ctx.Writer(fmt.Sprintf("  #%d [%s|%s] %s (%s)\n",
-				i+1, f.ID, f.Topic, truncate(oneLine(f.Content), 160), f.UpdatedAt.Format("01-02 15:04")))
+				i+1, f.ID, f.Topic, runtimeagent.Truncate(runtimeagent.OneLine(f.Content), 160), f.UpdatedAt.Format("01-02 15:04")))
 		}
 
 	case "list":
@@ -88,7 +89,7 @@ func (p *AgentPlugin) handleMemory(ctx *spec.Context) error {
 		ctx.Writer(fmt.Sprintf("facts: %d\n\n", len(facts)))
 		for i, f := range facts {
 			ctx.Writer(fmt.Sprintf("  #%d [%s|%s] %s (%s)\n",
-				i+1, f.ID, f.Topic, truncate(oneLine(f.Content), 160), f.UpdatedAt.Format("01-02 15:04")))
+				i+1, f.ID, f.Topic, runtimeagent.Truncate(runtimeagent.OneLine(f.Content), 160), f.UpdatedAt.Format("01-02 15:04")))
 		}
 
 	case "tasks":
@@ -110,7 +111,7 @@ func (p *AgentPlugin) handleMemory(ctx *spec.Context) error {
 		ctx.Writer(fmt.Sprintf("tasks: %d\n\n", len(tasks)))
 		for i, t := range tasks {
 			ctx.Writer(fmt.Sprintf("  #%d [%s|%s] %s\n     %s\n",
-				i+1, t.ID, t.Status, truncate(oneLine(t.Title), 80), truncate(oneLine(t.Summary), 160)))
+				i+1, t.ID, t.Status, runtimeagent.Truncate(runtimeagent.OneLine(t.Title), 80), runtimeagent.Truncate(runtimeagent.OneLine(t.Summary), 160)))
 			if len(t.NextSteps) > 0 {
 				ctx.Writer("     下一步: " + strings.Join(t.NextSteps, "；") + "\n")
 			}
@@ -193,7 +194,7 @@ func (p *AgentPlugin) handleTask(ctx *spec.Context) error {
 		ctx.Writer(fmt.Sprintf("tasks: %d open\n\n", len(tasks)))
 		for i, t := range tasks {
 			ctx.Writer(fmt.Sprintf("  #%d [%s] %s\n     %s\n",
-				i+1, t.ID, truncate(oneLine(t.Title), 80), truncate(oneLine(t.Summary), 160)))
+				i+1, t.ID, runtimeagent.Truncate(runtimeagent.OneLine(t.Title), 80), runtimeagent.Truncate(runtimeagent.OneLine(t.Summary), 160)))
 			if len(t.NextSteps) > 0 {
 				ctx.Writer("     下一步: " + strings.Join(t.NextSteps, "；") + "\n")
 			}
@@ -230,12 +231,12 @@ func (p *AgentPlugin) handleTask(ctx *spec.Context) error {
 		ctx.Writer(fmt.Sprintf("✔ 已关闭 task %s\n", id))
 
 	case "checkpoint":
-		sum, err := p.session.consolidate(ctx.Ctx)
+		sum, err := p.session.Consolidate(ctx.Ctx)
 		if err != nil {
 			ctx.Writer(fmt.Sprintf("✘ Consolidation failed: %v\n", err))
 			return nil
 		}
-		if notice := renderCheckpointNotice(sum); notice != "" {
+		if notice := runtimeagent.RenderCheckpointNotice(sum); notice != "" {
 			ctx.Writer(notice)
 		} else {
 			ctx.Writer("✔ Session consolidated (no new memory)\n")

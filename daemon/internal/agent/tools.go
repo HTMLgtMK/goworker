@@ -7,7 +7,8 @@ import (
 	"strings"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-core/spec"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
+	spec "github.com/tinguo/goworker/ai-runtime/plugin"
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
@@ -20,7 +21,7 @@ func (p *AgentPlugin) sandboxConfig() sandbox.Config {
 
 func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 	var tools []core.Tool
-	tools = append(tools, DefaultTools(cfg)...)
+	tools = append(tools, runtimeagent.DefaultTools(cfg)...)
 
 	for _, t := range p.hub.Tools() {
 		tool := t
@@ -46,7 +47,7 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 		tools = append(tools, core.Tool{
 			Name:        "skill_" + skill.Name,
 			Description: fmt.Sprintf("Load the %s skill. Call it when you need to: %s", skill.Name, skill.Description),
-			Parameters:  normalizeSchema(nil),
+			Parameters:  runtimeagent.NormalizeSchema(nil),
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
 				return skill.Content, nil
 			},
@@ -92,16 +93,16 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 					switch {
 					case r.Task != nil:
 						t := r.Task
-						fmt.Fprintf(&b, "- task [%s] %s\n", t.Status, oneLine(t.Title))
+						fmt.Fprintf(&b, "- task [%s] %s\n", t.Status, runtimeagent.OneLine(t.Title))
 						if t.Summary != "" {
-							b.WriteString("  " + oneLine(t.Summary) + "\n")
+							b.WriteString("  " + runtimeagent.OneLine(t.Summary) + "\n")
 						}
 					case r.Fact != nil:
 						f := r.Fact
 						if f.Topic != "" {
-							fmt.Fprintf(&b, "- fact [%s] %s\n", f.Topic, oneLine(f.Content))
+							fmt.Fprintf(&b, "- fact [%s] %s\n", f.Topic, runtimeagent.OneLine(f.Content))
 						} else {
-							fmt.Fprintf(&b, "- fact %s\n", oneLine(f.Content))
+							fmt.Fprintf(&b, "- fact %s\n", runtimeagent.OneLine(f.Content))
 						}
 					}
 				}

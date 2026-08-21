@@ -6,13 +6,84 @@ import (
 	"os"
 	"strings"
 
-	coreconfig "github.com/tinguo/goworker/ai-core/config"
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-core/spec"
 	"github.com/tinguo/goworker/ai-memory"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	spec "github.com/tinguo/goworker/ai-runtime/plugin"
 )
 
-// 本文件是配置与诊断类命令：/model /usage /compact /skills /history /rules。
+// 本文件是配置与诊断类命令：/agent /new /model /usage /compact /skills /history /rules。
+// 命令逻辑全部委托给 Session SDK，这里只做 plugin.Context → RunCallbacks 的薄适配。
+
+// ---- /agent 命令 ----
+
+func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
+	return p.session.Run(ctx.Ctx, runtimeagent.RunRequest{Input: strings.Join(ctx.Args, " ")}, callbacksFromPlugin(ctx))
+}
+
+// callbacksFromPlugin 把 plugin.Context 的 I/O 回调适配成 runtimeagent.RunCallbacks。
+// WriteToken 只在 ctx 提供时注入，避免把 nil 包装成非 nil 绕过 SDK 的 nil 保护。
+func callbacksFromPlugin(ctx *spec.Context) runtimeagent.RunCallbacks {
+	cb := runtimeagent.RunCallbacks{
+		Write:   ctx.Writer,
+		Decide:  ctx.Decide,
+		Publish: ctx.Publish,
+	}
+	if ctx.WriteToken != nil {
+		cb.WriteToken = func(kind runtimeagent.RenderKind, content string) {
+			ctx.WriteToken(spec.RenderKind(kind), content)
+		}
+	}
+	return cb
+}
+
+// ---- /new 命令 ----
+
+func (p *AgentPlugin) handleNew(ctx *spec.Context) error {
+	// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
+	// 后台固化旧会话，不阻塞输入；快照走只读，新会话创建不影响这份引用。
+	old := p.session
+
+	// pending 快照（store 生效时用游标后的增量，否则全量）
+	var pending []core.Message
+	if p.store != nil {
+		pending = p.store.PendingAfterCursor()
+		if len(pending) == 0 {
+			pending = old.Conversation() // 兜底全量
+		}
+	} else {
+		pending = old.Conversation()
+	}
+
+	if p.memory != nil && len(pending) > 0 {
+		// 后台固化旧会话，不阻塞输入。登记 bgWg：Stop 关 memory 前等它结束。
+		p.bgWg.Add(1)
+		go func() {
+			defer p.bgWg.Done()
+			old.CheckpointAsync(pending, ctx.Writer)
+		}()
+		ctx.Writer("✔ New session started, consolidating previous session in background…\n")
+	} else if p.memory == nil {
+		ctx.Writer("✔ New session started (memory disabled)\n")
+	} else {
+		ctx.Writer("✔ New session started\n")
+	}
+
+	// 先归档旧 store，再开新会话（新 store 写新文件）
+	// pending 快照已在 Archive 前取出，不受归档影响
+	if p.store != nil {
+		if err := p.store.Archive(); err != nil {
+			slog.Warn("session: archive failed", "err", err)
+		}
+	}
+
+	// 创建新会话（新对象 = 新会话，旧状态随对象回收）
+	p.startSession()
+
+	ctx.Writer("✔ STM cleared, memory will be retrieved on every query\n")
+	return nil
+}
 
 // ---- /model 命令 ----
 
@@ -57,7 +128,7 @@ func (p *AgentPlugin) handleModel(ctx *spec.Context) error {
 		case "api_key":
 			cfg.LLM.APIKey = val
 		case "context_window":
-			n, err := coreconfig.ParseContextWindow(val)
+			n, err := runtimeconfig.ParseContextWindow(val)
 			if err != nil {
 				ctx.Writer(fmt.Sprintf("✘ %v\n", err))
 				return nil
@@ -65,21 +136,21 @@ func (p *AgentPlugin) handleModel(ctx *spec.Context) error {
 			cfg.LLM.ContextWindow = n
 		// compress_at/compact_keep 委托 SetField，校验与 /config 单一来源
 		case "compress_at":
-			f, err := coreconfig.ParseCompressAt(val)
+			f, err := runtimeconfig.ParseCompressAt(val)
 			if err != nil {
 				ctx.Writer(fmt.Sprintf("✘ %v\n", err))
 				return nil
 			}
 			cfg.LLM.CompressAt = f
 		case "compact_keep":
-			n, err := coreconfig.ParseCompactKeep(val)
+			n, err := runtimeconfig.ParseCompactKeep(val)
 			if err != nil {
 				ctx.Writer(fmt.Sprintf("✘ %v\n", err))
 				return nil
 			}
 			cfg.LLM.CompactKeep = n
 		case "max_iterations":
-			n, err := coreconfig.ParseMaxIterations(val)
+			n, err := runtimeconfig.ParseMaxIterations(val)
 			if err != nil {
 				ctx.Writer(fmt.Sprintf("✘ %v\n", err))
 				return nil
@@ -137,20 +208,20 @@ func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
 		ctx.Writer(fmt.Sprintf("usage: %d model calls this session\n\n", len(calls)))
 		for i, c := range calls {
 			line := fmt.Sprintf("  #%-2d  in %-7s  out %-7s  (est %s)",
-				i+1, humanize(c.PromptTokens), humanize(c.CompletionTokens), humanize(c.EstimateTokens))
+				i+1, runtimeagent.Humanize(c.PromptTokens), runtimeagent.Humanize(c.CompletionTokens), runtimeagent.Humanize(c.EstimateTokens))
 			// 模型没返回 cache 字段时明细保持简洁，不挂一串 0
 			if c.PromptCacheHitTokens+c.PromptCacheMissTokens > 0 {
 				line += fmt.Sprintf("  hit: %-7s miss: %-7s / %s",
-					humanize(c.PromptCacheHitTokens), humanize(c.PromptCacheMissTokens), humanize(c.PromptCacheHitTokens+c.PromptCacheMissTokens))
+					runtimeagent.Humanize(c.PromptCacheHitTokens), runtimeagent.Humanize(c.PromptCacheMissTokens), runtimeagent.Humanize(c.PromptCacheHitTokens+c.PromptCacheMissTokens))
 			}
 			ctx.Writer(line + "\n")
 		}
 		ctx.Writer("\n")
 		totalLine := fmt.Sprintf("  total: in %s  out %s  total %s",
-			humanize(total.PromptTokens), humanize(total.CompletionTokens), humanize(total.TotalTokens))
+			runtimeagent.Humanize(total.PromptTokens), runtimeagent.Humanize(total.CompletionTokens), runtimeagent.Humanize(total.TotalTokens))
 		if rate, ok := total.CacheHitRate(); ok {
 			totalLine += fmt.Sprintf("  cache %.1f%% (%s hit / %s miss)",
-				rate, humanize(total.PromptCacheHitTokens), humanize(total.PromptCacheMissTokens))
+				rate, runtimeagent.Humanize(total.PromptCacheHitTokens), runtimeagent.Humanize(total.PromptCacheMissTokens))
 		}
 		ctx.Writer(totalLine + "\n")
 
@@ -158,7 +229,7 @@ func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
 		if w := p.cfg.LLM.ContextWindow; w > 0 && total.LastPromptTokens > 0 {
 			pct := float64(total.LastPromptTokens) / float64(w) * 100
 			ctx.Writer(fmt.Sprintf("  context: %.2f%% (last in %s / window %s)\n",
-				pct, humanize(total.LastPromptTokens), humanize(w)))
+				pct, runtimeagent.Humanize(total.LastPromptTokens), runtimeagent.Humanize(w)))
 		}
 	}
 
@@ -171,14 +242,14 @@ func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
 			tokens += c.Tokens
 		}
 		ctx.Writer(fmt.Sprintf("  compact: %d time(s), %d msgs → %d msgs (summarize %s)\n",
-			len(comps), msgsIn, msgsOut, humanize(tokens)))
+			len(comps), msgsIn, msgsOut, runtimeagent.Humanize(tokens)))
 	}
 
 	// 当前历史占用：压缩后的直观体现，不必等下一次模型调用。
 	conv := p.session.Conversation()
 	if convLen := len(conv); convLen > 0 {
 		convEst := core.EstimateTokens(conv)
-		line := fmt.Sprintf("  history: %s est (%d msgs)", humanize(convEst), convLen)
+		line := fmt.Sprintf("  history: %s est (%d msgs)", runtimeagent.Humanize(convEst), convLen)
 		if w := p.cfg.LLM.ContextWindow; w > 0 {
 			line += fmt.Sprintf(", %.2f%% of window", float64(convEst)/float64(w)*100)
 		}
@@ -190,7 +261,7 @@ func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
 // ---- /compact 命令 ----
 
 func (p *AgentPlugin) handleCompact(ctx *spec.Context) error {
-	return p.session.Compact(ctx)
+	return p.session.Compact(ctx.Ctx, callbacksFromPlugin(ctx))
 }
 
 // ---- /skills 命令 ----
@@ -218,7 +289,7 @@ func (p *AgentPlugin) handleHistory(ctx *spec.Context) error {
 
 	ctx.Writer(fmt.Sprintf("history: %d messages\n\n", len(conv)))
 	for i, m := range conv {
-		ctx.Writer(fmt.Sprintf("  #%-2d [%-9s] %s\n", i+1, m.Role, describeMessage(m)))
+		ctx.Writer(fmt.Sprintf("  #%-2d [%-9s] %s\n", i+1, m.Role, runtimeagent.DescribeMessage(m)))
 	}
 	return nil
 }

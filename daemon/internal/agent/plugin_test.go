@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,11 +15,11 @@ import (
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-core/middlewares"
-	"github.com/tinguo/goworker/ai-core/spec"
 	"github.com/tinguo/goworker/ai-memory"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/mcp"
+	spec "github.com/tinguo/goworker/ai-runtime/plugin"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/ai-sandbox"
 )
@@ -39,22 +40,61 @@ func testHub(cfg *runtimeconfig.Config) (*spec.Hub, *[]*runtimeconfig.Config) {
 	return hub, &saved
 }
 
-// newAgentPlugin 构造带完整依赖的插件：会话状态收敛在 Session，测试直接操作 p.session。
+// newAgentPlugin 构造带完整依赖的插件：NewProvider 走真实 OpenAI 端点（cfg.LLM.Endpoint）。
+// 需要固定 provider 的测试用 newAgentPluginP。
 func newAgentPlugin(hub *spec.Hub) *AgentPlugin {
 	cfg, _ := hub.Config.(*runtimeconfig.Config)
 	p := &AgentPlugin{hub: hub, cfg: cfg}
 	// 与 Init 编排一致：资源确认后组装 deps + 创建会话
-	p.deps = SessionDeps{
+	p.deps = runtimeagent.SessionDeps{
 		Config:       cfg,
 		AuditDir:     "",
 		Memory:       p.memory,
 		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
 		NewProvider: func(cfg *runtimeconfig.Config) core.Provider {
-			return NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
+			return runtimeagent.NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
 		},
 	}
 	p.refreshSession()
 	return p
+}
+
+// newAgentPluginP 注入固定 provider：深播种测试不依赖真实 LLM 端点。
+func newAgentPluginP(hub *spec.Hub, pv core.Provider) *AgentPlugin {
+	cfg, _ := hub.Config.(*runtimeconfig.Config)
+	p := &AgentPlugin{hub: hub, cfg: cfg}
+	p.deps = runtimeagent.SessionDeps{
+		Config:       cfg,
+		AuditDir:     "",
+		Memory:       p.memory,
+		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		NewProvider:  func(*runtimeconfig.Config) core.Provider { return pv },
+	}
+	p.refreshSession()
+	return p
+}
+
+// fixedProvider 每次调用返回固定 assistant 内容，用于播种会话/压缩。
+type fixedProvider struct{ content string }
+
+func (p fixedProvider) Name() string  { return "fixed" }
+func (p fixedProvider) Model() string { return "m" }
+func (p fixedProvider) Chat(context.Context, *core.ChatRequest) (*core.ChatResponse, error) {
+	return &core.ChatResponse{Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: p.content}}}}, nil
+}
+func (p fixedProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	return nil, errors.New("not implemented")
+}
+
+// seedRuns 走公开 Run API 播种会话：每轮追加 user input + assistant 回复。
+// daemon 拿不到 Session 内部字段，这是唯一正当的填充路径。
+func seedRuns(p *AgentPlugin, inputs ...string) {
+	var out strings.Builder
+	for _, in := range inputs {
+		_ = p.session.Run(context.Background(), runtimeagent.RunRequest{Input: in}, runtimeagent.RunCallbacks{
+			Write: func(s string) { out.WriteString(s) },
+		})
+	}
 }
 
 // setMemory 设置插件 memory 并重建会话，模拟 Init 的编排顺序（资源就绪后创建会话）。
@@ -68,7 +108,7 @@ func (p *AgentPlugin) setMemory(c *memory.Client) {
 // refreshSession 用当前 deps 重建会话，对齐 startSession 的会话边界构造
 // （测试不读真实文件 —— deps 由测试直接注入）。
 func (p *AgentPlugin) refreshSession() {
-	p.session = NewSession(p.deps)
+	p.session = runtimeagent.NewSession(p.deps)
 }
 
 // newContext 构造带输出捕获的 spec.Context。
@@ -128,40 +168,28 @@ func TestHandleModel_RejectsBadCompressionKeys(t *testing.T) {
 }
 
 func TestHandleCompact_CompressesConversation(t *testing.T) {
-	// mock OpenAI 兼容端点：压缩调用返回固定摘要
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
-			t.Errorf("unexpected path: %s", r.URL.Path)
-		}
-		json.NewEncoder(w).Encode(core.ChatResponse{
-			Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: "COMPACTED"}}},
-		})
-	}))
-	defer srv.Close()
-
 	cfg := runtimeconfig.Default()
-	cfg.LLM.Endpoint = srv.URL
 	cfg.LLM.CompactKeep = 2
 	hub, _ := testHub(cfg)
-	p := newAgentPlugin(hub)
+	p := newAgentPluginP(hub, fixedProvider{content: "COMPACTED"})
 
-	// 6 条会话历史
-	var conv []core.Message
-	for i := 0; i < 3; i++ {
-		conv = append(conv, core.Message{Role: "user", Content: "q"}, core.Message{Role: "assistant", Content: "a"})
+	// 播种 3 轮 user/assistant 对（走公开 Run API）
+	seedRuns(p, "q", "q", "q")
+	if n := len(p.session.Conversation()); n != 6 {
+		t.Fatalf("seeded conversation = %d msgs, want 6", n)
 	}
-	p.session.conversation = conv
 
 	ctx, buf := newContext()
 	if err := p.handleCompact(ctx); err != nil {
 		t.Fatalf("handleCompact: %v", err)
 	}
 
-	if len(p.session.conversation) >= len(conv) {
-		t.Fatalf("conversation not shrunk: %d → %d", len(conv), len(p.session.conversation))
+	conv := p.session.Conversation()
+	if len(conv) >= 6 {
+		t.Fatalf("conversation not shrunk: %d → %d", 6, len(conv))
 	}
-	if p.session.conversation[0].Role != "system" || p.session.conversation[0].Content != "COMPACTED" {
-		t.Errorf("conversation[0] = %+v, want COMPACTED summary", p.session.conversation[0])
+	if conv[0].Role != "system" {
+		t.Errorf("conversation[0] = %+v, want system summary", conv[0])
 	}
 	if !strings.Contains(buf.String(), "✔ 已压缩") {
 		t.Errorf("output = %q, want success message", buf.String())
@@ -170,24 +198,12 @@ func TestHandleCompact_CompressesConversation(t *testing.T) {
 
 func TestHandleUsage_ShowsCompaction(t *testing.T) {
 	// /compact 后 /usage 必须能看出压缩：消耗进账 + 当前历史占用
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(core.ChatResponse{
-			Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: "COMPACTED"}}},
-		})
-	}))
-	defer srv.Close()
-
 	cfg := runtimeconfig.Default()
-	cfg.LLM.Endpoint = srv.URL
 	cfg.LLM.CompactKeep = 2
 	hub, _ := testHub(cfg)
-	p := newAgentPlugin(hub)
+	p := newAgentPluginP(hub, fixedProvider{content: "COMPACTED"})
 
-	var conv []core.Message
-	for i := 0; i < 3; i++ {
-		conv = append(conv, core.Message{Role: "user", Content: "q"}, core.Message{Role: "assistant", Content: "a"})
-	}
-	p.session.conversation = conv
+	seedRuns(p, "q", "q", "q")
 
 	compactCtx, _ := newContext()
 	if err := p.handleCompact(compactCtx); err != nil {
@@ -210,67 +226,24 @@ func TestHandleUsage_ShowsCompaction(t *testing.T) {
 func TestHandleHistory_ShowsMessages(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	hub, _ := testHub(cfg)
-	p := newAgentPlugin(hub)
-	p.session.conversation = []core.Message{
-		{Role: "user", Content: "第一个问题"},
-		{Role: "assistant", Content: "第一个回答"},
-		{Role: "tool", Content: strings.Repeat("x", 300), ToolCallID: "c1"},
-	}
+	// 长回复用于验证截断渲染
+	p := newAgentPluginP(hub, fixedProvider{content: strings.Repeat("x", 300)})
+
+	seedRuns(p, "第一个问题")
 
 	ctx, buf := newContext()
 	if err := p.handleHistory(ctx); err != nil {
 		t.Fatalf("handleHistory: %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "history: 3 messages") {
+	if !strings.Contains(out, "history: 2 messages") {
 		t.Errorf("output missing message count:\n%s", out)
 	}
 	if !strings.Contains(out, "[user") || !strings.Contains(out, "第一个问题") {
 		t.Errorf("output missing user message:\n%s", out)
 	}
 	if !strings.Contains(out, "…") {
-		t.Errorf("output should truncate long content:\n%s", out)
-	}
-}
-
-func TestDescribeMessage_ToolCallExpandsName(t *testing.T) {
-	m := core.Message{
-		Role: "assistant",
-		ToolCalls: []core.ToolCall{{
-			Function: core.ToolCallFunction{Name: "bash", Arguments: `{"command":"ls -la"}`},
-		}},
-	}
-	got := describeMessage(m)
-	if !strings.Contains(got, "bash(") || !strings.Contains(got, "ls -la") {
-		t.Errorf("describeMessage = %q, want tool call name+args", got)
-	}
-	if strings.Contains(got, "\n") {
-		t.Errorf("describeMessage should be single line, got %q", got)
-	}
-}
-
-func TestDescribeMessage_FoldsMultiline(t *testing.T) {
-	m := core.Message{Role: "tool", Content: "line1\nline2\nline3"}
-	got := describeMessage(m)
-	if strings.Contains(got, "\n") {
-		t.Errorf("multiline not folded: %q", got)
-	}
-	if !strings.Contains(got, "⏎") {
-		t.Errorf("fold marker missing: %q", got)
-	}
-}
-
-func TestTruncate(t *testing.T) {
-	if got := truncate("short", 10); got != "short" {
-		t.Errorf("truncate(short) = %q", got)
-	}
-	long := "中文内容特别长，用来验证不会切半字符"
-	got := truncate(long, 6)
-	if len([]rune(got)) != 7 { // 6 rune + …
-		t.Errorf("truncate got %d runes, want 7: %q", len([]rune(got)), got)
-	}
-	if got := truncate("x", 0); got != "x" {
-		t.Errorf("truncate n=0 should not truncate: %q", got)
+		t.Errorf("output should Truncate long content:\n%s", out)
 	}
 }
 
@@ -376,7 +349,8 @@ func buildFakeMCPServer(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pkgDir := filepath.Join(wd, "..", "mcp", "testdata", "fakeserver")
+	// daemon/internal/agent → 仓库根（3 级上溯）→ ai-runtime/mcp/testdata/fakeserver
+	pkgDir := filepath.Join(wd, "..", "..", "..", "ai-runtime", "mcp", "testdata", "fakeserver")
 	out := filepath.Join(t.TempDir(), "fakeserver")
 	cmd := exec.Command("go", "build", "-o", out, pkgDir)
 	cmd.Stderr = os.Stderr
@@ -665,8 +639,8 @@ func TestHandleNew_EmptyConversationSkipsCheckpoint(t *testing.T) {
 	if err := p.handleNew(ctx); err != nil {
 		t.Fatalf("handleNew: %v", err)
 	}
-	if len(p.session.conversation) != 0 {
-		t.Errorf("conversation not cleared: %d", len(p.session.conversation))
+	if len(p.session.Conversation()) != 0 {
+		t.Errorf("conversation not cleared: %d", len(p.session.Conversation()))
 	}
 	if !strings.Contains(buf.String(), "New session started") {
 		t.Errorf("output = %q", buf.String())
@@ -694,8 +668,7 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	p := newAgentPlugin(hub)
 	ms, _ := memory.NewClient(t.TempDir(), 10)
 	p.setMemory(ms)
-	p.session.conversation = []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
-	p.session.usage.Record(0, 0, &core.UsageInfo{TotalTokens: 10})
+	seedRuns(p, "q")
 
 	// 固化是后台 goroutine 执行的，writer 必须线程安全
 	var out lockedBuf
@@ -711,8 +684,8 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	}
 
 	// STM 立即清空（同步路径，不等后台）
-	if len(p.session.conversation) != 0 {
-		t.Errorf("conversation not cleared: %d", len(p.session.conversation))
+	if len(p.session.Conversation()) != 0 {
+		t.Errorf("conversation not cleared: %d", len(p.session.Conversation()))
 	}
 	if !strings.Contains(out.String(), "New session started") {
 		t.Errorf("output = %q", out.String())
@@ -780,26 +753,6 @@ func TestHandleTask_DisabledShowsHint(t *testing.T) {
 	}
 }
 
-// ---- 修复回归测试 ----
-
-func TestStripMemoryBlocks(t *testing.T) {
-	msgs := []core.Message{
-		{Role: "system", Content: middlewares.MemoryBlockPrefix + " 来自之前的会话，仅供参考"},
-		{Role: "user", Content: "hi"},
-		{Role: "system", Content: "压缩摘要：上次任务状态"}, // 普通 system 消息不受影响
-	}
-	got := stripMemoryBlocks(msgs)
-	if len(got) != 2 {
-		t.Fatalf("got %d messages, want 2 (%+v)", len(got), got)
-	}
-	if got[0].Role != "user" || got[0].Content != "hi" {
-		t.Errorf("user message lost: %+v", got[0])
-	}
-	if got[1].Content != "压缩摘要：上次任务状态" {
-		t.Errorf("non-memory system message should survive: %+v", got[1])
-	}
-}
-
 func TestInit_OpensMemory(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	cfg.Memory.Dir = t.TempDir()
@@ -858,46 +811,6 @@ func TestCollectTools_RegistersMemorySearch(t *testing.T) {
 	}
 }
 
-// TestCheckpoint_FiltersToolMessages 回归测试：conversation 含 tool 消息时，
-// 固化请求体不得泄漏 role="tool"（否则 OpenAI 400 missing field tool_call_id）。
-func TestCheckpoint_FiltersToolMessages(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Messages []struct {
-				Role string `json:"role"`
-			} `json:"messages"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Errorf("decode request body: %v", err)
-		}
-		for _, m := range body.Messages {
-			if m.Role == "tool" {
-				t.Errorf("checkpoint request leaked tool message: %+v", body.Messages)
-			}
-		}
-		json.NewEncoder(w).Encode(core.ChatResponse{
-			Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: `{"tasks":[],"decisions":[]}`}}},
-		})
-	}))
-	defer srv.Close()
-
-	cfg := runtimeconfig.Default()
-	cfg.LLM.Endpoint = srv.URL
-	hub, _ := testHub(cfg)
-	p := newAgentPlugin(hub)
-	ms, _ := memory.NewClient(t.TempDir(), 10)
-	p.setMemory(ms)
-	p.session.conversation = []core.Message{
-		{Role: "user", Content: "查下磁盘"},
-		{Role: "assistant", Content: "", ToolCalls: []core.ToolCall{{ID: "call_1", Type: "function", Function: core.ToolCallFunction{Name: "bash", Arguments: `{"command":"df -h"}`}}}},
-		{Role: "tool", ToolCallID: "call_1", Content: "Filesystem 1.9T 60% used"},
-		{Role: "assistant", Content: "磁盘用了 60%"},
-	}
-	if _, err := p.session.checkpoint(context.Background(), p.session.Conversation()); err != nil {
-		t.Fatalf("checkpoint: %v", err)
-	}
-}
-
 func TestHandleNew_LtmExtractDisabledSkipsFacts(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(core.ChatResponse{
@@ -915,7 +828,7 @@ func TestHandleNew_LtmExtractDisabledSkipsFacts(t *testing.T) {
 	p := newAgentPlugin(hub)
 	ms, _ := memory.NewClient(t.TempDir(), 10)
 	p.setMemory(ms)
-	p.session.conversation = []core.Message{{Role: "user", Content: "q"}, {Role: "assistant", Content: "a"}}
+	seedRuns(p, "q")
 
 	var out lockedBuf
 	ctx := &spec.Context{

@@ -5,10 +5,9 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"time"
-
-	"github.com/tinguo/goworker/ai-core/spec"
 )
 
 // ---- 工具 ----
@@ -110,10 +109,17 @@ type Delta struct {
 
 // Token 流式输出中的一个 token。
 type Token struct {
-	Type      string // "text" / "tool_call" / "tool_result" / "interrupt"
-	Content   string
-	Done      bool
-	Interrupt *spec.InterruptRequest // Type == "interrupt" 时填充
+	Type    string
+	Content string
+	Done    bool
+	Event   *RuntimeEvent
+}
+
+// RuntimeEvent 是运行时扩展事件载荷。agent kernel 只负责传递，不解释业务语义。
+type RuntimeEvent struct {
+	Type string          `json:"type"`
+	ID   string          `json:"id,omitempty"`
+	Data json.RawMessage `json:"data,omitempty"`
 }
 
 // Token 类型常量。
@@ -121,7 +127,7 @@ const (
 	TokenTypeText       = "text"
 	TokenTypeToolCall   = "tool_call"
 	TokenTypeToolResult = "tool_result"
-	TokenTypeInterrupt  = "interrupt"
+	TokenTypeEvent      = "event"
 )
 
 // ---- Provider ----
@@ -146,14 +152,6 @@ type MiddlewareResponse struct {
 	Err error
 }
 
-// DecisionProvider 抽象 HITL 决策来源。
-// 单机场景下由 ChannelDecisionProvider 包装 channel 实现，
-// 分布式场景下可实现为轮询 API 端点。
-type DecisionProvider interface {
-	// GetDecision 获取用户对中断请求的决策。阻塞直到有结果或 ctx 取消。
-	GetDecision(ctx context.Context, req *spec.InterruptRequest) spec.HITLDecision
-}
-
 // ---- Event structs ----
 
 // BeforeAgentEvent BeforeAgent 点位的事件。
@@ -171,41 +169,54 @@ type AfterAgentEvent struct {
 
 // BeforeModelEvent BeforeModel 点位的事件。
 type BeforeModelEvent struct {
-	Ctx     context.Context
-	History []Message
-	Input   string
+	Ctx       context.Context
+	Iteration int
+	History   []Message
+	Input     string
 	// History 可被 middleware 整体替换（如压缩历史）：Agent 循环 fire 事件后回读它作为实际发送的历史。
 	// 约定：只能整体赋值，不要改元素 —— 切片共享底层数组，改元素会污染调用方持有的数据。
 }
 
 // AfterModelEvent AfterModel 点位的事件。
 type AfterModelEvent struct {
-	Ctx     context.Context
-	History []Message
-	Err     error
-	Usage   *UsageInfo // 本次 Chat 调用的 token 用量，模型不返回时为 nil
+	Ctx       context.Context
+	Iteration int
+	History   []Message
+	Request   *ChatRequest
+	Response  *ChatResponse
+	Err       error
+	Usage     *UsageInfo // 本次 Chat 调用的 token 用量，模型不返回时为 nil
+}
+
+type TokenEmitter interface {
+	Emit(ctx context.Context, tok Token)
+}
+
+type ToolAbort struct {
+	Messages []Message
 }
 
 // BeforeToolEvent BeforeTool 点位的事件。
-// TokenCh 供 HITL middleware 发送 interrupt/reject token。
-// middleware 可设置 Aborted=true 跳过本次 tool call，
-// 或修改 Args 变更执行参数。ResponseMessages 会在 Aborted 后追加到会话历史。
+// middleware 可修改 Args 变更执行参数，或设置 Abort 跳过本次 tool call。
 type BeforeToolEvent struct {
-	Ctx              context.Context
-	History          []Message
-	Tool             *ToolCall
-	TokenCh          chan<- Token
-	Args             map[string]any
-	Aborted          bool
-	ResponseMessages []Message
+	Ctx       context.Context
+	Iteration int
+	History   []Message
+	Tool      *ToolCall
+	Emit      TokenEmitter
+	Args      map[string]any
+	Abort     *ToolAbort
 }
 
 // AfterToolEvent AfterTool 点位的事件。
 type AfterToolEvent struct {
-	Ctx     context.Context
-	History []Message
-	Tool    *ToolCall
-	Err     error
+	Ctx       context.Context
+	Iteration int
+	History   []Message
+	Tool      *ToolCall
+	Args      map[string]any
+	Result    string
+	Err       error
 }
 
 // ---- Hook 接口 ----

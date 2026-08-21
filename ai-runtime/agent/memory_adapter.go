@@ -3,11 +3,11 @@ package agent
 import (
 	"context"
 
-	"github.com/tinguo/goworker/ai-core/middlewares"
 	"github.com/tinguo/goworker/ai-memory"
+	"github.com/tinguo/goworker/ai-runtime/middlewares"
 )
 
-// memoryClientAdapter 把 ai-memory 的 *Client 适配成 ai-core/middlewares.MemoryClient。
+// memoryClientAdapter 把 ai-memory 的 *Client 适配成 middlewares.MemoryClient。
 // ai-core 零 memory 依赖，具体实现由 ai-runtime 注入。
 type memoryClientAdapter struct {
 	client *memory.Client

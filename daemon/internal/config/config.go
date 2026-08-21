@@ -3,9 +3,8 @@
 // 配置从 YAML 文件加载，缺失字段由默认值兜底。
 // 文件路径：~/.config/goworker/config.yaml（可用 GOWORKER_CONFIG_DIR 覆盖目录）。
 //
-// 分层：本包是 YAML 解析层 + 路径中枢；engine 段(LLM/Memory)用 ai-core/config，
-// 装配段(Session/MCP)用 ai-runtime/config，Sandbox 保留本地解析层（risky_patterns
-// 字符串/结构体双格式兼容），经 ToRuntime() 转成 ai-runtime 的聚合配置注入插件。
+// 分层：本包是 YAML 解析层 + 路径中枢；runtime 段(LLM/Memory/Session/MCP)用 ai-runtime/config，
+// Sandbox 保留本地解析层（risky_patterns 字符串/结构体双格式兼容），经 ToRuntime() 转成 ai-runtime 的聚合配置注入插件。
 package config
 
 import (
@@ -16,7 +15,6 @@ import (
 	"path/filepath"
 	"strconv"
 
-	coreconfig "github.com/tinguo/goworker/ai-core/config"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/logger"
 	"github.com/tinguo/goworker/ai-sandbox"
@@ -26,8 +24,8 @@ import (
 // Config 是 goworker 的整体配置。所有段顶层平铺，旧 config.yaml 不缩进 → 兼容。
 type Config struct {
 	Frontend FrontendConfig              `yaml:"frontend"`
-	LLM      coreconfig.LLMConfig        `yaml:"llm"`
-	Memory   coreconfig.MemoryConfig     `yaml:"memory"`
+	LLM      runtimeconfig.LLMConfig     `yaml:"llm"`
+	Memory   runtimeconfig.MemoryConfig  `yaml:"memory"`
 	Sandbox  SandboxConfig               `yaml:"sandbox"`
 	Session  runtimeconfig.SessionConfig `yaml:"session"`
 	MCP      runtimeconfig.MCPConfig     `yaml:"mcp"`
@@ -148,13 +146,13 @@ func (c *Config) ApplyRuntime(r *runtimeconfig.Config) {
 func Default() *Config {
 	logCfg := logger.Default()
 	logCfg.File = defaultLogPath()
-	mem := coreconfig.DefaultMemory()
+	mem := runtimeconfig.DefaultMemory()
 	mem.Dir = filepath.Join(DefaultDir(), "memory")
 	return &Config{
 		Frontend: FrontendConfig{
 			Stdin: StdinConfig{Theme: "default"},
 		},
-		LLM:    coreconfig.DefaultLLM(),
+		LLM:    runtimeconfig.DefaultLLM(),
 		Memory: mem,
 		Sandbox: SandboxConfig{
 			Mode: "normal",
@@ -219,25 +217,25 @@ func (c *Config) SetField(key, value string) error {
 	case "llm.api_key":
 		c.LLM.APIKey = value
 	case "llm.context_window":
-		n, err := coreconfig.ParseContextWindow(value)
+		n, err := runtimeconfig.ParseContextWindow(value)
 		if err != nil {
 			return err
 		}
 		c.LLM.ContextWindow = n
 	case "llm.compress_at":
-		f, err := coreconfig.ParseCompressAt(value)
+		f, err := runtimeconfig.ParseCompressAt(value)
 		if err != nil {
 			return err
 		}
 		c.LLM.CompressAt = f
 	case "llm.compact_keep":
-		n, err := coreconfig.ParseCompactKeep(value)
+		n, err := runtimeconfig.ParseCompactKeep(value)
 		if err != nil {
 			return err
 		}
 		c.LLM.CompactKeep = n
 	case "llm.max_iterations":
-		n, err := coreconfig.ParseMaxIterations(value)
+		n, err := runtimeconfig.ParseMaxIterations(value)
 		if err != nil {
 			return err
 		}

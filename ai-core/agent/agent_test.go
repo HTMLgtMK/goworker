@@ -8,8 +8,29 @@ import (
 	"testing"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-core/middlewares"
 )
+
+type iterationSpy struct {
+	fired *int
+}
+
+func (m iterationSpy) Name() string { return "iteration-spy" }
+
+func (m iterationSpy) OnBeforeModel(*core.BeforeModelEvent) *core.MiddlewareResponse {
+	(*m.fired)++
+	return nil
+}
+
+type beforeToolIterationSpy struct {
+	iterations *[]int
+}
+
+func (m beforeToolIterationSpy) Name() string { return "before-tool-iteration-spy" }
+
+func (m beforeToolIterationSpy) OnBeforeTool(ev *core.BeforeToolEvent) *core.MiddlewareResponse {
+	*m.iterations = append(*m.iterations, ev.Iteration)
+	return nil
+}
 
 // captureProvider 记录最后一次请求并返回最终答复。
 type captureProvider struct {
@@ -138,7 +159,7 @@ func TestAgent_CustomMaxIterationsRespected(t *testing.T) {
 
 func TestAgent_IterationMiddlewareFiresPerIteration(t *testing.T) {
 	fired := 0
-	iterMw := middlewares.NewIterationMiddleware(func() { fired++ })
+	iterMw := iterationSpy{fired: &fired}
 	// count=2：两轮 tool call + 一轮 final = 3 次迭代，每轮 OnBeforeModel fire 一次
 	a := NewAgent(&toolLoopProvider{count: 2}, "", testTools(), []core.Middleware{iterMw})
 	tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")
@@ -152,6 +173,26 @@ func TestAgent_IterationMiddlewareFiresPerIteration(t *testing.T) {
 	}
 	if fired != 3 {
 		t.Errorf("iteration events = %d, want 3", fired)
+	}
+	<-msgCh
+}
+
+func TestAgent_BeforeToolEventCarriesIteration(t *testing.T) {
+	iterations := []int{}
+	mw := beforeToolIterationSpy{iterations: &iterations}
+	// count=2：两轮 tool call，BeforeTool 应分别看到 iter 0 和 1。
+	a := NewAgent(&toolLoopProvider{count: 2}, "", testTools(), []core.Middleware{mw})
+	tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")
+	if err != nil {
+		t.Fatalf("Run err = %v", err)
+	}
+	for tok := range tokenCh {
+		if tok.Done {
+			break
+		}
+	}
+	if !reflect.DeepEqual(iterations, []int{0, 1}) {
+		t.Errorf("BeforeTool iterations = %v, want [0 1]", iterations)
 	}
 	<-msgCh
 }
