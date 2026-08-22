@@ -4,7 +4,10 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 )
 
-// NewIterationMiddleware 创建迭代事件发布器。publish 为 nil 时静默跳过。
+type IterationMiddleware struct {
+	publish func()
+}
+
 func NewIterationMiddleware(publish func()) *IterationMiddleware {
 	return &IterationMiddleware{publish: publish}
 }

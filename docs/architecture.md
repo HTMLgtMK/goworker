@@ -13,17 +13,17 @@ ai-core/                        [module github.com/tinguo/goworker/ai-core] 零 
 
 ai-runtime/                     [module github.com/tinguo/goworker/ai-runtime] 聚合层
   config/           # LLM/Memory/Sandbox/Session/MCP 配置 + Paths + 事件契约
-  plugin/           # 前端/插件协议：Hub, Command, Plugin, Context, RenderKind
   hitl/             # HITL 协议与 DecisionProvider
   agent/            # agent SDK：Session + SessionDeps + RunRequest/RunCallbacks + DefaultTools
-                    # （纯 Go API，零 plugin 依赖；宿主自行做 plugin 封装）
+                    # （纯 Go API，零宿主 plugin 协议依赖；宿主自行做 plugin 封装）
   middlewares/      # HITL/usage/iteration/compression/memory runtime 中间件
   session/          # 会话持久化 store（checkpoint/rewind/compact）
   mcp/ skills/ logger/ fakeserver/
 
 daemon/                         [module github.com/tinguo/goworker/daemon] REPL shell
   cmd/goworker/main.go          # 入口：载入 config → ToRuntime → Register(NewPlugin)
-  internal/agent/               # /agent 插件适配器：把 ai-runtime Session SDK 装配成 spec.Plugin
+  internal/plugin/              # daemon 插件/命令/前端上下文协议：Hub, Command, Plugin, Context, RenderKind
+  internal/agent/               # /agent 插件适配器：把 ai-runtime Session SDK 装配成 plugin.Plugin
                                 # （资源装载 skill/MCP/memory/store + 命令注册 + 生命周期）
   internal/config/              # 顶层平铺 config.yaml 解析 + ToRuntime/ApplyRuntime
   internal/core/                # Engine：插件生命周期、命令路由、中间件链、事件广播
@@ -41,7 +41,7 @@ daemon ──→ ai-runtime ──→ ai-core ──→ (zero goworker deps)
 - ai-core/agent 与 ai-memory、ai-sandbox、ai-runtime 零耦合：DefaultTools 在 ai-runtime/agent，MemoryClient 为 runtime 本地接口 + ai-runtime adapter。
 - 配置不跨层上溯：LLM/Memory/Sandbox/Session/MCP 在 ai-runtime/config；daemon 负责 YAML 兼容（risky_patterns 双格式）与本机路径派生。
 - 事件契约倒置：ai-runtime/config 定义 EventUsage/EventIteration + UsageEvent，daemon/statusbar 订阅渲染，statusbar 不进 SDK。
-- SDK/插件边界：ai-runtime/agent 是纯 Session SDK（零 plugin 依赖），spec.Plugin 适配器在 daemon/internal/agent —— 宿主换协议（HTTP/MCP 等）只需重写 adapter，SDK 不动。
+- SDK/插件边界：ai-runtime/agent 是纯 Session SDK（零宿主 plugin 协议依赖），plugin.Plugin 适配器在 daemon/internal/agent —— 宿主换协议（HTTP/MCP 等）只需重写 adapter，SDK 不动。
 
 ---
 

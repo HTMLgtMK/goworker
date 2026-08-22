@@ -9,8 +9,20 @@ import (
 
 	"github.com/tinguo/goworker/ai-core/core"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
-	"github.com/tinguo/goworker/ai-sandbox"
+	sandbox "github.com/tinguo/goworker/ai-sandbox"
 )
+
+// HITLMiddleware 通过 DecisionProvider 对接沙箱检查，拦截风险工具调用。
+// 覆盖两类工具：
+//   - bash：走 sandbox 正则规则（deny 直接拒绝 / risky 需要确认）
+//   - mcp_*：外部进程，sandbox 约束不到 —— strict/readonly 直接拒绝，normal 走 HITL 确认
+type HITLMiddleware struct {
+	sandboxCfg       sandbox.Config
+	decisionProvider hitl.DecisionProvider
+	audit            *sandbox.AuditLogger // nil = 不审计
+}
+
+type HITLOption func(*HITLMiddleware)
 
 var reqID atomic.Int64
 

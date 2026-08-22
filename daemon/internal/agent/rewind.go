@@ -6,15 +6,15 @@ import (
 
 	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
-	spec "github.com/tinguo/goworker/ai-runtime/plugin"
+	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
 // 本文件实现 /rewind 命令：回溯到历史检查点，恢复当时的完整对话视图。
 
 // registerRewindCommand 注册 /rewind 命令到 hub。
 // 由插件 Init 里调用 p.registerRewindCommand(h)。
-func (p *AgentPlugin) registerRewindCommand(h *spec.Hub) error {
-	return h.RegisterCommand(spec.Command{
+func (p *AgentPlugin) registerRewindCommand(h *plugin.Hub) error {
+	return h.RegisterCommand(plugin.Command{
 		Name:        "/rewind",
 		Description: "回溯到历史检查点，恢复当时的完整对话视图。无参列出检查点，/rewind <n> 回溯。",
 		Handler:     p.handleRewind,
@@ -25,7 +25,7 @@ func (p *AgentPlugin) registerRewindCommand(h *spec.Hub) error {
 //
 //	无参             → 列出最近 10 个 checkpoint（编号+时间+preview）
 //	/rewind <n>      → 回溯到编号为 n 的 checkpoint
-func (p *AgentPlugin) handleRewind(ctx *spec.Context) error {
+func (p *AgentPlugin) handleRewind(ctx *plugin.Context) error {
 	if p.store == nil {
 		ctx.Writer("会话持久化未启用，/rewind 不可用（检查 config.yaml 的 session.enabled）\n")
 		return nil
@@ -39,7 +39,7 @@ func (p *AgentPlugin) handleRewind(ctx *spec.Context) error {
 }
 
 // listRewindPoints 列出最近 10 个检查点。
-func (p *AgentPlugin) listRewindPoints(ctx *spec.Context) error {
+func (p *AgentPlugin) listRewindPoints(ctx *plugin.Context) error {
 	cks := p.store.Checkpoints(10)
 	if len(cks) == 0 {
 		ctx.Writer("(无检查点 — 先跑几轮 /agent，每次提交会自动打 checkpoint)\n")
@@ -56,7 +56,7 @@ func (p *AgentPlugin) listRewindPoints(ctx *spec.Context) error {
 }
 
 // doRewind 执行回溯到指定编号的检查点。
-func (p *AgentPlugin) doRewind(ctx *spec.Context, arg string) error {
+func (p *AgentPlugin) doRewind(ctx *plugin.Context, arg string) error {
 	n, err := strconv.Atoi(arg)
 	if err != nil {
 		ctx.Writer("用法: /rewind <n>  （n 是列表中的编号，用 /rewind 查看）\n")

@@ -1,13 +1,46 @@
 package middlewares
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
 
 	"github.com/tinguo/goworker/ai-core/core"
 	"github.com/tinguo/goworker/ai-runtime/config"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 )
+
+const MemoryBlockPrefix = "[记忆]"
+
+type MemoryTask struct {
+	ID        string
+	Title     string
+	Summary   string
+	NextSteps []string
+}
+
+type MemoryFact struct {
+	Topic   string
+	Content string
+}
+
+type MemoryResult struct {
+	Task  *MemoryTask
+	Fact  *MemoryFact
+	Score float64
+}
+
+type MemoryClient interface {
+	Search(ctx context.Context, query string, taskTopK, factTopK int) ([]MemoryResult, error)
+}
+
+type MemoryMiddleware struct {
+	client   MemoryClient
+	cfg      runtimeconfig.MemoryConfig
+	window   int
+	injected bool
+}
 
 func NewMemoryMiddleware(client MemoryClient, cfg config.MemoryConfig, window int) *MemoryMiddleware {
 	return &MemoryMiddleware{client: client, cfg: cfg, window: window}

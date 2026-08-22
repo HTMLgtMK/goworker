@@ -7,14 +7,14 @@ import (
 
 	"github.com/tinguo/goworker/ai-memory"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
-	spec "github.com/tinguo/goworker/ai-runtime/plugin"
+	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
 // 本文件是记忆与任务档案命令：/memory 与 /task。
 
 // ---- /memory 命令 ----
 
-func (p *AgentPlugin) handleMemory(ctx *spec.Context) error {
+func (p *AgentPlugin) handleMemory(ctx *plugin.Context) error {
 	if p.memory == nil {
 		ctx.Writer("memory 未启用（检查 config.yaml 的 memory.enabled 与存储目录权限）\n")
 		return nil
@@ -150,7 +150,7 @@ func (p *AgentPlugin) handleMemory(ctx *spec.Context) error {
 	return nil
 }
 
-func (p *AgentPlugin) memoryHelp(ctx *spec.Context) {
+func (p *AgentPlugin) memoryHelp(ctx *plugin.Context) {
 	ctx.Writer("Usage:\n")
 	ctx.Writer("  /memory                 — show this help\n")
 	ctx.Writer("  /memory add <text>      — manually remember a fact\n")
@@ -166,7 +166,7 @@ func (p *AgentPlugin) memoryHelp(ctx *spec.Context) {
 
 // ---- /task 命令 ----
 
-func (p *AgentPlugin) handleTask(ctx *spec.Context) error {
+func (p *AgentPlugin) handleTask(ctx *plugin.Context) error {
 	if p.memory == nil {
 		ctx.Writer("memory 未启用（检查 config.yaml 的 memory.enabled 与存储目录权限）\n")
 		return nil
@@ -248,7 +248,7 @@ func (p *AgentPlugin) handleTask(ctx *spec.Context) error {
 	return nil
 }
 
-func (p *AgentPlugin) taskHelp(ctx *spec.Context) {
+func (p *AgentPlugin) taskHelp(ctx *plugin.Context) {
 	ctx.Writer("用法:\n")
 	ctx.Writer("  /task               — 显示本帮助\n")
 	ctx.Writer("  /task list          — 列出未完成任务\n")

@@ -1,4 +1,4 @@
-package core
+package middlewares
 
 import (
 	"context"
@@ -6,43 +6,45 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/tinguo/goworker/ai-core/core"
 )
 
 // stubProvider 记录请求并返回固定内容，用于 Compressor 测试。
 type stubProvider struct {
-	lastReq *ChatRequest
+	lastReq *core.ChatRequest
 	resp    string
 	err     error
 }
 
 func (p *stubProvider) Name() string  { return "stub" }
 func (p *stubProvider) Model() string { return "stub-model" }
-func (p *stubProvider) Chat(_ context.Context, req *ChatRequest) (*ChatResponse, error) {
+func (p *stubProvider) Chat(_ context.Context, req *core.ChatRequest) (*core.ChatResponse, error) {
 	p.lastReq = req
 	if p.err != nil {
 		return nil, p.err
 	}
-	return &ChatResponse{Choices: []ResponseChoice{{Message: Message{Role: "assistant", Content: p.resp}}}}, nil
+	return &core.ChatResponse{Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: p.resp}}}}, nil
 }
-func (p *stubProvider) ChatStream(context.Context, *ChatRequest) (<-chan Token, error) {
+func (p *stubProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
 	return nil, errors.New("not implemented")
 }
 
-func msg(role, content string) Message {
-	return Message{Role: role, Content: content}
+func msg(role, content string) core.Message {
+	return core.Message{Role: role, Content: content}
 }
 
-func toolCallMsg(id string) Message {
-	return Message{Role: "assistant", Content: "call tool", ToolCalls: []ToolCall{{ID: id, Function: ToolCallFunction{Name: "bash", Arguments: "echo hi"}}}}
+func toolCallMsg(id string) core.Message {
+	return core.Message{Role: "assistant", Content: "call tool", ToolCalls: []core.ToolCall{{ID: id, Function: core.ToolCallFunction{Name: "bash", Arguments: "echo hi"}}}}
 }
 
-func toolMsg(id, content string) Message {
-	return Message{Role: "tool", Content: content, ToolCallID: id}
+func toolMsg(id, content string) core.Message {
+	return core.Message{Role: "tool", Content: content, ToolCallID: id}
 }
 
 func TestCompressor_RollsHistory(t *testing.T) {
 	// 12 条历史，keepLast=5 → 朴素切点 7（user，安全）→ 只发前 7 条给模型
-	var hist []Message
+	var hist []core.Message
 	for i := 0; i < 6; i++ {
 		hist = append(hist, msg("user", "q"))
 		hist = append(hist, msg("assistant", "a"))
@@ -78,7 +80,7 @@ func TestCompressor_RollsHistory(t *testing.T) {
 }
 
 func TestCompressor_NoOpWhenShort(t *testing.T) {
-	hist := []Message{msg("user", "hi"), msg("assistant", "yo")}
+	hist := []core.Message{msg("user", "hi"), msg("assistant", "yo")}
 	stub := &stubProvider{}
 	c := NewCompressor(stub, 10, false)
 	out, err := c.Compress(context.Background(), hist)
@@ -95,7 +97,7 @@ func TestCompressor_NoOpWhenShort(t *testing.T) {
 
 func TestCompressor_BoundaryMovesBackPastToolTail(t *testing.T) {
 	// 3 组 tool 配对，keepLast=4，朴素切点 5 落在 tool 上 → 回退到 4（asst(c2)，前一条是 user）→ 安全
-	hist := []Message{
+	hist := []core.Message{
 		msg("user", "q1"), toolCallMsg("c1"), toolMsg("c1", "r1"),
 		msg("user", "q2"), toolCallMsg("c2"), toolMsg("c2", "r2"),
 		msg("user", "q3"), toolCallMsg("c3"), toolMsg("c3", "r3"),
@@ -120,7 +122,7 @@ func TestCompressor_BoundaryMovesBackPastToolTail(t *testing.T) {
 func TestCompressor_NoBoundaryNoOp(t *testing.T) {
 	// [asst(tool), tool]，keepLast=1：唯一候选切点落在 tool 上，
 	// 拆开就把 tool 和它的 asst 分离 → 无安全切点，不压
-	hist := []Message{
+	hist := []core.Message{
 		toolCallMsg("c1"), toolMsg("c1", "r1"),
 	}
 	stub := &stubProvider{resp: "S"}
@@ -139,7 +141,7 @@ func TestCompressor_NoBoundaryNoOp(t *testing.T) {
 
 func TestCompressor_KeepsSystemPromptVerbatim(t *testing.T) {
 	// 首位 system 是系统提示，压缩后必须原样保留，不能进摘要
-	hist := []Message{
+	hist := []core.Message{
 		msg("system", "You are a coding assistant with tool access."),
 		msg("user", "q1"), msg("assistant", "a1"),
 		msg("user", "q2"), msg("assistant", "a2"),
@@ -165,7 +167,7 @@ func TestCompressor_KeepsSystemPromptVerbatim(t *testing.T) {
 func TestCompressor_ProtectsAllLeadingSystemMessages(t *testing.T) {
 	// 自动压缩场景：前导 system 是 agent 提示 + memory middleware 注入的记忆块。
 	// 两者都必须原样保留、不进摘要 —— 摘要没有 [记忆] 前缀剥不掉，进 STM 会污染固化。
-	hist := []Message{
+	hist := []core.Message{
 		msg("system", "You are a coding assistant with tool access."),
 		msg("system", "[记忆] 来自之前的会话..."),
 		msg("user", "q1"), msg("assistant", "a1"),
@@ -196,7 +198,7 @@ func TestCompressor_ProtectsAllLeadingSystemMessages(t *testing.T) {
 func TestCompressor_ReRollsLeadingSummaryWhenNotProtected(t *testing.T) {
 	// /compact 场景：p.conversation[0] 是上次压缩留下的摘要（system 角色），
 	// protectSystem=false 时它必须被再次滚动，不能原样冻结 —— 否则摘要一条条累积。
-	hist := []Message{
+	hist := []core.Message{
 		msg("system", "S1 上次的摘要"),
 		msg("user", "q1"), msg("assistant", "a1"),
 		msg("user", "q2"), msg("assistant", "a2"),
@@ -222,7 +224,7 @@ func TestCompressor_ReRollsLeadingSummaryWhenNotProtected(t *testing.T) {
 func TestCompressor_ReportsCompression(t *testing.T) {
 	var report CompressReport
 	reported := false
-	hist := []Message{msg("user", "a"), msg("user", "b"), msg("user", "c")}
+	hist := []core.Message{msg("user", "a"), msg("user", "b"), msg("user", "c")}
 	stub := &stubProvider{resp: "S"}
 	c := NewCompressor(stub, 1, false, func(r CompressReport) { report = r; reported = true })
 	out, err := c.Compress(context.Background(), hist)
@@ -242,7 +244,7 @@ func TestCompressor_ReportsCompression(t *testing.T) {
 }
 
 func TestCompressor_NoReportWithoutCallback(t *testing.T) {
-	hist := []Message{msg("user", "a"), msg("user", "b"), msg("user", "c")}
+	hist := []core.Message{msg("user", "a"), msg("user", "b"), msg("user", "c")}
 	stub := &stubProvider{resp: "S"}
 	c := NewCompressor(stub, 1, false) // 3 参，无回调
 	if _, err := c.Compress(context.Background(), hist); err != nil {
@@ -252,7 +254,7 @@ func TestCompressor_NoReportWithoutCallback(t *testing.T) {
 
 func TestCompressor_NoPanicOnZeroKeepLast(t *testing.T) {
 	// 导出 API 防御：keepLast <= 0 时不得越界 panic，应安全退化
-	hist := []Message{msg("user", "a"), msg("user", "b"), msg("user", "c")}
+	hist := []core.Message{msg("user", "a"), msg("user", "b"), msg("user", "c")}
 	stub := &stubProvider{resp: "S"}
 	c := NewCompressor(stub, 0, false)
 	out, err := c.Compress(context.Background(), hist)
@@ -268,7 +270,7 @@ func TestCompressor_NoPanicOnZeroKeepLast(t *testing.T) {
 }
 
 func TestCompressor_ProviderErrorPropagates(t *testing.T) {
-	hist := []Message{msg("user", "a"), msg("user", "b"), msg("user", "c")}
+	hist := []core.Message{msg("user", "a"), msg("user", "b"), msg("user", "c")}
 	stub := &stubProvider{err: errors.New("api down")}
 	c := NewCompressor(stub, 1, false)
 	_, err := c.Compress(context.Background(), hist)

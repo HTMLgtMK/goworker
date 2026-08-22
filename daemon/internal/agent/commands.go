@@ -10,7 +10,7 @@ import (
 	"github.com/tinguo/goworker/ai-memory"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
-	spec "github.com/tinguo/goworker/ai-runtime/plugin"
+	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
 // 本文件是配置与诊断类命令：/agent /new /model /usage /compact /skills /history /rules。
@@ -18,13 +18,13 @@ import (
 
 // ---- /agent 命令 ----
 
-func (p *AgentPlugin) handleAgent(ctx *spec.Context) error {
+func (p *AgentPlugin) handleAgent(ctx *plugin.Context) error {
 	return p.session.Run(ctx.Ctx, runtimeagent.RunRequest{Input: strings.Join(ctx.Args, " ")}, callbacksFromPlugin(ctx))
 }
 
 // callbacksFromPlugin 把 plugin.Context 的 I/O 回调适配成 runtimeagent.RunCallbacks。
 // WriteToken 只在 ctx 提供时注入，避免把 nil 包装成非 nil 绕过 SDK 的 nil 保护。
-func callbacksFromPlugin(ctx *spec.Context) runtimeagent.RunCallbacks {
+func callbacksFromPlugin(ctx *plugin.Context) runtimeagent.RunCallbacks {
 	cb := runtimeagent.RunCallbacks{
 		Write:   ctx.Writer,
 		Decide:  ctx.Decide,
@@ -32,7 +32,7 @@ func callbacksFromPlugin(ctx *spec.Context) runtimeagent.RunCallbacks {
 	}
 	if ctx.WriteToken != nil {
 		cb.WriteToken = func(kind runtimeagent.RenderKind, content string) {
-			ctx.WriteToken(spec.RenderKind(kind), content)
+			ctx.WriteToken(plugin.RenderKind(kind), content)
 		}
 	}
 	return cb
@@ -40,7 +40,7 @@ func callbacksFromPlugin(ctx *spec.Context) runtimeagent.RunCallbacks {
 
 // ---- /new 命令 ----
 
-func (p *AgentPlugin) handleNew(ctx *spec.Context) error {
+func (p *AgentPlugin) handleNew(ctx *plugin.Context) error {
 	// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
 	// 后台固化旧会话，不阻塞输入；快照走只读，新会话创建不影响这份引用。
 	old := p.session
@@ -87,7 +87,7 @@ func (p *AgentPlugin) handleNew(ctx *spec.Context) error {
 
 // ---- /model 命令 ----
 
-func (p *AgentPlugin) handleModel(ctx *spec.Context) error {
+func (p *AgentPlugin) handleModel(ctx *plugin.Context) error {
 	args := ctx.Args
 
 	if len(args) == 0 {
@@ -176,7 +176,7 @@ func (p *AgentPlugin) handleModel(ctx *spec.Context) error {
 	return nil
 }
 
-func (p *AgentPlugin) showConfig(ctx *spec.Context) {
+func (p *AgentPlugin) showConfig(ctx *plugin.Context) {
 	cfg := p.cfg
 	keyDisplay := cfg.LLM.APIKey
 	if keyDisplay != "" {
@@ -197,7 +197,7 @@ func (p *AgentPlugin) showConfig(ctx *spec.Context) {
 
 // ---- /usage 命令 ----
 
-func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
+func (p *AgentPlugin) handleUsage(ctx *plugin.Context) error {
 	calls, comps, total := p.session.UsageSnapshot()
 	if len(calls) == 0 && len(comps) == 0 {
 		ctx.Writer("(no agent calls yet — run /agent first)\n")
@@ -260,13 +260,13 @@ func (p *AgentPlugin) handleUsage(ctx *spec.Context) error {
 
 // ---- /compact 命令 ----
 
-func (p *AgentPlugin) handleCompact(ctx *spec.Context) error {
+func (p *AgentPlugin) handleCompact(ctx *plugin.Context) error {
 	return p.session.Compact(ctx.Ctx, callbacksFromPlugin(ctx))
 }
 
 // ---- /skills 命令 ----
 
-func (p *AgentPlugin) handleSkills(ctx *spec.Context) error {
+func (p *AgentPlugin) handleSkills(ctx *plugin.Context) error {
 	if len(p.skills) == 0 {
 		ctx.Writer("(no skills loaded — drop SKILL.md files in ~/.config/goworker/skills/ or .goworker/skills/)\n")
 		return nil
@@ -280,7 +280,7 @@ func (p *AgentPlugin) handleSkills(ctx *spec.Context) error {
 
 // ---- /history 命令 ----
 
-func (p *AgentPlugin) handleHistory(ctx *spec.Context) error {
+func (p *AgentPlugin) handleHistory(ctx *plugin.Context) error {
 	conv := p.session.Conversation()
 	if len(conv) == 0 {
 		ctx.Writer("(no conversation history yet — run /agent first)\n")
@@ -298,7 +298,7 @@ func (p *AgentPlugin) handleHistory(ctx *spec.Context) error {
 
 // handleRules 只读展示当前生效的指令快照 —— 与注入 system prompt 的内容一致，
 // 方便核对"agent 到底被灌了什么规矩"。
-func (p *AgentPlugin) handleRules(ctx *spec.Context) error {
+func (p *AgentPlugin) handleRules(ctx *plugin.Context) error {
 	if p.deps.Instruction == nil {
 		ctx.Writer("declarative instructions disabled (memory.enabled=false or load failed)\n")
 		return nil

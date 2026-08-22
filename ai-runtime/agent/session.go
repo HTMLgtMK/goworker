@@ -200,9 +200,9 @@ func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, 
 // newCompressor 构造压缩器，onCompress 统一记进 token 账本（/usage 能看到压缩）。
 // protectSystem=true：history[0] 是本轮注入的系统提示，压掉模型就忘了怎么用工具；
 // /compact 场景 conversation 不含系统提示，首位可能是上次的摘要，允许被再次滚动，传 false。
-func (s *Session) newCompressor(provider core.Provider, protectSystem bool) *core.Compressor {
+func (s *Session) newCompressor(provider core.Provider, protectSystem bool) *middlewares.Compressor {
 	cfg := s.deps.Config
-	return core.NewCompressor(provider, cfg.LLM.CompactKeep, protectSystem, func(r core.CompressReport) {
+	return middlewares.NewCompressor(provider, cfg.LLM.CompactKeep, protectSystem, func(r middlewares.CompressReport) {
 		s.usage.RecordCompaction(core.Compaction{BeforeMsgs: r.BeforeMsgs, AfterMsgs: r.AfterMsgs, Tokens: r.Tokens})
 	})
 }

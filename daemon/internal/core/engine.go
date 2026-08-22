@@ -5,10 +5,10 @@ import (
 	"sort"
 	"strings"
 
-	spec "github.com/tinguo/goworker/ai-runtime/plugin"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/logger"
 	"github.com/tinguo/goworker/daemon/internal/config"
+	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
 // Engine 是 goworker 的核心引擎。
@@ -23,12 +23,12 @@ type Engine struct {
 	config          *config.Config
 	runtimeCfg      *runtimeconfig.Config
 	log             *logger.Logger
-	plugins         map[string]spec.Plugin
-	commands        map[string]spec.Command
-	tools           map[string]spec.Tool
-	interceptors    []spec.PluginInterceptor
-	listeners       []func(spec.Event)
-	fallbackHandler func(ctx *spec.Context) error // 未匹配命令的兜底处理器
+	plugins         map[string]plugin.Plugin
+	commands        map[string]plugin.Command
+	tools           map[string]plugin.Tool
+	interceptors    []plugin.PluginInterceptor
+	listeners       []func(plugin.Event)
+	fallbackHandler func(ctx *plugin.Context) error // 未匹配命令的兜底处理器
 }
 
 // NewEngine 创建一个引擎并关联全局配置与日志器。
@@ -44,11 +44,11 @@ func NewEngine(cfg *config.Config, runtimeCfg *runtimeconfig.Config, l *logger.L
 		config:       cfg,
 		runtimeCfg:   runtimeCfg,
 		log:          l,
-		plugins:      make(map[string]spec.Plugin),
-		commands:     make(map[string]spec.Command),
-		tools:        make(map[string]spec.Tool),
-		interceptors: make([]spec.PluginInterceptor, 0),
-		listeners:    make([]func(spec.Event), 0),
+		plugins:      make(map[string]plugin.Plugin),
+		commands:     make(map[string]plugin.Command),
+		tools:        make(map[string]plugin.Tool),
+		interceptors: make([]plugin.PluginInterceptor, 0),
+		listeners:    make([]func(plugin.Event), 0),
 	}
 }
 
@@ -56,7 +56,7 @@ func NewEngine(cfg *config.Config, runtimeCfg *runtimeconfig.Config, l *logger.L
 func (e *Engine) Config() *config.Config { return e.config }
 
 // SaveConfig 持久化配置到 YAML 文件并同步内存。
-// cfg 是插件注入的 ai-runtime 配置（spec.Hub.Config 已 any 化），
+// cfg 是插件注入的 ai-runtime 配置（plugin.Hub.Config 已 any 化），
 // 回写解析层后整份落盘，保证 runtime→daemon→磁盘三处一致。
 func (e *Engine) SaveConfig(cfg any) error {
 	rc, ok := cfg.(*runtimeconfig.Config)
@@ -70,28 +70,28 @@ func (e *Engine) SaveConfig(cfg any) error {
 
 // SetFallbackHandler 设置未匹配命令的兜底处理器。
 // 当用户输入不是任何已注册命令时，引擎会调用此 handler 而非返回错误。
-func (e *Engine) SetFallbackHandler(fn func(ctx *spec.Context) error) {
+func (e *Engine) SetFallbackHandler(fn func(ctx *plugin.Context) error) {
 	e.fallbackHandler = fn
 }
 
 // ---- Middleware ----
 
 // Use 注册一个中间件，按注册顺序依次执行。
-func (e *Engine) Use(interceptor spec.PluginInterceptor) {
+func (e *Engine) Use(interceptor plugin.PluginInterceptor) {
 	e.interceptors = append(e.interceptors, interceptor)
 }
 
 // ---- Plugin ----
 
 // Register 注册一个插件并初始化。
-func (e *Engine) Register(p spec.Plugin) error {
+func (e *Engine) Register(p plugin.Plugin) error {
 	name := p.Name()
 	if _, exists := e.plugins[name]; exists {
 		return fmt.Errorf("plugin %q already registered", name)
 	}
 
 	// 依赖检查
-	if dp, ok := p.(spec.DependentPlugin); ok {
+	if dp, ok := p.(plugin.DependentPlugin); ok {
 		for _, dep := range dp.Dependencies() {
 			if _, exists := e.plugins[dep]; !exists {
 				return fmt.Errorf("plugin %q depends on %q, not registered", name, dep)
@@ -112,19 +112,19 @@ func (e *Engine) Register(p spec.Plugin) error {
 	return nil
 }
 
-// pluginHub 构造 *spec.Hub 适配器，将 Engine 的方法暴露给插件。
-func (e *Engine) pluginHub() *spec.Hub {
-	return &spec.Hub{
-		RegisterCommand: func(cmd spec.Command) error {
+// pluginHub 构造 *plugin.Hub 适配器，将 Engine 的方法暴露给插件。
+func (e *Engine) pluginHub() *plugin.Hub {
+	return &plugin.Hub{
+		RegisterCommand: func(cmd plugin.Command) error {
 			return e.RegisterCommand(cmd)
 		},
-		RegisterTool: func(tool spec.Tool) error {
+		RegisterTool: func(tool plugin.Tool) error {
 			return e.RegisterTool(tool)
 		},
-		AddEventListener: func(fn func(spec.Event)) {
+		AddEventListener: func(fn func(plugin.Event)) {
 			e.listeners = append(e.listeners, fn)
 		},
-		Plugin: func(name string) spec.Plugin {
+		Plugin: func(name string) plugin.Plugin {
 			return e.plugins[name]
 		},
 		Plugins: func() []string {
@@ -134,18 +134,18 @@ func (e *Engine) pluginHub() *spec.Hub {
 			}
 			return names
 		},
-		Tools: func() []spec.Tool {
+		Tools: func() []plugin.Tool {
 			return e.Tools()
 		},
-		Notify: func(event spec.Event) {
+		Notify: func(event plugin.Event) {
 			e.Notify(event)
 		},
-		Eval: func(ctx *spec.Context, input string) error {
+		Eval: func(ctx *plugin.Context, input string) error {
 			return e.Eval(ctx, input)
 		},
 		Config:     e.runtimeCfg,
 		SaveConfig: e.SaveConfig,
-		SetFallbackHandler: func(fn func(ctx *spec.Context) error) {
+		SetFallbackHandler: func(fn func(ctx *plugin.Context) error) {
 			e.SetFallbackHandler(fn)
 		},
 	}
@@ -154,7 +154,7 @@ func (e *Engine) pluginHub() *spec.Hub {
 // Command 注册
 
 // RegisterCommand 注册一个命令，支持别名。
-func (e *Engine) RegisterCommand(cmd spec.Command) error {
+func (e *Engine) RegisterCommand(cmd plugin.Command) error {
 	if _, exists := e.commands[cmd.Name]; exists {
 		return fmt.Errorf("command %q already registered", cmd.Name)
 	}
@@ -173,9 +173,9 @@ func (e *Engine) RegisterCommand(cmd spec.Command) error {
 }
 
 // Commands 返回所有已注册的命令（去重）。
-func (e *Engine) Commands() []spec.Command {
+func (e *Engine) Commands() []plugin.Command {
 	seen := make(map[string]bool)
-	out := make([]spec.Command, 0, len(e.commands))
+	out := make([]plugin.Command, 0, len(e.commands))
 	for _, cmd := range e.commands {
 		if !seen[cmd.Name] {
 			seen[cmd.Name] = true
@@ -187,7 +187,7 @@ func (e *Engine) Commands() []spec.Command {
 
 // ---- Tool 注册 ----
 
-func (e *Engine) RegisterTool(tool spec.Tool) error {
+func (e *Engine) RegisterTool(tool plugin.Tool) error {
 	if _, exists := e.tools[tool.Name]; exists {
 		return fmt.Errorf("tool %q already registered", tool.Name)
 	}
@@ -196,8 +196,8 @@ func (e *Engine) RegisterTool(tool spec.Tool) error {
 	return nil
 }
 
-func (e *Engine) Tools() []spec.Tool {
-	out := make([]spec.Tool, 0, len(e.tools))
+func (e *Engine) Tools() []plugin.Tool {
+	out := make([]plugin.Tool, 0, len(e.tools))
 	for _, tool := range e.tools {
 		out = append(out, tool)
 	}
@@ -210,7 +210,7 @@ func (e *Engine) Tools() []spec.Tool {
 // ---- 核心执行 ----
 
 // Eval 解析输入并执行命令，经过中间件链。
-func (e *Engine) Eval(ctx *spec.Context, input string) error {
+func (e *Engine) Eval(ctx *plugin.Context, input string) error {
 	parts := strings.Fields(input)
 	if len(parts) == 0 {
 		return fmt.Errorf("empty input")
@@ -264,7 +264,7 @@ func (e *Engine) StartAll() error {
 		if err := p.Start(); err != nil {
 			return fmt.Errorf("plugin %q start: %w", name, err)
 		}
-		e.Notify(spec.Event{Type: spec.EventPluginStarted, Payload: name})
+		e.Notify(plugin.Event{Type: plugin.EventPluginStarted, Payload: name})
 		e.log.Info("plugin started", "name", name)
 	}
 	return nil
@@ -281,15 +281,15 @@ func (e *Engine) StopAll() {
 		if err := e.plugins[name].Stop(); err != nil {
 			e.log.Error("plugin stop error", "name", name, "error", err)
 		}
-		e.Notify(spec.Event{Type: spec.EventPluginStopped, Payload: name})
+		e.Notify(plugin.Event{Type: plugin.EventPluginStopped, Payload: name})
 		e.log.Info("plugin stopped", "name", name)
 	}
 }
 
 // Notify 向所有 EventAwarePlugin 和外部监听者广播事件。
-func (e *Engine) Notify(event spec.Event) {
+func (e *Engine) Notify(event plugin.Event) {
 	for name, p := range e.plugins {
-		if ep, ok := p.(spec.EventAwarePlugin); ok {
+		if ep, ok := p.(plugin.EventAwarePlugin); ok {
 			if err := ep.OnEvent(event); err != nil {
 				e.log.Error("plugin OnEvent error", "name", name, "event", event.Type, "error", err)
 			}
@@ -302,7 +302,7 @@ func (e *Engine) Notify(event spec.Event) {
 
 // ---- 查询 ----
 
-func (e *Engine) Plugin(name string) spec.Plugin {
+func (e *Engine) Plugin(name string) plugin.Plugin {
 	return e.plugins[name]
 }
 

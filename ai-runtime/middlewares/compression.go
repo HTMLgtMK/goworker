@@ -6,7 +6,14 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 )
 
-func NewCompressionMiddleware(compressor *core.Compressor, window int, compressAt float64) *CompressionMiddleware {
+type CompressionMiddleware struct {
+	compressor *Compressor
+	window     int
+	compressAt float64
+	done       bool
+}
+
+func NewCompressionMiddleware(compressor *Compressor, window int, compressAt float64) *CompressionMiddleware {
 	return &CompressionMiddleware{compressor: compressor, window: window, compressAt: compressAt}
 }
 

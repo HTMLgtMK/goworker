@@ -4,15 +4,15 @@ import (
 	"fmt"
 	"strings"
 
-	spec "github.com/tinguo/goworker/ai-runtime/plugin"
+	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
 // RegisterBuiltinCommands 注册引擎内置命令（/help, /config 等）。
 func (e *Engine) RegisterBuiltinCommands() {
-	e.RegisterCommand(spec.Command{
+	e.RegisterCommand(plugin.Command{
 		Name:        "/help",
 		Description: "显示帮助",
-		Handler: func(ctx *spec.Context) error {
+		Handler: func(ctx *plugin.Context) error {
 			ctx.Writer("Available commands:\n")
 			for _, cmd := range e.Commands() {
 				ctx.Writer(fmt.Sprintf("  %s  — %s\n", cmd.Name, cmd.Description))
@@ -21,11 +21,11 @@ func (e *Engine) RegisterBuiltinCommands() {
 		},
 	})
 
-	e.RegisterCommand(spec.Command{
+	e.RegisterCommand(plugin.Command{
 		Name:        "/config",
 		Aliases:     []string{"/cfg"},
 		Description: "查看/修改全局配置",
-		Handler: func(ctx *spec.Context) error {
+		Handler: func(ctx *plugin.Context) error {
 			args := ctx.Args
 
 			if len(args) == 0 {

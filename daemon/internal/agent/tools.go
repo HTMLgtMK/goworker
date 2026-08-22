@@ -8,8 +8,8 @@ import (
 
 	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
-	spec "github.com/tinguo/goworker/ai-runtime/plugin"
 	"github.com/tinguo/goworker/ai-sandbox"
+	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
 // 本文件是工具收集：把 hub 命令 / skill / memory / profile / MCP 工具统一
@@ -31,7 +31,7 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 			Parameters:  parseSchema(tool.Schema),
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
 				var buf strings.Builder
-				err := p.hub.Eval(spec.NewContext(context.Background(), func(s string) { buf.WriteString(s) }, nil, nil), "/"+tool.Name)
+				err := p.hub.Eval(plugin.NewContext(context.Background(), func(s string) { buf.WriteString(s) }, nil, nil), "/"+tool.Name)
 				if err != nil {
 					return buf.String(), err
 				}

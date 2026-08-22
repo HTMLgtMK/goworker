@@ -285,31 +285,3 @@ type UsageTracker struct {
 	total       Usage        // 累计快照，status bar 用
 	compactions []Compaction // 历史压缩记录，/usage 命令展示用
 }
-
-// ---- Compressor ----
-
-// CompressReport 压缩一次的结果，交给调用方记账/展示。
-type CompressReport struct {
-	BeforeMsgs int // 压缩前消息条数
-	AfterMsgs  int // 压缩后消息条数
-	Tokens     int // summarize 调用消耗（模型返回 total，缺省用估算）
-}
-
-// Compressor 通过 LLM 把过长的对话历史压成"滚动摘要"：
-// 保留最近 keepLast 条消息原文，只把更早的旧段发给模型要一段摘要，
-// 输出 [摘要] + 最近 N 条。
-//
-// 为什么不全量压成一条：ReAct 会话里工具结果、文件路径、最近结论是
-// 继续干活的关键上下文，压掉就断线了。滚动只牺牲最古老的记忆，
-// 而且压缩调用只读旧段，不会在压缩这一步把窗口撑爆。
-type Compressor struct {
-	provider Provider
-	keepLast int
-	// protectSystem 为 true 时，首位 system 消息（agent 系统提示）原样保留、不参与压缩。
-	// 自动压缩路径要开：ReAct 循环里 history[0] 是 buildMessages 注入的提示词，压掉模型就忘了怎么用工具。
-	// /compact 路径要关：p.conversation 从不含系统提示（plugin 存的是 messages[1:]），
-	// 首位可能是上次的摘要，必须允许被再次滚动，否则摘要会一条条累积。
-	protectSystem bool
-	// onCompress 压缩成功后回调（可选），调用方用它把压缩记进 token 账本。
-	onCompress func(CompressReport)
-}

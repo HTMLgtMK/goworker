@@ -4,6 +4,12 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 )
 
+type UsageMiddleware struct {
+	tracker *core.UsageTracker
+	iter    int
+	publish func(core.Usage)
+}
+
 // NewUsageMiddleware 创建一个 token 用量观察者，记录到外部注入的 tracker。
 // publish 为 nil 时不发布事件。
 // iter 每 Run 归零：Usage.Iteration 语义是"本次 /agent 内的第几轮"，跨 query 累计的

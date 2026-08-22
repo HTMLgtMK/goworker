@@ -1,4 +1,4 @@
-// Package plugin 定义 goworker runtime 的插件、命令与前端上下文协议。
+// Package plugin 定义 daemon 内部插件、命令与前端上下文协议。
 package plugin
 
 import (
@@ -34,7 +34,7 @@ type EventAwarePlugin interface {
 }
 
 // Hub 是插件注册、事件广播的抽象接口。
-// 具体实现由 core.Engine 完成，插件在 Init 时通过 *Hub 注册命令。
+// 具体实现由 daemon/internal/core.Engine 完成，插件在 Init 时通过 *Hub 注册命令。
 type Hub struct {
 	RegisterCommand    func(cmd Command) error
 	RegisterTool       func(tool Tool) error

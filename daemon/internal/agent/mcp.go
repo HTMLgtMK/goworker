@@ -11,7 +11,7 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	"github.com/tinguo/goworker/ai-runtime/mcp"
-	spec "github.com/tinguo/goworker/ai-runtime/plugin"
+	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
 // 本文件是 MCP 集成：server 连接（loadMCP）与工具桥接（mcpToolToCore），
@@ -19,7 +19,7 @@ import (
 
 // ---- /mcp 命令 ----
 
-func (p *AgentPlugin) handleMCP(ctx *spec.Context) error {
+func (p *AgentPlugin) handleMCP(ctx *plugin.Context) error {
 	servers := p.cfg.MCP.Servers
 	if len(servers) == 0 {
 		ctx.Writer("(no MCP servers configured — add mcp.servers to config.yaml)\n")

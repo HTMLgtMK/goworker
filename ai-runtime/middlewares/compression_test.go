@@ -42,7 +42,7 @@ func bigHistory() []core.Message {
 
 func TestCompressionMiddleware_CompressesAboveThreshold(t *testing.T) {
 	stub := &compressStubProvider{resp: "SUMMARY"}
-	mw := NewCompressionMiddleware(core.NewCompressor(stub, 2, false), 100, 0.8) // 阈值 80
+	mw := NewCompressionMiddleware(NewCompressor(stub, 2, false), 100, 0.8) // 阈值 80
 
 	orig := bigHistory()
 	ev := &core.BeforeModelEvent{Ctx: context.Background(), History: orig}
@@ -62,7 +62,7 @@ func TestCompressionMiddleware_CompressesAboveThreshold(t *testing.T) {
 
 func TestCompressionMiddleware_SkipsBelowThreshold(t *testing.T) {
 	stub := &compressStubProvider{}
-	mw := NewCompressionMiddleware(core.NewCompressor(stub, 2, false), 100, 0.8)
+	mw := NewCompressionMiddleware(NewCompressor(stub, 2, false), 100, 0.8)
 
 	small := []core.Message{{Role: "user", Content: "hi"}}
 	ev := &core.BeforeModelEvent{Ctx: context.Background(), History: small}
@@ -78,7 +78,7 @@ func TestCompressionMiddleware_SkipsBelowThreshold(t *testing.T) {
 
 func TestCompressionMiddleware_DisabledWithoutWindow(t *testing.T) {
 	stub := &compressStubProvider{}
-	mw := NewCompressionMiddleware(core.NewCompressor(stub, 2, false), 0, 0.8) // 没配窗口
+	mw := NewCompressionMiddleware(NewCompressor(stub, 2, false), 0, 0.8) // 没配窗口
 
 	orig := bigHistory()
 	ev := &core.BeforeModelEvent{Ctx: context.Background(), History: orig}
@@ -95,7 +95,7 @@ func TestCompressionMiddleware_DisabledWithoutWindow(t *testing.T) {
 func TestCompressionMiddleware_StopsAfterNoRelief(t *testing.T) {
 	// 压缩后仍超阈值（keepLast 尾巴本身太大）→ 置 done，后续迭代不再重复压缩，防风暴
 	stub := &compressStubProvider{resp: "SUMMARY"}
-	mw := NewCompressionMiddleware(core.NewCompressor(stub, 2, false), 100, 0.8)
+	mw := NewCompressionMiddleware(NewCompressor(stub, 2, false), 100, 0.8)
 
 	orig := bigHistory()
 	ev := &core.BeforeModelEvent{Ctx: context.Background(), History: orig}
@@ -119,7 +119,7 @@ func TestCompressionMiddleware_StopsAfterNoRelief(t *testing.T) {
 
 func TestCompressionMiddleware_DegradesOnCompressError(t *testing.T) {
 	stub := &compressStubProvider{err: errors.New("api down")}
-	mw := NewCompressionMiddleware(core.NewCompressor(stub, 2, false), 100, 0.8)
+	mw := NewCompressionMiddleware(NewCompressor(stub, 2, false), 100, 0.8)
 
 	orig := bigHistory()
 	ev := &core.BeforeModelEvent{Ctx: context.Background(), History: orig}

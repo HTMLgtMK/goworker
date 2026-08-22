@@ -19,15 +19,15 @@ import (
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/mcp"
-	spec "github.com/tinguo/goworker/ai-runtime/plugin"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/ai-sandbox"
+	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
-// testHub 构造一个最小可用的 spec.Hub，只暴露测试需要的字段。
-func testHub(cfg *runtimeconfig.Config) (*spec.Hub, *[]*runtimeconfig.Config) {
+// testHub 构造一个最小可用的 plugin.Hub，只暴露测试需要的字段。
+func testHub(cfg *runtimeconfig.Config) (*plugin.Hub, *[]*runtimeconfig.Config) {
 	var saved []*runtimeconfig.Config
-	hub := &spec.Hub{
+	hub := &plugin.Hub{
 		Config: cfg,
 		SaveConfig: func(c any) error {
 			if rc, ok := c.(*runtimeconfig.Config); ok {
@@ -35,14 +35,14 @@ func testHub(cfg *runtimeconfig.Config) (*spec.Hub, *[]*runtimeconfig.Config) {
 			}
 			return nil
 		},
-		Tools: func() []spec.Tool { return nil }, // collectTools 依赖，缺了会 nil 函数 panic
+		Tools: func() []plugin.Tool { return nil }, // collectTools 依赖，缺了会 nil 函数 panic
 	}
 	return hub, &saved
 }
 
 // newAgentPlugin 构造带完整依赖的插件：NewProvider 走真实 OpenAI 端点（cfg.LLM.Endpoint）。
 // 需要固定 provider 的测试用 newAgentPluginP。
-func newAgentPlugin(hub *spec.Hub) *AgentPlugin {
+func newAgentPlugin(hub *plugin.Hub) *AgentPlugin {
 	cfg, _ := hub.Config.(*runtimeconfig.Config)
 	p := &AgentPlugin{hub: hub, cfg: cfg}
 	// 与 Init 编排一致：资源确认后组装 deps + 创建会话
@@ -60,7 +60,7 @@ func newAgentPlugin(hub *spec.Hub) *AgentPlugin {
 }
 
 // newAgentPluginP 注入固定 provider：深播种测试不依赖真实 LLM 端点。
-func newAgentPluginP(hub *spec.Hub, pv core.Provider) *AgentPlugin {
+func newAgentPluginP(hub *plugin.Hub, pv core.Provider) *AgentPlugin {
 	cfg, _ := hub.Config.(*runtimeconfig.Config)
 	p := &AgentPlugin{hub: hub, cfg: cfg}
 	p.deps = runtimeagent.SessionDeps{
@@ -111,16 +111,16 @@ func (p *AgentPlugin) refreshSession() {
 	p.session = runtimeagent.NewSession(p.deps)
 }
 
-// newContext 构造带输出捕获的 spec.Context。
+// newContext 构造带输出捕获的 plugin.Context。
 // WriteToken 与 Writer 都写进同一 buffer —— Session.Run 的流式输出测试需要它。
-func newContext(args ...string) (*spec.Context, *strings.Builder) {
+func newContext(args ...string) (*plugin.Context, *strings.Builder) {
 	var buf strings.Builder
-	return &spec.Context{
+	return &plugin.Context{
 		Ctx:  context.Background(),
 		Args: args,
-		FrontendContext: spec.FrontendContext{
+		FrontendContext: plugin.FrontendContext{
 			Writer:     func(s string) { buf.WriteString(s) },
-			WriteToken: func(_ spec.RenderKind, s string) { buf.WriteString(s) },
+			WriteToken: func(_ plugin.RenderKind, s string) { buf.WriteString(s) },
 		},
 	}, &buf
 }
@@ -672,10 +672,10 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 
 	// 固化是后台 goroutine 执行的，writer 必须线程安全
 	var out lockedBuf
-	ctx := &spec.Context{
+	ctx := &plugin.Context{
 		Ctx:  context.Background(),
 		Args: nil,
-		FrontendContext: spec.FrontendContext{
+		FrontendContext: plugin.FrontendContext{
 			Writer: out.Write,
 		},
 	}
@@ -756,11 +756,11 @@ func TestHandleTask_DisabledShowsHint(t *testing.T) {
 func TestInit_OpensMemory(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	cfg.Memory.Dir = t.TempDir()
-	hub := &spec.Hub{
+	hub := &plugin.Hub{
 		Config:             cfg,
-		RegisterCommand:    func(spec.Command) error { return nil },
-		SetFallbackHandler: func(func(*spec.Context) error) {},
-		Tools:              func() []spec.Tool { return nil },
+		RegisterCommand:    func(plugin.Command) error { return nil },
+		SetFallbackHandler: func(func(*plugin.Context) error) {},
+		Tools:              func() []plugin.Tool { return nil },
 	}
 	p := &AgentPlugin{cfg: cfg}
 	if err := p.Init(hub); err != nil {
@@ -831,10 +831,10 @@ func TestHandleNew_LtmExtractDisabledSkipsFacts(t *testing.T) {
 	seedRuns(p, "q")
 
 	var out lockedBuf
-	ctx := &spec.Context{
+	ctx := &plugin.Context{
 		Ctx:  context.Background(),
 		Args: nil,
-		FrontendContext: spec.FrontendContext{
+		FrontendContext: plugin.FrontendContext{
 			Writer: out.Write,
 		},
 	}
