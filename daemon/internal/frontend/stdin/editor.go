@@ -29,6 +29,10 @@ type LineEditor struct {
 	pos      int      // rune 索引
 	history  []string // 历史记录，最新在末尾
 	histIdx  int      // -1 = 新输入，0 到 len-1 = 历史中的索引
+
+	termWidth     int
+	renderedRows  int
+	cursorLineIdx int
 }
 
 // NewLineEditor 创建并进入 raw mode。
@@ -39,13 +43,18 @@ func NewLineEditor(cancelCh <-chan struct{}) (*LineEditor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("make raw: %w", err)
 	}
+	width := 80
+	if w, _, err := term.GetSize(fd); err == nil && w > 0 {
+		width = w
+	}
 	return &LineEditor{
-		keyCh:    make(chan KeyEvent, 64),
-		cancelCh: cancelCh,
-		state:    state,
-		Prompt:   "> ",
-		history:  make([]string, 0, maxHistory),
-		histIdx:  -1,
+		keyCh:     make(chan KeyEvent, 64),
+		cancelCh:  cancelCh,
+		state:     state,
+		Prompt:    "> ",
+		termWidth: width,
+		history:   make([]string, 0, maxHistory),
+		histIdx:   -1,
 	}, nil
 }
 
@@ -192,17 +201,73 @@ func (e *LineEditor) addHistory(line string) {
 
 func (e *LineEditor) drawPrompt() {
 	fmt.Fprint(os.Stderr, e.Prompt)
+	e.renderedRows = 1
+	e.cursorLineIdx = 0
 }
 
 func (e *LineEditor) redrawInput() {
-	display := string(e.buf)
-	pw := uniseg.StringWidth(e.Prompt)
-	fmt.Fprintf(os.Stderr, "\r%s%s\033[K", e.Prompt, display)
-	if e.pos < len(e.buf) {
-		prefix := string(e.buf[:e.pos])
-		w := pw + uniseg.StringWidth(prefix)
-		fmt.Fprintf(os.Stderr, "\r\033[%dC", w)
+	if e.cursorLineIdx > 0 {
+		fmt.Fprintf(os.Stderr, "\033[%dA", e.cursorLineIdx)
 	}
+	fmt.Fprint(os.Stderr, "\r")
+	for row := 0; row < e.renderedRows; row++ {
+		fmt.Fprint(os.Stderr, "\033[K")
+		if row < e.renderedRows-1 {
+			fmt.Fprint(os.Stderr, "\r\n")
+		}
+	}
+	if e.renderedRows > 1 {
+		fmt.Fprintf(os.Stderr, "\033[%dA\r", e.renderedRows-1)
+	}
+
+	display := string(e.buf)
+	fmt.Fprintf(os.Stderr, "%s%s", e.Prompt, display)
+
+	total := e.terminalPosition(len(e.buf))
+	cursor := e.terminalPosition(e.pos)
+	e.renderedRows = total.row + 1
+	e.cursorLineIdx = cursor.row
+	if up := total.row - cursor.row; up > 0 {
+		fmt.Fprintf(os.Stderr, "\033[%dA", up)
+	}
+	fmt.Fprintf(os.Stderr, "\r\033[%dC", cursor.col)
+}
+
+type terminalPos struct {
+	row int
+	col int
+}
+
+func (e *LineEditor) terminalPosition(pos int) terminalPos {
+	if pos > len(e.buf) {
+		pos = len(e.buf)
+	}
+	text := e.Prompt + string(e.buf[:pos])
+	width := e.width()
+	position := terminalPos{}
+	graphemes := uniseg.NewGraphemes(text)
+	for graphemes.Next() {
+		w := graphemes.Width()
+		if w <= 0 {
+			continue
+		}
+		if position.col > 0 && position.col+w > width {
+			position.row++
+			position.col = 0
+		}
+		position.col += w
+		if position.col > width {
+			position.col = width
+		}
+	}
+	return position
+}
+
+func (e *LineEditor) width() int {
+	if e.termWidth > 0 {
+		return e.termWidth
+	}
+	return 80
 }
 
 func (e *LineEditor) clearInput() {

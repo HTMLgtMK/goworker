@@ -1,6 +1,9 @@
 package stdin
 
 import (
+	"io"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -351,6 +354,74 @@ func TestDrainThenReadLine_MultipleEnter(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
+	}
+}
+
+func TestRedrawInputClearsWrappedPreviousRender(t *testing.T) {
+	ed, _ := testLineEditor()
+	ed.Prompt = "> "
+	ed.termWidth = 6
+
+	output := captureStderr(t, func() {
+		ed.buf = []rune("abcde")
+		ed.pos = len(ed.buf)
+		ed.redrawInput()
+
+		ed.buf = []rune("a")
+		ed.pos = len(ed.buf)
+		ed.redrawInput()
+	})
+
+	if !strings.Contains(output, "\x1b[1A") {
+		t.Fatalf("redraw did not move up to clear wrapped input: %q", output)
+	}
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stderr: %v", err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	return string(out)
+}
+
+func TestTerminalPositionWrapsWideGraphemeAtLineEdge(t *testing.T) {
+	ed, _ := testLineEditor()
+	ed.Prompt = "> "
+	ed.termWidth = 4
+	ed.buf = []rune("a你")
+
+	got := ed.terminalPosition(len(ed.buf))
+	want := terminalPos{row: 1, col: 2}
+	if got != want {
+		t.Fatalf("terminalPosition wide edge = %#v, want %#v", got, want)
+	}
+}
+
+func TestTerminalPositionExactWidthStaysOnCurrentRow(t *testing.T) {
+	ed, _ := testLineEditor()
+	ed.Prompt = "> "
+	ed.termWidth = 4
+	ed.buf = []rune("ab")
+
+	got := ed.terminalPosition(len(ed.buf))
+	want := terminalPos{row: 0, col: 4}
+	if got != want {
+		t.Fatalf("terminalPosition exact width = %#v, want %#v", got, want)
 	}
 }
 
