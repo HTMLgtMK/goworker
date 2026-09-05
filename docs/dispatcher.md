@@ -198,3 +198,106 @@ general 任务无 git 收尾，approve 即完成。
 - **request_permission 无人值守策略**：默认拒绝并记审计，避免 worker 卡死等不到人
 - **MCP 对照**：MCP 方案更简单但缺任务生命周期语义（无 permission 回调标准流、无 session 恢复）；
   ACP 的 `session/load` 支持崩溃恢复 dispatcher 侧任务，这是选 ACP 的核心收益之一
+
+## 11. 规划：/dispatch 进度接 statusbar 渲染
+
+### 现状与关键差异
+
+现有 statusbar 事件链（usage/iteration）：
+
+```
+Session SDK ──RunCallbacks.Publish──→ Bar.Publish ──→ addon.OnRegister 订阅
+                                                          │
+                              addon.Tick 消费 channel ←───┘（200ms 一帧）
+```
+
+`Publish` 是命令执行时经 `ctx.Publish` 注入的（stdin.go:288），随命令结束失效。
+dispatcher 任务跑在**后台 goroutine**，没有命令 Context —— 需要常驻发布路径。
+
+### 方案：经 Engine 事件总线桥接（零协议改动）
+
+```
+dispatcher plugin ──hub.Notify(plugin.Event)──→ Engine.Notify ──AddEventListener──┐
+                                                                                   ▼
+                                        stdin 前端桥接 listener ──sb.Publish──→ Bar
+                                                                                   ▼
+                                                            TaskAddon.OnRegister 订阅
+```
+
+- dispatcher 插件只依赖已有的 `hub.Notify`（daemon 内部协议），不感知 statusbar
+- 前端持有 engine 引用，启动 Bar 时 AddEventListener 把
+  `task_status` / `task_progress` 两类事件桥接到 `sb.Publish`
+  ——桥接 listener 只做一次 Publish（轻），不会拖慢 dispatcher goroutine
+- 符合「事件契约倒置」惯例：契约跟类型走，定义在 ai-dispatch/task，
+  daemon 两侧（dispatcher 发布、stdin 渲染）各自 import
+
+### 1. 事件契约（ai-dispatch/task/events.go，新增）
+
+```go
+const (
+    EventTaskStatus   = "task_status"   // 状态迁移（低频，必达）
+    EventTaskProgress = "task_progress" // 执行进度（高频，可丢）
+)
+
+type StatusEvent struct {
+    TaskID string
+    From, To Status
+    Kind     Kind
+    Worker   string
+}
+
+type ProgressEvent struct {
+    TaskID  string
+    Kind    string // session/update 子类型（agent_message_chunk/tool_call/…）
+    Summary string // 文本摘要（Content.Text 截断），空表示结构化更新
+}
+```
+
+### 2. 发布点（daemon/internal/dispatcher）
+
+- **task_status**：不改 orchestrator。插件 `save()` 是全部落盘的汇聚点，
+  在此对比 store 旧快照与新任务的 Status，不同即 `hub.Notify` 一次
+- **task_progress**：`orch.SetProgress` 现有闭包里，除 ACP 路由外
+  追加 `hub.Notify(EventTaskProgress, ProgressEvent{...})`
+- 节流：起步不做（orchestrator 透传的是消息块级而非 token 级）；
+  addon 端 channel 缓冲 + drop 兜底（对齐 IterationAddon 的 15 缓冲策略）。
+  若后续接流式 worker 再在插件端加 200ms 窗口合并
+
+### 3. 渲染（daemon/internal/frontend/stdin/task_addon.go，新增 TaskAddon）
+
+```go
+// 状态：running（atomic.Int64）、review（atomic.Int64）、latest（atomic.Value 存摘要）
+// Tick 排水事件 channel 更新状态；Render 拼接输出
+```
+
+Render 输出形态：
+
+| 场景 | 输出 |
+|---|---|
+| 无任务 | `""`（不占位） |
+| 1 个运行中 | `dispatch 1 run` |
+| 混合 | `dispatch 2 run 1 review` |
+| 有待审批 | `!1 review` 段高亮（审批等待是用户必须看的） |
+
+状态映射：`To == working` → running++；终态 → running--；
+`To == awaiting_review` → review++；approve/reject 后 review--。
+与 agent addon 的差异：**Reset 清摘要但不清计数**——dispatcher 是常驻的，
+计数跨 /new 生命周期。
+
+### 4. 接线与测试
+
+- stdin.go `sb.Use(...)` 追加 `NewTaskAddon()`
+- 测试：
+  - TaskAddon 单测：事件序列（working→progress→awaiting_review→approve）
+    → 逐帧 Render 快照
+  - dispatcher 插件：save diff 发 status 事件、progress 转发，hub.Notify 断言
+  - 桥接：stdin 前端集成测试，Engine.Notify → addon 收到
+- 验收：REPL 派发任务后状态栏实时出现 `dispatch 1 run`，worker 进度摘要滚动，
+  完成后 `!1 review` 高亮提示审批
+
+### 5. 开放问题
+
+- 多任务并跑时摘要行拥挤：V1 只显示最新一条；V2 可按任务轮换或只显计数
+- TUI/Web 前端复用：桥接逻辑在 stdin 前端内，TUI 实现时按同样模式自行桥接
+- 「有任务时 statusbar 是否常驻启动」：目前 Bar.Start 在 /agent 时触发，
+  dispatcher 事件到达时 Bar 可能未启动——桥接 listener 需惰性 Start 或丢弃早到事件
