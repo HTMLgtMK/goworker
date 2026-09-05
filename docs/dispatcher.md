@@ -60,12 +60,13 @@ type Task struct {
     ID         string    // task_<ulid>
     Source     string    // "repl" | "acp:<client-name>"
     Prompt     string    // 任务描述（自然语言）
-    Repo       string    // 目标仓库绝对路径
-    BaseBranch string    // 起点分支
+    Repo       string    // 目标仓库绝对路径（可以不是 git 仓库）
     Worker     string    // worker 名称
+    Isolation  string    // "worktree" | "shared"，默认 worktree（git 仓库时）
     Status     Status
-    Worktree   string    // .goworker/dispatch/<ID>/
-    Branch     string    // dispatch/<ID>
+    BaseCommit string    // 派发时的 HEAD SHA，commit 收集边界（git 仓库时）
+    Worktree   string    // 仅 worktree 模式：.goworker/dispatch/<ID>/
+    Branch     string    // 仅 worktree 模式：dispatch/<ID>
     Commits    []string  // 完成后收集的 commit 摘要
     Error      string
     CreatedAt / UpdatedAt / ExpiresAt time.Time
@@ -77,12 +78,12 @@ type Task struct {
 ```
 queued ──→ dispatching ──→ working ──→ awaiting_review ──→ merging ──→ done
    │            │             │              │                
-   │            │             │              └── rejected（丢弃 worktree）
+   │            │             │              └── rejected（弃置任务产物）
    └────────────┴─────────────┴──────────────────→ failed / cancelled
 ```
 
 - `working`：消费 worker 的 `session/update`（agent_message_chunk / tool_call / plan）广播为 `EventTaskProgress`，statusbar 可订阅
-- `awaiting_review`：worker prompt 返回 stop reason 后，dispatcher `git log base..HEAD` 收集 commit 清单，发起 HITL
+- `awaiting_review`：worker prompt 返回 stop reason 后，dispatcher 收集 commit 清单（`BaseCommit..HEAD`，worktree 模式下即 `base..dispatch/<ID>`）发起 HITL；非 git 仓库则收集为空，审批看 worker 自述
 - 超时沿用现有约定：`ExpiresAt` 为唯一超时来源（对齐 ef5a57b 的 HITL 决策）
 
 ## 5. 双角色 ACP 接入
@@ -109,9 +110,9 @@ dispatch:
 
 派发流程（ai-dispatch/client.go）：
 
-1. `git worktree add` 建隔离工作区（见 §6）
+1. 记录 `BaseCommit`（git 仓库时）；按 `Isolation` 决定是否建 worktree（见 §6）
 2. spawn worker 子进程 → `initialize`（协商 `loadSession` 等能力）→ `authenticate`（如需）
-3. `session/new`（cwd = worktree 路径）→ `session/prompt`（任务 Prompt）
+3. `session/new`（cwd = worktree 路径或 repo 本体）→ `session/prompt`（任务 Prompt）
 4. 流式消费 `session/update` → 转发事件；worker 若发起 `session/request_permission`，
    有人的 REPL 会话在时转发给前端弹批，无人值守按 worker 配置的 fallback policy 决绝
 5. stop reason 返回 → 收集 commits → 进入 `awaiting_review`
@@ -126,20 +127,31 @@ dispatch:
 - 长任务与 HTTP 不同：ACP 是随连接存活的会话，提交方断连 = 取消（`session/cancel`）
   ——设计上明确「提交方需保持连接」，或后续加持久化任务队列的外部补偿接口
 
-## 6. 工作区隔离（worktree）
+## 6. 工作区隔离（可选策略，非前置条件）
 
-- 每任务：`git worktree add <repo>/.goworker/dispatch/<ID> -b dispatch/<ID> <BaseBranch>`
-- worker 全程在 worktree 内工作，互相不可见，REPL 主工作区不受污染
-- done → 人工把 `dispatch/<ID>` 合入（fast-forward / merge / cherry-pick 由人决定），
-  `git worktree remove` 收尾；rejected/failed → 直接 remove（保留分支可选）
-- 非 git 目录的任务直接拒绝（failed: not a git repo）
+**worktree 不是派发的必要条件**，是 `Isolation` 的默认选项；派发只要求一个工作目录。
+
+| 模式 | 行为 | 适用 |
+|---|---|---|
+| `worktree`（git 仓库默认） | `git worktree add <repo>/.goworker/dispatch/<ID> -b dispatch/<ID>`；worker 全程在 worktree 内 | 并行多任务、不想污染主工作区 |
+| `shared` | worker 直接在 repo 工作区干活，能看见未提交的本地改动 | 串行任务、轻任务、需要本地上下文 |
+| 非 git 目录 | 强制 shared；BaseCommit/Commits 留空 | 文档、分析类任务 |
+
+commit 收集不依赖 worktree：派发前记 `BaseCommit`（HEAD SHA），收工后 `BaseCommit..HEAD`
+即为该任务产出（shared 模式下若主区有用户未提交改动混入，由 HITL 审批环节兜底把关）。
+
+worktree 模式的收尾：done → 人工合入（fast-forward / merge / cherry-pick 由人决定）后
+`git worktree remove`；rejected/failed → 直接 remove（保留分支可选）。
 
 ## 7. HITL 合并审批
 
 复用现有 HITL 协议（decision channel + ExpiresAt）：
 
-- 触发：任务进入 `awaiting_review`，向 REPL 推送审批请求（commit 清单 + diff stat）
-- 决策：`approve`（执行合并）、`reject`（弃 worktree）、`edit`（人接管，dispatcher 挂起）
+- 触发：任务进入 `awaiting_review`，向 REPL 推送审批请求（commit 清单 + diff stat；
+  shared/非 git 模式无 commit 清单，审批看 worker 自述与进度记录）
+- 决策：`approve`（worktree 模式执行合并；shared 模式仅标记完成，commit 已在原地）、
+  `reject`（worktree 弃置清理；shared 模式仅记录，改动由人自行处理）、
+  `edit`（人接管，dispatcher 挂起）
 - 无人在场：任务挂起等待，不超时自动决策（与 bash 命令审批不同，合并是重决策）
 - 每个决策写 `audit/dispatch.jsonl`（复用 audit 风格）
 
@@ -165,7 +177,7 @@ dispatch:
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | M1 | ai-dispatch：ACP protocol + task 状态机 + JSONL store（单测全覆盖） | go test；fake ACP agent/client 互测 |
-| M2 | client.go 派发链路 + worktree 隔离 | 用 gemini-cli 或 fake worker 真实跑通一个任务并产出 commit |
+| M2 | client.go 派发链路 + 隔离策略（worktree 默认，shared 可选） | fake worker 真实跑通一个任务并产出 commit；shared 与 worktree 两模式 |
 | M3 | dispatcher 插件 + REPL 命令 + HITL 审批 + statusbar 事件 | REPL 全流程：加任务→进度→审批→合入 |
 | M4 | ACP Agent 端点（接受外部任务）+ ZCode 自身 ACP 化 | 两个 goworker 实例互派任务 |
 
