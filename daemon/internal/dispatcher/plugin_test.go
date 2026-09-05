@@ -58,7 +58,18 @@ func newCommitWorker(rwc io.ReadWriteCloser) *commitWorker {
 		w.mu.Unlock()
 		return protocol.NewSessionResponse{SessionID: "sess_fake"}, nil
 	})
-	w.conn.Handle(protocol.MethodSessionPrompt, func(context.Context, json.RawMessage) (any, error) {
+	w.conn.Handle(protocol.MethodSessionPrompt, func(_ context.Context, params json.RawMessage) (any, error) {
+		var req protocol.PromptRequest
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, err
+		}
+		_ = w.conn.Notify(protocol.MethodSessionUpdate, protocol.SessionUpdate{
+			SessionID: req.SessionID,
+			Update: protocol.SessionUpdateBody{
+				SessionUpdate: protocol.UpdateAgentMessageChunk,
+				Content:       &protocol.ContentBlock{Type: "text", Text: "committing"},
+			},
+		})
 		w.mu.Lock()
 		dir := w.workdir
 		w.mu.Unlock()

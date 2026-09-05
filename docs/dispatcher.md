@@ -128,13 +128,18 @@ dispatch:
 
 ### 5.2 Agent 角色（接受外部任务）
 
-`goworker acp --listen stdio|socket`：dispatcher 以 ACP Agent 身份对外服务。
+入口（已实现）：
 
-- 外部 ACP Client（Codex 编排层、另一个 goworker）spawn 本进程或连 socket，
-  `session/prompt` 的内容即任务，落 `Source: "acp:<client>"`
-- 进度通过 `session/update` 流式回给提交方；任务完成即 prompt 返回 stop reason
-- 长任务与 HTTP 不同：ACP 是随连接存活的会话，提交方断连 = 取消（`session/cancel`）
-  ——设计上明确「提交方需保持连接」，或后续加持久化任务队列的外部补偿接口
+- **dispatcher ingress**：`dispatch.enabled` 的插件 Start 时监听
+  `<DispatchDir>/acp.sock`（unix socket），外部 ACP Client（Codex 编排层、
+  另一个 goworker）连接后 `session/prompt` 的内容即任务，落 `Source: "acp"`；
+  进度经 `session/update` 流式回给提交方，任务完成即 prompt 返回 stop reason
+- **ZCode worker 化**：`goworker acp` 以 stdio ACP Agent 模式暴露 Session SDK
+  （provider/工具装配与 agent 插件共用 ProviderFactory），任意 ACP Client
+  （包括本项目 dispatcher 的 worker 配置 `command: goworker, args: ["acp"]`）
+  都能驱动 ZCode；HITL 请求无人值守一律拒绝
+
+长任务与 HTTP 不同：ACP 是随连接存活的会话，提交方断连 = 取消（`session/cancel`）。
 
 ## 6. 工作区隔离（由任务类型决定）
 

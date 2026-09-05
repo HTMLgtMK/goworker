@@ -1,0 +1,125 @@
+// ACP worker 模式：把 ai-runtime Session 暴露成 ACP Agent（stdio）。
+// `goworker acp` 启动后，任意 ACP Client（包括本项目的 dispatcher，或 Zed 等
+// 编辑器）都能把 ZCode 当作 worker 驱动：session/prompt 的文本即 agent 输入，
+// token 流经 session/update 回传。
+package agent
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/tinguo/goworker/ai-dispatch"
+	"github.com/tinguo/goworker/ai-dispatch/protocol"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+)
+
+// ACPWorkerDeps 是 worker 模式的最小装配输入。
+type ACPWorkerDeps struct {
+	Config   *runtimeconfig.Config
+	AuditDir string // sandbox 审计目录（可空）
+}
+
+// acpWorker 实现 dispatch.TaskHandler：一个 ACP session 对应一个 Session 会话。
+type acpWorker struct {
+	deps ACPWorkerDeps
+
+	mu       sync.Mutex
+	sessions map[string]*runtimeagent.Session
+}
+
+// ServeACPWorker 在给定连接上服务 ACP worker 协议，返回 Server 便于测试与关闭。
+func ServeACPWorker(rwc io.ReadWriteCloser, deps ACPWorkerDeps) *dispatch.Server {
+	return dispatch.ServeConn(rwc, &acpWorker{deps: deps, sessions: map[string]*runtimeagent.Session{}})
+}
+
+func (w *acpWorker) SetSession(sessionID, _ string) {
+	// worker 模式下 cwd 由调用方进程自行管理；预留参数对齐 SessionAware。
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sessions[sessionID] = runtimeagent.NewSession(runtimeagent.SessionDeps{
+		Config:       w.deps.Config,
+		AuditDir:     w.deps.AuditDir,
+		Memory:       nil,
+		CollectTools: runtimeagent.DefaultTools,
+		NewProvider:  ProviderFactory(acpHTTPClient()),
+		Store:        nil, // worker 会话由调用方管理生命周期，本地不持久化
+	})
+}
+
+// Run 执行一回合：session/prompt 文本进 Session.Run，token 流映射为 session/update。
+func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispatch.Reporter) (string, error) {
+	w.mu.Lock()
+	session, ok := w.sessions[sessionID]
+	w.mu.Unlock()
+	if !ok {
+		return "", statusError(fmt.Sprintf("unknown session %q (call session/new first)", sessionID))
+	}
+
+	cb := runtimeagent.RunCallbacks{
+		Write: func(text string) {
+			rep.MessageChunk(sessionID, text)
+		},
+		WriteToken: func(kind runtimeagent.RenderKind, content string) {
+			rep.Update(sessionID, tokenToUpdate(kind, content))
+		},
+		// 无人值守：HITL 请求一律拒绝（Session SDK 对 nil Decide 的默认行为）
+	}
+	if err := session.Run(ctx, runtimeagent.RunRequest{Input: prompt}, cb); err != nil {
+		return "", err
+	}
+	return protocol.StopEndTurn, nil
+}
+
+// tokenToUpdate 把 SDK 的 token 流映射为 ACP session/update 子类型。
+func tokenToUpdate(kind runtimeagent.RenderKind, content string) protocol.SessionUpdateBody {
+	switch kind {
+	case runtimeagent.KindThinking:
+		return protocol.SessionUpdateBody{
+			SessionUpdate: protocol.UpdateAgentThoughtChunk,
+			Content:       &protocol.ContentBlock{Type: "text", Text: content},
+		}
+	case runtimeagent.KindToolCall:
+		return protocol.SessionUpdateBody{
+			SessionUpdate: protocol.UpdateToolCall,
+			Title:         content,
+			Status:        "pending",
+		}
+	case runtimeagent.KindToolResult:
+		return protocol.SessionUpdateBody{
+			SessionUpdate: protocol.UpdateToolCallUpdate,
+			Title:         content,
+			Status:        "completed",
+		}
+	default: // text
+		return protocol.SessionUpdateBody{
+			SessionUpdate: protocol.UpdateAgentMessageChunk,
+			Content:       &protocol.ContentBlock{Type: "text", Text: content},
+		}
+	}
+}
+
+// statusError 生成 -32000 RPC 错误（protocol.Conn 会识别 *RPCError）。
+func statusError(message string) error {
+	return &protocol.RPCError{Code: -32000, Message: message}
+}
+
+// acpHTTPClient worker 模式的 LLM 客户端：与 agent 插件同为 2min 总超时。
+func acpHTTPClient() *http.Client {
+	return &http.Client{Timeout: 2 * time.Minute}
+}
+
+// stdioConn 把进程 stdin/stdout 拼成 ACP 传输通道；Close 不关进程标准流。
+type stdioConn struct{}
+
+func (stdioConn) Read(b []byte) (int, error)  { return os.Stdin.Read(b) }
+func (stdioConn) Write(b []byte) (int, error) { return os.Stdout.Write(b) }
+func (stdioConn) Close() error                { return nil }
+
+// Stdio 返回 worker 模式的标准传输通道。
+func Stdio() io.ReadWriteCloser { return stdioConn{} }

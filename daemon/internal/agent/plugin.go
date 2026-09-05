@@ -6,7 +6,6 @@ package agent
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -20,9 +19,6 @@ import (
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/mcp"
-	runtimeprovider "github.com/tinguo/goworker/ai-runtime/provider"
-	runtimeanthropic "github.com/tinguo/goworker/ai-runtime/provider/anthropic"
-	runtimeopenai "github.com/tinguo/goworker/ai-runtime/provider/openai"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/daemon/internal/plugin"
@@ -237,39 +233,7 @@ func (p *AgentPlugin) startSession() {
 
 	// 会话层组装：资源就绪后构造 deps 与首会话。
 
-	modelProvider := func(cfg *runtimeconfig.Config) (core.Provider, error) {
-		name, provider, err := cfg.LLM.ResolveDefault()
-		if err != nil {
-			return nil, err
-		}
-		switch provider.Type {
-		case runtimeconfig.ProviderTypeOpenAI:
-			return runtimeopenai.NewProvider(
-				name,
-				provider.Endpoint,
-				provider.APIKey,
-				provider.Model,
-				client,
-				runtimeopenai.WithThinkingOptions(runtimeprovider.ThinkingOptions{
-					RequestMode: provider.Thinking.RequestMode,
-					Effort:      provider.Thinking.Effort,
-				}),
-			), nil
-
-		case runtimeconfig.ProviderTypeAnthropic:
-			return runtimeanthropic.NewProvider(
-				name,
-				provider.Endpoint,
-				provider.APIKey,
-				provider.Model,
-				client,
-				runtimeanthropic.AnthropicAuthType(provider.AuthType),
-				runtimeanthropic.WithAnthropicMaxTokens(provider.MaxTokens),
-			), nil
-		default:
-			return nil, fmt.Errorf("unsupported provider type %q", provider.Type)
-		}
-	}
+	modelProvider := ProviderFactory(client)
 
 	p.deps = runtimeagent.SessionDeps{
 		Config:       p.cfg,

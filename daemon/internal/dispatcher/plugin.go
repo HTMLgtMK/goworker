@@ -8,13 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-
-	"os/exec"
 
 	"github.com/tinguo/goworker/ai-dispatch"
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
@@ -36,11 +36,26 @@ type DispatcherPlugin struct {
 	mu      sync.Mutex
 	running map[string]context.CancelFunc
 	wg      sync.WaitGroup
+
+	// ACP 入口：socket listener、活跃连接与任务→连接的进度路由
+	listener   net.Listener
+	acpServers []*dispatch.Server
+	acpRoutes  map[string]acpRoute
+}
+
+type acpRoute struct {
+	server    *dispatch.Server
+	sessionID string
 }
 
 // NewPlugin 构造 dispatcher 插件。cfg.Dispatch.Enabled=false 时 main 不会注册本插件。
 func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *DispatcherPlugin {
-	return &DispatcherPlugin{cfg: cfg, paths: paths, running: make(map[string]context.CancelFunc)}
+	return &DispatcherPlugin{
+		cfg:       cfg,
+		paths:     paths,
+		running:   make(map[string]context.CancelFunc),
+		acpRoutes: make(map[string]acpRoute),
+	}
 }
 
 func (p *DispatcherPlugin) Name() string { return "dispatcher" }
@@ -55,6 +70,14 @@ func (p *DispatcherPlugin) Init(h *plugin.Hub) error {
 	p.store = store
 	p.orch = dispatch.NewOrchestrator(store)
 	p.orch.SetProgress(func(taskID string, u protocol.SessionUpdateBody) {
+		// ACP 提交方的任务：进度路由回对应连接；REPL 任务只留 debug 日志
+		p.mu.Lock()
+		route, ok := p.acpRoutes[taskID]
+		p.mu.Unlock()
+		if ok {
+			route.server.Update(route.sessionID, u)
+			return
+		}
 		slog.Debug("dispatch progress", "task", taskID, "kind", u.SessionUpdate)
 	})
 
@@ -75,19 +98,132 @@ func (p *DispatcherPlugin) Init(h *plugin.Hub) error {
 // SetOpener 注入 worker 连接方式（测试用）。
 func (p *DispatcherPlugin) SetOpener(op dispatch.Opener) { p.orch.SetOpener(op) }
 
-func (p *DispatcherPlugin) Start() error { return nil }
+// Start 打开 ACP 入口（unix socket），接受外部 ACP Client 提交任务。
+// socket 路径：<DispatchDir>/acp.sock。
+func (p *DispatcherPlugin) Start() error {
+	sockPath := filepath.Join(p.paths.DispatchDir, "acp.sock")
+	_ = os.Remove(sockPath) // 残留 socket 会 bind 失败
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		return fmt.Errorf("dispatcher: listen %s: %w", sockPath, err)
+	}
+	p.listener = ln
+
+	p.wg.Add(1)
+	go p.acceptLoop()
+	slog.Info("dispatcher: acp ingress listening", "socket", sockPath)
+	return nil
+}
+
+func (p *DispatcherPlugin) acceptLoop() {
+	defer p.wg.Done()
+	for {
+		conn, err := p.listener.Accept()
+		if err != nil {
+			return // listener 已关闭
+		}
+		server := dispatch.ServeConn(conn, &acpIngress{plugin: p})
+		p.mu.Lock()
+		p.acpServers = append(p.acpServers, server)
+		p.mu.Unlock()
+	}
+}
 
 func (p *DispatcherPlugin) Stop() error {
+	if p.listener != nil {
+		_ = p.listener.Close()
+	}
 	p.mu.Lock()
+	for _, server := range p.acpServers {
+		_ = server.Close()
+	}
 	for _, cancel := range p.running {
 		cancel()
 	}
 	p.mu.Unlock()
 	p.wg.Wait()
+	_ = os.Remove(filepath.Join(p.paths.DispatchDir, "acp.sock"))
 	if p.store != nil {
 		return p.store.Close()
 	}
 	return nil
+}
+
+// acpIngress 是 ACP 入口侧的 TaskHandler：session/prompt 文本即任务，
+// 复用与 REPL 完全相同的 orchestrator 派发链路。
+type acpIngress struct {
+	plugin *DispatcherPlugin
+
+	mu       sync.Mutex
+	sessions map[string]string // ACP sessionID → 提交方声明的工作目录
+}
+
+func (h *acpIngress) SetSession(sessionID, cwd string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.sessions == nil {
+		h.sessions = make(map[string]string)
+	}
+	h.sessions[sessionID] = cwd
+}
+
+func (h *acpIngress) cwd(sessionID string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sessions[sessionID]
+}
+
+func (h *acpIngress) Run(ctx context.Context, sessionID, prompt string, rep dispatch.Reporter) (string, error) {
+	p := h.plugin
+	cwd := h.cwd(sessionID)
+	if cwd == "" {
+		return "", statusError("missing session cwd")
+	}
+
+	worker, err := p.cfg.Dispatch.ResolveDefaultWorker()
+	if err != nil {
+		return "", err
+	}
+	kind := task.KindCode
+	if !dispatch.DetectGit(ctx, cwd) {
+		kind = task.KindGeneral
+	}
+	now := time.Now()
+	t := &task.Task{
+		ID:        task.NewID(),
+		Source:    "acp",
+		Kind:      kind,
+		Prompt:    prompt,
+		Repo:      cwd,
+		Worker:    worker,
+		Status:    task.StatusQueued,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := p.store.Add(t); err != nil {
+		return "", err
+	}
+
+	// 进度路由：orchestrator 的全局 ProgressFunc 按 taskID 转回本连接
+	p.mu.Lock()
+	p.acpRoutes[t.ID] = acpRoute{server: rep.(*dispatch.Server), sessionID: sessionID}
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.acpRoutes, t.ID)
+		p.mu.Unlock()
+	}()
+
+	p.audit("acp-submit", t.ID, cwd)
+	outcome, err := p.orch.Run(ctx, t, p.workerSpec(worker))
+	if err != nil {
+		return "", err
+	}
+	if len(outcome.Task.Commits) > 0 {
+		rep.MessageChunk(sessionID, fmt.Sprintf("任务完成，产出 %d 个 commit，等待审批（/dispatch approve %s）",
+			len(outcome.Task.Commits), t.ID))
+	}
+	return outcome.StopReason, nil
 }
 
 // ---- /dispatch ----
@@ -481,4 +617,9 @@ func orOne(n int) int {
 		return 1
 	}
 	return n
+}
+
+// statusError 生成 -32000 RPC 错误（ai-dispatch 的 protocol.Conn 会识别）。
+func statusError(message string) error {
+	return &protocol.RPCError{Code: -32000, Message: message}
 }

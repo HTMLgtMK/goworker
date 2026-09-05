@@ -25,12 +25,20 @@ type Reporter interface {
 	MessageChunk(sessionID, text string)
 }
 
+// SessionAware 是 handler 的可选扩展：session/new 时收到提交方声明的 cwd，
+// 供任务派发侧决定工作目录（git 仓库判型等）。
+type SessionAware interface {
+	SetSession(sessionID, cwd string)
+}
+
 // Server 是 ACP Agent 角色：接受外部 ACP Client 的任务提交。
 // 一条连接一个 Server；session/prompt 的内容即任务。
 type Server struct {
 	conn    *protocol.Conn
 	closeFn func() error
 	handler TaskHandler
+
+	done chan struct{} // 读循环退出（对端断开）后关闭
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc // sessionID → prompt 执行的 cancel
@@ -47,9 +55,16 @@ func ServeConn(rwc io.ReadWriteCloser, handler TaskHandler) *Server {
 	s.conn.Handle(protocol.MethodSessionNew, s.handleSessionNew)
 	s.conn.Handle(protocol.MethodSessionPrompt, s.handlePrompt)
 	s.conn.HandleNotification(protocol.MethodSessionCancel, s.handleCancel)
-	go func() { _ = s.conn.Serve() }()
+	s.done = make(chan struct{})
+	go func() {
+		defer close(s.done)
+		_ = s.conn.Serve()
+	}()
 	return s
 }
+
+// Done 在连接读循环退出（对端断开）后关闭。
+func (s *Server) Done() <-chan struct{} { return s.done }
 
 // Close 断开连接。
 func (s *Server) Close() error {
@@ -75,7 +90,11 @@ func (s *Server) handleSessionNew(_ context.Context, params json.RawMessage) (an
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, fmt.Errorf("dispatch: decode session/new: %w", err)
 	}
-	return protocol.NewSessionResponse{SessionID: newHexID("sess")}, nil
+	sessionID := newHexID("sess")
+	if aware, ok := s.handler.(SessionAware); ok {
+		aware.SetSession(sessionID, req.Cwd)
+	}
+	return protocol.NewSessionResponse{SessionID: sessionID}, nil
 }
 
 func (s *Server) handlePrompt(ctx context.Context, params json.RawMessage) (any, error) {

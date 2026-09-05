@@ -20,7 +20,38 @@ import (
 
 // ---- 入口 ----
 
+// runACPWorker 以 stdio ACP Agent 模式服务 ZCode 会话：配置解析、HTTP 客户端、
+// provider 装配与 agent 插件共用同一套（ProviderFactory），stdin EOF 即退出。
+func runACPWorker() {
+	cfgPath := config.DefaultPath()
+	cfg := config.Load(cfgPath)
+	if cfg == nil {
+		os.Exit(1)
+	}
+	log, err := logger.Setup(cfg.Log)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "init logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer log.Close()
+	slog.SetDefault(log.Logger)
+
+	server := agent.ServeACPWorker(agent.Stdio(), agent.ACPWorkerDeps{
+		Config:   cfg.ToRuntime(),
+		AuditDir: filepath.Join(config.DefaultDir(), "audit"),
+	})
+	// 阻塞到对端关闭输入（dispatcher spawn 的子进程随任务结束被回收）
+	<-server.Done()
+	_ = server.Close()
+}
+
 func main() {
+	// goworker acp：ZCode 以 ACP worker 身份跑在 stdio 上（被 dispatcher/编辑器驱动）
+	if len(os.Args) > 1 && os.Args[1] == "acp" {
+		runACPWorker()
+		return
+	}
+
 	// 加载全局配置
 	cfgPath := config.DefaultPath()
 	cfg := config.Load(cfgPath)
