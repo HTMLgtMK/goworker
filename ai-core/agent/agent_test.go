@@ -126,6 +126,96 @@ func (p *toolLoopProvider) ChatStream(context.Context, *core.ChatRequest) (<-cha
 	return nil, errors.New("not implemented")
 }
 
+type thinkingProvider struct {
+	messages []core.Message
+	calls    int
+}
+
+func (p *thinkingProvider) Name() string  { return "thinking" }
+func (p *thinkingProvider) Model() string { return "m" }
+func (p *thinkingProvider) Chat(context.Context, *core.ChatRequest) (*core.ChatResponse, error) {
+	message := p.messages[p.calls]
+	p.calls++
+	return &core.ChatResponse{Choices: []core.ResponseChoice{{Message: message}}}, nil
+}
+func (p *thinkingProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	return nil, errors.New("not implemented")
+}
+
+func TestAgent_EmitsThinkingBeforeFinalContent(t *testing.T) {
+	provider := &thinkingProvider{messages: []core.Message{{
+		Role:     "assistant",
+		Content:  "answer",
+		Thinking: core.Thinking{Text: "reasoning"},
+	}}}
+	a := NewAgent(provider, "", nil, nil)
+
+	tokenCh, msgCh, err := a.Run(context.Background(), nil, "question")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var got []core.Token
+	for token := range tokenCh {
+		if !token.Done {
+			got = append(got, token)
+		}
+	}
+	want := []core.Token{
+		{Type: core.TokenTypeThinking, Content: "reasoning"},
+		{Type: core.TokenTypeText, Content: "answer"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("tokens = %#v, want %#v", got, want)
+	}
+	messages := <-msgCh
+	if gotThinking := messages[len(messages)-1].Thinking.Text; gotThinking != "reasoning" {
+		t.Errorf("history thinking = %q, want reasoning", gotThinking)
+	}
+}
+
+func TestAgent_EmitsThinkingBeforeToolCallAndFinalContent(t *testing.T) {
+	provider := &thinkingProvider{messages: []core.Message{
+		{
+			Role:     "assistant",
+			Content:  "using tool",
+			Thinking: core.Thinking{Text: "tool reasoning"},
+			ToolCalls: []core.ToolCall{{
+				ID:   "c1",
+				Type: "function",
+				Function: core.ToolCallFunction{
+					Name:      "bash",
+					Arguments: `{"command":"echo hi"}`,
+				},
+			}},
+		},
+		{Role: "assistant", Content: "done", Thinking: core.Thinking{Text: "final reasoning"}},
+	}}
+	a := NewAgent(provider, "", testTools(), nil)
+
+	tokenCh, msgCh, err := a.Run(context.Background(), nil, "question")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var gotTypes []string
+	for token := range tokenCh {
+		if !token.Done {
+			gotTypes = append(gotTypes, token.Type)
+		}
+	}
+	wantTypes := []string{
+		core.TokenTypeThinking,
+		core.TokenTypeText,
+		core.TokenTypeToolCall,
+		core.TokenTypeToolResult,
+		core.TokenTypeThinking,
+		core.TokenTypeText,
+	}
+	if !reflect.DeepEqual(gotTypes, wantTypes) {
+		t.Errorf("token types = %v, want %v", gotTypes, wantTypes)
+	}
+	<-msgCh
+}
+
 func TestAgent_CustomMaxIterationsRespected(t *testing.T) {
 	a := NewAgent(&toolLoopProvider{count: 999}, "", testTools(), nil, WithMaxIterations(3))
 	tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")
@@ -333,7 +423,7 @@ func (replaceMW) OnBeforeModel(ev *core.BeforeModelEvent) *core.MiddlewareRespon
 
 func TestAgent_SendsReplacedHistoryToChat(t *testing.T) {
 	provider := &captureProvider{}
-	a := NewAgent(provider, "", nil, []core.Middleware{replaceMW{}})
+	a := NewAgent(provider, "test", nil, []core.Middleware{replaceMW{}})
 
 	tokenCh, msgCh, err := a.Run(context.Background(), nil, "hello")
 	if err != nil {

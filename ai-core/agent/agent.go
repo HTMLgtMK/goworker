@@ -65,7 +65,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 			req := &core.ChatRequest{
 				Model:    a.provider.Model(),
 				Messages: messages,
-				Tools:    toolSpecs(a.tools),
+				Tools:    a.tools,
 			}
 
 			resp, err := a.provider.Chat(ctx, req)
@@ -108,16 +108,12 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 					return
 				}
 				messages = append(messages, msg)
-				sendToken(ctx, ch, core.Token{Type: core.TokenTypeText, Content: msg.Content})
+				emitMessageTokens(ctx, ch, msg)
 				finished = true
 				break
 			}
 			messages = append(messages, msg)
-
-			// intermediate thinking text
-			if msg.Content != "" {
-				sendToken(ctx, ch, core.Token{Type: core.TokenTypeText, Content: msg.Content})
-			}
+			emitMessageTokens(ctx, ch, msg)
 
 			for _, tc := range msg.ToolCalls {
 				if tc.Type != "function" {
@@ -237,20 +233,21 @@ func (a *Agent) buildMessages(history []core.Message, input string) []core.Messa
 	return msgs
 }
 
-func toolSpecs(tools []core.Tool) []map[string]any {
-	specs := make([]map[string]any, 0, len(tools))
-	for _, t := range tools {
-		specs = append(specs, t.ToolSpec())
-	}
-	return specs
-}
-
 type tokenEmitter struct {
 	ch chan<- core.Token
 }
 
 func (e tokenEmitter) Emit(ctx context.Context, tok core.Token) {
 	sendToken(ctx, e.ch, tok)
+}
+
+func emitMessageTokens(ctx context.Context, ch chan<- core.Token, message core.Message) {
+	if message.Thinking.Text != "" {
+		sendToken(ctx, ch, core.Token{Type: core.TokenTypeThinking, Content: message.Thinking.Text})
+	}
+	if message.Content != "" {
+		sendToken(ctx, ch, core.Token{Type: core.TokenTypeText, Content: message.Content})
+	}
 }
 
 func sendToken(ctx context.Context, ch chan<- core.Token, tok core.Token) {

@@ -58,6 +58,8 @@ func Humanize(n int) string {
 // 接收者已去掉（函数体不依赖插件状态），供 Session.Run 直接调用。
 func renderKind(t core.Token) (RenderKind, string) {
 	switch t.Type {
+	case core.TokenTypeThinking:
+		return KindThinking, t.Content
 	case core.TokenTypeToolCall:
 		return KindToolCall, t.Content
 	case core.TokenTypeToolResult:

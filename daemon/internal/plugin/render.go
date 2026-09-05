@@ -5,6 +5,7 @@ type RenderKind string
 
 const (
 	KindText       RenderKind = "text"        // 所有文本输出，一律 markdown 渲染
+	KindThinking   RenderKind = "thinking"    // 模型推理：独立弱化展示
 	KindToolCall   RenderKind = "tool_call"   // 工具调用：● name(args)
 	KindToolResult RenderKind = "tool_result" // 工具结果：⎿ output
 )

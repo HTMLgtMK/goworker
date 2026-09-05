@@ -23,6 +23,7 @@ type RenderKind string
 
 const (
 	KindText       RenderKind = "text"
+	KindThinking   RenderKind = "thinking"
 	KindToolCall   RenderKind = "tool_call"
 	KindToolResult RenderKind = "tool_result"
 )
@@ -48,11 +49,11 @@ type Session struct {
 // SessionDeps 是会话构造输入包：插件级资源 + 本会话参数，Init 组装后每次 NewSession 复用。
 // 其余字段跨会话不变。可变资源（instructions）的装载在 plugin 层，这里只收最终值。
 type SessionDeps struct {
-	Config       *runtimeconfig.Config                         // 运行配置（含 Sandbox 段）
-	AuditDir     string                                        // sandbox 审计落盘目录
-	Memory       *memory.Client                                // nil = 禁用
-	CollectTools func(cfg *sandbox.Config) []core.Tool         // 方法值捕获 p，按需收集工具
-	NewProvider  func(cfg *runtimeconfig.Config) core.Provider // 默认 NewOpenAIProvider，测试注入 fake
-	Instruction  *memory.InstructionSet                        // 会话边界刷新（Init / /new 经 startSession 重载）
-	Store        *session.Store                                // nil = 持久化禁用
+	Config       *runtimeconfig.Config                                  // 运行配置（含 Sandbox 段）
+	AuditDir     string                                                 // sandbox 审计落盘目录
+	Memory       *memory.Client                                         // nil = 禁用
+	CollectTools func(cfg *sandbox.Config) []core.Tool                  // 方法值捕获 p，按需收集工具
+	NewProvider  func(cfg *runtimeconfig.Config) (core.Provider, error) // 按当前 default_provider 构造协议适配器
+	Instruction  *memory.InstructionSet                                 // 会话边界刷新（Init / /new 经 startSession 重载）
+	Store        *session.Store                                         // nil = 持久化禁用
 }

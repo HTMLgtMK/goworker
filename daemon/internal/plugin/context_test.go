@@ -54,6 +54,7 @@ func TestSessionIsValid(t *testing.T) {
 func TestRenderKindValues(t *testing.T) {
 	cases := map[RenderKind]string{
 		KindText:       "text",
+		KindThinking:   "thinking",
 		KindToolCall:   "tool_call",
 		KindToolResult: "tool_result",
 	}

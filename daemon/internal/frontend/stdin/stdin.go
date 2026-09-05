@@ -17,7 +17,11 @@ import (
 )
 
 // rawNL 在 raw mode 下 \n 不会自动回车到行首，需要补 \r
-const rawNL = "\r\n"
+const (
+	rawNL         = "\r\n"
+	thinkingColor = "\033[38;5;244m"
+	ansiReset     = "\033[0m"
+)
 
 // StdinFrontend 是一个基于标准输入/输出的用户界面。
 //
@@ -99,6 +103,23 @@ func (f *StdinFrontend) Write(s string) {
 func (f *StdinFrontend) writeText(content string) {
 	rendered := RenderMarkdown(strings.TrimSpace(content), f.termWidth)
 	f.Write("\n" + block(markerText, rendered))
+}
+
+func formatThinking(content string, width int) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	rendered := RenderMarkdown(content, width)
+	formatted := block(markerText, "Thinking\n"+rendered)
+	formatted = strings.ReplaceAll(formatted, ansiReset, ansiReset+thinkingColor)
+	return thinkingColor + formatted + ansiReset
+}
+
+func (f *StdinFrontend) writeThinking(content string) {
+	if rendered := formatThinking(content, f.termWidth); rendered != "" {
+		f.Write("\n" + rendered)
+	}
 }
 
 // writeToolCall 渲染工具调用 token。
@@ -203,6 +224,8 @@ func (f *StdinFrontend) Run() error {
 			switch kind {
 			case plugin.KindText:
 				f.writeText(content)
+			case plugin.KindThinking:
+				f.writeThinking(content)
 			case plugin.KindToolCall:
 				f.writeToolCall(content)
 			case plugin.KindToolResult:

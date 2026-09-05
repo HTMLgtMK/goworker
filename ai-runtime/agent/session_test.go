@@ -20,7 +20,9 @@ func testSession(pv core.Provider) (*Session, *runtimeconfig.Config) {
 		AuditDir:     "",
 		Memory:       nil,
 		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
-		NewProvider:  func(*runtimeconfig.Config) core.Provider { return pv },
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			return pv, nil
+		},
 	})
 	return s, cfg
 }
@@ -31,6 +33,68 @@ func testRunCallbacks(buf *strings.Builder) RunCallbacks {
 		WriteToken: func(_ RenderKind, s string) {
 			buf.WriteString(s)
 		},
+	}
+}
+
+func TestRenderKind_Thinking(t *testing.T) {
+	kind, content := renderKind(core.Token{Type: core.TokenTypeThinking, Content: "reasoning"})
+	if kind != KindThinking || content != "reasoning" {
+		t.Errorf("renderKind = (%q, %q), want (%q, reasoning)", kind, content, KindThinking)
+	}
+}
+
+func TestSessionRun_HidesThinkingWithoutDroppingHistory(t *testing.T) {
+	provider := &captureProvider{response: core.Message{
+		Role:     "assistant",
+		Content:  "answer",
+		Thinking: core.Thinking{Text: "reasoning"},
+	}}
+	s, cfg := testSession(provider)
+	cfg.LLM.Thinking.Show = false
+
+	var kinds []RenderKind
+	var output strings.Builder
+	callbacks := RunCallbacks{
+		Write: func(value string) { output.WriteString(value) },
+		WriteToken: func(kind RenderKind, content string) {
+			kinds = append(kinds, kind)
+			output.WriteString(content)
+		},
+	}
+	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, callbacks); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, kind := range kinds {
+		if kind == KindThinking {
+			t.Fatalf("thinking should be hidden, kinds = %v", kinds)
+		}
+	}
+	if strings.Contains(output.String(), "reasoning") {
+		t.Errorf("output = %q, should hide reasoning", output.String())
+	}
+	last := s.conversation[len(s.conversation)-1]
+	if last.Thinking.Text != "reasoning" {
+		t.Errorf("history thinking = %q, want reasoning", last.Thinking.Text)
+	}
+}
+
+func TestSessionRun_ShowsThinkingByDefault(t *testing.T) {
+	provider := &captureProvider{response: core.Message{
+		Role:     "assistant",
+		Content:  "answer",
+		Thinking: core.Thinking{Text: "reasoning"},
+	}}
+	s, _ := testSession(provider)
+
+	var kinds []RenderKind
+	callbacks := RunCallbacks{
+		WriteToken: func(kind RenderKind, _ string) { kinds = append(kinds, kind) },
+	}
+	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, callbacks); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(kinds) < 2 || kinds[0] != KindThinking || kinds[1] != KindText {
+		t.Errorf("render kinds = %v, want thinking then text", kinds)
 	}
 }
 

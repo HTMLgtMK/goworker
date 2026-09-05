@@ -32,8 +32,10 @@ func testSessionWithStore(t *testing.T, pv core.Provider) (*Session, *session.St
 		AuditDir:     "",
 		Memory:       nil,
 		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
-		NewProvider:  func(*runtimeconfig.Config) core.Provider { return pv },
-		Store:        st,
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			return pv, nil
+		},
+		Store: st,
 	})
 	return s, st, cfg, dir
 }
@@ -200,8 +202,10 @@ func TestSessionIntegration_NewSessionRestoresFromStore(t *testing.T) {
 		AuditDir:     "",
 		Memory:       nil,
 		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
-		NewProvider:  func(*runtimeconfig.Config) core.Provider { return &captureProvider{} },
-		Store:        st,
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			return &captureProvider{}, nil
+		},
+		Store: st,
 	})
 
 	conv := s.Conversation()

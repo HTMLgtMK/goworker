@@ -31,8 +31,12 @@ func (s *Session) checkpoint(ctx context.Context, conv []core.Message, cfg *runt
 		return nil, nil
 	}
 	cwd, _ := os.Getwd()
+	provider, err := s.deps.NewProvider(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create checkpoint provider: %w", err)
+	}
 	return s.deps.Memory.Checkpoint(ctx, toMemoryMessages(conv), memory.CheckpointOptions{
-		LLM:        &llmAdapter{inner: s.deps.NewProvider(cfg)},
+		LLM:        &llmAdapter{inner: provider},
 		LtmExtract: cfg.Memory.LtmExtract,
 		TokenUsage: s.usage.Snapshot().TotalTokens,
 		CWD:        cwd,
@@ -50,6 +54,7 @@ func (s *Session) CheckpointAsync(conv []core.Message, writer func(string)) {
 	// 后台固化读配置做快照：主线程可能并发 /model set 改 cfg.LLM.*，goroutine 里不能碰共享指针。
 	// 浅拷贝即可 —— checkpoint 只读 LLM（字符串）+ Memory.LtmExtract（bool），全是值类型。
 	cfgSnap := *s.deps.Config
+	cfgSnap.LLM = s.deps.Config.LLM.Clone()
 	sum, err := s.checkpoint(ctx, conv, &cfgSnap)
 	if err != nil {
 		writer(fmt.Sprintf("⚠ Consolidation failed (history kept only in STM, lost on exit): %v\n", err))

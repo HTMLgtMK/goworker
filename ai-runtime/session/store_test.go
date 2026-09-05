@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -104,6 +105,56 @@ func readJSONLFile(t *testing.T, path string) []string {
 }
 
 // ── 测试用例 ──────────────────────────────────────────────────────────
+
+func TestThinkingRoundtripAndLegacyCompatibility(t *testing.T) {
+	dir := tempDir(t)
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	custom := map[string]json.RawMessage{
+		"openai": json.RawMessage(`{"version":1,"fields":{"reasoning_content":"must replay"}}`),
+	}
+	message := core.Message{
+		Role:     "assistant",
+		Content:  "answer",
+		MsgID:    "m_thinking",
+		Thinking: core.Thinking{Text: "must replay"},
+		Custom:   custom,
+	}
+	if _, err := s.Commit([]core.Message{message}); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	view := reopened.ActiveView()
+	if len(view) != 1 {
+		t.Fatalf("ActiveView length = %d, want 1", len(view))
+	}
+	if view[0].Thinking.Text != "must replay" || !reflect.DeepEqual(view[0].Custom, custom) {
+		t.Errorf("message = %#v, want thinking and custom data preserved", view[0])
+	}
+
+	legacy := Record{Kind: kindMsg, Msg: &msgFields{ID: "m_legacy", Role: "assistant", Content: "plain"}}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal legacy: %v", err)
+	}
+	var decoded Record
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal legacy: %v", err)
+	}
+	if got := recordToMessage(decoded); got.Thinking.Text != "" || got.Custom != nil {
+		t.Errorf("legacy message = %#v, want no thinking or custom data", got)
+	}
+}
 
 // TestActiveViewRoundtrip 验证 Commit → ActiveView 完整往返。
 func TestActiveViewRoundtrip(t *testing.T) {
@@ -613,6 +664,50 @@ func TestConcurrentAppendRace(t *testing.T) {
 }
 
 // TestArchive 验证 Archive 后旧文件进 archive/，新文件空。
+func assertPrivateMode(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 && got != 0o600 {
+		t.Errorf("permissions for %s = %04o, want 0700 or 0600", path, got)
+	}
+}
+
+func TestOpenRestrictsSessionPermissions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sessions")
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	assertPrivateMode(t, dir)
+	assertPrivateMode(t, filepath.Join(dir, "current.jsonl"))
+}
+
+func TestOpenRestrictsExistingArchivePermissions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sessions")
+	archiveDir := filepath.Join(dir, "archive")
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		t.Fatalf("create archive dir: %v", err)
+	}
+	archivePath := filepath.Join(archiveDir, "old.jsonl")
+	if err := os.WriteFile(archivePath, []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	assertPrivateMode(t, archiveDir)
+	assertPrivateMode(t, archivePath)
+}
+
 func TestArchive(t *testing.T) {
 	s := openStore(t)
 
@@ -652,6 +747,9 @@ func TestArchive(t *testing.T) {
 	if !strings.HasSuffix(entries[0].Name(), ".jsonl") {
 		t.Errorf("archive file should be .jsonl, got %q", entries[0].Name())
 	}
+	assertPrivateMode(t, archiveDir)
+	assertPrivateMode(t, filepath.Join(archiveDir, entries[0].Name()))
+	assertPrivateMode(t, currentPath)
 
 	// ActiveView 应该是空
 	view := s.ActiveView()

@@ -10,6 +10,7 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 	"github.com/tinguo/goworker/ai-memory"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	runtimeopenai "github.com/tinguo/goworker/ai-runtime/provider/openai"
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
@@ -37,7 +38,9 @@ func TestCheckpoint_FiltersToolMessages(t *testing.T) {
 	defer srv.Close()
 
 	cfg := runtimeconfig.Default()
-	cfg.LLM.Endpoint = srv.URL
+	provider := cfg.LLM.Providers["openai"]
+	provider.Endpoint = srv.URL
+	cfg.LLM.Providers["openai"] = provider
 	ms, err := memory.NewClient(t.TempDir(), 10)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -49,7 +52,9 @@ func TestCheckpoint_FiltersToolMessages(t *testing.T) {
 		AuditDir:     "",
 		Memory:       ms,
 		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
-		NewProvider:  func(*runtimeconfig.Config) core.Provider { return NewOpenAIProvider(srv.URL, "", "mock") },
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			return runtimeopenai.NewProvider("mock", srv.URL, "", "mock", srv.Client()), nil
+		},
 	})
 	s.conversation = []core.Message{
 		{Role: "user", Content: "查下磁盘"},

@@ -22,14 +22,31 @@ type Tool struct {
 
 // ---- 消息 ----
 
+// ToolChoice 控制模型是否可以调用工具。
+type ToolChoice string
+
+const (
+	ToolChoiceAuto     ToolChoice = "auto"
+	ToolChoiceRequired ToolChoice = "required"
+	ToolChoiceNone     ToolChoice = "none"
+)
+
+// Thinking 是模型推理的厂商无关视图。
+// Text 仅供展示层消费。
+type Thinking struct {
+	Text string `json:"text,omitempty"`
+}
+
 // Message 是聊天会话中的单条消息。
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	MsgID      string     `json:"-"`
-	CreatedAt  time.Time  `json:"-"`
+	Role       string                     `json:"role"`
+	Content    string                     `json:"content"`
+	ToolCallID string                     `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCall                 `json:"tool_calls,omitempty"`
+	Thinking   Thinking                   `json:"thinking,omitempty"`
+	Custom     map[string]json.RawMessage `json:"custom,omitempty"`
+	MsgID      string                     `json:"-"`
+	CreatedAt  time.Time                  `json:"-"`
 }
 
 // ToolCall 是 LLM 请求的函数调用。
@@ -49,12 +66,12 @@ type ToolCallFunction struct {
 
 // ChatRequest /v1/chat/completions 请求体。
 type ChatRequest struct {
-	Model          string           `json:"model"`
-	Messages       []Message        `json:"messages"`
-	Stream         bool             `json:"stream"`
-	Tools          []map[string]any `json:"tools,omitempty"`
-	ToolChoice     any              `json:"tool_choice,omitempty"`
-	ResponseFormat any              `json:"response_format,omitempty"`
+	Model      string     `json:"model"`
+	Messages   []Message  `json:"messages"`
+	Stream     bool       `json:"stream"`
+	Tools      []Tool     `json:"tools,omitempty"`
+	ToolChoice ToolChoice `json:"tool_choice,omitempty"`
+	JSONMode   bool       `json:"json_mode,omitempty"`
 }
 
 // ChatResponse 非流式响应。
@@ -125,6 +142,7 @@ type RuntimeEvent struct {
 // Token 类型常量。
 const (
 	TokenTypeText       = "text"
+	TokenTypeThinking   = "thinking"
 	TokenTypeToolCall   = "tool_call"
 	TokenTypeToolResult = "tool_result"
 	TokenTypeEvent      = "event"

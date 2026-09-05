@@ -41,8 +41,14 @@ type Store struct {
 
 // Open 打开或创建 dir 下的会话存储。目录不存在则创建，jsonl 文件不存在则新建。
 func Open(dir string) (*Store, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("session: create dir %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("session: restrict dir %s: %w", dir, err)
+	}
+	if err := restrictArchivePermissions(filepath.Join(dir, "archive")); err != nil {
+		return nil, err
 	}
 
 	path := filepath.Join(dir, "current.jsonl")
@@ -54,9 +60,13 @@ func Open(dir string) (*Store, error) {
 	}
 
 	// 以 append 模式打开文件句柄
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("session: open file %s: %w", path, err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("session: restrict file %s: %w", path, err)
 	}
 
 	s := &Store{
@@ -269,6 +279,8 @@ func (s *Store) Compact(coveredFrom, coveredTo, summary string) error {
 		cloneID := NewMsgID()
 		cloneRec := newMsgRecord(cloneID, prevClone, orig.Msg.Role, orig.Msg.Content,
 			orig.Msg.ToolCalls, orig.Msg.ToolCallID, origID, now)
+		cloneRec.Msg.Thinking = orig.Msg.Thinking
+		cloneRec.Msg.Custom = orig.Msg.Custom
 		if err := s.appendRecord(cloneRec); err != nil {
 			return fmt.Errorf("session: append clone %s: %w", cloneID, err)
 		}
@@ -441,8 +453,11 @@ func (s *Store) Archive() error {
 
 	// 创建 archive 目录
 	archiveDir := filepath.Join(s.dir, "archive")
-	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+	if err := os.MkdirAll(archiveDir, 0o700); err != nil {
 		return fmt.Errorf("session: create archive dir: %w", err)
+	}
+	if err := os.Chmod(archiveDir, 0o700); err != nil {
+		return fmt.Errorf("session: restrict archive dir: %w", err)
 	}
 
 	// rename current.jsonl → archive/<unix_nano>.jsonl
@@ -453,9 +468,13 @@ func (s *Store) Archive() error {
 	}
 
 	// 重开空文件
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("session: reopen after archive: %w", err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return fmt.Errorf("session: restrict reopened file: %w", err)
 	}
 	s.file = f
 	s.recs = nil
@@ -466,6 +485,28 @@ func (s *Store) Archive() error {
 }
 
 // ── 内部辅助 ──────────────────────────────────────────────────────────
+
+func restrictArchivePermissions(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("session: read archive dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("session: restrict archive dir: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if err := os.Chmod(filepath.Join(dir, entry.Name()), 0o600); err != nil {
+			return fmt.Errorf("session: restrict archive file %s: %w", entry.Name(), err)
+		}
+	}
+	return nil
+}
 
 // appendRecord 将一条记录序列化后追加到文件末尾并 fsync。
 // 调用方必须持有 s.mu。

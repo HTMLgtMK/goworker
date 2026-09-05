@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/tinguo/goworker/ai-core/core"
@@ -88,111 +90,179 @@ func (p *AgentPlugin) handleNew(ctx *plugin.Context) error {
 // ---- /model 命令 ----
 
 func (p *AgentPlugin) handleModel(ctx *plugin.Context) error {
-	args := ctx.Args
-
-	if len(args) == 0 {
+	if len(ctx.Args) == 0 {
 		p.showConfig(ctx)
 		return nil
 	}
-
-	switch args[0] {
-	case "help":
-		ctx.Writer("用法:\n")
-		ctx.Writer("  /model            — 查看当前配置\n")
-		ctx.Writer("  /model set <k>=<v> — 设置配置\n")
-		ctx.Writer("  可用 key: endpoint, model, api_key, context_window, compress_at, compact_keep, max_iterations, sandbox_mode\n")
-		ctx.Writer("  context_window: 模型上下文窗口，如 32768 / 32k / 128k\n")
-		ctx.Writer("  compress_at: 历史压缩触发阈值（0-1），用量达窗口该比例自动压缩，0 关闭\n")
-		ctx.Writer("  compact_keep: 滚动压缩保留的最近消息条数\n")
-		ctx.Writer("  max_iterations: ReAct 循环最大迭代数（模型往返次数），0 = 默认 15\n")
-		ctx.Writer("  sandbox_mode: off, normal, strict, readonly\n")
-
-	case "set":
-		if len(args) < 2 {
-			ctx.Writer("用法: /model set <key>=<value>\n")
+	switch ctx.Args[0] {
+	case "list":
+		names := make([]string, 0, len(p.cfg.LLM.Providers))
+		for name := range p.cfg.LLM.Providers {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			marker := " "
+			if name == p.cfg.LLM.DefaultProvider {
+				marker = "*"
+			}
+			provider := p.cfg.LLM.Providers[name]
+			ctx.Writer(fmt.Sprintf("%s %s (%s, %s)\n", marker, name, provider.Type, provider.Model))
+		}
+	case "use":
+		if len(ctx.Args) != 2 {
+			ctx.Writer("用法: /model use <provider>\n")
 			return nil
 		}
-		kv := strings.SplitN(args[1], "=", 2)
-		if len(kv) != 2 {
-			ctx.Writer("格式错误，示例: /model set endpoint=http://localhost:8000/v1\n")
+		candidate := *p.cfg
+		candidate.LLM = p.cfg.LLM.Clone()
+		candidate.LLM.DefaultProvider = ctx.Args[1]
+		if err := candidate.LLM.Validate(); err != nil {
+			ctx.Writer(fmt.Sprintf("✘ %v\n", err))
 			return nil
 		}
-		key, val := kv[0], kv[1]
-
-		cfg := p.cfg
-		switch key {
-		case "endpoint":
-			cfg.LLM.Endpoint = val
-		case "model":
-			cfg.LLM.Model = val
-		case "api_key":
-			cfg.LLM.APIKey = val
-		case "context_window":
-			n, err := runtimeconfig.ParseContextWindow(val)
-			if err != nil {
-				ctx.Writer(fmt.Sprintf("✘ %v\n", err))
-				return nil
-			}
-			cfg.LLM.ContextWindow = n
-		// compress_at/compact_keep 委托 SetField，校验与 /config 单一来源
-		case "compress_at":
-			f, err := runtimeconfig.ParseCompressAt(val)
-			if err != nil {
-				ctx.Writer(fmt.Sprintf("✘ %v\n", err))
-				return nil
-			}
-			cfg.LLM.CompressAt = f
-		case "compact_keep":
-			n, err := runtimeconfig.ParseCompactKeep(val)
-			if err != nil {
-				ctx.Writer(fmt.Sprintf("✘ %v\n", err))
-				return nil
-			}
-			cfg.LLM.CompactKeep = n
-		case "max_iterations":
-			n, err := runtimeconfig.ParseMaxIterations(val)
-			if err != nil {
-				ctx.Writer(fmt.Sprintf("✘ %v\n", err))
-				return nil
-			}
-			cfg.LLM.MaxIterations = n
-		case "sandbox_mode":
-			cfg.Sandbox.Mode = val
-		default:
-			ctx.Writer(fmt.Sprintf("未知配置项: %s（可用: endpoint, model, api_key, context_window, compress_at, compact_keep, max_iterations, sandbox_mode）\n", key))
-			return nil
-		}
-
-		if err := p.hub.SaveConfig(cfg); err != nil {
+		if err := p.hub.SaveConfig(&candidate); err != nil {
 			ctx.Writer(fmt.Sprintf("✘ 保存失败: %v\n", err))
 			return nil
 		}
-		ctx.Writer(fmt.Sprintf("✔ %s 已更新\n", key))
-
+		ctx.Writer(fmt.Sprintf("✔ 已切换到 provider %s\n", ctx.Args[1]))
+	case "set":
+		if len(ctx.Args) != 2 {
+			ctx.Writer("用法: /model set <key>=<value>\n")
+			return nil
+		}
+		kv := strings.SplitN(ctx.Args[1], "=", 2)
+		if len(kv) != 2 {
+			ctx.Writer("格式错误，示例: /model set model=gpt-4o\n")
+			return nil
+		}
+		candidate := *p.cfg
+		candidate.LLM = p.cfg.LLM.Clone()
+		if err := setModelField(&candidate, kv[0], kv[1]); err != nil {
+			ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+			return nil
+		}
+		if err := p.hub.SaveConfig(&candidate); err != nil {
+			ctx.Writer(fmt.Sprintf("✘ 保存失败: %v\n", err))
+			return nil
+		}
+		ctx.Writer(fmt.Sprintf("✔ %s 已更新\n", kv[0]))
+	case "help":
+		ctx.Writer("用法: /model | /model list | /model use <provider> | /model set <key>=<value>\n")
+		ctx.Writer("Provider 字段: endpoint, model, api_key, context_window, thinking_request_mode, thinking_effort, auth_type, max_tokens\n")
+		ctx.Writer("全局字段: global.compress_at, global.compact_keep, global.max_iterations, global.thinking_show\n")
 	default:
 		ctx.Writer("未知子命令，使用 /model help 查看用法\n")
 	}
-
 	return nil
 }
 
-func (p *AgentPlugin) showConfig(ctx *plugin.Context) {
-	cfg := p.cfg
-	keyDisplay := cfg.LLM.APIKey
-	if keyDisplay != "" {
-		keyDisplay = "***"
-	} else {
-		keyDisplay = "(未设置)"
+func setModelField(cfg *runtimeconfig.Config, key, value string) error {
+	if strings.HasPrefix(key, "global.") {
+		switch strings.TrimPrefix(key, "global.") {
+		case "compress_at":
+			parsed, err := runtimeconfig.ParseCompressAt(value)
+			if err != nil {
+				return err
+			}
+			cfg.LLM.CompressAt = parsed
+		case "compact_keep":
+			parsed, err := runtimeconfig.ParseCompactKeep(value)
+			if err != nil {
+				return err
+			}
+			cfg.LLM.CompactKeep = parsed
+		case "max_iterations":
+			parsed, err := runtimeconfig.ParseMaxIterations(value)
+			if err != nil {
+				return err
+			}
+			cfg.LLM.MaxIterations = parsed
+		case "thinking_show":
+			parsed, err := runtimeconfig.ParseThinkingShow(value)
+			if err != nil {
+				return err
+			}
+			cfg.LLM.Thinking.Show = parsed
+		default:
+			return fmt.Errorf("未知全局配置项: %s", key)
+		}
+		return cfg.LLM.Validate()
 	}
+	providerName := cfg.LLM.DefaultProvider
+	provider := cfg.LLM.Providers[providerName]
+	switch key {
+	case "endpoint":
+		provider.Endpoint = value
+	case "model":
+		provider.Model = value
+	case "api_key":
+		provider.APIKey = value
+	case "context_window":
+		parsed, err := runtimeconfig.ParseContextWindow(value)
+		if err != nil {
+			return err
+		}
+		provider.ContextWindow = parsed
+	case "thinking_request_mode":
+		parsed, err := runtimeconfig.ParseThinkingRequestMode(value)
+		if err != nil {
+			return err
+		}
+		provider.Thinking.RequestMode = parsed
+	case "thinking_effort":
+		parsed, err := runtimeconfig.ParseThinkingEffort(value)
+		if err != nil {
+			return err
+		}
+		provider.Thinking.Effort = parsed
+	case "auth_type":
+		provider.AuthType = runtimeconfig.AnthropicAuthType(value)
+	case "max_tokens":
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			return fmt.Errorf("无效 max_tokens: %s", value)
+		}
+		provider.MaxTokens = parsed
+	default:
+		return fmt.Errorf("未知 provider 配置项: %s", key)
+	}
+	cfg.LLM.Providers[providerName] = provider
+	return cfg.LLM.Validate()
+}
 
-	ctx.Writer(fmt.Sprintf("Endpoint:      %s\n", cfg.LLM.Endpoint))
-	ctx.Writer(fmt.Sprintf("Model:         %s\n", cfg.LLM.Model))
-	ctx.Writer(fmt.Sprintf("API Key:       %s\n", keyDisplay))
-	ctx.Writer(fmt.Sprintf("Context Window: %d\n", cfg.LLM.ContextWindow))
-	ctx.Writer(fmt.Sprintf("Compress At:    %v\n", cfg.LLM.CompressAt))
-	ctx.Writer(fmt.Sprintf("Compact Keep:   %d\n", cfg.LLM.CompactKeep))
-	ctx.Writer(fmt.Sprintf("Max Iterations: %d\n", cfg.LLM.MaxIterations))
-	ctx.Writer(fmt.Sprintf("Sandbox Mode:  %s\n", cfg.Sandbox.Mode))
+func (p *AgentPlugin) showConfig(ctx *plugin.Context) {
+	name, provider, err := p.cfg.LLM.ResolveDefault()
+	if err != nil {
+		ctx.Writer(fmt.Sprintf("✘ Provider 配置错误: %v\n", err))
+		return
+	}
+	keyDisplay := "(未设置)"
+	if provider.APIKey != "" {
+		keyDisplay = "***"
+	}
+	ctx.Writer(fmt.Sprintf("Provider:       %s (%s)\n", name, provider.Type))
+	ctx.Writer(fmt.Sprintf("Endpoint:       %s\n", provider.Endpoint))
+	ctx.Writer(fmt.Sprintf("Model:          %s\n", provider.Model))
+	ctx.Writer(fmt.Sprintf("API Key:        %s\n", keyDisplay))
+	ctx.Writer(fmt.Sprintf("Context Window: %d\n", provider.ContextWindow))
+	ctx.Writer(fmt.Sprintf("Compress At:    %v\n", p.cfg.LLM.CompressAt))
+	ctx.Writer(fmt.Sprintf("Compact Keep:   %d\n", p.cfg.LLM.CompactKeep))
+	ctx.Writer(fmt.Sprintf("Max Iterations: %d\n", p.cfg.LLM.MaxIterations))
+	ctx.Writer(fmt.Sprintf("Thinking Show:  %t\n", p.cfg.LLM.Thinking.Show))
+	if provider.Type == runtimeconfig.ProviderTypeOpenAI {
+		ctx.Writer(fmt.Sprintf("Thinking Mode:  %s\n", provider.Thinking.RequestMode))
+		ctx.Writer(fmt.Sprintf("Thinking Effort: %s\n", provider.Thinking.Effort))
+	}
+	ctx.Writer(fmt.Sprintf("Sandbox Mode:   %s\n", p.cfg.Sandbox.Mode))
+}
+
+func selectedContextWindow(cfg *runtimeconfig.Config) int {
+	_, provider, err := cfg.LLM.ResolveDefault()
+	if err != nil {
+		return 0
+	}
+	return provider.ContextWindow
 }
 
 // ---- /usage 命令 ----
@@ -226,7 +296,7 @@ func (p *AgentPlugin) handleUsage(ctx *plugin.Context) error {
 		ctx.Writer(totalLine + "\n")
 
 		// context usage uses "last prompt / window" — the final ReAct request already holds all history
-		if w := p.cfg.LLM.ContextWindow; w > 0 && total.LastPromptTokens > 0 {
+		if w := selectedContextWindow(p.cfg); w > 0 && total.LastPromptTokens > 0 {
 			pct := float64(total.LastPromptTokens) / float64(w) * 100
 			ctx.Writer(fmt.Sprintf("  context: %.2f%% (last in %s / window %s)\n",
 				pct, runtimeagent.Humanize(total.LastPromptTokens), runtimeagent.Humanize(w)))
@@ -250,7 +320,7 @@ func (p *AgentPlugin) handleUsage(ctx *plugin.Context) error {
 	if convLen := len(conv); convLen > 0 {
 		convEst := core.EstimateTokens(conv)
 		line := fmt.Sprintf("  history: %s est (%d msgs)", runtimeagent.Humanize(convEst), convLen)
-		if w := p.cfg.LLM.ContextWindow; w > 0 {
+		if w := selectedContextWindow(p.cfg); w > 0 {
 			line += fmt.Sprintf(", %.2f%% of window", float64(convEst)/float64(w)*100)
 		}
 		ctx.Writer(line + "\n")
