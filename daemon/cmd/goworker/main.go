@@ -43,8 +43,22 @@ func runACPWorker() {
 	defer log.Close()
 	slog.SetDefault(log.Logger)
 
+	// 沙箱下发：dispatcher 侧可经 worker 的 env 配置收紧无人值守 worker 的命令门禁，
+	// 如 env: ["GOWORKER_SANDBOX_MODE=strict"]。取值与 sandbox 模式一致，非法值拒绝启动。
+	runtimeCfg := cfg.ToRuntime()
+	if mode := os.Getenv("GOWORKER_SANDBOX_MODE"); mode != "" {
+		switch mode {
+		case "normal", "strict", "readonly", "off":
+			runtimeCfg.Sandbox.Mode = mode
+		default:
+			fmt.Fprintf(os.Stderr, "invalid GOWORKER_SANDBOX_MODE %q (normal|strict|readonly|off)\n", mode)
+			os.Exit(1)
+		}
+		slog.Info("acp worker: sandbox mode overridden", "mode", mode)
+	}
+
 	server := agent.ServeACPWorker(agent.Stdio(), agent.ACPWorkerDeps{
-		Config:   cfg.ToRuntime(),
+		Config:   runtimeCfg,
 		AuditDir: filepath.Join(config.DefaultDir(), "audit"),
 	})
 	// 阻塞到对端关闭输入（dispatcher spawn 的子进程随任务结束被回收）

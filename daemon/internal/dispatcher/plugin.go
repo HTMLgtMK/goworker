@@ -69,6 +69,7 @@ func (p *DispatcherPlugin) Init(h *plugin.Hub) error {
 	}
 	p.store = store
 	p.orch = dispatch.NewOrchestrator(store)
+	p.resumeInterrupted()
 	p.orch.SetStatusListener(func(t *task.Task, from, to task.Status) {
 		p.notifyStatus(t, from, to)
 	})
@@ -107,6 +108,19 @@ func (p *DispatcherPlugin) Init(h *plugin.Hub) error {
 		Description: "查看已配置的 ACP worker 清单",
 		Handler:     p.handleWorkers,
 	})
+}
+
+// resumeInterrupted 重启恢复：store 里停在 queued/dispatching/working 的任务
+// 全部重新派发。working 任务带 WorkerSession 时 orchestrator 优先 session/load
+// 续接 worker 上下文（能力协商失败则降级重跑）。
+func (p *DispatcherPlugin) resumeInterrupted() {
+	for _, t := range p.store.List() {
+		if t.Status.Terminal() || t.Status == task.StatusAwaitingReview {
+			continue // awaiting_review 等人审批，不需要重派
+		}
+		slog.Info("dispatcher: resuming interrupted task", "task", t.ID, "status", t.Status)
+		p.launch(&t, p.runOptions(t.Worker)...)
+	}
 }
 
 // SetOpener 注入 worker 连接方式（测试用）。
@@ -187,52 +201,111 @@ func (h *acpIngress) cwd(sessionID string) string {
 	return h.sessions[sessionID]
 }
 
+// Run 处理一回合提交。除同步派发外支持控制指令（外部编排无需长连接）：
+//
+//	--detach <prompt>       异步入队即返回（提交方断连不影响任务）
+//	--ls [status]           任务列表
+//	--status <task_id>      任务详情快照
+//	--approve <task_id>     审批通过（code 任务尝试 ff 合并）
+//	--complete <task_id>    人工合并后收尾
+//	--reject <task_id>      拒绝
+//	--cancel <task_id>      取消
 func (h *acpIngress) Run(ctx context.Context, sessionID, prompt string, rep dispatch.Reporter) (string, error) {
 	p := h.plugin
 	cwd := h.cwd(sessionID)
 	if cwd == "" {
 		return "", statusError("missing session cwd")
 	}
+	write := func(text string) { rep.MessageChunk(sessionID, text) }
+	trim := strings.TrimSpace
 
-	worker, err := p.cfg.Dispatch.ResolveDefaultWorker()
-	if err != nil {
-		return "", err
+	switch {
+	case trim(prompt) == "" || strings.HasPrefix(trim(prompt), "#"):
+		return "", statusError("empty prompt")
+	case strings.HasPrefix(prompt, "--detach "):
+		return h.detach(ctx, sessionID, cwd, trim(strings.TrimPrefix(prompt, "--detach ")), rep)
+	case prompt == "--ls" || strings.HasPrefix(prompt, "--ls "):
+		p.doList(trim(strings.TrimPrefix(prompt, "--ls")), write)
+		return protocol.StopEndTurn, nil
+	case strings.HasPrefix(prompt, "--status "):
+		p.doShow(trim(strings.TrimPrefix(prompt, "--status ")), write)
+		return protocol.StopEndTurn, nil
+	case strings.HasPrefix(prompt, "--approve "):
+		p.doApprove(ctx, trim(strings.TrimPrefix(prompt, "--approve ")), write)
+		return protocol.StopEndTurn, nil
+	case strings.HasPrefix(prompt, "--complete "):
+		p.doComplete(ctx, trim(strings.TrimPrefix(prompt, "--complete ")), write)
+		return protocol.StopEndTurn, nil
+	case strings.HasPrefix(prompt, "--reject "):
+		p.doReject(ctx, trim(strings.TrimPrefix(prompt, "--reject ")), write)
+		return protocol.StopEndTurn, nil
+	case strings.HasPrefix(prompt, "--cancel "):
+		p.doCancel(ctx, trim(strings.TrimPrefix(prompt, "--cancel ")), write)
+		return protocol.StopEndTurn, nil
+	case strings.HasPrefix(trim(prompt), "--"):
+		return "", statusError(fmt.Sprintf("unknown directive %q (detach/ls/status/approve/complete/reject/cancel)", trim(prompt)))
 	}
+	return h.dispatchSync(ctx, sessionID, cwd, prompt, rep)
+}
+
+// newTaskFromIngress 按 cwd 判型创建任务（不落盘，orchestrator 首次 save 负责）。
+func (p *DispatcherPlugin) newTaskFromIngress(cwd, worker, prompt string) *task.Task {
 	kind := task.KindCode
-	if !dispatch.DetectGit(ctx, cwd) {
+	if !dispatch.DetectGit(context.Background(), cwd) {
 		kind = task.KindGeneral
 	}
 	now := time.Now()
-	t := &task.Task{
-		ID:        task.NewID(),
-		Source:    "acp",
-		Kind:      kind,
-		Prompt:    prompt,
-		Repo:      cwd,
-		Worker:    worker,
-		Status:    task.StatusQueued,
-		CreatedAt: now,
-		UpdatedAt: now,
+	return &task.Task{
+		ID: task.NewID(), Source: "acp", Kind: kind, Prompt: prompt,
+		Repo: cwd, Worker: worker, Status: task.StatusQueued,
+		CreatedAt: now, UpdatedAt: now,
 	}
-	// 入队落盘由 orchestrator 首次 save 完成（并触发 queued 状态事件）
+}
+
+// detach 异步入队：注册进度路由的副本无效（无人在连接上看），任务照常广播
+// task_status/task_progress 事件；prompt 立即返回 task ID，提交方可安全断连，
+// 之后用 --status 查询、--approve/--reject 审批（补偿接口）。
+func (h *acpIngress) detach(ctx context.Context, sessionID, cwd, prompt string, rep dispatch.Reporter) (string, error) {
+	p := h.plugin
+	worker, ok := p.resolveWorker("", prompt, func(string) {})
+	if !ok {
+		return "", statusError("no worker configured")
+	}
+	t := p.newTaskFromIngress(cwd, worker, prompt)
+	p.audit("acp-submit", t.ID, cwd+" (detach)")
+	p.launch(t, p.runOptions(worker)...)
+	rep.MessageChunk(sessionID, fmt.Sprintf("任务 %s 已异步入队（%s），可用 --status %s 查询", t.ID, t.Kind, t.ID))
+	return protocol.StopEndTurn, nil
+}
+
+// dispatchSync 同步派发：连接存续期间跑完任务，进度实时回流。
+func (h *acpIngress) dispatchSync(ctx context.Context, sessionID, cwd, prompt string, rep dispatch.Reporter) (string, error) {
+	p := h.plugin
+	worker, ok := p.resolveWorker("", prompt, func(string) {})
+	if !ok {
+		return "", statusError("no worker configured")
+	}
+	t := p.newTaskFromIngress(cwd, worker, prompt)
 
 	// 进度路由：orchestrator 的全局 ProgressFunc 按 taskID 转回本连接
-	p.mu.Lock()
-	p.acpRoutes[t.ID] = acpRoute{server: rep.(*dispatch.Server), sessionID: sessionID}
-	p.mu.Unlock()
-	defer func() {
+	if server, ok := rep.(*dispatch.Server); ok {
 		p.mu.Lock()
-		delete(p.acpRoutes, t.ID)
+		p.acpRoutes[t.ID] = acpRoute{server: server, sessionID: sessionID}
 		p.mu.Unlock()
-	}()
+		defer func() {
+			p.mu.Lock()
+			delete(p.acpRoutes, t.ID)
+			p.mu.Unlock()
+		}()
+	}
 
 	p.audit("acp-submit", t.ID, cwd)
-	outcome, err := p.orch.Run(ctx, t, p.workerSpec(worker))
+	outcome, err := p.orch.Run(ctx, t, p.workerSpec(worker), p.runOptions(worker)...)
 	if err != nil {
 		return "", err
 	}
 	if len(outcome.Task.Commits) > 0 {
-		rep.MessageChunk(sessionID, fmt.Sprintf("任务完成，产出 %d 个 commit，等待审批（/dispatch approve %s）",
+		rep.MessageChunk(sessionID, fmt.Sprintf("任务完成，产出 %d 个 commit，等待审批（--approve %s）",
 			len(outcome.Task.Commits), t.ID))
 	}
 	return outcome.StopReason, nil
@@ -282,12 +355,8 @@ func (p *DispatcherPlugin) handleDispatch(ctx *plugin.Context) error {
 		return p.handleCancel(ctx, args[1])
 	}
 
-	// 加任务：[/worker|--general] 前缀 + prompt
-	worker, err := p.cfg.Dispatch.ResolveDefaultWorker()
-	if err != nil {
-		ctx.Writer("✘ " + err.Error() + "\n")
-		return nil
-	}
+	// 加任务：[/worker|--general] 前缀 + prompt；未显式指定 worker 时走关键词路由
+	worker := ""
 	general := false
 	promptArgs := args
 	for len(promptArgs) > 0 {
@@ -308,11 +377,27 @@ func (p *DispatcherPlugin) handleDispatch(ctx *plugin.Context) error {
 		p.writeUsage(ctx)
 		return nil
 	}
-	if _, ok := p.cfg.Dispatch.Worker(worker); !ok {
-		ctx.Writer(fmt.Sprintf("✘ worker %q 未配置（/workers 查看）\n", worker))
-		return nil
-	}
 	return p.addTask(ctx, worker, general, strings.Join(promptArgs, " "))
+}
+
+// resolveWorker 派发 worker：显式指定 > 关键词路由 > default_worker。
+func (p *DispatcherPlugin) resolveWorker(explicit, prompt string, write func(string)) (string, bool) {
+	if explicit != "" {
+		if _, ok := p.cfg.Dispatch.Worker(explicit); !ok {
+			write(fmt.Sprintf("✘ worker %q 未配置（/workers 查看）\n", explicit))
+			return "", false
+		}
+		return explicit, true
+	}
+	if name, ok := p.cfg.Dispatch.MatchWorker(prompt); ok {
+		return name, true
+	}
+	name, err := p.cfg.Dispatch.ResolveDefaultWorker()
+	if err != nil {
+		write("✘ " + err.Error() + "\n")
+		return "", false
+	}
+	return name, true
 }
 
 func (p *DispatcherPlugin) writeUsage(ctx *plugin.Context) {
@@ -329,10 +414,14 @@ func (p *DispatcherPlugin) writeUsage(ctx *plugin.Context) {
 `)
 }
 
-func (p *DispatcherPlugin) addTask(ctx *plugin.Context, worker string, general bool, prompt string) error {
+func (p *DispatcherPlugin) addTask(ctx *plugin.Context, explicitWorker string, general bool, prompt string) error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
+	}
+	worker, ok := p.resolveWorker(explicitWorker, prompt, ctx.Writer)
+	if !ok {
+		return nil
 	}
 	kind := task.KindCode
 	if general || !dispatch.DetectGit(ctx.Ctx, cwd) {
@@ -363,7 +452,7 @@ func (p *DispatcherPlugin) addTask(ctx *plugin.Context, worker string, general b
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	p.launch(t)
+	p.launch(t, p.runOptions(worker)...)
 	// 入队落盘由 orchestrator 首次 save 完成（并触发 queued 状态事件）
 	ctx.Writer(fmt.Sprintf("⏳ 任务 %s 已入队（%s → %s worker）\n", t.ID, kind, worker))
 	return nil
@@ -392,8 +481,29 @@ func (p *DispatcherPlugin) updateTask(t *task.Task) error {
 	return nil
 }
 
+// runOptions 按 worker 配置生成派发选项：无人值守权限应答策略。
+func (p *DispatcherPlugin) runOptions(worker string) []dispatch.RunOption {
+	w, ok := p.cfg.Dispatch.Worker(worker)
+	if !ok || w.OnPermission != "allow" {
+		return nil // 默认拒绝
+	}
+	return []dispatch.RunOption{dispatch.WithPermissionPolicy(
+		func(_ context.Context, req protocol.PermissionRequest) (string, error) {
+			for _, opt := range req.Options {
+				if strings.Contains(opt.Kind, "allow") {
+					return opt.OptionID, nil
+				}
+			}
+			if len(req.Options) > 0 {
+				return req.Options[0].OptionID, nil
+			}
+			return "", fmt.Errorf("worker requested permission with no options")
+		},
+	)}
+}
+
 // launch 后台执行任务。orchestrator 负责状态机流转与 worktree 清理。
-func (p *DispatcherPlugin) launch(t *task.Task) {
+func (p *DispatcherPlugin) launch(t *task.Task, opts ...dispatch.RunOption) {
 	runCtx, cancel := context.WithCancel(context.Background())
 	p.mu.Lock()
 	p.running[t.ID] = cancel
@@ -409,7 +519,7 @@ func (p *DispatcherPlugin) launch(t *task.Task) {
 		}()
 
 		spec := p.workerSpec(t.Worker)
-		outcome, err := p.orch.Run(runCtx, t, spec)
+		outcome, err := p.orch.Run(runCtx, t, spec, opts...)
 		if err != nil {
 			slog.Warn("dispatch task ended", "task", t.ID, "err", err)
 			return
@@ -431,97 +541,116 @@ func (p *DispatcherPlugin) handleList(ctx *plugin.Context, args []string) error 
 	if len(args) > 0 {
 		filter = args[0]
 	}
+	p.doList(filter, ctx.Writer)
+	return nil
+}
+
+func (p *DispatcherPlugin) doList(filter string, write func(string)) {
 	tasks := p.store.List()
 	if len(tasks) == 0 {
-		ctx.Writer("（暂无任务）\n")
-		return nil
+		write("（暂无任务）\n")
+		return
 	}
 	for _, t := range tasks {
 		if filter != "" && string(t.Status) != filter {
 			continue
 		}
-		line := fmt.Sprintf("%s  %-15s %-8s %-8s %s\n", t.ID, t.Status, t.Kind, t.Worker, truncate(t.Prompt, 48))
-		ctx.Writer(line)
+		write(fmt.Sprintf("%s  %-15s %-8s %-8s %s\n", t.ID, t.Status, t.Kind, t.Worker, truncate(t.Prompt, 48)))
 	}
-	return nil
 }
 
 func (p *DispatcherPlugin) handleShow(ctx *plugin.Context, id string) error {
+	p.doShow(id, ctx.Writer)
+	return nil
+}
+
+func (p *DispatcherPlugin) doShow(id string, write func(string)) {
 	t, ok := p.store.Get(id)
 	if !ok {
-		ctx.Writer(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
-		return nil
+		write(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
+		return
 	}
 	data, _ := json.MarshalIndent(t, "", "  ")
-	ctx.Writer(string(data) + "\n")
-	return nil
+	write(string(data) + "\n")
 }
 
 // handleApprove 审批通过：code 任务尝试 ff 合并（失败则提示走人工 complete），
 // general 任务直接标记完成。
 func (p *DispatcherPlugin) handleApprove(ctx *plugin.Context, id string) error {
+	p.doApprove(ctx.Ctx, id, ctx.Writer)
+	return nil
+}
+
+func (p *DispatcherPlugin) doApprove(execCtx context.Context, id string, write func(string)) {
 	t, ok := p.store.Get(id)
 	if !ok {
-		ctx.Writer(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
-		return nil
+		write(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
+		return
 	}
 	if t.Status != task.StatusAwaitingReview {
-		ctx.Writer(fmt.Sprintf("✘ 任务 %s 状态为 %s，仅 awaiting_review 可审批\n", id, t.Status))
-		return nil
+		write(fmt.Sprintf("✘ 任务 %s 状态为 %s，仅 awaiting_review 可审批\n", id, t.Status))
+		return
 	}
 	p.audit("approve", t.ID, "")
 
 	if t.Kind == task.KindGeneral {
 		if err := t.Transition(task.StatusDone); err != nil {
-			return err
+			write(fmt.Sprintf("✘ %v\n", err))
+			return
 		}
 		if err := p.updateTask(&t); err != nil {
-			return err
+			write(fmt.Sprintf("✘ %v\n", err))
+			return
 		}
-		ctx.Writer(fmt.Sprintf("✔ 任务 %s 已完成\n", id))
-		return nil
+		write(fmt.Sprintf("✔ 任务 %s 已完成\n", id))
+		return
 	}
 
 	// code 任务：ff 合并进派发时的分支头
 	if out, err := gitMergeFF(t.Repo, t.Branch); err != nil {
-		ctx.Writer(fmt.Sprintf("✘ ff 合并失败（可能有分叉或冲突）：\n%s\n请人工合并后执行 /dispatch complete %s\n", strings.TrimSpace(out), id))
-		return nil
+		write(fmt.Sprintf("✘ ff 合并失败（可能有分叉或冲突）：\n%s\n请人工合并后执行 /dispatch complete %s\n", strings.TrimSpace(out), id))
+		return
 	}
-	if err := p.finishCodeTask(ctx, &t, "approved"); err != nil {
-		return err
+	if err := p.finishCodeTask(execCtx, &t, "approved"); err != nil {
+		write(fmt.Sprintf("✘ %v\n", err))
+		return
 	}
-	ctx.Writer(fmt.Sprintf("✔ 任务 %s 已合并并完成\n", id))
-	return nil
+	write(fmt.Sprintf("✔ 任务 %s 已合并并完成\n", id))
 }
 
 // handleComplete 人工合并后的收尾：清 worktree + 分支，标记 done。
 func (p *DispatcherPlugin) handleComplete(ctx *plugin.Context, id string) error {
-	snapshot, ok := p.store.Get(id)
-	if !ok || snapshot.Kind != task.KindCode {
-		ctx.Writer(fmt.Sprintf("✘ code 任务 %s 不存在\n", id))
-		return nil
-	}
-	t := snapshot
-	if t.Status != task.StatusAwaitingReview {
-		ctx.Writer(fmt.Sprintf("✘ 任务 %s 状态为 %s，仅 awaiting_review 可收尾\n", id, t.Status))
-		return nil
-	}
-	p.audit("complete", t.ID, "")
-	if err := p.finishCodeTask(ctx, &t, "merged-manually"); err != nil {
-		return err
-	}
-	ctx.Writer(fmt.Sprintf("✔ 任务 %s 已收尾完成\n", id))
+	p.doComplete(ctx.Ctx, id, ctx.Writer)
 	return nil
 }
 
-func (p *DispatcherPlugin) finishCodeTask(ctx *plugin.Context, t *task.Task, via string) error {
+func (p *DispatcherPlugin) doComplete(execCtx context.Context, id string, write func(string)) {
+	snapshot, ok := p.store.Get(id)
+	if !ok || snapshot.Kind != task.KindCode {
+		write(fmt.Sprintf("✘ code 任务 %s 不存在\n", id))
+		return
+	}
+	t := snapshot
+	if t.Status != task.StatusAwaitingReview {
+		write(fmt.Sprintf("✘ 任务 %s 状态为 %s，仅 awaiting_review 可收尾\n", id, t.Status))
+		return
+	}
+	p.audit("complete", t.ID, "")
+	if err := p.finishCodeTask(execCtx, &t, "merged-manually"); err != nil {
+		write(fmt.Sprintf("✘ %v\n", err))
+		return
+	}
+	write(fmt.Sprintf("✔ 任务 %s 已收尾完成\n", id))
+}
+
+func (p *DispatcherPlugin) finishCodeTask(execCtx context.Context, t *task.Task, via string) error {
 	if err := t.Transition(task.StatusMerging); err != nil {
 		return err
 	}
 	if err := p.updateTask(t); err != nil {
 		return err
 	}
-	_ = dispatch.RemoveWorktree(ctx.Ctx, t.Repo, t.Worktree, t.Branch, true)
+	_ = dispatch.RemoveWorktree(execCtx, t.Repo, t.Worktree, t.Branch, true)
 	if err := t.Transition(task.StatusDone); err != nil {
 		return err
 	}
@@ -531,40 +660,51 @@ func (p *DispatcherPlugin) finishCodeTask(ctx *plugin.Context, t *task.Task, via
 
 // handleReject 拒绝任务：code 任务弃置 worktree 与分支。
 func (p *DispatcherPlugin) handleReject(ctx *plugin.Context, id string) error {
+	p.doReject(ctx.Ctx, id, ctx.Writer)
+	return nil
+}
+
+func (p *DispatcherPlugin) doReject(execCtx context.Context, id string, write func(string)) {
 	t, ok := p.store.Get(id)
 	if !ok {
-		ctx.Writer(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
-		return nil
+		write(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
+		return
 	}
 	if t.Status != task.StatusAwaitingReview {
-		ctx.Writer(fmt.Sprintf("✘ 任务 %s 状态为 %s，仅 awaiting_review 可拒绝\n", id, t.Status))
-		return nil
+		write(fmt.Sprintf("✘ 任务 %s 状态为 %s，仅 awaiting_review 可拒绝\n", id, t.Status))
+		return
 	}
 	if err := t.Transition(task.StatusRejected); err != nil {
-		return err
+		write(fmt.Sprintf("✘ %v\n", err))
+		return
 	}
 	if err := p.updateTask(&t); err != nil {
-		return err
+		write(fmt.Sprintf("✘ %v\n", err))
+		return
 	}
 	if t.Kind == task.KindCode && t.Worktree != "" {
-		_ = dispatch.RemoveWorktree(ctx.Ctx, t.Repo, t.Worktree, t.Branch, true)
+		_ = dispatch.RemoveWorktree(execCtx, t.Repo, t.Worktree, t.Branch, true)
 	}
 	p.audit("reject", t.ID, "")
-	ctx.Writer(fmt.Sprintf("✘ 任务 %s 已拒绝，产物已清理\n", id))
-	return nil
+	write(fmt.Sprintf("✘ 任务 %s 已拒绝，产物已清理\n", id))
 }
 
 // handleCancel 取消任务：运行中的取消 ctx（orchestrator 落 cancelled），
 // 排队/待审的直接流转。
 func (p *DispatcherPlugin) handleCancel(ctx *plugin.Context, id string) error {
+	p.doCancel(ctx.Ctx, id, ctx.Writer)
+	return nil
+}
+
+func (p *DispatcherPlugin) doCancel(execCtx context.Context, id string, write func(string)) {
 	t, ok := p.store.Get(id)
 	if !ok {
-		ctx.Writer(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
-		return nil
+		write(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
+		return
 	}
 	if t.Status.Terminal() {
-		ctx.Writer(fmt.Sprintf("✘ 任务 %s 已是终态 %s\n", id, t.Status))
-		return nil
+		write(fmt.Sprintf("✘ 任务 %s 已是终态 %s\n", id, t.Status))
+		return
 	}
 
 	p.mu.Lock()
@@ -573,22 +713,22 @@ func (p *DispatcherPlugin) handleCancel(ctx *plugin.Context, id string) error {
 	if running {
 		p.audit("cancel", t.ID, "running")
 		cancel()
-		ctx.Writer(fmt.Sprintf("⏳ 任务 %s 取消中（worker 中断后落 cancelled）\n", id))
-		return nil
+		write(fmt.Sprintf("⏳ 任务 %s 取消中（worker 中断后落 cancelled）\n", id))
+		return
 	}
 	if err := t.Transition(task.StatusCancelled); err != nil {
-		ctx.Writer(fmt.Sprintf("✘ 任务 %s 无法取消: %v\n", id, err))
-		return nil
+		write(fmt.Sprintf("✘ 任务 %s 无法取消: %v\n", id, err))
+		return
 	}
 	if err := p.updateTask(&t); err != nil {
-		return err
+		write(fmt.Sprintf("✘ %v\n", err))
+		return
 	}
 	if t.Kind == task.KindCode && t.Worktree != "" {
-		_ = dispatch.RemoveWorktree(ctx.Ctx, t.Repo, t.Worktree, t.Branch, true)
+		_ = dispatch.RemoveWorktree(execCtx, t.Repo, t.Worktree, t.Branch, true)
 	}
 	p.audit("cancel", t.ID, "queued")
-	ctx.Writer(fmt.Sprintf("✘ 任务 %s 已取消\n", id))
-	return nil
+	write(fmt.Sprintf("✘ 任务 %s 已取消\n", id))
 }
 
 // ---- /workers ----

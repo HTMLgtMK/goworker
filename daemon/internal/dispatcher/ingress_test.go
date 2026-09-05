@@ -102,6 +102,30 @@ func TestIngress_ACPClientSubmitsTask(t *testing.T) {
 	_ = waitForStatus(t, p, tasks[0].ID, task.StatusAwaitingReview)
 }
 
+// pollUpdatesText 轮询累积所有 update 文本直到条件满足（通知与响应异步到达）。
+func pollUpdatesText(t *testing.T, done func(string) bool) string {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		var texts string
+		for _, u := range ingressUpdates {
+			if u.Update.Content != nil {
+				texts += u.Update.Content.Text
+			}
+		}
+		mu.Unlock()
+		if done(texts) {
+			return texts
+		}
+		select {
+		case <-deadline:
+			return texts
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 // fakeACPTaskClient 是带 update 收集的 ACP 客户端。
 type fakeACPTaskClient struct {
 	conn *protocol.Conn
@@ -124,4 +148,99 @@ func newFakeACPTaskClient(conn net.Conn) *fakeACPTaskClient {
 	})
 	go func() { _ = fc.conn.Serve() }()
 	return fc
+}
+
+// TestIngress_DetachAndCompensation 异步入队即返回 → 断连安全 →
+// 新连接 --status 查询 → --approve 审批（补偿接口全链路）。
+func TestIngress_DetachAndCompensation(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	repo := initGitRepo(t)
+	short, err := os.MkdirTemp("", "gwd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(short) })
+	p.paths.DispatchDir = short
+	if err := p.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	dial := func() *fakeACPTaskClient {
+		conn, err := net.Dial("unix", filepath.Join(short, "acp.sock"))
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		fc := newFakeACPTaskClient(conn)
+		t.Cleanup(func() { _ = fc.conn.Close() })
+		return fc
+	}
+
+	// 第一条连接：--detach 提交，立即返回 task ID，随后主动断连
+	fc := dial()
+	var newResp protocol.NewSessionResponse
+	if err := fc.conn.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: repo}, &newResp); err != nil {
+		t.Fatal(err)
+	}
+	var promptResp protocol.PromptResponse
+	if err := fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+		SessionID: newResp.SessionID,
+		Prompt:    []protocol.ContentBlock{protocol.TextBlock("--detach add a feature")},
+	}, &promptResp); err != nil {
+		t.Fatalf("detach prompt: %v", err)
+	}
+	if promptResp.StopReason != protocol.StopEndTurn {
+		t.Fatalf("detach stop = %q", promptResp.StopReason)
+	}
+	mu.Lock()
+	ingressUpdates = nil // 丢弃此前测试的通知残留
+	mu.Unlock()
+	detachTexts := pollUpdatesText(t, func(text string) bool { return strings.Contains(text, "已异步入队") })
+	taskID := extractTaskID(t, detachTexts)
+	_ = fc.conn.Close() // 模拟提交方断连
+
+	// 任务应继续执行到 awaiting_review（不受断连影响）
+	tk := waitForStatus(t, p, taskID, task.StatusAwaitingReview)
+	if len(tk.Commits) != 1 {
+		t.Fatalf("commits = %v", tk.Commits)
+	}
+
+	// 新连接：--status 查询快照
+	fc2 := dial()
+	if err := fc2.conn.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: repo}, &newResp); err != nil {
+		t.Fatal(err)
+	}
+	if err := fc2.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+		SessionID: newResp.SessionID,
+		Prompt:    []protocol.ContentBlock{protocol.TextBlock("--status " + taskID)},
+	}, &promptResp); err != nil {
+		t.Fatalf("status prompt: %v", err)
+	}
+	mu.Lock()
+	ingressUpdates = nil
+	mu.Unlock()
+	if err := fc2.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+		SessionID: newResp.SessionID,
+		Prompt:    []protocol.ContentBlock{protocol.TextBlock("--status " + taskID)},
+	}, &promptResp); err != nil {
+		t.Fatal(err)
+	}
+	_ = promptResp
+	snapshotText := pollUpdatesText(t, func(text string) bool {
+		return strings.Contains(text, `"status": "awaiting_review"`) && strings.Contains(text, taskID)
+	})
+	if !strings.Contains(snapshotText, `"status": "awaiting_review"`) || !strings.Contains(snapshotText, taskID) {
+		t.Errorf("status snapshot = %q", snapshotText)
+	}
+
+	// 远程审批：--approve → done
+	if err := fc2.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+		SessionID: newResp.SessionID,
+		Prompt:    []protocol.ContentBlock{protocol.TextBlock("--approve " + taskID)},
+	}, &promptResp); err != nil {
+		t.Fatalf("approve prompt: %v", err)
+	}
+	waitForStatus(t, p, taskID, task.StatusDone)
 }

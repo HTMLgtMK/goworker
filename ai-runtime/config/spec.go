@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/tinguo/goworker/ai-core/core"
 	sandbox "github.com/tinguo/goworker/ai-sandbox"
@@ -126,6 +127,7 @@ type DispatchConfig struct {
 	Workers       []WorkerConfig `yaml:"workers"`
 	DefaultWorker string         `yaml:"default_worker,omitempty"` // 空 = 第一个 worker
 	MaxParallel   int            `yaml:"max_parallel,omitempty"`   // 0 = 1
+	Routes        []RouteConfig  `yaml:"routes,omitempty"`         // 关键词路由，优先于 default_worker
 }
 
 // WorkerConfig 描述一个 ACP worker 子进程（claude-agent-acp / codex-acp / goworker acp）。
@@ -133,6 +135,16 @@ type WorkerConfig struct {
 	Name    string   `yaml:"name"`
 	Command string   `yaml:"command"`
 	Args    []string `yaml:"args,omitempty"`
+	// OnPermission 无人值守时 worker 权限请求的应答策略：
+	// "deny"（默认，拒绝并记审计）| "allow"（自动选择首个 allow 类 option）。
+	OnPermission string `yaml:"on_permission,omitempty"`
+}
+
+// RouteConfig 是关键词路由：prompt 命中任一关键词（大小写不敏感的包含匹配）
+// 即派发给指定 worker；多条 route 按声明顺序，首条命中生效。
+type RouteConfig struct {
+	Keywords []string `yaml:"keywords"`
+	Worker   string   `yaml:"worker"`
 }
 
 // Validate 校验 dispatch 配置；未启用时仅校验已填写的部分。
@@ -156,6 +168,21 @@ func (c DispatchConfig) Validate() error {
 	if c.MaxParallel < 0 {
 		return fmt.Errorf("dispatch.max_parallel must be >= 0")
 	}
+	for _, w := range c.Workers {
+		switch w.OnPermission {
+		case "", "deny", "allow":
+		default:
+			return fmt.Errorf("dispatch.workers[%s]: invalid on_permission %q (deny|allow)", w.Name, w.OnPermission)
+		}
+	}
+	for i, r := range c.Routes {
+		if len(r.Keywords) == 0 {
+			return fmt.Errorf("dispatch.routes[%d]: keywords is required", i)
+		}
+		if !seen[r.Worker] {
+			return fmt.Errorf("dispatch.routes[%d]: worker %q is not in workers", i, r.Worker)
+		}
+	}
 	if c.Enabled {
 		if len(c.Workers) == 0 {
 			return fmt.Errorf("dispatch.enabled requires at least one worker")
@@ -176,6 +203,19 @@ func (c DispatchConfig) ResolveDefaultWorker() (string, error) {
 		return c.Workers[0].Name, nil
 	}
 	return "", fmt.Errorf("dispatch: no workers configured")
+}
+
+// MatchWorker 关键词路由：返回首个命中的 worker 名；未命中返回 false。
+func (c DispatchConfig) MatchWorker(prompt string) (string, bool) {
+	lower := strings.ToLower(prompt)
+	for _, r := range c.Routes {
+		for _, kw := range r.Keywords {
+			if kw != "" && strings.Contains(lower, strings.ToLower(kw)) {
+				return r.Worker, true
+			}
+		}
+	}
+	return "", false
 }
 
 // Worker 返回指定名称的 worker 配置。

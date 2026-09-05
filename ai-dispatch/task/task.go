@@ -78,6 +78,7 @@ type Task struct {
 	BaseCommit string    `json:"base_commit,omitempty"` // 仅 code 任务
 	Worktree   string    `json:"worktree,omitempty"`    // 仅 code 任务
 	Branch     string    `json:"branch,omitempty"`      // 仅 code 任务
+	WorkerSession string `json:"worker_session,omitempty"` // worker 侧 ACP 会话 ID（崩溃恢复用）
 	Commits    []string  `json:"commits,omitempty"`     // 仅 code 任务
 	Error      string    `json:"error,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`

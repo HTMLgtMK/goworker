@@ -90,3 +90,33 @@ func TestTaskAddon_IgnoresForeignPayloads(t *testing.T) {
 		t.Fatalf("render = %q", got)
 	}
 }
+
+func TestTaskAddon_SummaryRotation(t *testing.T) {
+	a := NewTaskAddon()
+	// 两个任务都运行中并各自汇报进度
+	a.applyStatus(task.StatusEvent{TaskID: "task_1", From: task.StatusQueued, To: task.StatusWorking})
+	a.applyStatus(task.StatusEvent{TaskID: "task_2", From: task.StatusQueued, To: task.StatusWorking})
+	a.applyProgress(task.ProgressEvent{TaskID: "task_1", Kind: "agent_message_chunk", Summary: "step A"})
+	a.applyProgress(task.ProgressEvent{TaskID: "task_2", Kind: "agent_message_chunk", Summary: "step B"})
+
+	// 每帧轮换：B → A → B
+	a.Tick(t.Context())
+	if got := a.Render(); got != "dispatch 2 run · step B" {
+		t.Fatalf("render#1 = %q", got)
+	}
+	a.Tick(t.Context())
+	if got := a.Render(); got != "dispatch 2 run · step A" {
+		t.Fatalf("render#2 = %q", got)
+	}
+	a.Tick(t.Context())
+	if got := a.Render(); got != "dispatch 2 run · step B" {
+		t.Fatalf("render#3 = %q", got)
+	}
+
+	// 任务 2 终态：只剩任务 1 的摘要，轮换退化为固定显示
+	a.applyStatus(task.StatusEvent{TaskID: "task_2", From: task.StatusWorking, To: task.StatusFailed})
+	a.Tick(t.Context())
+	if got := a.Render(); got != "dispatch 1 run · step A" {
+		t.Fatalf("render after terminal = %q", got)
+	}
+}

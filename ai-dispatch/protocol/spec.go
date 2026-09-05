@@ -56,6 +56,14 @@ type AuthMethod struct {
 	Description string `json:"description,omitempty"`
 }
 
+// ---- session/load（可选，能力协商 AgentCapabilities.LoadSession）----
+
+type LoadSessionRequest struct {
+	SessionID  string           `json:"sessionId"`
+	Cwd        string           `json:"cwd"`
+	McpServers []map[string]any `json:"mcpServers,omitempty"`
+}
+
 // ---- session/new ----
 
 type NewSessionRequest struct {

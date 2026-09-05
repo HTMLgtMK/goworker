@@ -34,7 +34,10 @@ session:
 #     - name: zcode
 #       command: goworker
 #       args: [\"acp\"]
-#       env: [\"GOWORKER_CONFIG_DIR=<另一个实例的目录>\"]
+#       env: [\"GOWORKER_CONFIG_DIR=<另一个实例的目录>\", \"GOWORKER_SANDBOX_MODE=strict\"]
+#   routes:
+#     - keywords: [\"测试\", \"review\"]
+#       worker: zcode
 ")
     message(STATUS "已生成 ${CONFIG_FILE}")
 else()

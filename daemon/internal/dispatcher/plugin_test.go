@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,7 @@ import (
 
 // recordingHub 用真实 plugin.Hub 结构（函数字段）记录注册的命令与事件。
 type recordingHub struct {
+	mu       sync.Mutex
 	commands map[string]plugin.Command
 	events   []plugin.Event
 }
@@ -34,6 +36,8 @@ func newRecordingHub() (*plugin.Hub, *recordingHub) {
 			return nil
 		},
 		Notify: func(event plugin.Event) {
+			rh.mu.Lock()
+			defer rh.mu.Unlock()
 			rh.events = append(rh.events, event)
 		},
 	}, rh
@@ -41,6 +45,8 @@ func newRecordingHub() (*plugin.Hub, *recordingHub) {
 
 // eventsOfType 返回指定类型的事件载荷。
 func (h *recordingHub) eventsOfType(t string) []any {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	var out []any
 	for _, e := range h.events {
 		if string(e.Type) == t {
@@ -300,10 +306,9 @@ func changeCwd(t *testing.T, dir string) {
 
 func extractTaskID(t *testing.T, out string) string {
 	t.Helper()
-	for _, field := range strings.Fields(out) {
-		if strings.HasPrefix(field, "task_") {
-			return field
-		}
+	re := regexp.MustCompile(`task_[0-9a-f]+`)
+	if id := re.FindString(out); id != "" {
+		return id
 	}
 	t.Fatalf("no task id in output: %q", out)
 	return ""

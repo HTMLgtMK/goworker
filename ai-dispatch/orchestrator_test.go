@@ -252,3 +252,184 @@ func TestOrchestrator_WorkerFailureFailsTaskAndCleansWorktree(t *testing.T) {
 		t.Errorf("worktree should be cleaned up on failure:\n%s", out)
 	}
 }
+
+// ---- 崩溃恢复：session/load 续接 ----
+
+// loadableWorker 支持声明 loadSession 能力并记录 load/new 调用。
+type loadableWorker struct {
+	conn     *protocol.Conn
+	mu       sync.Mutex
+	loadCaps bool
+	loaded   []string
+	created  int
+}
+
+func newLoadableWorker(rwc io.ReadWriteCloser, loadCaps bool) *loadableWorker {
+	w := &loadableWorker{conn: protocol.NewConn(rwc), loadCaps: loadCaps}
+	w.conn.Handle(protocol.MethodInitialize, func(context.Context, json.RawMessage) (any, error) {
+		return protocol.InitializeResponse{
+			ProtocolVersion:   protocol.Version,
+			AgentCapabilities: protocol.AgentCapabilities{LoadSession: loadCaps},
+		}, nil
+	})
+	w.conn.Handle(protocol.MethodSessionNew, func(context.Context, json.RawMessage) (any, error) {
+		w.mu.Lock()
+		w.created++
+		w.mu.Unlock()
+		return protocol.NewSessionResponse{SessionID: "sess_new"}, nil
+	})
+	w.conn.Handle(protocol.MethodSessionLoad, func(_ context.Context, params json.RawMessage) (any, error) {
+		var req protocol.LoadSessionRequest
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, err
+		}
+		w.mu.Lock()
+		w.loaded = append(w.loaded, req.SessionID)
+		w.mu.Unlock()
+		return protocol.NewSessionResponse{SessionID: req.SessionID}, nil
+	})
+	w.conn.Handle(protocol.MethodSessionPrompt, func(_ context.Context, params json.RawMessage) (any, error) {
+		var req protocol.PromptRequest
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, err
+		}
+		_ = w.conn.Notify(protocol.MethodSessionUpdate, protocol.SessionUpdate{
+			SessionID: req.SessionID,
+			Update: protocol.SessionUpdateBody{
+				SessionUpdate: protocol.UpdateAgentMessageChunk,
+				Content:       &protocol.ContentBlock{Type: "text", Text: "resumed work"},
+			},
+		})
+		return protocol.PromptResponse{StopReason: protocol.StopEndTurn}, nil
+	})
+	go func() { _ = w.conn.Serve() }()
+	return w
+}
+
+func TestOrchestrator_CrashRecovery_LoadsWorkerSession(t *testing.T) {
+	store, err := task.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// 模拟崩溃残留：任务停在 working，且已建立过 worker 会话
+	now := time.Now()
+	tk := &task.Task{
+		ID: task.NewID(), Source: "repl", Kind: task.KindGeneral,
+		Prompt: "resume me", Repo: t.TempDir(), Worker: "fake",
+		Status: task.StatusQueued, WorkerSession: "sess_prev",
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.Add(tk); err != nil {
+		t.Fatal(err)
+	}
+	tk.Status = task.StatusWorking // 模拟崩溃残留：已推进到 working
+	if err := store.Update(tk); err != nil {
+		t.Fatal(err)
+	}
+	tk2, _ := store.Get(tk.ID)
+
+	var worker *loadableWorker
+	orch := NewOrchestrator(store)
+	orch.SetOpener(func(context.Context, WorkerSpec) (io.ReadWriteCloser, io.Closer, error) {
+		clientEnd, agentEnd := net.Pipe()
+		worker = newLoadableWorker(agentEnd, true)
+		t.Cleanup(func() { _ = worker.conn.Close() })
+		return clientEnd, clientEnd, nil
+	})
+
+	outcome, err := orch.Run(context.Background(), &tk2, WorkerSpec{Name: "fake", Command: "fake"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if outcome.Task.Status != task.StatusAwaitingReview {
+		t.Errorf("status = %q", outcome.Task.Status)
+	}
+	if got := worker.loaded; len(got) != 1 || got[0] != "sess_prev" {
+		t.Errorf("session/load calls = %v, want [sess_prev]", got)
+	}
+	if worker.created != 0 {
+		t.Errorf("unexpected session/new calls = %d", worker.created)
+	}
+	if outcome.Task.WorkerSession != "sess_prev" {
+		t.Errorf("WorkerSession = %q", outcome.Task.WorkerSession)
+	}
+	saved, _ := store.Get(tk.ID)
+	if saved.WorkerSession != "sess_prev" {
+		t.Errorf("persisted WorkerSession = %q", saved.WorkerSession)
+	}
+}
+
+func TestOrchestrator_CrashRecovery_FallsBackToNewSession(t *testing.T) {
+	store, err := task.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now()
+	tk := &task.Task{
+		ID: task.NewID(), Source: "repl", Kind: task.KindGeneral,
+		Prompt: "resume me", Repo: t.TempDir(), Worker: "fake",
+		Status: task.StatusQueued, WorkerSession: "sess_prev",
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.Add(tk); err != nil {
+		t.Fatal(err)
+	}
+	tk.Status = task.StatusWorking // 模拟崩溃残留：已推进到 working
+	if err := store.Update(tk); err != nil {
+		t.Fatal(err)
+	}
+	tk2, _ := store.Get(tk.ID)
+
+	var worker *loadableWorker
+	orch := NewOrchestrator(store)
+	orch.SetOpener(func(context.Context, WorkerSpec) (io.ReadWriteCloser, io.Closer, error) {
+		clientEnd, agentEnd := net.Pipe()
+		worker = newLoadableWorker(agentEnd, false) // worker 不支持 load
+		t.Cleanup(func() { _ = worker.conn.Close() })
+		return clientEnd, clientEnd, nil
+	})
+
+	if _, err := orch.Run(context.Background(), &tk2, WorkerSpec{Name: "fake", Command: "fake"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(worker.loaded) != 0 || worker.created != 1 {
+		t.Errorf("fallback: loaded=%v created=%d, want no load + 1 new", worker.loaded, worker.created)
+	}
+}
+
+func TestOrchestrator_FreshTaskHasNoWorkerSession(t *testing.T) {
+	dir := t.TempDir()
+	store, err := task.Open(filepath.Join(dir, "tasks.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var worker *loadableWorker
+	orch := NewOrchestrator(store)
+	orch.SetOpener(func(context.Context, WorkerSpec) (io.ReadWriteCloser, io.Closer, error) {
+		clientEnd, agentEnd := net.Pipe()
+		worker = newLoadableWorker(agentEnd, true)
+		t.Cleanup(func() { _ = worker.conn.Close() })
+		return clientEnd, clientEnd, nil
+	})
+
+	tk := &task.Task{
+		ID: task.NewID(), Source: "repl", Kind: task.KindGeneral,
+		Prompt: "fresh", Repo: dir, Worker: "fake",
+		Status: task.StatusQueued, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if _, err := orch.Run(context.Background(), tk, WorkerSpec{Name: "fake", Command: "fake"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(worker.loaded) != 0 || worker.created != 1 {
+		t.Errorf("fresh task: loaded=%v created=%d, want new session only", worker.loaded, worker.created)
+	}
+	if tk.WorkerSession != "sess_new" {
+		t.Errorf("WorkerSession = %q, want persisted new session id", tk.WorkerSession)
+	}
+}

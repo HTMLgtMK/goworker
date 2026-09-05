@@ -46,23 +46,47 @@ type Outcome struct {
 	StopReason string
 }
 
+// RunOption 定制单次派发行为。
+type RunOption func(*runConfig)
+
+type runConfig struct {
+	permission func(context.Context, protocol.PermissionRequest) (string, error)
+}
+
+// WithPermissionPolicy 覆盖本次派发的权限应答策略；nil = 拒绝（无人值守默认）。
+func WithPermissionPolicy(fn func(context.Context, protocol.PermissionRequest) (string, error)) RunOption {
+	return func(rc *runConfig) { rc.permission = fn }
+}
+
 // Run 派发单个任务到 awaiting_review / failed / cancelled。
 // awaiting_review 返回 nil error；其余情况返回 error 且任务已落终态并清理。
-func (o *Orchestrator) Run(ctx context.Context, t *task.Task, spec WorkerSpec) (Outcome, error) {
-	// 先落 queued 快照，后续任何失败路径都能以 Update 记录终态
-	if err := o.save(t); err != nil {
-		return Outcome{}, err
+func (o *Orchestrator) Run(ctx context.Context, t *task.Task, spec WorkerSpec, opts ...RunOption) (Outcome, error) {
+	rc := runConfig{}
+	for _, opt := range opts {
+		opt(&rc)
 	}
-	if err := o.prepare(t); err != nil {
-		return Outcome{}, o.fail(ctx, t, err)
-	}
-	if err := o.save(t); err != nil {
-		return Outcome{}, o.fail(ctx, t, err)
-	}
-	if err := t.Transition(task.StatusDispatching); err != nil {
-		return Outcome{}, o.fail(ctx, t, err)
-	}
-	if err := o.save(t); err != nil {
+	// 崩溃恢复：任务从 store 重放出来时可能停在 dispatching/working（worker 会话
+	// 曾建立）。此时跳过入队/建工作区，按能力协商走 session/load 续接。
+	resuming := t.Status == task.StatusDispatching || t.Status == task.StatusWorking
+
+	if !resuming {
+		// 先落 queued 快照，后续任何失败路径都能以 Update 记录终态
+		if err := o.save(t); err != nil {
+			return Outcome{}, err
+		}
+		if err := o.prepare(t); err != nil {
+			return Outcome{}, o.fail(ctx, t, err)
+		}
+		if err := o.save(t); err != nil {
+			return Outcome{}, o.fail(ctx, t, err)
+		}
+		if err := t.Transition(task.StatusDispatching); err != nil {
+			return Outcome{}, o.fail(ctx, t, err)
+		}
+		if err := o.save(t); err != nil {
+			return Outcome{}, o.fail(ctx, t, err)
+		}
+	} else if err := o.verifyWorkspace(t); err != nil {
 		return Outcome{}, o.fail(ctx, t, err)
 	}
 
@@ -72,20 +96,23 @@ func (o *Orchestrator) Run(ctx context.Context, t *task.Task, spec WorkerSpec) (
 	}
 	defer client.Close()
 
-	if _, err := client.Initialize(ctx); err != nil {
+	init, err := client.Initialize(ctx)
+	if err != nil {
 		return Outcome{}, o.fail(ctx, t, fmt.Errorf("initialize worker %q: %w", spec.Name, err))
 	}
 	cwd := t.Worktree
 	if cwd == "" {
 		cwd = t.Repo
 	}
-	sessionID, err := client.NewSession(ctx, cwd)
+	sessionID, err := o.establishSession(ctx, client, init, t, cwd, resuming)
 	if err != nil {
-		return Outcome{}, o.fail(ctx, t, fmt.Errorf("new session: %w", err))
+		return Outcome{}, o.fail(ctx, t, err)
 	}
 
-	if err := t.Transition(task.StatusWorking); err != nil {
-		return Outcome{}, o.fail(ctx, t, err)
+	if t.Status != task.StatusWorking {
+		if err := t.Transition(task.StatusWorking); err != nil {
+			return Outcome{}, o.fail(ctx, t, err)
+		}
 	}
 	if err := o.save(t); err != nil {
 		return Outcome{}, o.fail(ctx, t, err)
@@ -97,7 +124,7 @@ func (o *Orchestrator) Run(ctx context.Context, t *task.Task, spec WorkerSpec) (
 				o.progress(t.ID, u.Update)
 			}
 		},
-		// M2 无人值守：权限请求一律拒绝
+		OnPermission: rc.permission, // nil = 无人值守拒绝
 	})
 
 	stop, err := client.Prompt(ctx, sessionID, []protocol.ContentBlock{protocol.TextBlock(t.Prompt)})
@@ -124,6 +151,44 @@ func (o *Orchestrator) Run(ctx context.Context, t *task.Task, spec WorkerSpec) (
 		return Outcome{}, o.fail(ctx, t, err)
 	}
 	return Outcome{Task: *t, StopReason: stop}, nil
+}
+
+// establishSession 建立或恢复 worker 会话：崩溃恢复且 worker 声明 loadSession
+// 能力时走 session/load 续接上下文；否则开新会话（任务从头执行，优雅降级）。
+// 会话 ID 持久化到 Task.WorkerSession 供下次恢复。
+func (o *Orchestrator) establishSession(
+	ctx context.Context, client *Client, init protocol.InitializeResponse,
+	t *task.Task, cwd string, resuming bool,
+) (string, error) {
+	if resuming && t.WorkerSession != "" && init.AgentCapabilities.LoadSession {
+		sessionID, err := client.SessionLoad(ctx, t.WorkerSession, cwd)
+		if err != nil {
+			// load 失败不致命：降级为全新会话重跑任务
+			sessionID, err = client.NewSession(ctx, cwd)
+			if err != nil {
+				return "", fmt.Errorf("new session after failed load: %w", err)
+			}
+		}
+		t.WorkerSession = sessionID
+		return sessionID, nil
+	}
+	sessionID, err := client.NewSession(ctx, cwd)
+	if err != nil {
+		return "", fmt.Errorf("new session: %w", err)
+	}
+	t.WorkerSession = sessionID
+	return sessionID, nil
+}
+
+// verifyWorkspace 崩溃恢复前置校验：code 任务的 worktree 应仍存在且可用。
+func (o *Orchestrator) verifyWorkspace(t *task.Task) error {
+	if t.Kind != task.KindCode || t.Worktree == "" {
+		return nil
+	}
+	if !DetectGit(context.Background(), t.Worktree) {
+		return fmt.Errorf("worktree %s is gone or not a git work tree", t.Worktree)
+	}
+	return nil
 }
 
 // prepare 按 Kind 做派发前置：code 任务校验 git 仓库并建 worktree；
