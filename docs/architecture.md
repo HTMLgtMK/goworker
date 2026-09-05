@@ -11,8 +11,17 @@ ai-core/                        [module github.com/tinguo/goworker/ai-core] 零 
   core/             # Tool, Message, Usage, Compressor, RuntimeEvent（spec.go 集中类型）
   agent/            # ReAct 引擎本体（无 DefaultTools，sandbox/memory/config 无关）
 
+ai-dispatch/                    [module github.com/tinguo/goworker/ai-dispatch] stdlib only
+  protocol/         # ACP wire 层：JSON-RPC 2.0 双端 Conn + REV_1 类型与方法
+  task/             # Task 状态机（code/general）+ JSONL 快照 store + 事件契约（task_status/task_progress）
+  client.go         # ACP Client 角色：spawn worker 子进程、驱动任务回合、权限反向应答
+  server.go         # ACP Agent 角色：接受任务提交、Reporter 进度流、session/cancel、SessionAware(cwd)
+  orchestrator.go   # 派发编排：prepare（worktree/BaseCommit）→ spawn → prompt → 收集 commits → awaiting_review
+  workspace.go      # git 操作：DetectGit / HeadCommit / AddWorktree / RemoveWorktree / CollectCommits
+
 ai-runtime/                     [module github.com/tinguo/goworker/ai-runtime] 聚合层
-  config/           # LLM/Memory/Sandbox/Session/MCP 配置 + Paths + 事件契约
+  config/           # LLM/Memory/Sandbox/Session/MCP/Dispatch 配置 + Paths + 事件契约
+  provider/         # LLM 协议适配层：BaseProvider + openai/ + anthropic/（thinking 归一化与 Custom 回放）
   hitl/             # HITL 协议与 DecisionProvider
   agent/            # agent SDK：Session + SessionDeps + RunRequest/RunCallbacks + DefaultTools
                     # （纯 Go API，零宿主 plugin 协议依赖；宿主自行做 plugin 封装）
@@ -20,28 +29,32 @@ ai-runtime/                     [module github.com/tinguo/goworker/ai-runtime] �
   session/          # 会话持久化 store（checkpoint/rewind/compact）
   mcp/ skills/ logger/ fakeserver/
 
-daemon/                         [module github.com/tinguo/goworker/daemon] REPL shell
-  cmd/goworker/main.go          # 入口：载入 config → ToRuntime → Register(NewPlugin)
+daemon/                         [module github.com/tinguo/goworker/daemon] REPL shell + dispatcher 宿主
+  cmd/goworker/main.go          # 入口：REPL / `acp`（ZCode worker 模式）；dispatcher.enabled 才注册 dispatcher 插件
   internal/plugin/              # daemon 插件/命令/前端上下文协议：Hub, Command, Plugin, Context, RenderKind
-  internal/agent/               # /agent 插件适配器：把 ai-runtime Session SDK 装配成 plugin.Plugin
-                                # （资源装载 skill/MCP/memory/store + 命令注册 + 生命周期）
+  internal/agent/               # /agent 插件适配器：Session SDK → plugin.Plugin（资源装载 + 生命周期）
+                                # + ProviderFactory（LLM provider 装配，REPL 与 acp worker 共用）+ acp_worker.go
+  internal/dispatcher/          # dispatcher 插件：/dispatch /workers 命令族、ACP ingress socket、HITL 审批、审计
   internal/config/              # 顶层平铺 config.yaml 解析 + ToRuntime/ApplyRuntime
-  internal/core/                # Engine：插件生命周期、命令路由、中间件链、事件广播
-  internal/frontend/            # stdin REPL + statusbar（addon 订阅 ai-runtime 事件）
+  internal/core/                # Engine：插件生命周期、命令路由、中间件链、事件广播（AddEventListener）
+  internal/frontend/            # stdin REPL + statusbar（addon 订阅 Engine 事件桥接）
 ```
 
 依赖方向（禁止反向）：
 
 ```
 daemon ──→ ai-runtime ──→ ai-core ──→ (zero goworker deps)
-                 ├──→ ai-memory
-                 └──→ ai-sandbox
+    │         ├──→ ai-memory
+    │         └──→ ai-sandbox
+    └──→ ai-dispatch ──→ (stdlib only)
 ```
 
 - ai-core/agent 与 ai-memory、ai-sandbox、ai-runtime 零耦合：DefaultTools 在 ai-runtime/agent，MemoryClient 为 runtime 本地接口 + ai-runtime adapter。
-- 配置不跨层上溯：LLM/Memory/Sandbox/Session/MCP 在 ai-runtime/config；daemon 负责 YAML 兼容（risky_patterns 双格式）与本机路径派生。
-- 事件契约倒置：ai-runtime/config 定义 EventUsage/EventIteration + UsageEvent，daemon/statusbar 订阅渲染，statusbar 不进 SDK。
-- SDK/插件边界：ai-runtime/agent 是纯 Session SDK（零宿主 plugin 协议依赖），plugin.Plugin 适配器在 daemon/internal/agent —— 宿主换协议（HTTP/MCP 等）只需重写 adapter，SDK 不动。
+- 配置不跨层上溯：LLM/Memory/Sandbox/Session/MCP/Dispatch 在 ai-runtime/config；daemon 负责 YAML 兼容（risky_patterns 双格式）与本机路径派生。
+- 事件契约倒置：ai-runtime/config 定义 EventUsage/EventIteration + UsageEvent；ai-dispatch/task 定义 EventTaskStatus/EventTaskProgress（契约跟 Task 类型走）。前端 addon 订阅渲染，statusbar 不进 SDK。
+- 事件桥接分两路：/agent 走命令 Context 注入的 ctx.Publish（随命令生命周期）；dispatcher 任务跑后台 goroutine，经 hub.Notify → Engine.AddEventListener → 前端桥接（常驻，零协议改动）。
+- SDK/插件边界：ai-runtime/agent 是纯 Session SDK（零宿主 plugin 协议依赖），plugin.Plugin 适配器在 daemon/internal/agent —— 宿主换协议（HTTP/MCP/ACP）只需重写 adapter，SDK 不动。ACP worker 模式（goworker acp）与 /agent 插件共用 ProviderFactory，保证装配一致。
+- dispatcher 隔离：ai-dispatch 是独立模块（stdlib only），双角色（Client 驱动 worker / Server 接受提交）由 daemon/internal/dispatcher 插件装配；code 任务强制 worktree 隔离，合并必须 HITL（设计见 docs/dispatcher.md）。
 
 ---
 

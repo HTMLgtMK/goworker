@@ -18,8 +18,8 @@
 
 - [x] **结构化日志** — 替换 `log.Printf`，引入 log level（debug/info/warn/error）、结构化字段（request_id, plugin, cmd）、可插拔输出后端（slog Handler）。`internal/logger/`：`Setup` 装配、按大小轮转、按天清理，`config.yaml` 新增 `log:` 段（level/file/max_size_mb/max_age_days）
 - [ ] **LLM 调用限流 & 重试** — 429/5xx 自动重试 + exponential backoff，可配置的 rate limit，防止 API 被打爆
-- [ ] **Makefile** — 常用命令封装（build/test/lint/run/clean），不用手敲 `go run` 长路径
-- [ ] **版本信息** — `-version` 标志 + `ldflags` 注入版本号/commit/构建时间，方便线上定位
+- [x] **构建编排（CMake 替代 Makefile）** — `CMakeLists.txt` 驱动 Go toolchain：build（版本注入）/test/test-race/vet/run/install 目标、`-DGOOS/-DGOARCH` 交叉编译、`instance` 目标生成多运行时隔离目录；脱离 workspace 的独立编译由 daemon/go.mod require+replace 支持
+- [x] **版本信息** — `main.version` 变量 + `-v/--version/version` 子命令；CMake 构建经 `git describe` 注入（`ldflags -X main.version=...`），源码直跑为 dev
 - [ ] **CI 流程** — `.github/workflows/`：go vet、golangci-lint、race detector、build 检查，合 PR 前自动跑
 
 ---
