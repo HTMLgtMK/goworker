@@ -13,6 +13,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/agent"
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/core"
+	"github.com/tinguo/goworker/daemon/internal/dispatcher"
 	"github.com/tinguo/goworker/daemon/internal/frontend/stdin"
 	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
@@ -49,6 +50,7 @@ func main() {
 		SkillsUser:    filepath.Join(config.DefaultDir(), "skills"),
 		SkillsProject: filepath.Join(".goworker", "skills"),
 		AuditDir:      filepath.Join(config.DefaultDir(), "audit"),
+		DispatchDir:   filepath.Join(config.DefaultDir(), "dispatch"),
 	}
 
 	engine := core.NewEngine(cfg, runtimeCfg, log)
@@ -61,6 +63,14 @@ func main() {
 	if err := engine.Register(agent.NewPlugin(runtimeCfg, paths)); err != nil {
 		log.Error("register AgentPlugin failed", "error", err)
 		return
+	}
+
+	// dispatcher 插件：dispatch.enabled=true 才注册，默认不影响现有功能
+	if runtimeCfg.Dispatch.Enabled {
+		if err := engine.Register(dispatcher.NewPlugin(runtimeCfg, paths)); err != nil {
+			log.Error("register DispatcherPlugin failed", "error", err)
+			return
+		}
 	}
 
 	// 内置命令

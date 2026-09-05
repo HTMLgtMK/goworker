@@ -93,7 +93,8 @@ func (o *Orchestrator) Run(ctx context.Context, t *task.Task, spec WorkerSpec) (
 	stop, err := client.Prompt(ctx, sessionID, []protocol.ContentBlock{protocol.TextBlock(t.Prompt)})
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			_ = o.fail(ctx, t, ctxErr) // 已落终态，错误随 ctx 返回
+			// 用户取消：落 cancelled 终态（区别于失败），错误随 ctx 返回
+			o.cancelInto(ctx, t, ctxErr)
 			return Outcome{}, ctxErr
 		}
 		return Outcome{}, o.fail(ctx, t, fmt.Errorf("prompt: %w", err))
@@ -164,6 +165,15 @@ func (o *Orchestrator) startWorker(ctx context.Context, spec WorkerSpec) (*Clien
 		opener = ProcessOpener
 	}
 	return StartWorkerWithOpener(ctx, spec, opener)
+}
+
+// cancelInto 把任务落 cancelled 并清理 code 任务的 worktree；迁移不了（如已终态）回退 failed。
+func (o *Orchestrator) cancelInto(ctx context.Context, t *task.Task, cause error) {
+	if err := t.Transition(task.StatusCancelled); err != nil {
+		_ = t.FailInto(cause.Error())
+	}
+	_ = o.save(t)
+	o.cleanupCodeWorkspace(ctx, t)
 }
 
 // fail 把任务落 failed 并清理 code 任务的 worktree；已在终态则只保快照。

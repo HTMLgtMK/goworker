@@ -24,13 +24,14 @@ import (
 
 // Config 是 goworker 的整体配置。所有段顶层平铺，旧 config.yaml 不缩进 → 兼容。
 type Config struct {
-	Frontend FrontendConfig              `yaml:"frontend"`
-	LLM      runtimeconfig.LLMConfig     `yaml:"llm"`
-	Memory   runtimeconfig.MemoryConfig  `yaml:"memory"`
-	Sandbox  SandboxConfig               `yaml:"sandbox"`
-	Session  runtimeconfig.SessionConfig `yaml:"session"`
-	MCP      runtimeconfig.MCPConfig     `yaml:"mcp"`
-	Log      logger.Config               `yaml:"log"`
+	Frontend FrontendConfig               `yaml:"frontend"`
+	LLM      runtimeconfig.LLMConfig      `yaml:"llm"`
+	Memory   runtimeconfig.MemoryConfig   `yaml:"memory"`
+	Sandbox  SandboxConfig                `yaml:"sandbox"`
+	Session  runtimeconfig.SessionConfig  `yaml:"session"`
+	MCP      runtimeconfig.MCPConfig      `yaml:"mcp"`
+	Dispatch runtimeconfig.DispatchConfig `yaml:"dispatch"`
+	Log      logger.Config                `yaml:"log"`
 }
 
 type FrontendConfig struct {
@@ -124,11 +125,12 @@ func fromSandbox(s sandbox.SandboxConfig) SandboxConfig {
 // ToRuntime 复制出 ai-runtime 的聚合配置，供插件消费。
 func (c *Config) ToRuntime() *runtimeconfig.Config {
 	return &runtimeconfig.Config{
-		LLM:     c.LLM.Clone(),
-		Memory:  c.Memory,
-		Sandbox: c.Sandbox.ToSandbox(),
-		Session: c.Session,
-		MCP:     c.MCP,
+		LLM:      c.LLM.Clone(),
+		Memory:   c.Memory,
+		Sandbox:  c.Sandbox.ToSandbox(),
+		Session:  c.Session,
+		MCP:      c.MCP,
+		Dispatch: c.Dispatch,
 	}
 }
 
@@ -138,6 +140,7 @@ func (c *Config) ApplyRuntime(r *runtimeconfig.Config) {
 	c.Memory = r.Memory
 	c.Session = r.Session
 	c.MCP = r.MCP
+	c.Dispatch = r.Dispatch
 	c.Sandbox = fromSandbox(r.Sandbox)
 }
 
@@ -458,6 +461,10 @@ func Load(path string) *Config {
 	}
 	if err := cfg.LLM.Validate(); err != nil {
 		slog.Error("config: invalid LLM configuration", "err", err)
+		return nil
+	}
+	if err := cfg.Dispatch.Validate(); err != nil {
+		slog.Error("config: invalid dispatch configuration", "err", err)
 		return nil
 	}
 	return cfg

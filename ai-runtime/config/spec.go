@@ -5,6 +5,8 @@
 package config
 
 import (
+	"fmt"
+
 	"github.com/tinguo/goworker/ai-core/core"
 	sandbox "github.com/tinguo/goworker/ai-sandbox"
 )
@@ -109,11 +111,81 @@ type MCPServer struct {
 
 // Config 是 ai-runtime 的运行配置聚合。
 type Config struct {
-	LLM     LLMConfig             `yaml:"llm"`
-	Memory  MemoryConfig          `yaml:"memory"`
-	Sandbox sandbox.SandboxConfig `yaml:"sandbox"`
-	Session SessionConfig         `yaml:"session"`
-	MCP     MCPConfig             `yaml:"mcp"`
+	LLM      LLMConfig             `yaml:"llm"`
+	Memory   MemoryConfig          `yaml:"memory"`
+	Sandbox  sandbox.SandboxConfig `yaml:"sandbox"`
+	Session  SessionConfig         `yaml:"session"`
+	MCP      MCPConfig             `yaml:"mcp"`
+	Dispatch DispatchConfig        `yaml:"dispatch"`
+}
+
+// DispatchConfig 是 commit dispatcher 的配置。
+// Enabled=false 时 dispatcher 插件不注册，其余字段不生效。
+type DispatchConfig struct {
+	Enabled       bool           `yaml:"enabled"`
+	Workers       []WorkerConfig `yaml:"workers"`
+	DefaultWorker string         `yaml:"default_worker,omitempty"` // 空 = 第一个 worker
+	MaxParallel   int            `yaml:"max_parallel,omitempty"`   // 0 = 1
+}
+
+// WorkerConfig 描述一个 ACP worker 子进程（claude-agent-acp / codex-acp / goworker acp）。
+type WorkerConfig struct {
+	Name    string   `yaml:"name"`
+	Command string   `yaml:"command"`
+	Args    []string `yaml:"args,omitempty"`
+}
+
+// Validate 校验 dispatch 配置；未启用时仅校验已填写的部分。
+func (c DispatchConfig) Validate() error {
+	seen := make(map[string]bool, len(c.Workers))
+	for i, w := range c.Workers {
+		if w.Name == "" {
+			return fmt.Errorf("dispatch.workers[%d]: name is required", i)
+		}
+		if seen[w.Name] {
+			return fmt.Errorf("dispatch.workers[%d]: duplicate name %q", i, w.Name)
+		}
+		if w.Command == "" {
+			return fmt.Errorf("dispatch.workers[%d] (%s): command is required", i, w.Name)
+		}
+		seen[w.Name] = true
+	}
+	if c.DefaultWorker != "" && !seen[c.DefaultWorker] {
+		return fmt.Errorf("dispatch.default_worker %q is not in workers", c.DefaultWorker)
+	}
+	if c.MaxParallel < 0 {
+		return fmt.Errorf("dispatch.max_parallel must be >= 0")
+	}
+	if c.Enabled {
+		if len(c.Workers) == 0 {
+			return fmt.Errorf("dispatch.enabled requires at least one worker")
+		}
+		if c.DefaultWorker == "" {
+			return fmt.Errorf("dispatch.default_worker is required when enabled")
+		}
+	}
+	return nil
+}
+
+// ResolveDefaultWorker 返回默认 worker 名：显式配置 > 第一个 worker。
+func (c DispatchConfig) ResolveDefaultWorker() (string, error) {
+	if c.DefaultWorker != "" {
+		return c.DefaultWorker, nil
+	}
+	if len(c.Workers) > 0 {
+		return c.Workers[0].Name, nil
+	}
+	return "", fmt.Errorf("dispatch: no workers configured")
+}
+
+// Worker 返回指定名称的 worker 配置。
+func (c DispatchConfig) Worker(name string) (WorkerConfig, bool) {
+	for _, w := range c.Workers {
+		if w.Name == name {
+			return w, true
+		}
+	}
+	return WorkerConfig{}, false
 }
 
 // Paths 是宿主注入的目录路径，避免 ai-runtime 反向依赖 daemon 的 DefaultDir。
@@ -122,6 +194,7 @@ type Paths struct {
 	SkillsUser    string // 用户级 skills 目录
 	SkillsProject string // 项目级 skills 目录
 	AuditDir      string // sandbox 审计落盘目录
+	DispatchDir   string // dispatcher 任务持久化目录
 }
 
 // 状态栏事件契约。statusbar 是前端 UI，不进 SDK；前端 addon 订阅这些事件名与载荷。
