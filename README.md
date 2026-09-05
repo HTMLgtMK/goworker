@@ -119,9 +119,24 @@ Config cascades: in-memory → `$LLM_*` env vars → `~/.config/goworker/.env`.
 ## Getting Started
 
 ```bash
-cd daemon
-go run cmd/goworker/main.go     # go.work resolves the ai-* modules; standalone builds use the replaces in daemon/go.mod
+cmake -B build && cmake --build build   # -> build/bin/goworker（版本号经 git describe 注入）
+./build/bin/goworker                    # REPL
+./build/bin/goworker acp                # ACP worker 模式（被 dispatcher/编辑器驱动）
+./build/bin/goworker version
+
+cmake --build build --target test       # 全量测试
+cmake --build build --target vet
+cmake --build build --target instance   # 生成本地隔离子实例目录（多运行时）
+
+# 交叉编译
+cmake -B build -DGOOS=linux -DGOARCH=amd64 && cmake --build build
+
+# 无 CMake 时：go build（workspace 内）
+cd daemon && go run cmd/goworker/main.go
 ```
+
+多运行时：`GOWORKER_CONFIG_DIR=<dir>` 隔离每个实例的 config/sessions/memory/dispatch 与 acp.sock，
+dispatcher 在 `<dir>/dispatch/acp.sock` 接受外部 ACP 任务提交（见 docs/dispatcher.md）。
 
 ## Why goworker?
 
