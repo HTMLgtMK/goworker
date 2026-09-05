@@ -82,6 +82,9 @@ func (s *Store) Add(t *Task) error {
 	if t.Status != StatusQueued {
 		return fmt.Errorf("task: new task must be %s, got %s", StatusQueued, t.Status)
 	}
+	if !ValidKind(t.Kind) {
+		return fmt.Errorf("task: invalid kind %q", t.Kind)
+	}
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now()
 	}

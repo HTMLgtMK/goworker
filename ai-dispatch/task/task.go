@@ -9,6 +9,20 @@ import (
 	"time"
 )
 
+// Kind 任务类型：隔离要求与产物形态由它决定。
+type Kind string
+
+const (
+	// KindCode 代码任务：必须在 git 仓库中派发，worktree 硬性隔离，
+	// 产物为 BaseCommit..HEAD 的 commit 清单。
+	KindCode Kind = "code"
+	// KindGeneral 非代码任务（文档/调研/分析）：免 git、免 worktree，
+	// 产物为 worker 自述/产出文件。
+	KindGeneral Kind = "general"
+)
+
+func ValidKind(k Kind) bool { return k == KindCode || k == KindGeneral }
+
 // Status 任务生命周期状态。
 type Status string
 
@@ -34,7 +48,8 @@ var transitions = map[Status][]Status{
 	StatusQueued:         {StatusDispatching, StatusFailed, StatusCancelled},
 	StatusDispatching:    {StatusWorking, StatusFailed, StatusCancelled},
 	StatusWorking:        {StatusAwaitingReview, StatusFailed, StatusCancelled},
-	StatusAwaitingReview: {StatusMerging, StatusRejected, StatusFailed, StatusCancelled},
+	// awaiting_review → done 供 general 任务使用：产物确认通过即完成，无合并步。
+	StatusAwaitingReview: {StatusMerging, StatusDone, StatusRejected, StatusFailed, StatusCancelled},
 	StatusMerging:        {StatusDone, StatusFailed, StatusCancelled},
 }
 
@@ -55,14 +70,15 @@ func CanTransition(from, to Status) bool {
 type Task struct {
 	ID         string    `json:"id"`
 	Source     string    `json:"source"` // "repl" | "acp:<client>"
+	Kind       Kind      `json:"kind"`
 	Prompt     string    `json:"prompt"`
-	Repo       string    `json:"repo"`
-	BaseBranch string    `json:"base_branch,omitempty"`
+	Repo       string    `json:"repo"` // code 任务必须；general 任务可选（workdir）
 	Worker     string    `json:"worker"`
 	Status     Status    `json:"status"`
-	Worktree   string    `json:"worktree,omitempty"`
-	Branch     string    `json:"branch,omitempty"`
-	Commits    []string  `json:"commits,omitempty"`
+	BaseCommit string    `json:"base_commit,omitempty"` // 仅 code 任务
+	Worktree   string    `json:"worktree,omitempty"`    // 仅 code 任务
+	Branch     string    `json:"branch,omitempty"`      // 仅 code 任务
+	Commits    []string  `json:"commits,omitempty"`     // 仅 code 任务
 	Error      string    `json:"error,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`

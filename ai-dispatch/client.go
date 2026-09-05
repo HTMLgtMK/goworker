@@ -93,7 +93,12 @@ func NewClient(name string, rwc io.ReadWriteCloser, closeFn func() error) *Clien
 
 // StartWorker spawn worker 子进程并建立 ACP 连接。
 func StartWorker(ctx context.Context, spec WorkerSpec) (*Client, error) {
-	rwc, closer, err := ProcessOpener(ctx, spec)
+	return StartWorkerWithOpener(ctx, spec, ProcessOpener)
+}
+
+// StartWorkerWithOpener 允许替换连接建立方式（测试注入 net.Pipe 等）。
+func StartWorkerWithOpener(ctx context.Context, spec WorkerSpec, opener Opener) (*Client, error) {
+	rwc, closer, err := opener(ctx, spec)
 	if err != nil {
 		return nil, err
 	}

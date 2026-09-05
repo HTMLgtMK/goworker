@@ -13,6 +13,7 @@ func newTask(prompt string) *Task {
 	return &Task{
 		ID:        NewID(),
 		Source:    "repl",
+		Kind:      KindCode,
 		Prompt:    prompt,
 		Repo:      "/repo",
 		Worker:    "claude",
