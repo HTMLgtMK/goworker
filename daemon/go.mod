@@ -9,6 +9,7 @@ require (
 	github.com/muesli/termenv v0.16.0
 	github.com/rivo/uniseg v0.4.7
 	github.com/tinguo/goworker/ai-core v0.0.0-00010101000000-000000000000
+	github.com/tinguo/goworker/ai-dispatch v0.0.0-00010101000000-000000000000
 	github.com/tinguo/goworker/ai-runtime v0.0.0-00010101000000-000000000000
 	github.com/tinguo/goworker/ai-sandbox v0.0.0-00010101000000-000000000000
 	gopkg.in/yaml.v3 v3.0.1
@@ -42,6 +43,7 @@ require (
 
 replace (
 	github.com/tinguo/goworker/ai-core => ../ai-core
+	github.com/tinguo/goworker/ai-dispatch => ../ai-dispatch
 	github.com/tinguo/goworker/ai-memory => ../ai-memory
 	github.com/tinguo/goworker/ai-runtime => ../ai-runtime
 	github.com/tinguo/goworker/ai-sandbox => ../ai-sandbox
