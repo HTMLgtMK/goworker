@@ -45,9 +45,9 @@ func (s Status) Terminal() bool {
 
 // transitions 合法的状态迁移表。
 var transitions = map[Status][]Status{
-	StatusQueued:         {StatusDispatching, StatusFailed, StatusCancelled},
-	StatusDispatching:    {StatusWorking, StatusFailed, StatusCancelled},
-	StatusWorking:        {StatusAwaitingReview, StatusFailed, StatusCancelled},
+	StatusQueued:      {StatusDispatching, StatusFailed, StatusCancelled},
+	StatusDispatching: {StatusWorking, StatusFailed, StatusCancelled},
+	StatusWorking:     {StatusAwaitingReview, StatusFailed, StatusCancelled},
 	// awaiting_review → done 供 general 任务使用：产物确认通过即完成，无合并步。
 	StatusAwaitingReview: {StatusMerging, StatusDone, StatusRejected, StatusFailed, StatusCancelled},
 	StatusMerging:        {StatusDone, StatusFailed, StatusCancelled},
@@ -68,22 +68,22 @@ func CanTransition(from, to Status) bool {
 
 // Task 是一次委派执行的全量快照。
 type Task struct {
-	ID         string    `json:"id"`
-	Source     string    `json:"source"` // "repl" | "acp:<client>"
-	Kind       Kind      `json:"kind"`
-	Prompt     string    `json:"prompt"`
-	Repo       string    `json:"repo"` // code 任务必须；general 任务可选（workdir）
-	Worker     string    `json:"worker"`
-	Status     Status    `json:"status"`
-	BaseCommit string    `json:"base_commit,omitempty"` // 仅 code 任务
-	Worktree   string    `json:"worktree,omitempty"`    // 仅 code 任务
-	Branch     string    `json:"branch,omitempty"`      // 仅 code 任务
-	WorkerSession string `json:"worker_session,omitempty"` // worker 侧 ACP 会话 ID（崩溃恢复用）
-	Commits    []string  `json:"commits,omitempty"`     // 仅 code 任务
-	Error      string    `json:"error,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
-	ExpiresAt  time.Time `json:"expires_at,omitempty"` // 唯一超时来源
+	ID            string    `json:"id"`
+	Source        string    `json:"source"` // "repl" | "acp:<client>"
+	Kind          Kind      `json:"kind"`
+	Prompt        string    `json:"prompt"`
+	Repo          string    `json:"repo"` // code 任务必须；general 任务可选（workdir）
+	Worker        string    `json:"worker"`
+	Status        Status    `json:"status"`
+	BaseCommit    string    `json:"base_commit,omitempty"`    // 仅 code 任务
+	Worktree      string    `json:"worktree,omitempty"`       // 仅 code 任务
+	Branch        string    `json:"branch,omitempty"`         // 仅 code 任务
+	WorkerSession string    `json:"worker_session,omitempty"` // worker 侧 ACP 会话 ID（崩溃恢复用）
+	Commits       []string  `json:"commits,omitempty"`        // 仅 code 任务
+	Error         string    `json:"error,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	ExpiresAt     time.Time `json:"expires_at,omitempty"` // 唯一超时来源
 }
 
 // NewID 生成 task_<16hex>。
