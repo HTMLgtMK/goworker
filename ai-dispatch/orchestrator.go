@@ -21,6 +21,8 @@ type Orchestrator struct {
 	store    *task.Store
 	opener   Opener // nil 时用 ProcessOpener
 	progress ProgressFunc
+	// onStatus 状态迁移回调（save 落盘时 diff 触发），宿主用于广播事件
+	onStatus func(t *task.Task, from, to task.Status)
 }
 
 func NewOrchestrator(store *task.Store) *Orchestrator {
@@ -32,6 +34,11 @@ func (o *Orchestrator) SetOpener(op Opener) { o.opener = op }
 
 // SetProgress 注册进度回调。
 func (o *Orchestrator) SetProgress(fn ProgressFunc) { o.progress = fn }
+
+// SetStatusListener 注册状态迁移回调（含首次入队 queued）。
+func (o *Orchestrator) SetStatusListener(fn func(t *task.Task, from, to task.Status)) {
+	o.onStatus = fn
+}
 
 // Outcome 是一个任务跑到终点的结果。
 type Outcome struct {
@@ -53,6 +60,9 @@ func (o *Orchestrator) Run(ctx context.Context, t *task.Task, spec WorkerSpec) (
 		return Outcome{}, o.fail(ctx, t, err)
 	}
 	if err := t.Transition(task.StatusDispatching); err != nil {
+		return Outcome{}, o.fail(ctx, t, err)
+	}
+	if err := o.save(t); err != nil {
 		return Outcome{}, o.fail(ctx, t, err)
 	}
 
@@ -152,11 +162,19 @@ func (o *Orchestrator) prepare(t *task.Task) error {
 }
 
 // save 把任务快照写入 store；新任务 Add，已存在 Update。
+// 状态变化时触发 onStatus（含首次入队，from 为空）。
 func (o *Orchestrator) save(t *task.Task) error {
-	if _, ok := o.store.Get(t.ID); ok {
-		return o.store.Update(t)
+	old, exists := o.store.Get(t.ID)
+	var err error
+	if exists {
+		err = o.store.Update(t)
+	} else {
+		err = o.store.Add(t)
 	}
-	return o.store.Add(t)
+	if err == nil && o.onStatus != nil && old.Status != t.Status {
+		o.onStatus(t, old.Status, t.Status)
+	}
+	return err
 }
 
 func (o *Orchestrator) startWorker(ctx context.Context, spec WorkerSpec) (*Client, error) {

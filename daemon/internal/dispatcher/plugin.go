@@ -69,6 +69,9 @@ func (p *DispatcherPlugin) Init(h *plugin.Hub) error {
 	}
 	p.store = store
 	p.orch = dispatch.NewOrchestrator(store)
+	p.orch.SetStatusListener(func(t *task.Task, from, to task.Status) {
+		p.notifyStatus(t, from, to)
+	})
 	p.orch.SetProgress(func(taskID string, u protocol.SessionUpdateBody) {
 		// ACP 提交方的任务：进度路由回对应连接；REPL 任务只留 debug 日志
 		p.mu.Lock()
@@ -76,9 +79,20 @@ func (p *DispatcherPlugin) Init(h *plugin.Hub) error {
 		p.mu.Unlock()
 		if ok {
 			route.server.Update(route.sessionID, u)
-			return
+		} else {
+			slog.Debug("dispatch progress", "task", taskID, "kind", u.SessionUpdate)
 		}
-		slog.Debug("dispatch progress", "task", taskID, "kind", u.SessionUpdate)
+		// statusbar 进度广播（addon 端 channel drop 兜底）
+		if u.Content != nil {
+			p.hub.Notify(plugin.Event{
+				Type: plugin.EventType(task.EventTaskProgress),
+				Payload: task.ProgressEvent{
+					TaskID:  taskID,
+					Kind:    u.SessionUpdate,
+					Summary: task.Summarize(u.SessionUpdate, u.Content.Text, 48),
+				},
+			})
+		}
 	})
 
 	if err := h.RegisterCommand(plugin.Command{
@@ -200,9 +214,7 @@ func (h *acpIngress) Run(ctx context.Context, sessionID, prompt string, rep disp
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	if err := p.store.Add(t); err != nil {
-		return "", err
-	}
+	// 入队落盘由 orchestrator 首次 save 完成（并触发 queued 状态事件）
 
 	// 进度路由：orchestrator 的全局 ProgressFunc 按 taskID 转回本连接
 	p.mu.Lock()
@@ -351,11 +363,32 @@ func (p *DispatcherPlugin) addTask(ctx *plugin.Context, worker string, general b
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	if err := p.store.Add(t); err != nil {
+	p.launch(t)
+	// 入队落盘由 orchestrator 首次 save 完成（并触发 queued 状态事件）
+	ctx.Writer(fmt.Sprintf("⏳ 任务 %s 已入队（%s → %s worker）\n", t.ID, kind, worker))
+	return nil
+}
+
+// notifyStatus 广播状态迁移事件（save diff 与插件侧流转共用）。
+func (p *DispatcherPlugin) notifyStatus(t *task.Task, from, to task.Status) {
+	if from == to {
+		return
+	}
+	p.hub.Notify(plugin.Event{
+		Type: plugin.EventType(task.EventTaskStatus),
+		Payload: task.StatusEvent{
+			TaskID: t.ID, From: from, To: to, Kind: t.Kind, Worker: t.Worker,
+		},
+	})
+}
+
+// updateTask 插件侧流转（approve/reject/cancel）的落盘 + 事件广播。
+func (p *DispatcherPlugin) updateTask(t *task.Task) error {
+	old, _ := p.store.Get(t.ID)
+	if err := p.store.Update(t); err != nil {
 		return err
 	}
-	p.launch(t)
-	ctx.Writer(fmt.Sprintf("⏳ 任务 %s 已入队（%s → %s worker）\n", t.ID, kind, worker))
+	p.notifyStatus(t, old.Status, t.Status)
 	return nil
 }
 
@@ -442,7 +475,7 @@ func (p *DispatcherPlugin) handleApprove(ctx *plugin.Context, id string) error {
 		if err := t.Transition(task.StatusDone); err != nil {
 			return err
 		}
-		if err := p.store.Update(&t); err != nil {
+		if err := p.updateTask(&t); err != nil {
 			return err
 		}
 		ctx.Writer(fmt.Sprintf("✔ 任务 %s 已完成\n", id))
@@ -485,7 +518,7 @@ func (p *DispatcherPlugin) finishCodeTask(ctx *plugin.Context, t *task.Task, via
 	if err := t.Transition(task.StatusMerging); err != nil {
 		return err
 	}
-	if err := p.store.Update(t); err != nil {
+	if err := p.updateTask(t); err != nil {
 		return err
 	}
 	_ = dispatch.RemoveWorktree(ctx.Ctx, t.Repo, t.Worktree, t.Branch, true)
@@ -493,7 +526,7 @@ func (p *DispatcherPlugin) finishCodeTask(ctx *plugin.Context, t *task.Task, via
 		return err
 	}
 	p.audit("done", t.ID, via)
-	return p.store.Update(t)
+	return p.updateTask(t)
 }
 
 // handleReject 拒绝任务：code 任务弃置 worktree 与分支。
@@ -510,7 +543,7 @@ func (p *DispatcherPlugin) handleReject(ctx *plugin.Context, id string) error {
 	if err := t.Transition(task.StatusRejected); err != nil {
 		return err
 	}
-	if err := p.store.Update(&t); err != nil {
+	if err := p.updateTask(&t); err != nil {
 		return err
 	}
 	if t.Kind == task.KindCode && t.Worktree != "" {
@@ -547,7 +580,7 @@ func (p *DispatcherPlugin) handleCancel(ctx *plugin.Context, id string) error {
 		ctx.Writer(fmt.Sprintf("✘ 任务 %s 无法取消: %v\n", id, err))
 		return nil
 	}
-	if err := p.store.Update(&t); err != nil {
+	if err := p.updateTask(&t); err != nil {
 		return err
 	}
 	if t.Kind == task.KindCode && t.Worktree != "" {

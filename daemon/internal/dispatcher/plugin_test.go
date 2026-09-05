@@ -20,9 +20,10 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
-// recordingHub 用真实 plugin.Hub 结构（函数字段）记录注册的命令。
+// recordingHub 用真实 plugin.Hub 结构（函数字段）记录注册的命令与事件。
 type recordingHub struct {
 	commands map[string]plugin.Command
+	events   []plugin.Event
 }
 
 func newRecordingHub() (*plugin.Hub, *recordingHub) {
@@ -32,7 +33,21 @@ func newRecordingHub() (*plugin.Hub, *recordingHub) {
 			rh.commands[cmd.Name] = cmd
 			return nil
 		},
+		Notify: func(event plugin.Event) {
+			rh.events = append(rh.events, event)
+		},
 	}, rh
+}
+
+// eventsOfType 返回指定类型的事件载荷。
+func (h *recordingHub) eventsOfType(t string) []any {
+	var out []any
+	for _, e := range h.events {
+		if string(e.Type) == t {
+			out = append(out, e.Payload)
+		}
+	}
+	return out
 }
 
 // commitWorker 模拟干活的 ACP worker：在 cwd 是 git 仓库时产生一个空 commit。
@@ -222,12 +237,11 @@ func TestPlugin_RejectCleansUpWorktree(t *testing.T) {
 	repo := initGitRepo(t)
 	changeCwd(t, repo)
 
-	runCmd(t, p, hub, "/dispatch", "some task")
-	out := runCmd(t, p, hub, "/dispatch", "ls")
-	id := extractTaskID(t, out)
+	addOut := runCmd(t, p, hub, "/dispatch", "some task")
+	id := extractTaskID(t, addOut)
 	waitForStatus(t, p, id, task.StatusAwaitingReview)
 
-	out = runCmd(t, p, hub, "/dispatch", "reject", id)
+	out := runCmd(t, p, hub, "/dispatch", "reject", id)
 	if !strings.Contains(out, "已拒绝") {
 		t.Fatalf("reject output = %q", out)
 	}

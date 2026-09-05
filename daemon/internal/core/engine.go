@@ -300,6 +300,11 @@ func (e *Engine) StopAll() {
 	}
 }
 
+// AddEventListener 注册外部事件监听者（前端桥接 statusbar 等场景）。
+func (e *Engine) AddEventListener(fn func(plugin.Event)) {
+	e.listeners = append(e.listeners, fn)
+}
+
 // Notify 向所有 EventAwarePlugin 和外部监听者广播事件。
 func (e *Engine) Notify(event plugin.Event) {
 	for name, p := range e.plugins {
