@@ -131,7 +131,7 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 func e2eRunCallbacks(buf *strings.Builder) agent.RunCallbacks {
 	return agent.RunCallbacks{
 		Write: func(s string) { buf.WriteString(s) },
-		WriteToken: func(_ agent.RenderKind, content string) {
+		WriteToken: func(_ agent.RenderKind, content string, _ bool) {
 			buf.WriteString(content)
 		},
 	}

@@ -89,10 +89,10 @@ type Event struct {
 // ---- 执行上下文 ----
 
 type FrontendContext struct {
-	Decide     func(*hitl.InterruptRequest) hitl.Decision // 前端注入：执行一次 HITL 决策会话（nil 表示不支持交互式确认）
-	Writer     func(string)                               // 输出回调，由前端注入
-	WriteToken func(kind RenderKind, content string)      // 前端注入：带类型的 token 渲染
-	Publish    func(event string, data any)               // 可选：广播事件（status bar 用），线程安全
+	Decide     func(*hitl.InterruptRequest) hitl.Decision       // 前端注入：执行一次 HITL 决策会话（nil 表示不支持交互式确认）
+	Writer     func(string)                                     // 输出回调，由前端注入
+	WriteToken func(kind RenderKind, content string, done bool) // 前端注入：带类型的 token 渲染；done 表示运行输出结束，前端据此定稿流式渲染
+	Publish    func(event string, data any)                     // 可选：广播事件（status bar 用），线程安全
 }
 
 // Context 是命令执行的上下文。

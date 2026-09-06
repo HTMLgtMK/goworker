@@ -18,8 +18,8 @@ import (
 	"github.com/tinguo/goworker/ai-memory"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
-	runtimeopenai "github.com/tinguo/goworker/ai-runtime/provider/openai"
 	"github.com/tinguo/goworker/ai-runtime/mcp"
+	runtimeopenai "github.com/tinguo/goworker/ai-runtime/provider/openai"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/ai-sandbox"
 	"github.com/tinguo/goworker/daemon/internal/plugin"
@@ -132,7 +132,7 @@ func newContext(args ...string) (*plugin.Context, *strings.Builder) {
 		Args: args,
 		FrontendContext: plugin.FrontendContext{
 			Writer:     func(s string) { buf.WriteString(s) },
-			WriteToken: func(_ plugin.RenderKind, s string) { buf.WriteString(s) },
+			WriteToken: func(_ plugin.RenderKind, s string, _ bool) { buf.WriteString(s) },
 		},
 	}, &buf
 }

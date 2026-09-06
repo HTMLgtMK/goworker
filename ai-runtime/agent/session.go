@@ -135,11 +135,12 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 // HITL 决策由前端按 spec 契约完成，plugin 只负责转交；agentCtx 取消时决策投递放弃。
 func (s *Session) streamTokens(cb RunCallbacks, agentCtx context.Context, tokenCh <-chan core.Token, decisions chan hitl.Decision) {
 	for tok := range tokenCh {
-		// 先输出内容再检查 Done — Done token 也可能带内容（如错误信息）
+		// 先输出内容再检查 Done — Done token 也可能带内容（如错误信息）。
+		// 空 content 的 Done 也要转发：前端靠它定稿未完成的流式渲染。
 		showToken := tok.Type != core.TokenTypeThinking || s.deps.Config.LLM.Thinking.Show
-		if showToken && tok.Content != "" && cb.WriteToken != nil {
+		if showToken && cb.WriteToken != nil && (tok.Content != "" || tok.Done) {
 			kind, c := renderKind(tok)
-			cb.WriteToken(kind, c)
+			cb.WriteToken(kind, c, tok.Done)
 		}
 		if tok.Done {
 			break

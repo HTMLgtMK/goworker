@@ -29,8 +29,10 @@ const (
 )
 
 type RunCallbacks struct {
-	Write      func(string)
-	WriteToken func(kind RenderKind, content string)
+	Write func(string)
+	// WriteToken 按类型投递渲染 token。done 表示整个 agent 运行的输出已结束
+	// （空 content 的收尾标记），前端借此定稿未完成的流式渲染。
+	WriteToken func(kind RenderKind, content string, done bool)
 	Decide     func(*hitl.InterruptRequest) hitl.Decision
 	Publish    func(event string, data any)
 }

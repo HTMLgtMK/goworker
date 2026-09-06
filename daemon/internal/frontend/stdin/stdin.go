@@ -44,7 +44,8 @@ type StdinFrontend struct {
 
 	cancelledByUser atomic.Bool // 用户按了 Esc/Ctrl+C
 
-	sb *statusbar.Bar
+	sb     *statusbar.Bar
+	stream *streamRenderer // 流式 token 增量渲染器
 }
 
 func NewStdinFrontend(engine *core.Engine, config *config.StdinConfig) *StdinFrontend {
@@ -55,12 +56,15 @@ func NewStdinFrontend(engine *core.Engine, config *config.StdinConfig) *StdinFro
 	sb := statusbar.New()
 	sb.Use(NewProgressAddon(), NewIterationAddon(), NewUsageAddon())
 
-	return &StdinFrontend{
+	f := &StdinFrontend{
 		engine:   engine,
 		sb:       sb,
 		stack:    NewConsumerStack(),
+		stream:   newStreamRenderer(nil),
 		cancelCh: make(chan struct{}, 1),
 	}
+	f.stream.bind(f)
+	return f
 }
 
 // dispatchStdin 是唯一的 os.Stdin 字节读取者，投递给 KeyDecoder 解码。
@@ -98,13 +102,27 @@ func (f *StdinFrontend) Write(s string) {
 	})
 }
 
-// writeText 渲染文本类 token（markdown 输出）。
-// 统一走 block() 编组：首行 ● 前缀，延续行对齐到内容列。
-func (f *StdinFrontend) writeText(content string) {
-	rendered := RenderMarkdown(strings.TrimSpace(content), f.termWidth)
-	f.Write("\n" + block(markerText, rendered))
+// handleToken 处理 WriteToken 回调：text/thinking 走流式增量渲染，
+// tool 类 token 先定稿未完成的流式段落再按整块渲染。done 定稿全部。
+func (f *StdinFrontend) handleToken(kind plugin.RenderKind, content string, done bool) {
+	switch kind {
+	case plugin.KindText, plugin.KindThinking:
+		if content != "" {
+			f.stream.append(kind, content)
+		}
+	case plugin.KindToolCall:
+		f.stream.finish()
+		f.writeToolCall(content)
+	case plugin.KindToolResult:
+		f.stream.finish()
+		f.writeToolResult(content)
+	}
+	if done {
+		f.stream.finish()
+	}
 }
 
+// formatThinking 把 thinking 文本渲染成灰色弱化的定稿块（流式段落定稿复用）。
 func formatThinking(content string, width int) string {
 	content = strings.TrimSpace(content)
 	if content == "" {
@@ -114,12 +132,6 @@ func formatThinking(content string, width int) string {
 	formatted := block(markerText, "Thinking\n"+rendered)
 	formatted = strings.ReplaceAll(formatted, ansiReset, ansiReset+thinkingColor)
 	return thinkingColor + formatted + ansiReset
-}
-
-func (f *StdinFrontend) writeThinking(content string) {
-	if rendered := formatThinking(content, f.termWidth); rendered != "" {
-		f.Write("\n" + rendered)
-	}
 }
 
 // writeToolCall 渲染工具调用 token。
@@ -220,18 +232,7 @@ func (f *StdinFrontend) Run() error {
 		ctx := plugin.NewContext(context.Background(), f.Write, f.decide, nil)
 
 		// 注入 WriteToken — 所有渲染逻辑收敛至此
-		ctx.WriteToken = func(kind plugin.RenderKind, content string) {
-			switch kind {
-			case plugin.KindText:
-				f.writeText(content)
-			case plugin.KindThinking:
-				f.writeThinking(content)
-			case plugin.KindToolCall:
-				f.writeToolCall(content)
-			case plugin.KindToolResult:
-				f.writeToolResult(content)
-			}
-		}
+		ctx.WriteToken = f.handleToken
 
 		// 判断是否需要启用取消监听（agent 交互）
 		isAgent := !strings.HasPrefix(line, "/") || strings.HasPrefix(line, "/agent")
