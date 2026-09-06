@@ -80,6 +80,9 @@ func TestStreamRenderer_ThinkingGrayAndKindSwitch(t *testing.T) {
 	if !strings.Contains(out.String(), thinkingColor) {
 		t.Errorf("thinking line not gray: %q", out.String())
 	}
+	if !strings.Contains(out.String(), markerThinking.glyph) || strings.Contains(out.String(), markerText.glyph) {
+		t.Errorf("thinking raw line should use ✻ anchor, not ●: %q", out.String())
+	}
 	out.Reset()
 	// kind 切换：先定稿 thinking 段落，text 重新开始（不需要分隔换行）
 	s.append(plugin.KindText, "answer\n")

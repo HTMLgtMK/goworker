@@ -131,8 +131,13 @@ func (s *streamRenderer) emitLine(line string) {
 		s.needSep = false
 	}
 	if s.fresh {
-		b.WriteString(markerText.glyph)
-		cols += markerText.indent
+		// thinking 用 ✻ 锚点与正文 ● 区分
+		glyph := markerText
+		if s.kind == plugin.KindThinking {
+			glyph = markerThinking
+		}
+		b.WriteString(glyph.glyph)
+		cols += glyph.indent
 		s.fresh = false
 	}
 	if s.kind == plugin.KindThinking {
@@ -169,7 +174,7 @@ func physicalRows(cols, termWidth int) int {
 }
 
 // renderParagraph 渲染当前段落的原始文本为带锚点的定稿块。
-// thinking 段落走灰色弱化样式。
+// thinking 段落走 ✻ 锚点 + 灰色弱化样式。
 func (s *streamRenderer) renderParagraph() string {
 	text := s.text.String()
 	if s.kind == plugin.KindThinking {

@@ -129,7 +129,7 @@ func formatThinking(content string, width int) string {
 		return ""
 	}
 	rendered := RenderMarkdown(content, width)
-	formatted := block(markerText, "Thinking\n"+rendered)
+	formatted := block(markerThinking, "Thinking\n"+rendered)
 	formatted = strings.ReplaceAll(formatted, ansiReset, ansiReset+thinkingColor)
 	return thinkingColor + formatted + ansiReset
 }
