@@ -2,7 +2,13 @@ package core
 
 import (
 	"fmt"
+	"os"
+	"runtime"
+	"runtime/debug"
 	"strings"
+
+	term "github.com/charmbracelet/x/term"
+	"github.com/muesli/termenv"
 
 	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
@@ -19,6 +25,13 @@ func (e *Engine) RegisterBuiltinCommands() {
 			}
 			return nil
 		},
+	})
+
+	e.RegisterCommand(plugin.Command{
+		Name:        "/diagnose",
+		Aliases:     []string{"/diag"},
+		Description: "输出终端/主题/LLM/运行时诊断信息（排版问题排查用）",
+		Handler:     e.handleDiagnose,
 	})
 
 	e.RegisterCommand(plugin.Command{
@@ -70,4 +83,72 @@ func (e *Engine) RegisterBuiltinCommands() {
 			return nil
 		},
 	})
+}
+
+// handleDiagnose 输出排版与运行环境诊断信息。
+// 排版类 bug（折行错位、锚点错位）几乎都源于"渲染宽度 ≠ 真实终端宽度"、
+// 颜色能力误判、主题 margin 叠加——这里把这些一次打全。
+func (e *Engine) handleDiagnose(ctx *plugin.Context) error {
+	w := func(format string, args ...any) {
+		ctx.Writer(fmt.Sprintf(format, args...))
+	}
+
+	w("== 终端 ==\n")
+	files := []struct {
+		name string
+		fd   uintptr
+	}{
+		{"stdin", os.Stdin.Fd()},
+		{"stdout", os.Stdout.Fd()},
+		{"stderr", os.Stderr.Fd()},
+	}
+	for _, f := range files {
+		cols, rows := 0, 0
+		if cw, ch, err := term.GetSize(f.fd); err == nil {
+			cols, rows = cw, ch
+		}
+		w("  %-6s tty=%-5v %dx%d（列x行）\n", f.name, term.IsTerminal(f.fd), cols, rows)
+	}
+	w("  TERM=%s COLORTERM=%s\n", os.Getenv("TERM"), os.Getenv("COLORTERM"))
+	w("  termenv profile=%s\n", termenv.ColorProfile().String())
+	w("  注：渲染宽度取自 stdin 侧；若与窗口实际宽度不符（resize 未刷新），折行必然错位\n")
+
+	w("== 前端/主题 ==\n")
+	w("  theme=%s\n", e.Config().Frontend.Stdin.Theme)
+
+	w("== LLM ==\n")
+	llm := e.Config().LLM
+	name, p, err := llm.ResolveDefault()
+	if err != nil {
+		w("  default provider: 解析失败 — %v\n", err)
+	} else {
+		key := p.APIKey
+		if len(key) > 10 {
+			key = key[:6] + "…" + fmt.Sprintf("(%d chars)", len(key))
+		} else if key != "" {
+			key = fmt.Sprintf("(%d chars)", len(key))
+		}
+		w("  default=%s type=%s model=%s\n", name, p.Type, p.Model)
+		w("  endpoint=%s\n", p.Endpoint)
+		w("  context_window=%d thinking(mode=%s effort=%s show=%v)\n",
+			p.ContextWindow, p.Thinking.RequestMode, p.Thinking.Effort, llm.Thinking.Show)
+		w("  api_key=%s\n", key)
+		w("  streaming: openai 类型自动启用 ChatStream（含 SSE 增量/usage），无需配置\n")
+	}
+	w("  providers: ")
+	for n := range llm.Providers {
+		w("%s ", n)
+	}
+	w("\n")
+
+	w("== 运行时 ==\n")
+	w("  %s %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.revision" {
+				w("  commit=%s\n", setting.Value)
+			}
+		}
+	}
+	return nil
 }
