@@ -93,6 +93,7 @@ type Stopper interface {
 type Bar struct {
 	mu     sync.Mutex
 	active bool
+	ticked bool // Start 以来是否刷新过至少一轮；瞬时命令 Stop 时据此静默
 	addons []Addon
 
 	// 事件总线：Publish/Subscribe
@@ -152,11 +153,12 @@ func (b *Bar) Active() bool { return b.active }
 
 // ---- 生命周期 ----
 
-// Start 激活状态栏并重置所有 addon。通常在 agent 运行前调用。
+// Start 激活状态栏并重置所有 addon。通常在命令运行前调用。
 func (b *Bar) Start() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.active = true
+	b.ticked = false
 	for _, a := range b.addons {
 		a.Reset()
 	}
@@ -164,10 +166,15 @@ func (b *Bar) Start() {
 
 // Stop 停用状态栏，将最终状态写入终端作为永久行，然后换行。
 // 停用前会通知所有实现了 Stopper 接口的 addon，以便切换显示。
+// Start 以来从未 Tick 过（瞬时命令，/help 等）则静默停用，不落任何行，
+// 避免每条快命令都残留一行 "✓ ⏱ 3ms"。
 func (b *Bar) Stop() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.active = false
+	if !b.ticked {
+		return
+	}
 
 	// 通知 addon 即将停用
 	for _, a := range b.addons {
@@ -210,6 +217,7 @@ func (b *Bar) Run(ctx context.Context, pause PauseFunc) {
 				a.Tick(ctx)
 			}
 			b.draw()
+			b.ticked = true
 			b.mu.Unlock()
 		}
 	}

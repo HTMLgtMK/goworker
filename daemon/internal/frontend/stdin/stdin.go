@@ -13,6 +13,7 @@ import (
 
 	term "github.com/charmbracelet/x/term"
 
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/core"
@@ -255,6 +256,12 @@ func (f *StdinFrontend) Run() error {
 
 	go f.dispatchStdin()
 
+	// 常驻状态栏刷新循环：active 由 ProgressAddon 的事件驱动（begin 激活/end 停用），
+	// 非活跃时空转。ctx 与前端同生命周期。
+	sbCtx, sbCancel := context.WithCancel(context.Background())
+	defer sbCancel()
+	go f.sb.Run(sbCtx, func() bool { return f.stack.Top() == f.hitlConsumer })
+
 	for {
 		line, canceled, err := editor.ReadLine()
 		if err != nil {
@@ -281,13 +288,10 @@ func (f *StdinFrontend) Run() error {
 		// 注入 WriteToken — 所有渲染逻辑收敛至此
 		ctx.WriteToken = f.handleToken
 
-		// 判断是否需要启用取消监听（agent 交互）
-		isAgent := !strings.HasPrefix(line, "/") || strings.HasPrefix(line, "/agent")
-		if isAgent {
-			f.runWithCancel(ctx, line)
-		} else if err := f.engine.Eval(ctx, line); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\r\n", err)
-		}
+		// 所有命令（含斜杠命令）统一走取消监听 + 状态栏事件驱动：
+		// 长耗时命令（/compact /new 的固化与压缩）期间 Esc 可取消，
+		// 状态栏 begin/end 由 runWithCancel 统一发布，命令内部发阶段事件
+		f.runWithCancel(ctx, line)
 	}
 }
 
@@ -327,14 +331,19 @@ func (k *keyWatcher) Consume(ev KeyEvent) bool {
 	return true
 }
 
-// runWithCancel 启动 agent：挂载取消回调到常驻 keyWatcher，agent 结束后卸载。
+// runWithCancel 启动命令：挂载取消回调到常驻 keyWatcher，结束后卸载。
+// 状态栏生命周期事件驱动：命令前发 PhaseBegin、结束后（含取消）发 PhaseEnd，
+// 阶段文本由命令内部经 ctx.Publish 发布，ProgressAddon 订阅并驱动 Bar。
 func (f *StdinFrontend) runWithCancel(ctx *plugin.Context, line string) {
 	f.cancelledByUser.Store(false)
 	f.agentCtx, f.agentCancel = context.WithCancel(context.Background())
 
-	// 注入事件总线，agent plugin 可通过 Publish 广播事件给 status bar addon
+	// 注入事件总线：命令（Session.Compact / handleNew 等）经此发阶段事件
 	ctx.Publish = f.sb.Publish
-	f.sb.Start()
+	ctx.Publish(runtimeconfig.EventPhase, runtimeconfig.PhaseEvent{Kind: runtimeconfig.PhaseBegin})
+	defer func() {
+		ctx.Publish(runtimeconfig.EventPhase, runtimeconfig.PhaseEvent{Kind: runtimeconfig.PhaseEnd})
+	}()
 
 	// 包装取消回调：用户取消时置 cancelledByUser，避免 Eval 返回的取消错误被当异常打印
 	f.keyWatcher.attach(func() {
@@ -343,7 +352,6 @@ func (f *StdinFrontend) runWithCancel(ctx *plugin.Context, line string) {
 	})
 	defer func() {
 		f.keyWatcher.detach()
-		f.sb.Stop()
 		f.agentCancel()
 		f.agentCtx = nil
 		f.agentCancel = nil
@@ -352,9 +360,6 @@ func (f *StdinFrontend) runWithCancel(ctx *plugin.Context, line string) {
 
 	// 注入可取消的 context（handleAgent 会 WithTimeout 派生，取消沿链传播）
 	ctx.Ctx = f.agentCtx
-
-	// 状态栏刷新；HITL 激活（栈顶为 HITL consumer）时暂停
-	go f.sb.Run(f.agentCtx, func() bool { return f.stack.Top() == f.hitlConsumer })
 
 	err := f.engine.Eval(ctx, line)
 

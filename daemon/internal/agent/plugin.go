@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
@@ -50,10 +49,6 @@ type AgentPlugin struct {
 	mcpClients map[string]mcp.Client // server name → 连接，Stop 时统一关闭
 	mcpTools   []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
 	memory     *memory.Client        // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
-	// bgWg 追踪 /new 后台固化 goroutine：Stop 关 memory 前必须等它结束，
-	// 否则后台固化往正在关闭的 badger 写（崩溃/部分写）。命令主 goroutine 串行派发，
-	// Add/Wait 无并发问题。
-	bgWg sync.WaitGroup
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
@@ -181,9 +176,6 @@ func (p *AgentPlugin) Stop() error {
 			slog.Warn("memory: stop checkpoint failed", "err", err)
 		}
 		cancel()
-		// 等 /new 后台固化收尾：它可能还在写同一 badger，Close 会跟它抢（崩溃/部分写）。
-		// 后台固化自带 120s 超时，Wait 有界。
-		p.bgWg.Wait()
 		if err := p.memory.Close(); err != nil {
 			slog.Warn("memory close error", "err", err)
 		}
