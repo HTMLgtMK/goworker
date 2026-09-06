@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tinguo/goworker/ai-dispatch"
+	dispatch "github.com/tinguo/goworker/ai-dispatch"
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
@@ -65,7 +65,7 @@ func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispa
 		Write: func(text string) {
 			rep.MessageChunk(sessionID, text)
 		},
-		WriteToken: func(kind runtimeagent.RenderKind, content string) {
+		WriteToken: func(kind runtimeagent.RenderKind, content string, done bool) {
 			rep.Update(sessionID, tokenToUpdate(kind, content))
 		},
 		// 无人值守：HITL 请求一律拒绝（Session SDK 对 nil Decide 的默认行为）

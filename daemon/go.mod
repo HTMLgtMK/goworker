@@ -10,6 +10,7 @@ require (
 	github.com/rivo/uniseg v0.4.7
 	github.com/tinguo/goworker/ai-core v0.0.0-00010101000000-000000000000
 	github.com/tinguo/goworker/ai-dispatch v0.0.0-00010101000000-000000000000
+	github.com/tinguo/goworker/ai-memory v0.0.0-00010101000000-000000000000
 	github.com/tinguo/goworker/ai-runtime v0.0.0-00010101000000-000000000000
 	github.com/tinguo/goworker/ai-sandbox v0.0.0-00010101000000-000000000000
 	gopkg.in/yaml.v3 v3.0.1
@@ -31,7 +32,6 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/microcosm-cc/bluemonday v1.0.27 // indirect
 	github.com/muesli/reflow v0.3.0 // indirect
-	github.com/tinguo/goworker/ai-memory v0.0.0-00010101000000-000000000000 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yuin/goldmark v1.7.13 // indirect
 	github.com/yuin/goldmark-emoji v1.0.6 // indirect
