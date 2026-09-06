@@ -161,11 +161,21 @@ func physicalRows(cols, termWidth int) int {
 }
 
 // renderMessage 渲染当前消息的原始文本为带锚点的定稿块。
+// glamour 渲染宽度 = 终端宽 - 锚点列，折行在锚点列内完成，行宽永不溢出。
 // thinking 消息走 ✻ 锚点 + 灰色弱化样式。
 func (s *streamRenderer) renderMessage() string {
-	text := s.text.String()
+	text := strings.TrimSpace(s.text.String())
 	if s.kind == plugin.KindThinking {
 		return formatThinking(text, s.f.termWidth)
 	}
-	return block(markerText, RenderMarkdown(strings.TrimSpace(text), s.f.termWidth))
+	rendered := RenderMarkdown(text, renderWidth(s.f.termWidth, markerText.indent))
+	return layoutBlock(markerText, normalizeRendered(rendered))
+}
+
+// renderWidth 终端宽减去锚点列后的内容渲染宽度；终端宽未知（0）时按 80 兜底。
+func renderWidth(termWidth, indent int) int {
+	if termWidth <= 0 {
+		termWidth = 80
+	}
+	return termWidth - indent
 }

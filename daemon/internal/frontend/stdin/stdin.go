@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
 	"sync/atomic"
+	"syscall"
 
 	term "github.com/charmbracelet/x/term"
 
@@ -122,15 +124,17 @@ func (f *StdinFrontend) handleToken(kind plugin.RenderKind, content string, done
 	}
 }
 
-// formatThinking 把 thinking 文本渲染成灰色弱化的定稿块（流式段落定稿复用）。
+// formatThinking 把 thinking 文本渲染成灰色弱化的定稿块（流式消息定稿复用）。
+// 与正文同构：✻ Thinking 头行 + 内容行对齐到锚点列，整体灰色。
 func formatThinking(content string, width int) string {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return ""
 	}
 	// 先剥掉 glamour 的正文主题色再灰化，否则深色前景覆盖灰色，thinking 看起来和正文同色
-	rendered := stripANSI(RenderMarkdown(content, width))
-	formatted := block(markerThinking, "Thinking\n"+rendered)
+	rendered := stripANSI(RenderMarkdown(content, renderWidth(width, markerThinking.indent)))
+	lines := append([]string{"Thinking"}, normalizeRendered(rendered)...)
+	formatted := layoutBlock(markerThinking, lines)
 	formatted = strings.ReplaceAll(formatted, ansiReset, ansiReset+thinkingColor)
 	return thinkingColor + formatted + ansiReset
 }
@@ -210,6 +214,19 @@ func (f *StdinFrontend) Run() error {
 	if w, _, err := term.GetSize(os.Stdin.Fd()); err == nil && w > 0 {
 		f.termWidth = w
 	}
+
+	// SIGWINCH 实时跟踪宽度：markdown wrap、流式擦除行数都依赖它，
+	// 快照式的启动取值会在 resize 后全部错位
+	winch := make(chan os.Signal, 1)
+	signal.Notify(winch, syscall.SIGWINCH)
+	defer signal.Stop(winch)
+	go func() {
+		for range winch {
+			if w, _, err := term.GetSize(os.Stdin.Fd()); err == nil && w > 0 {
+				f.termWidth = w
+			}
+		}
+	}()
 
 	go f.dispatchStdin()
 
