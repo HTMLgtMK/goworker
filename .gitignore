@@ -40,6 +40,7 @@ vendor/
 
 # Build artifacts
 /tmp/
+build/
 
 # Tooling runtime state
 .omc/
