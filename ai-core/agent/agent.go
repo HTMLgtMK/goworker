@@ -68,7 +68,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 				Tools:    a.tools,
 			}
 
-			resp, err := a.provider.Chat(ctx, req)
+			resp, streamed, err := a.chat(ctx, req, ch)
 
 			var usage *core.UsageInfo
 			if resp != nil {
@@ -108,12 +108,17 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 					return
 				}
 				messages = append(messages, msg)
-				emitMessageTokens(ctx, ch, msg)
+				// 流式路径的 thinking/text 增量已在 chat() 透传，不再整段重发
+				if !streamed {
+					emitMessageTokens(ctx, ch, msg)
+				}
 				finished = true
 				break
 			}
 			messages = append(messages, msg)
-			emitMessageTokens(ctx, ch, msg)
+			if !streamed {
+				emitMessageTokens(ctx, ch, msg)
+			}
 
 			for _, tc := range msg.ToolCalls {
 				if tc.Type != "function" {
@@ -189,6 +194,39 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 	}()
 
 	return ch, msgCh, nil
+}
+
+// chat 发起一次模型调用：优先走流式 —— thinking/text 增量即时透传给前端，
+// tool_calls 分片由 provider 在流结束时重组为完整响应；provider 不支持流式
+// （返回错误，如 anthropic 当前桩实现）则回退非流式。流式中断（ctx 取消）或
+// 未收到重组响应时向上报错，由调用方走 agent error 通道。
+// 返回的 streamed 表示响应内容是否已随流式增量透传（调用方据此跳过整段重发）。
+func (a *Agent) chat(ctx context.Context, req *core.ChatRequest, ch chan<- core.Token) (*core.ChatResponse, bool, error) {
+	stream, err := a.provider.ChatStream(ctx, req)
+	if err != nil || stream == nil {
+		// 不支持流式（含假后端/桩实现直接返回 nil channel）→ 回退非流式
+		resp, err := a.provider.Chat(ctx, req)
+		return resp, false, err
+	}
+
+	var final *core.ChatResponse
+	for tok := range stream {
+		if tok.Response != nil {
+			final = tok.Response
+			continue
+		}
+		// 剥掉增量上的 done 标记：provider 层的 done 表示"本轮模型响应结束"，
+		// 与 session 层"Done 即整个运行结束"的语义冲突；done 只由 Run 收尾发出
+		tok.Done = false
+		sendToken(ctx, ch, tok)
+	}
+	if final != nil {
+		return final, true, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	return nil, false, fmt.Errorf("stream ended without a complete response")
 }
 
 // fireMiddlewareEvent 统一分发 middleware 事件到各 hook 接口。

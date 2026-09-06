@@ -306,6 +306,8 @@ func (p *Provider) ChatStream(ctx context.Context, req *core.ChatRequest) (<-cha
 
 	wireReq := p.buildChatRequest(&request)
 	wireReq.Stream = true
+	// 请求末尾的独立 usage chunk；不支持的兼容后端会忽略该字段
+	wireReq.StreamOptions = &StreamOptions{IncludeUsage: true}
 	body, err := json.Marshal(wireReq)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -334,9 +336,36 @@ func (p *Provider) ChatStream(ctx context.Context, req *core.ChatRequest) (<-cha
 	return tokenCh, nil
 }
 
+// readSSE 解析 SSE 流。
+//
+// thinking/text 增量实时投递（token 直达前端做流式渲染）；tool_calls 分片按
+// index 合并、不透传；流结束时把重组出的完整响应通过带 Response 的收尾 token
+// 一次性交付，agent 用它回填历史并触发 AfterModel 中间件。
+//
+// done 语义保持与旧契约一致：finish_reason 所在 chunk 打 Done=true，代表
+// "本轮模型响应结束"——不等于整个 agent 运行结束，也不代表会话结束。
+// finish chunk 之后继续读到 [DONE]/EOF：include_usage 的 usage chunk 落在它后面。
 func (p *Provider) readSSE(ctx context.Context, body io.ReadCloser, tokenCh chan<- core.Token) {
 	defer body.Close()
 	defer close(tokenCh)
+
+	var (
+		content strings.Builder
+		rcText  strings.Builder // reasoning_content 增量
+		rText   strings.Builder // reasoning 增量
+		calls   []core.ToolCall // 按 Delta.Index 合并的 tool call 分片
+		usage   *core.UsageInfo
+		finish  string
+	)
+	// 投递失败（ctx 取消）时直接返回，让 close(tokenCh) 收尾
+	send := func(tok core.Token) bool {
+		select {
+		case tokenCh <- tok:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
 
 	reader := bufio.NewReader(body)
 	for {
@@ -348,7 +377,7 @@ func (p *Provider) readSSE(ctx context.Context, body io.ReadCloser, tokenCh chan
 
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			return
+			break
 		}
 		line = strings.TrimRight(line, "\r\n")
 
@@ -357,27 +386,109 @@ func (p *Provider) readSSE(ctx context.Context, body io.ReadCloser, tokenCh chan
 		}
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
-			return
+			break
 		}
 
 		var chunk core.StreamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
 		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
 		if len(chunk.Choices) == 0 {
 			continue
 		}
 
-		content := chunk.Choices[0].Delta.Content
-		finishReason := chunk.Choices[0].FinishReason
-
-		select {
-		case tokenCh <- core.Token{Type: core.TokenTypeText, Content: content, Done: finishReason != ""}:
-		case <-ctx.Done():
-			return
+		delta := chunk.Choices[0].Delta
+		if delta.ReasoningContent != "" {
+			rcText.WriteString(delta.ReasoningContent)
+			if !send(core.Token{Type: core.TokenTypeThinking, Content: delta.ReasoningContent}) {
+				return
+			}
 		}
-		if finishReason != "" {
-			return
+		if delta.Reasoning != "" {
+			rText.WriteString(delta.Reasoning)
+			if !send(core.Token{Type: core.TokenTypeThinking, Content: delta.Reasoning}) {
+				return
+			}
+		}
+		if delta.Content != "" {
+			content.WriteString(delta.Content)
+			if !send(core.Token{Type: core.TokenTypeText, Content: delta.Content}) {
+				return
+			}
+		}
+		for _, dt := range delta.ToolCalls {
+			for len(calls) <= dt.Index {
+				calls = append(calls, core.ToolCall{})
+			}
+			merged := &calls[dt.Index]
+			if dt.ID != "" {
+				merged.ID = dt.ID
+			}
+			if dt.Type != "" {
+				merged.Type = dt.Type
+			}
+			if dt.Function.Name != "" {
+				merged.Function.Name = dt.Function.Name
+			}
+			merged.Function.Arguments += dt.Function.Arguments
+		}
+		if chunk.Choices[0].FinishReason != "" {
+			finish = chunk.Choices[0].FinishReason
+			if !send(core.Token{Type: core.TokenTypeText, Done: true}) {
+				return
+			}
 		}
 	}
+
+	// 空流（无任何增量）不重组也不发收尾 token，保持旧行为
+	if content.Len() == 0 && rcText.Len() == 0 && rText.Len() == 0 && len(calls) == 0 {
+		return
+	}
+
+	thinkingText := rcText.String() + rText.String()
+	msg := core.Message{Role: "assistant", Content: content.String()}
+	// reasoning_details 是结构化数组，流式分片重组不出原始 RawMessage，故不重建
+	// 该字段；reasoning_content/reasoning（字符串型）按 Custom 契约回放，保证
+	// 工具轮次间的 thinking 回放与非流式路径一致。DeepSeek 等后端不要求回传
+	// reasoning_content，收到该字段也会忽略，无兼容风险。
+	if thinkingText != "" {
+		msg.Thinking = core.Thinking{Text: thinkingText}
+	}
+	fields := make(map[string]json.RawMessage, 2)
+	if rcText.Len() > 0 {
+		if raw, err := json.Marshal(rcText.String()); err == nil {
+			fields["reasoning_content"] = raw
+		}
+	}
+	if rText.Len() > 0 {
+		if raw, err := json.Marshal(rText.String()); err == nil {
+			fields["reasoning"] = raw
+		}
+	}
+	if len(fields) > 0 {
+		payload, err := json.Marshal(struct {
+			Version int                        `json:"version"`
+			Fields  map[string]json.RawMessage `json:"fields"`
+		}{Version: 1, Fields: fields})
+		if err == nil {
+			msg.Custom = map[string]json.RawMessage{p.Name(): payload}
+		}
+	}
+	if len(calls) > 0 {
+		msg.ToolCalls = calls
+	}
+	send(core.Token{
+		Type: core.TokenTypeText,
+		Done: true,
+		Response: &core.ChatResponse{
+			Choices: []core.ResponseChoice{{
+				Message:      msg,
+				FinishReason: finish,
+			}},
+			Usage: usage,
+		},
+	})
 }
