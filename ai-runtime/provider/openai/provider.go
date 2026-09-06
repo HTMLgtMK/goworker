@@ -355,8 +355,8 @@ func (p *Provider) readSSE(ctx context.Context, body io.ReadCloser, tokenCh chan
 		rText   strings.Builder // reasoning 增量
 		calls   []core.ToolCall // 按 Delta.Index 合并的 tool call 分片
 		usage   *core.UsageInfo
-		finish  string
 	)
+	acc := &streamAcc{content: &content, rcText: &rcText, rText: &rText, calls: &calls}
 	// 投递失败（ctx 取消）时直接返回，让 close(tokenCh) 收尾
 	send := func(tok core.Token) bool {
 		select {
@@ -376,70 +376,39 @@ func (p *Provider) readSSE(ctx context.Context, body io.ReadCloser, tokenCh chan
 		}
 
 		line, err := reader.ReadString('\n')
-		if err != nil {
-			break
+		if err != nil && err != io.EOF {
+			// 传输中断（连接重置等）：按失败处理，跳过末尾重组——
+			// 绝不能把截断的半截响应当成功交付，那会污染会话历史
+			return
 		}
 		line = strings.TrimRight(line, "\r\n")
-
-		if !strings.HasPrefix(line, "data: ") {
-			continue
+		if strings.HasPrefix(line, "data:") {
+			// 容忍 "data:"/"data: " 两种分隔（SSE 规范只要求冒号）
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "[DONE]" {
+				break
+			}
+			var chunk core.StreamChunk
+			if jsonErr := json.Unmarshal([]byte(data), &chunk); jsonErr == nil {
+				if chunk.Usage != nil {
+					usage = chunk.Usage
+				}
+				if len(chunk.Choices) > 0 {
+					if !p.handleStreamDelta(chunk.Choices[0].Delta, acc, send) {
+						return
+					}
+					if fr := chunk.Choices[0].FinishReason; fr != "" {
+						acc.finish = fr
+						if !send(core.Token{Type: core.TokenTypeText, Done: true}) {
+							return
+						}
+					}
+				}
+			}
 		}
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
+		if err == io.EOF {
+			// 流正常结束（部分后端不发 [DONE]），处理完最后一段后收尾
 			break
-		}
-
-		var chunk core.StreamChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
-		}
-		if chunk.Usage != nil {
-			usage = chunk.Usage
-		}
-		if len(chunk.Choices) == 0 {
-			continue
-		}
-
-		delta := chunk.Choices[0].Delta
-		if delta.ReasoningContent != "" {
-			rcText.WriteString(delta.ReasoningContent)
-			if !send(core.Token{Type: core.TokenTypeThinking, Content: delta.ReasoningContent}) {
-				return
-			}
-		}
-		if delta.Reasoning != "" {
-			rText.WriteString(delta.Reasoning)
-			if !send(core.Token{Type: core.TokenTypeThinking, Content: delta.Reasoning}) {
-				return
-			}
-		}
-		if delta.Content != "" {
-			content.WriteString(delta.Content)
-			if !send(core.Token{Type: core.TokenTypeText, Content: delta.Content}) {
-				return
-			}
-		}
-		for _, dt := range delta.ToolCalls {
-			for len(calls) <= dt.Index {
-				calls = append(calls, core.ToolCall{})
-			}
-			merged := &calls[dt.Index]
-			if dt.ID != "" {
-				merged.ID = dt.ID
-			}
-			if dt.Type != "" {
-				merged.Type = dt.Type
-			}
-			if dt.Function.Name != "" {
-				merged.Function.Name = dt.Function.Name
-			}
-			merged.Function.Arguments += dt.Function.Arguments
-		}
-		if chunk.Choices[0].FinishReason != "" {
-			finish = chunk.Choices[0].FinishReason
-			if !send(core.Token{Type: core.TokenTypeText, Done: true}) {
-				return
-			}
 		}
 	}
 
@@ -478,7 +447,18 @@ func (p *Provider) readSSE(ctx context.Context, body io.ReadCloser, tokenCh chan
 		}
 	}
 	if len(calls) > 0 {
-		msg.ToolCalls = calls
+		// 过滤从未收到首片的空槽（如畸形分片从 index=1 开始），
+		// 避免 agent 把空 tool call 回填进历史
+		merged := make([]core.ToolCall, 0, len(calls))
+		for _, c := range calls {
+			if c.ID == "" && c.Function.Name == "" {
+				continue
+			}
+			merged = append(merged, c)
+		}
+		if len(merged) > 0 {
+			msg.ToolCalls = merged
+		}
 	}
 	send(core.Token{
 		Type: core.TokenTypeText,
@@ -486,9 +466,64 @@ func (p *Provider) readSSE(ctx context.Context, body io.ReadCloser, tokenCh chan
 		Response: &core.ChatResponse{
 			Choices: []core.ResponseChoice{{
 				Message:      msg,
-				FinishReason: finish,
+				FinishReason: acc.finish,
 			}},
 			Usage: usage,
 		},
 	})
+}
+
+// streamAcc 聚合单条 SSE 流的累积状态（readSSE 局部使用）。
+type streamAcc struct {
+	content *strings.Builder
+	rcText  *strings.Builder
+	rText   *strings.Builder
+	calls   *[]core.ToolCall
+	finish  string
+}
+
+// handleStreamDelta 处理单个 SSE 增量：thinking/text 实时投递，tool_calls
+// 分片按 index 合并，finish_reason 记入 acc 并投递 done 标记。
+// 返回 false 表示投递失败（ctx 取消），调用方须立即终止且不做末尾重组。
+// 负 index 是畸形数据，跳过——readSSE 运行在独立 goroutine，越界 panic 会
+// 带崩整个进程。
+func (p *Provider) handleStreamDelta(delta core.Delta, acc *streamAcc, send func(core.Token) bool) bool {
+	if delta.ReasoningContent != "" {
+		acc.rcText.WriteString(delta.ReasoningContent)
+		if !send(core.Token{Type: core.TokenTypeThinking, Content: delta.ReasoningContent}) {
+			return false
+		}
+	}
+	if delta.Reasoning != "" {
+		acc.rText.WriteString(delta.Reasoning)
+		if !send(core.Token{Type: core.TokenTypeThinking, Content: delta.Reasoning}) {
+			return false
+		}
+	}
+	if delta.Content != "" {
+		acc.content.WriteString(delta.Content)
+		if !send(core.Token{Type: core.TokenTypeText, Content: delta.Content}) {
+			return false
+		}
+	}
+	for _, dt := range delta.ToolCalls {
+		if dt.Index < 0 {
+			continue
+		}
+		for len(*acc.calls) <= dt.Index {
+			*acc.calls = append(*acc.calls, core.ToolCall{})
+		}
+		merged := &(*acc.calls)[dt.Index]
+		if dt.ID != "" {
+			merged.ID = dt.ID
+		}
+		if dt.Type != "" {
+			merged.Type = dt.Type
+		}
+		if dt.Function.Name != "" {
+			merged.Function.Name = dt.Function.Name
+		}
+		merged.Function.Arguments += dt.Function.Arguments
+	}
+	return true
 }

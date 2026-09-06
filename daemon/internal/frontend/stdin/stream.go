@@ -134,7 +134,7 @@ func (s *streamRenderer) emitLine(line string) {
 	} else {
 		b.WriteString(line)
 	}
-	s.rows += physicalRows(cols+uniseg.StringWidth(line), s.f.termWidth)
+	s.rows += physicalRows(cols+uniseg.StringWidth(line), s.f.Width())
 	s.text.WriteString(line + "\n")
 	out := b.String()
 
@@ -168,9 +168,9 @@ func physicalRows(cols, termWidth int) int {
 func (s *streamRenderer) renderMessage() string {
 	text := strings.TrimSpace(s.text.String())
 	if s.kind == plugin.KindThinking {
-		return formatThinking(text, s.f.termWidth)
+		return formatThinking(text, s.f.Width())
 	}
-	rendered := RenderMarkdown(text, renderWidth(s.f.termWidth, markerText.indent))
+	rendered := RenderMarkdown(text, renderWidth(s.f.Width(), markerText.indent))
 	return layoutBlock(markerText, normalizeRendered(rendered))
 }
 

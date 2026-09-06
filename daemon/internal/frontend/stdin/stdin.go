@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"github.com/rivo/uniseg"
+
 	term "github.com/charmbracelet/x/term"
 
 	"github.com/tinguo/goworker/ai-runtime/hitl"
@@ -17,6 +19,9 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/frontend/statusbar"
 	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
+
+// Width 返回当前终端列数（atomic，SIGWINCH 与渲染并发访问安全）。
+func (f *StdinFrontend) Width() int { return int(f.termWidth.Load()) }
 
 // rawNL 在 raw mode 下 \n 不会自动回车到行首，需要补 \r
 const (
@@ -31,9 +36,11 @@ const (
 // 再按 consumer stack 责任链路由：栈顶消费者优先，第一个消费的节点终止。
 // keyWatcher 常驻栈底，取消键穿透所有行消费者后由它统一处理。
 type StdinFrontend struct {
-	engine    *core.Engine
-	editor    *LineEditor
-	termWidth int // 终端列数，用于 markdown 渲染的 word wrap 和 HR 宽度
+	engine *core.Engine
+	editor *LineEditor
+	// 终端列数，用于 markdown 渲染的 word wrap 和 HR 宽度。
+	// SIGWINCH goroutine 写、token 消费 goroutine 读，必须 atomic。
+	termWidth atomic.Int32
 
 	stack        *ConsumerStack
 	decoder      *KeyDecoder
@@ -134,7 +141,7 @@ func formatThinking(content string, width int) string {
 	if content == "" {
 		return ""
 	}
-	prefixCols := markerThinking.indent + len(thinkingHeader) + 2 // "✻ Thinking  "
+	prefixCols := markerThinking.indent + uniseg.StringWidth(thinkingHeader) + 2 // "✻ Thinking  "
 	// 先剥掉 glamour 的正文主题色再灰化，否则深色前景覆盖灰色，thinking 看起来和正文同色
 	rendered := stripANSI(RenderMarkdown(content, renderWidth(width, prefixCols)))
 	lines := normalizeRendered(rendered)
@@ -228,9 +235,9 @@ func (f *StdinFrontend) Run() error {
 	f.stack.Push(editor)       // 主输入行消费者
 
 	// 获取终端宽度，失败则用 80 列作为兜底
-	f.termWidth = 80
+	f.termWidth.Store(80)
 	if w, _, err := term.GetSize(os.Stdin.Fd()); err == nil && w > 0 {
-		f.termWidth = w
+		f.termWidth.Store(int32(w))
 	}
 
 	// SIGWINCH 实时跟踪宽度：markdown wrap、流式擦除行数都依赖它，
@@ -241,7 +248,7 @@ func (f *StdinFrontend) Run() error {
 	go func() {
 		for range winch {
 			if w, _, err := term.GetSize(os.Stdin.Fd()); err == nil && w > 0 {
-				f.termWidth = w
+				f.termWidth.Store(int32(w))
 			}
 		}
 	}()

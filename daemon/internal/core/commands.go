@@ -122,11 +122,9 @@ func (e *Engine) handleDiagnose(ctx *plugin.Context) error {
 	if err != nil {
 		w("  default provider: 解析失败 — %v\n", err)
 	} else {
-		key := p.APIKey
-		if len(key) > 10 {
-			key = key[:6] + "…" + fmt.Sprintf("(%d chars)", len(key))
-		} else if key != "" {
-			key = fmt.Sprintf("(%d chars)", len(key))
+		key := ""
+		if p.APIKey != "" {
+			key = fmt.Sprintf("***(%d chars)", len(p.APIKey))
 		}
 		w("  default=%s type=%s model=%s\n", name, p.Type, p.Model)
 		w("  endpoint=%s\n", p.Endpoint)

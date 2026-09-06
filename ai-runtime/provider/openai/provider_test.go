@@ -593,3 +593,55 @@ func TestProvider_ChatStreamNoTokensOnEmptyStream(t *testing.T) {
 		t.Errorf("empty stream emitted %d tokens, want 0", n)
 	}
 }
+
+func TestProvider_ChatStreamTransportErrorDiscardsAssembly(t *testing.T) {
+	// 中途断连：写了半截数据后直接断开（非 EOF 收尾）。
+	// 截断的半截响应绝不能被重组为"成功"——那会把半截内容写进会话历史。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"))
+		w.(http.Flusher).Flush()
+		conn, buf, _ := w.(http.Hijacker).Hijack()
+		buf.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\" trun"))
+		buf.Flush()
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	tokens, err := newTestProvider(srv.URL).ChatStream(context.Background(), &core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	for tok := range tokens {
+		if tok.Response != nil {
+			t.Fatalf("truncated stream must not deliver assembled response: %#v", tok.Response)
+		}
+	}
+}
+
+func TestProvider_ChatStreamMalformedToolCallDeltas(t *testing.T) {
+	srv := newChatServer(t, func([]byte) string {
+		return "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":-1,\"id\":\"bad\",\"function\":{\"name\":\"evil\"}}]}}]}\n\n" +
+			"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":2,\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+			"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+			"data: [DONE]\n"
+	})
+	tokens, err := newTestProvider(srv.URL).ChatStream(context.Background(), &core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	var final *core.ChatResponse
+	for tok := range tokens {
+		if tok.Response != nil {
+			final = tok.Response
+		}
+	}
+	if final == nil {
+		t.Fatal("stream never delivered assembled response")
+	}
+	calls := final.Choices[0].Message.ToolCalls
+	// 负 index 分片跳过；index=2 起步的合法分片保留（前面的空槽被滤掉）
+	if len(calls) != 1 || calls[0].Function.Name != "lookup" {
+		t.Errorf("tool calls = %#v, want single lookup without negative-index entry", calls)
+	}
+}

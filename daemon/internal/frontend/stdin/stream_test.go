@@ -126,7 +126,7 @@ func TestStreamRenderer_BlankLeadingLineNoOrphanMarker(t *testing.T) {
 
 func TestStreamRenderer_WrappedLineRowCountsPhysicalRows(t *testing.T) {
 	s, out := newTestStream()
-	s.f.termWidth = 20 // 窄终端放大折行效果
+	s.f.termWidth.Store(20) // 窄终端放大折行效果
 
 	// 首行：●(2) + 45 列 ASCII = 47 列 → 3 物理行；次行 4 列 → 1 行
 	s.append(plugin.KindText, strings.Repeat("a", 45)+"\nnext\n")

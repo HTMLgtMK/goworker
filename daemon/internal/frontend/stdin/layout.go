@@ -7,7 +7,7 @@ import (
 
 // trailingJunk 匹配行尾的空白与 SGR 序列混合串：glamour 的行尾 padding
 // 是"每个空格单独包一层颜色序列"，纯 TrimRight 剥不掉。
-var trailingJunk = regexp.MustCompile(`(?:\[[0-9;]*m|[ \t])+$`)
+var trailingJunk = regexp.MustCompile(`(?:\x1b\[[0-9;]*m|[ \t])+$`)
 
 // layoutBlock 把 glamour 渲染好的内容装配到锚点列下，实现"锚点独占一列、
 // 续行从锚点间距起"的悬挂缩进：
