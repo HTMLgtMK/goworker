@@ -23,11 +23,52 @@ func newChatServer(t *testing.T, respond func([]byte) string) *httptest.Server {
 		if err != nil {
 			t.Errorf("read request: %v", err)
 		}
+		resp := respond(body)
+		// agent 循环走 ChatStream：respond 返回非 SSE 的 JSON 响应时，
+		// 转成单 delta 块的 SSE 流下发（message → delta），保持用例写法不变
+		if probeStream(body) && !strings.HasPrefix(resp, "data: ") {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(toSSE(t, resp)))
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(respond(body)))
+		_, _ = w.Write([]byte(resp))
 	}))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+func probeStream(body []byte) bool {
+	var probe struct {
+		Stream bool `json:"stream"`
+	}
+	return json.Unmarshal(body, &probe) == nil && probe.Stream
+}
+
+// toSSE 把 OpenAIChatResponse 形状的 JSON 转成单 delta 块的 SSE 文本。
+// message 对象整体搬到 delta（content/reasoning_content/tool_calls 通吃）。
+func toSSE(t *testing.T, resp string) string {
+	t.Helper()
+	var wire struct {
+		Choices []struct {
+			Message map[string]any `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(resp), &wire); err != nil {
+		t.Fatalf("toSSE decode response: %v", err)
+	}
+	delta := map[string]any{}
+	finish := "stop"
+	if len(wire.Choices) > 0 {
+		delta = wire.Choices[0].Message
+	}
+	chunk, err := json.Marshal(map[string]any{
+		"choices": []map[string]any{{"delta": delta, "finish_reason": finish}},
+	})
+	if err != nil {
+		t.Fatalf("toSSE encode chunk: %v", err)
+	}
+	return "data: " + string(chunk) + "\n\ndata: [DONE]\n"
 }
 
 func newTestProvider(endpoint string, options ...ProviderOptions) *Provider {
@@ -469,5 +510,138 @@ func TestProvider_ChatStreamEmptyDeltaChunksAreIgnored(t *testing.T) {
 	}
 	if text.String() != "ok" {
 		t.Errorf("streamed text = %q, want %q", text.String(), "ok")
+	}
+}
+
+func TestProvider_ChatStreamAssemblesToolCallDeltas(t *testing.T) {
+	srv := newChatServer(t, func([]byte) string {
+		return "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n" +
+			"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]}}]}\n\n" +
+			"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\":\"}}]}}]}\n\n" +
+			"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]}}]}\n\n" +
+			"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n" +
+			"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+			"data: [DONE]\n"
+	})
+	tokens, err := newTestProvider(srv.URL).ChatStream(context.Background(), &core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	var thinking, text strings.Builder
+	var final *core.ChatResponse
+	for token := range tokens {
+		switch token.Type {
+		case core.TokenTypeThinking:
+			thinking.WriteString(token.Content)
+		case core.TokenTypeText:
+			text.WriteString(token.Content)
+		}
+		if token.Response != nil {
+			final = token.Response
+		}
+	}
+	if thinking.String() != "think" {
+		t.Errorf("thinking deltas = %q, want %q", thinking.String(), "think")
+	}
+	if text.String() != "" {
+		t.Errorf("text deltas = %q, want empty", text.String())
+	}
+	if final == nil {
+		t.Fatal("stream never delivered assembled response")
+	}
+	msg := final.Choices[0].Message
+	if len(msg.ToolCalls) != 1 || msg.ToolCalls[0].Function.Name != "lookup" ||
+		msg.ToolCalls[0].Function.Arguments != `{"q":1}` {
+		t.Errorf("assembled tool calls = %#v", msg.ToolCalls)
+	}
+	if msg.Thinking.Text != "think" {
+		t.Errorf("assembled thinking = %q", msg.Thinking.Text)
+	}
+	if final.Usage == nil || final.Usage.TotalTokens != 8 {
+		t.Errorf("usage = %#v, want total 8", final.Usage)
+	}
+	// Custom 回放契约：reasoning_content 键控到 provider name
+	raw, ok := msg.Custom["openai"]
+	if !ok {
+		t.Fatalf("assembled message missing Custom replay: %#v", msg.Custom)
+	}
+	var payload struct {
+		Fields map[string]json.RawMessage `json:"fields"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode custom payload: %v", err)
+	}
+	var rc string
+	if err := json.Unmarshal(payload.Fields["reasoning_content"], &rc); err != nil || rc != "think" {
+		t.Errorf("custom reasoning_content = %q, err %v", rc, err)
+	}
+}
+
+func TestProvider_ChatStreamNoTokensOnEmptyStream(t *testing.T) {
+	srv := newChatServer(t, func([]byte) string {
+		return "data: [DONE]\n"
+	})
+	tokens, err := newTestProvider(srv.URL).ChatStream(context.Background(), &core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	n := 0
+	for range tokens {
+		n++
+	}
+	if n != 0 {
+		t.Errorf("empty stream emitted %d tokens, want 0", n)
+	}
+}
+
+func TestProvider_ChatStreamTransportErrorDiscardsAssembly(t *testing.T) {
+	// 中途断连：写了半截数据后直接断开（非 EOF 收尾）。
+	// 截断的半截响应绝不能被重组为"成功"——那会把半截内容写进会话历史。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"))
+		w.(http.Flusher).Flush()
+		conn, buf, _ := w.(http.Hijacker).Hijack()
+		buf.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\" trun"))
+		buf.Flush()
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	tokens, err := newTestProvider(srv.URL).ChatStream(context.Background(), &core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	for tok := range tokens {
+		if tok.Response != nil {
+			t.Fatalf("truncated stream must not deliver assembled response: %#v", tok.Response)
+		}
+	}
+}
+
+func TestProvider_ChatStreamMalformedToolCallDeltas(t *testing.T) {
+	srv := newChatServer(t, func([]byte) string {
+		return "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":-1,\"id\":\"bad\",\"function\":{\"name\":\"evil\"}}]}}]}\n\n" +
+			"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":2,\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+			"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+			"data: [DONE]\n"
+	})
+	tokens, err := newTestProvider(srv.URL).ChatStream(context.Background(), &core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	var final *core.ChatResponse
+	for tok := range tokens {
+		if tok.Response != nil {
+			final = tok.Response
+		}
+	}
+	if final == nil {
+		t.Fatal("stream never delivered assembled response")
+	}
+	calls := final.Choices[0].Message.ToolCalls
+	// 负 index 分片跳过；index=2 起步的合法分片保留（前面的空槽被滤掉）
+	if len(calls) != 1 || calls[0].Function.Name != "lookup" {
+		t.Errorf("tool calls = %#v, want single lookup without negative-index entry", calls)
 	}
 }

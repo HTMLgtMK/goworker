@@ -30,7 +30,7 @@ func testSession(pv core.Provider) (*Session, *runtimeconfig.Config) {
 func testRunCallbacks(buf *strings.Builder) RunCallbacks {
 	return RunCallbacks{
 		Write: func(s string) { buf.WriteString(s) },
-		WriteToken: func(_ RenderKind, s string) {
+		WriteToken: func(_ RenderKind, s string, _ bool) {
 			buf.WriteString(s)
 		},
 	}
@@ -56,7 +56,7 @@ func TestSessionRun_HidesThinkingWithoutDroppingHistory(t *testing.T) {
 	var output strings.Builder
 	callbacks := RunCallbacks{
 		Write: func(value string) { output.WriteString(value) },
-		WriteToken: func(kind RenderKind, content string) {
+		WriteToken: func(kind RenderKind, content string, _ bool) {
 			kinds = append(kinds, kind)
 			output.WriteString(content)
 		},
@@ -88,7 +88,7 @@ func TestSessionRun_ShowsThinkingByDefault(t *testing.T) {
 
 	var kinds []RenderKind
 	callbacks := RunCallbacks{
-		WriteToken: func(kind RenderKind, _ string) { kinds = append(kinds, kind) },
+		WriteToken: func(kind RenderKind, _ string, _ bool) { kinds = append(kinds, kind) },
 	}
 	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, callbacks); err != nil {
 		t.Fatalf("Run: %v", err)

@@ -107,6 +107,7 @@ type StreamChunk struct {
 	Created int64         `json:"created"`
 	Model   string        `json:"model"`
 	Choices []DeltaChoice `json:"choices"`
+	Usage   *UsageInfo    `json:"usage,omitempty"` // stream_options.include_usage 时出现在末尾独立块
 }
 
 // DeltaChoice 表示流式响应中的一个增量选择。
@@ -118,8 +119,26 @@ type DeltaChoice struct {
 
 // Delta 是流式响应中的增量更新。
 type Delta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role             string          `json:"role,omitempty"`
+	Content          string          `json:"content,omitempty"`
+	ReasoningContent string          `json:"reasoning_content,omitempty"` // DeepSeek 等后端的 thinking 增量
+	Reasoning        string          `json:"reasoning,omitempty"`         // OpenRouter 等后端的 thinking 增量
+	ToolCalls        []DeltaToolCall `json:"tool_calls,omitempty"`
+}
+
+// DeltaToolCall 是流式响应中的 tool call 增量分片。
+// 后端按 index 分片下发：id/type/name 只在首片出现，arguments 逐段追加。
+type DeltaToolCall struct {
+	Index    int                   `json:"index"`
+	ID       string                `json:"id,omitempty"`
+	Type     string                `json:"type,omitempty"`
+	Function DeltaToolCallFunction `json:"function,omitempty"`
+}
+
+// DeltaToolCallFunction 是流式 tool call 的函数字段分片。
+type DeltaToolCallFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 // ---- Token ----
@@ -130,6 +149,10 @@ type Token struct {
 	Content string
 	Done    bool
 	Event   *RuntimeEvent
+
+	// Response 由流式 provider 在流结束时填充：增量 content/thinking/tool_calls
+	// 重组出的完整响应，供 agent 回填历史与触发 AfterModel 中间件。其余 token 为 nil。
+	Response *ChatResponse
 }
 
 // RuntimeEvent 是运行时扩展事件载荷。agent kernel 只负责传递，不解释业务语义。

@@ -135,11 +135,12 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 // HITL 决策由前端按 spec 契约完成，plugin 只负责转交；agentCtx 取消时决策投递放弃。
 func (s *Session) streamTokens(cb RunCallbacks, agentCtx context.Context, tokenCh <-chan core.Token, decisions chan hitl.Decision) {
 	for tok := range tokenCh {
-		// 先输出内容再检查 Done — Done token 也可能带内容（如错误信息）
+		// 先输出内容再检查 Done — Done token 也可能带内容（如错误信息）。
+		// 空 content 的 Done 也要转发：前端靠它定稿未完成的流式渲染。
 		showToken := tok.Type != core.TokenTypeThinking || s.deps.Config.LLM.Thinking.Show
-		if showToken && tok.Content != "" && cb.WriteToken != nil {
+		if showToken && cb.WriteToken != nil && (tok.Content != "" || tok.Done) {
 			kind, c := renderKind(tok)
-			cb.WriteToken(kind, c)
+			cb.WriteToken(kind, c, tok.Done)
 		}
 		if tok.Done {
 			break
@@ -240,6 +241,7 @@ func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks) error {
 
 	// 压缩会丢原文，先固化到任务档案 —— 这是原文丢失前的最后一次机会。
 	if s.deps.Memory != nil {
+		publishStage(cb, "固化记忆中")
 		sum, err := s.checkpoint(ctx, history, s.deps.Config)
 		if err != nil {
 			if cb.Write != nil {
@@ -266,6 +268,7 @@ func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks) error {
 		return nil
 	}
 	compressor := s.newCompressor(provider, false)
+	publishStage(cb, "压缩会话历史中")
 
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -295,6 +298,7 @@ func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks) error {
 // compactStore store 持久化模式压缩：ActiveView 先固化 → 压缩 → detectCompact → 落 compact。
 func (s *Session) compactStore(ctx context.Context, cb RunCallbacks) error {
 	// 先固化再折叠（原文丢失前最后一次机会）
+	publishStage(cb, "固化记忆中")
 	_, _ = s.Consolidate(ctx)
 
 	view := s.deps.Store.ActiveView()
@@ -316,6 +320,7 @@ func (s *Session) compactStore(ctx context.Context, cb RunCallbacks) error {
 	}
 	// protectSystem=false：conversation 不含系统提示，首位可能是上次的摘要，允许被再次滚动
 	compressor := s.newCompressor(provider, false)
+	publishStage(cb, "压缩会话历史中")
 
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()

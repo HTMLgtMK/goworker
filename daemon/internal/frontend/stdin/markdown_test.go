@@ -33,7 +33,7 @@ func TestFormatThinking(t *testing.T) {
 	SetTheme("light")
 	out := formatThinking("  **inspect**\n\nthen decide  ", 80)
 	plain := ansiStripper.ReplaceAllString(out, "")
-	if !strings.Contains(plain, "Thinking\n") {
+	if !strings.Contains(plain, "Thinking  inspect") {
 		t.Errorf("thinking marker missing: %q", plain)
 	}
 	if !strings.Contains(plain, "inspect") || !strings.Contains(plain, "then decide") {

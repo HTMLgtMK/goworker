@@ -291,7 +291,7 @@ func (c *Config) SetField(key, value string) error {
 		}
 		c.Session.Enabled = b
 	default:
-		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, llm.context_window, llm.compress_at, llm.compact_keep, llm.max_iterations, llm.thinking.show, llm.thinking.request_mode, llm.thinking.effort, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days, memory.dir, memory.enabled, memory.task_keep, memory.task_inject_n, memory.ltm_inject_top_k, memory.ltm_extract, session.dir, session.enabled, memory.inject_budget_ratio"
+		valid := "frontend.stdin.theme, llm.default_provider, llm.providers.<name>.{type,endpoint,model,api_key,context_window,max_tokens,auth_type,thinking.request_mode,thinking.effort}, llm.compress_at, llm.compact_keep, llm.max_iterations, llm.thinking.show, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days, memory.dir, memory.enabled, memory.task_keep, memory.task_inject_n, memory.ltm_inject_top_k, memory.ltm_extract, session.dir, session.enabled, memory.inject_budget_ratio"
 		return fmt.Errorf("未知配置项: %s（可用: %s）", key, valid)
 	}
 	return nil

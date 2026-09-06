@@ -132,7 +132,7 @@ func newContext(args ...string) (*plugin.Context, *strings.Builder) {
 		Args: args,
 		FrontendContext: plugin.FrontendContext{
 			Writer:     func(s string) { buf.WriteString(s) },
-			WriteToken: func(_ plugin.RenderKind, s string) { buf.WriteString(s) },
+			WriteToken: func(_ plugin.RenderKind, s string, _ bool) { buf.WriteString(s) },
 		},
 	}, &buf
 }

@@ -459,3 +459,69 @@ func testTools() []core.Tool {
 		},
 	}}
 }
+
+// streamProvider 走流式路径：thinking/text 增量透传，流结束带重组响应。
+type streamProvider struct {
+	calls int
+}
+
+func (p *streamProvider) Name() string  { return "stream" }
+func (p *streamProvider) Model() string { return "m" }
+func (p *streamProvider) Chat(context.Context, *core.ChatRequest) (*core.ChatResponse, error) {
+	return nil, errors.New("stream provider should not fall back to Chat")
+}
+func (p *streamProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	p.calls++
+	ch := make(chan core.Token, 4)
+	ch <- core.Token{Type: core.TokenTypeThinking, Content: "ponder"}
+	ch <- core.Token{Type: core.TokenTypeText, Content: "ans"}
+	ch <- core.Token{Type: core.TokenTypeText, Content: "wer", Done: true}
+	ch <- core.Token{Type: core.TokenTypeText, Done: true, Response: &core.ChatResponse{
+		Choices: []core.ResponseChoice{{Message: core.Message{
+			Role:     "assistant",
+			Content:  "answer",
+			Thinking: core.Thinking{Text: "ponder"},
+		}}},
+	}}
+	close(ch)
+	return ch, nil
+}
+
+func TestAgentRun_StreamsDeltasWithoutDuplication(t *testing.T) {
+	provider := &streamProvider{}
+	a := NewAgent(provider, "", nil, nil)
+
+	tokenCh, msgCh, err := a.Run(context.Background(), nil, "question")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var text strings.Builder
+	var thinking strings.Builder
+	textDeltas := 0
+	for tok := range tokenCh {
+		switch tok.Type {
+		case core.TokenTypeText:
+			if tok.Content != "" {
+				textDeltas++
+				text.WriteString(tok.Content)
+			}
+		case core.TokenTypeThinking:
+			thinking.WriteString(tok.Content)
+		}
+	}
+	messages := <-msgCh
+
+	if text.String() != "answer" || thinking.String() != "ponder" {
+		t.Errorf("streamed text=%q thinking=%q", text.String(), thinking.String())
+	}
+	// 增量透传 2 段 text（"ans"+"wer"），重组响应不产生第二次整段重发
+	if textDeltas != 2 {
+		t.Errorf("text delta count = %d, want 2", textDeltas)
+	}
+	if len(messages) != 3 || messages[len(messages)-1].Content != "answer" {
+		t.Errorf("history = %#v", messages)
+	}
+	if provider.calls != 1 {
+		t.Errorf("provider calls = %d, want 1", provider.calls)
+	}
+}

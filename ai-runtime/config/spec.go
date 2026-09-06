@@ -241,10 +241,27 @@ type Paths struct {
 const (
 	EventUsage     = "usage"
 	EventIteration = "iteration"
+	EventPhase     = "phase"
 )
 
 // UsageEvent 是 EventUsage 的载荷：usage 快照 + 上下文窗口。
 type UsageEvent struct {
 	Usage         core.Usage
 	ContextWindow int
+}
+
+// PhaseKind 标记 PhaseEvent 的语义。
+type PhaseKind int
+
+const (
+	PhaseBegin PhaseKind = iota // 命令开始执行：addon 据此激活状态栏
+	PhaseStage                  // 阶段切换：Label 为阶段名（如"固化记忆中"）
+	PhaseEnd                    // 命令执行结束：addon 据此定格并落行
+)
+
+// PhaseEvent 是 EventPhase 的载荷：长耗时命令（/compact /new /agent）的阶段进度。
+// 命令框架负责 begin/end，命令内部在切换阶段时发 stage。
+type PhaseEvent struct {
+	Kind  PhaseKind
+	Label string
 }

@@ -33,8 +33,8 @@ func callbacksFromPlugin(ctx *plugin.Context) runtimeagent.RunCallbacks {
 		Publish: ctx.Publish,
 	}
 	if ctx.WriteToken != nil {
-		cb.WriteToken = func(kind runtimeagent.RenderKind, content string) {
-			ctx.WriteToken(plugin.RenderKind(kind), content)
+		cb.WriteToken = func(kind runtimeagent.RenderKind, content string, done bool) {
+			ctx.WriteToken(plugin.RenderKind(kind), content, done)
 		}
 	}
 	return cb
@@ -44,7 +44,7 @@ func callbacksFromPlugin(ctx *plugin.Context) runtimeagent.RunCallbacks {
 
 func (p *AgentPlugin) handleNew(ctx *plugin.Context) error {
 	// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
-	// 后台固化旧会话，不阻塞输入；快照走只读，新会话创建不影响这份引用。
+	// 同步固化旧会话（阻塞，状态栏显示进度）；快照走只读，先取好再重建。
 	old := p.session
 
 	// pending 快照（store 生效时用游标后的增量，否则全量）
@@ -57,16 +57,9 @@ func (p *AgentPlugin) handleNew(ctx *plugin.Context) error {
 	} else {
 		pending = old.Conversation()
 	}
+	consolidate := p.memory != nil && len(pending) > 0
 
-	if p.memory != nil && len(pending) > 0 {
-		// 后台固化旧会话，不阻塞输入。登记 bgWg：Stop 关 memory 前等它结束。
-		p.bgWg.Add(1)
-		go func() {
-			defer p.bgWg.Done()
-			old.CheckpointAsync(pending, ctx.Writer)
-		}()
-		ctx.Writer("✔ New session started, consolidating previous session in background…\n")
-	} else if p.memory == nil {
+	if p.memory == nil {
 		ctx.Writer("✔ New session started (memory disabled)\n")
 	} else {
 		ctx.Writer("✔ New session started\n")
@@ -84,6 +77,12 @@ func (p *AgentPlugin) handleNew(ctx *plugin.Context) error {
 	p.startSession()
 
 	ctx.Writer("✔ STM cleared, memory will be retrieved on every query\n")
+
+	// 同步固化旧会话：阻塞至完成（内部 120s 超时），进度经 ctx.Publish 进状态栏，
+	// 结果/警告经 ctx.Writer 回显。主 goroutine 执行，可直接读共享配置。
+	if consolidate {
+		old.CheckpointSync(ctx.Ctx, pending, callbacksFromPlugin(ctx))
+	}
 	return nil
 }
 

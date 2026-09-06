@@ -10,11 +10,18 @@ type OpenAIChatRequest struct {
 	Model           string           `json:"model"`
 	Messages        []map[string]any `json:"messages"`
 	Stream          bool             `json:"stream"`
+	StreamOptions   *StreamOptions   `json:"stream_options,omitempty"`
 	Tools           []map[string]any `json:"tools,omitempty"`
 	ToolChoice      any              `json:"tool_choice,omitempty"`
 	ResponseFormat  any              `json:"response_format,omitempty"`
 	EnableThinking  bool             `json:"enable_thinking,omitempty"`
 	ReasoningEffort string           `json:"reasoning_effort,omitempty"`
+}
+
+// StreamOptions 是 OpenAI 流式请求的选项。IncludeUsage 让后端在 finish
+// 之后追加一个只含 usage 的独立 chunk，否则流式响应拿不到用量。
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type OpenAIChatResponse struct {

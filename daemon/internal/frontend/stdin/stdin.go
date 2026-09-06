@@ -4,18 +4,26 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
 	"sync/atomic"
+	"syscall"
+
+	"github.com/rivo/uniseg"
 
 	term "github.com/charmbracelet/x/term"
 
 	"github.com/tinguo/goworker/ai-dispatch/task"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/core"
 	"github.com/tinguo/goworker/daemon/internal/frontend/statusbar"
 	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
+
+// Width 返回当前终端列数（atomic，SIGWINCH 与渲染并发访问安全）。
+func (f *StdinFrontend) Width() int { return int(f.termWidth.Load()) }
 
 // rawNL 在 raw mode 下 \n 不会自动回车到行首，需要补 \r
 const (
@@ -30,9 +38,11 @@ const (
 // 再按 consumer stack 责任链路由：栈顶消费者优先，第一个消费的节点终止。
 // keyWatcher 常驻栈底，取消键穿透所有行消费者后由它统一处理。
 type StdinFrontend struct {
-	engine    *core.Engine
-	editor    *LineEditor
-	termWidth int // 终端列数，用于 markdown 渲染的 word wrap 和 HR 宽度
+	engine *core.Engine
+	editor *LineEditor
+	// 终端列数，用于 markdown 渲染的 word wrap 和 HR 宽度。
+	// SIGWINCH goroutine 写、token 消费 goroutine 读，必须 atomic。
+	termWidth atomic.Int32
 
 	stack        *ConsumerStack
 	decoder      *KeyDecoder
@@ -45,7 +55,8 @@ type StdinFrontend struct {
 
 	cancelledByUser atomic.Bool // 用户按了 Esc/Ctrl+C
 
-	sb *statusbar.Bar
+	sb     *statusbar.Bar
+	stream *streamRenderer // 流式 token 增量渲染器
 }
 
 func NewStdinFrontend(engine *core.Engine, config *config.StdinConfig) *StdinFrontend {
@@ -54,7 +65,7 @@ func NewStdinFrontend(engine *core.Engine, config *config.StdinConfig) *StdinFro
 	}
 
 	sb := statusbar.New()
-	sb.Use(NewProgressAddon(), NewIterationAddon(), NewUsageAddon(), NewTaskAddon())
+	sb.Use(NewProgressAddon(), NewIterationAddon(), NewUsageAddon())
 
 	// dispatcher 事件桥接：dispatcher 任务跑在后台 goroutine（无命令 Context），
 	// 不能走 /agent 的 ctx.Publish 注入链，改经 Engine 事件总线常驻转发。
@@ -66,12 +77,15 @@ func NewStdinFrontend(engine *core.Engine, config *config.StdinConfig) *StdinFro
 		}
 	})
 
-	return &StdinFrontend{
+	f := &StdinFrontend{
 		engine:   engine,
 		sb:       sb,
 		stack:    NewConsumerStack(),
+		stream:   newStreamRenderer(nil),
 		cancelCh: make(chan struct{}, 1),
 	}
+	f.stream.bind(f)
+	return f
 }
 
 // dispatchStdin 是唯一的 os.Stdin 字节读取者，投递给 KeyDecoder 解码。
@@ -109,28 +123,57 @@ func (f *StdinFrontend) Write(s string) {
 	})
 }
 
-// writeText 渲染文本类 token（markdown 输出）。
-// 统一走 block() 编组：首行 ● 前缀，延续行对齐到内容列。
-func (f *StdinFrontend) writeText(content string) {
-	rendered := RenderMarkdown(strings.TrimSpace(content), f.termWidth)
-	f.Write("\n" + block(markerText, rendered))
+// handleToken 处理 WriteToken 回调：text/thinking 走流式增量渲染，
+// tool 类 token 先定稿未完成的流式段落再按整块渲染。done 定稿全部。
+func (f *StdinFrontend) handleToken(kind plugin.RenderKind, content string, done bool) {
+	switch kind {
+	case plugin.KindText, plugin.KindThinking:
+		if content != "" {
+			f.stream.append(kind, content)
+		}
+	case plugin.KindToolCall:
+		f.stream.finish()
+		f.writeToolCall(content)
+	case plugin.KindToolResult:
+		f.stream.finish()
+		f.writeToolResult(content)
+	}
+	if done {
+		f.stream.finish()
+	}
 }
 
+// thinkingHeader 是 thinking 块的头行前缀，内容首行紧跟其后同行开始。
+const thinkingHeader = "✻ Thinking"
+
+// formatThinking 把 thinking 文本渲染成灰色弱化的定稿块（流式消息定稿复用）。
+// 形态：内容首行紧跟 "✻ Thinking" 头行（空两格），续行悬挂对齐到锚点列，整体灰色。
 func formatThinking(content string, width int) string {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return ""
 	}
-	rendered := RenderMarkdown(content, width)
-	formatted := block(markerText, "Thinking\n"+rendered)
+	prefixCols := markerThinking.indent + uniseg.StringWidth(thinkingHeader) + 2 // "✻ Thinking  "
+	// 先剥掉 glamour 的正文主题色再灰化，否则深色前景覆盖灰色，thinking 看起来和正文同色
+	rendered := stripANSI(RenderMarkdown(content, renderWidth(width, prefixCols)))
+	lines := normalizeRendered(rendered)
+	if len(lines) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(thinkingHeader + "  " + lines[0])
+	pad := strings.Repeat(" ", markerThinking.indent)
+	for _, l := range lines[1:] {
+		b.WriteString("\n")
+		if l != "" {
+			// 空行不垫缩进，避免行尾幽灵空白
+			b.WriteString(pad)
+		}
+		b.WriteString(l)
+	}
+	formatted := b.String()
 	formatted = strings.ReplaceAll(formatted, ansiReset, ansiReset+thinkingColor)
 	return thinkingColor + formatted + ansiReset
-}
-
-func (f *StdinFrontend) writeThinking(content string) {
-	if rendered := formatThinking(content, f.termWidth); rendered != "" {
-		f.Write("\n" + rendered)
-	}
 }
 
 // writeToolCall 渲染工具调用 token。
@@ -157,6 +200,10 @@ func (f *StdinFrontend) writeToolResult(content string) {
 // 将 HITLConsumer 压栈（栈顶，HITL 期间独占输入），会话结束弹出。
 // 用户按 Esc/Ctrl+C 取消时，一并取消整个 agent 执行。
 func (f *StdinFrontend) decide(req *hitl.InterruptRequest) hitl.Decision {
+	// 先定稿未完成的流式段落：HITL 提示会移动光标，悬挂的原始行会让
+	// 之后的擦除偏移错位（擦掉 HITL 输出或残留半截内容）
+	f.stream.finish()
+
 	f.stack.Push(f.hitlConsumer)
 	defer func() {
 		f.stack.Pop()
@@ -192,6 +239,9 @@ func (f *StdinFrontend) Run() error {
 	f.editor = editor
 	defer editor.Close()
 
+	// 命令补全候选：Commands() 在运行期不变（全部 Init 时注册），启动时缓存一次
+	editor.SetCompleter(newCompleter(f.engine.Commands()))
+
 	f.hitlConsumer = NewHITLConsumer(f.cancelCh, f.Write)
 	f.keyWatcher = &keyWatcher{cancelCh: f.cancelCh}
 	f.decoder = NewKeyDecoder(func(ev KeyEvent) { f.stack.dispatch(ev) })
@@ -200,12 +250,31 @@ func (f *StdinFrontend) Run() error {
 	f.stack.Push(editor)       // 主输入行消费者
 
 	// 获取终端宽度，失败则用 80 列作为兜底
-	f.termWidth = 80
+	f.termWidth.Store(80)
 	if w, _, err := term.GetSize(os.Stdin.Fd()); err == nil && w > 0 {
-		f.termWidth = w
+		f.termWidth.Store(int32(w))
 	}
 
+	// SIGWINCH 实时跟踪宽度：markdown wrap、流式擦除行数都依赖它，
+	// 快照式的启动取值会在 resize 后全部错位
+	winch := make(chan os.Signal, 1)
+	signal.Notify(winch, syscall.SIGWINCH)
+	defer signal.Stop(winch)
+	go func() {
+		for range winch {
+			if w, _, err := term.GetSize(os.Stdin.Fd()); err == nil && w > 0 {
+				f.termWidth.Store(int32(w))
+			}
+		}
+	}()
+
 	go f.dispatchStdin()
+
+	// 常驻状态栏刷新循环：active 由 ProgressAddon 的事件驱动（begin 激活/end 停用），
+	// 非活跃时空转。ctx 与前端同生命周期。
+	sbCtx, sbCancel := context.WithCancel(context.Background())
+	defer sbCancel()
+	go f.sb.Run(sbCtx, func() bool { return f.stack.Top() == f.hitlConsumer })
 
 	for {
 		line, canceled, err := editor.ReadLine()
@@ -231,26 +300,12 @@ func (f *StdinFrontend) Run() error {
 		ctx := plugin.NewContext(context.Background(), f.Write, f.decide, nil)
 
 		// 注入 WriteToken — 所有渲染逻辑收敛至此
-		ctx.WriteToken = func(kind plugin.RenderKind, content string) {
-			switch kind {
-			case plugin.KindText:
-				f.writeText(content)
-			case plugin.KindThinking:
-				f.writeThinking(content)
-			case plugin.KindToolCall:
-				f.writeToolCall(content)
-			case plugin.KindToolResult:
-				f.writeToolResult(content)
-			}
-		}
+		ctx.WriteToken = f.handleToken
 
-		// 判断是否需要启用取消监听（agent 交互）
-		isAgent := !strings.HasPrefix(line, "/") || strings.HasPrefix(line, "/agent")
-		if isAgent {
-			f.runWithCancel(ctx, line)
-		} else if err := f.engine.Eval(ctx, line); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\r\n", err)
-		}
+		// 所有命令（含斜杠命令）统一走取消监听 + 状态栏事件驱动：
+		// 长耗时命令（/compact /new 的固化与压缩）期间 Esc 可取消，
+		// 状态栏 begin/end 由 runWithCancel 统一发布，命令内部发阶段事件
+		f.runWithCancel(ctx, line)
 	}
 }
 
@@ -290,14 +345,19 @@ func (k *keyWatcher) Consume(ev KeyEvent) bool {
 	return true
 }
 
-// runWithCancel 启动 agent：挂载取消回调到常驻 keyWatcher，agent 结束后卸载。
+// runWithCancel 启动命令：挂载取消回调到常驻 keyWatcher，结束后卸载。
+// 状态栏生命周期事件驱动：命令前发 PhaseBegin、结束后（含取消）发 PhaseEnd，
+// 阶段文本由命令内部经 ctx.Publish 发布，ProgressAddon 订阅并驱动 Bar。
 func (f *StdinFrontend) runWithCancel(ctx *plugin.Context, line string) {
 	f.cancelledByUser.Store(false)
 	f.agentCtx, f.agentCancel = context.WithCancel(context.Background())
 
-	// 注入事件总线，agent plugin 可通过 Publish 广播事件给 status bar addon
+	// 注入事件总线：命令（Session.Compact / handleNew 等）经此发阶段事件
 	ctx.Publish = f.sb.Publish
-	f.sb.Start()
+	ctx.Publish(runtimeconfig.EventPhase, runtimeconfig.PhaseEvent{Kind: runtimeconfig.PhaseBegin})
+	defer func() {
+		ctx.Publish(runtimeconfig.EventPhase, runtimeconfig.PhaseEvent{Kind: runtimeconfig.PhaseEnd})
+	}()
 
 	// 包装取消回调：用户取消时置 cancelledByUser，避免 Eval 返回的取消错误被当异常打印
 	f.keyWatcher.attach(func() {
@@ -306,7 +366,6 @@ func (f *StdinFrontend) runWithCancel(ctx *plugin.Context, line string) {
 	})
 	defer func() {
 		f.keyWatcher.detach()
-		f.sb.Stop()
 		f.agentCancel()
 		f.agentCtx = nil
 		f.agentCancel = nil
@@ -315,9 +374,6 @@ func (f *StdinFrontend) runWithCancel(ctx *plugin.Context, line string) {
 
 	// 注入可取消的 context（handleAgent 会 WithTimeout 派生，取消沿链传播）
 	ctx.Ctx = f.agentCtx
-
-	// 状态栏刷新；HITL 激活（栈顶为 HITL consumer）时暂停
-	go f.sb.Run(f.agentCtx, func() bool { return f.stack.Top() == f.hitlConsumer })
 
 	err := f.engine.Eval(ctx, line)
 
