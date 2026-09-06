@@ -228,6 +228,9 @@ func (f *StdinFrontend) Run() error {
 	f.editor = editor
 	defer editor.Close()
 
+	// 命令补全候选：Commands() 在运行期不变（全部 Init 时注册），启动时缓存一次
+	editor.SetCompleter(newCompleter(f.engine.Commands()))
+
 	f.hitlConsumer = NewHITLConsumer(f.cancelCh, f.Write)
 	f.keyWatcher = &keyWatcher{cancelCh: f.cancelCh}
 	f.decoder = NewKeyDecoder(func(ev KeyEvent) { f.stack.dispatch(ev) })

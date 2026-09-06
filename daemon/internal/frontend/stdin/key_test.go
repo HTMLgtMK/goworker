@@ -104,14 +104,29 @@ func TestDecode_DeleteKey(t *testing.T) {
 }
 
 func TestDecode_UnknownCSI(t *testing.T) {
-	// ESC [ Z（未识别序列）→ 忽略，不产生事件
+	// ESC [ J（未识别序列）→ 忽略，不产生事件
 	d, ch := testDecoder()
-	feed(d, escByte, '[', 'Z')
+	feed(d, escByte, '[', 'J')
 
 	select {
 	case ev := <-ch:
 		t.Fatalf("unexpected event for unknown CSI: %+v", ev)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestDecode_TabAndShiftTab(t *testing.T) {
+	// 0x09 → KeyTab；ESC [ Z → KeyShiftTab
+	d, ch := testDecoder()
+	feed(d, tabByte)
+
+	if ev := recv(t, ch, time.Second); ev.Type != KeyTab {
+		t.Fatalf("want KeyTab, got %+v", ev)
+	}
+
+	feed(d, escByte, '[', 'Z')
+	if ev := recv(t, ch, time.Second); ev.Type != KeyShiftTab {
+		t.Fatalf("want KeyShiftTab, got %+v", ev)
 	}
 }
 

@@ -11,6 +11,7 @@ const (
 	ctrlCByte     = 0x03
 	enterByte     = '\r'
 	backspaceByte = 0x7f
+	tabByte       = 0x09
 )
 
 // KeyType 表示解码后的按键事件类型。
@@ -29,6 +30,8 @@ const (
 	KeyArrowRight                // →（CSI ESC [ C）
 	KeyEsc                       // 独立 Esc（取消）
 	KeyCtrlC                     // Ctrl+C（取消）
+	KeyTab                       // Tab（补全，0x09）
+	KeyShiftTab                  // Shift+Tab（反向补全，CSI ESC [ Z）
 )
 
 // KeyEvent 是解码后的按键事件。
@@ -106,6 +109,8 @@ func (d *KeyDecoder) process(b byte) {
 		d.esc.Reset(escTimeout)
 	case b == ctrlCByte:
 		d.emit(KeyEvent{Type: KeyCtrlC})
+	case b == tabByte:
+		d.emit(KeyEvent{Type: KeyTab})
 	case b == enterByte:
 		d.emit(KeyEvent{Type: KeyEnter})
 	case b == backspaceByte:
@@ -162,6 +167,9 @@ func (d *KeyDecoder) finishCSI(b byte) {
 	case 'D':
 		d.escDead = false
 		d.emit(KeyEvent{Type: KeyArrowLeft})
+	case 'Z':
+		d.escDead = false
+		d.emit(KeyEvent{Type: KeyShiftTab})
 	case '3':
 		d.esc3 = true // 等待 '~' 完成 Delete（ESC [ 3 ~）
 	default:

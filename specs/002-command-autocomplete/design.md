@@ -1,31 +1,34 @@
-# Design: 命令 autocomplete（Tab 按需补全）
+# Design: 命令 autocomplete（行内灰色提示 + Tab 按需补全）
 
-**Date**: 2026-09-06 | **Status**: 设计定稿，未实现
-**交互形态**: Tab 按需补全（zsh/fish 风格，用户已选定；非实时弹层）
+**Date**: 2026-09-06 | **Status**: Phase 1 已实现
+**交互形态**: 行内灰色提示（fish 风格 ghost）+ Tab 按需补全（zsh/fish 风格）
 
 ## 1. 目标与非目标
 
 **目标**
+- 行内灰色提示：输入 `/c` 时光标后实时跟出灰色 `ompact  压缩对话历史`（最佳匹配的剩余字符 + 描述），不按键即见。
 - 斜杠命令名的前缀补全：`/co` + Tab → `/compact`，唯一候选直接补全，多候选循环切换。
 - 候选可发现性：Tab 展示候选列表（命令名 + 描述），不再依赖 `/help` 记忆命令。
 
 **非目标（本期不做）**
-- 实时弹出候选菜单（输入即过滤、↑↓ 选择）——已否决，选 Tab 按需。
+- 实时弹出候选菜单（输入即过滤、↑↓ 选择）——已否决，选 Tab 按需（行内 ghost 提示补足可发现性）。
 - 参数级补全（Phase 2 设计见 §6，本期只出设计不实现）。
 - 模糊匹配（子序列/fuzzy）——首版严格前缀，模糊留 Phase 3。
 - 中文输入法组合期的补全（raw mode 下 IME 组合态无法可靠探测，跳过）。
 
 ## 2. 交互规格
 
+**行内灰色提示（ghost，无按键触发）**：光标在行尾且正在输入首个 `/` 词时，`redrawInput` 在光标后追加最佳匹配（排序第一个候选）的剩余字符与描述，整体灰色（同 thinking 的 38;5;244）。已输入完整命令名时仅跟灰色描述（提示该命令做什么）。纯展示：Enter 只提交 buf，Tab 接受提示（走下述 Tab 路径）；按终端宽度截断，换行行数计入渲染/擦除行数。无匹配、行内有空格、光标不在行尾、无 completer 时不显示。
+
 | 场景 | 行为 |
 |---|---|
-| 输入以 `/` 开头、光标在第一个词内、按 Tab | 计算候选（见 §3）。无候选：终端响铃（`\a`），无其他动作。唯一候选：直接补全为该命令名 + 尾随空格。多候选：进入 cycle 模式，先补全为排序第一个候选，列表临时展示在输入行下方 |
-| cycle 模式中再按 Tab | 补全切换到下一个候选（循环）；Shift-Tab 反向 |
+| 输入以 `/` 开头、光标在首个词的行尾、按 Tab | 计算候选（见 §3）。无候选：终端响铃（`\a`），无其他动作。唯一候选：直接补全为该命令名 + 尾随空格。多候选：进入 cycle 模式，先补全为排序第一个候选，列表临时展示在输入行下方 |
+| cycle 模式中再按 Tab | 补全切换到下一个候选（循环）；Shift-Tab 反向（同样循环） |
 | cycle 模式中任意编辑键（字符/退格/方向键） | 退出 cycle 模式，撤下候选列表，正常编辑 |
-| Enter / Esc / ↑↓ 历史 | 不受影响：Enter 提交当前行（同时退出 cycle），Esc 走既有取消链（keyWatcher），↑↓ 仍是历史导航 |
-| 光标不在第一个词内、或行不以 `/` 开头 | Tab 无动作（暂不响铃，避免噪音） |
+| Enter / Esc / ↑↓ 历史 | 不受影响：Enter 提交当前行（提交前先擦掉候选区，避免残留屏幕），Esc 走既有取消链（keyWatcher），↑↓ 仍是历史导航 |
+| 光标不在首个词的行尾、或行不以 `/` 开头 | Tab 无动作（暂不响铃，避免噪音）。行尾约束避免补全时静默丢弃光标后的内容 |
 
-**补全结果形态**：只补命令名本身（如 `/compact`），尾随一个空格，光标落词尾。别名不参与直接补全（补全 canonical 名），但参与候选匹配（`/l` + Tab 时 `/llm` 作为 `/agent` 的别名出现在候选里，补全为 `/agent`）。
+**补全结果形态**：只补命令名本身（如 `/compact`），唯一候选带尾随空格（参数从空格后开始；cycle 期间不带空格，便于继续轮换），光标落词尾。别名不参与直接补全（补全 canonical 名），但参与候选匹配（`/l` + Tab 时 `/llm` 作为 `/agent` 的别名命中，补全为 `/agent`）。`/quit` 不经 engine 注册（Run 主循环直接拦截），候选构建时静态补入，`/exit` `/q` 同样归并到它。
 
 ## 3. 数据源与匹配
 
@@ -52,8 +55,9 @@
 
 ### 4.3 渲染
 
+- **行内 ghost 提示**：`redrawInput` 绘制 `prompt + buf` 后经 `ghostHint()` 追加灰色提示（剩余字符 + 描述）；宽度经 `positionOf(prompt+buf+ghostPlain)` 计入行占位（含 ghost 引发的换行），光标回位数学不变（`popupRows + (tp.row - cursor.row)` 向上回溯）。ghost 纯展示、无状态，随每次 `redrawInput` 从 buf/pos 派生。
 - 候选列表渲染在输入行下方（输入行内容 + 候选多行），复用 `redrawInput()` 的多行擦除机制（`renderedRows` 已支持多行光标回溯）：
-  - `redrawInput` 改为绘制 `prompt + buf` 后追加候选块（cycle 激活时），擦除行数 = 输入行 + 候选行数。
+  - `redrawInput` 改为绘制 `prompt + buf + ghost` 后追加候选块（cycle 激活时），擦除行数 = 输入行（含 ghost 换行）+ 候选行数。
   - 候选行格式：`命令名  描述`，描述用灰色弱化（复用 thinking 的 `\033[38;5;244m`）；当前 cycle 指向的候选高亮（反白或青色）。
   - 候选超过终端剩余行数时截断 + `… (+N more)` 计数提示。
 - 与 statusbar 互不干扰：候选块属于输入区，由 editor 自管擦除；statusbar 在底部独立清/绘（`Write()` 已有 WithLock 协议）。但注意：cycle 激活期间若 statusbar 在刷（agent 不可能同时跑，主 goroutine 串行——实际不冲突）。
@@ -64,22 +68,25 @@
 
 ```go
 type candidate struct {
-    completion  string // 补全结果（canonical 命令名）
+    completion  string   // 补全结果（canonical 命令名，含前导 /）
     description string
+    tokens      []string // 可匹配 token（canonical + 别名，全小写）
 }
 
 type completer struct {
-    candidates []candidate          // 启动时从 engine.Commands() 缓存，已排序
+    candidates []candidate // 全量候选（已排序，frontend 启动时从 engine.Commands() 构建）
     cycling    bool
     cycleIdx   int
-    cycleFrom  string               // 进入 cycle 时的原始输入（Shift-Tab 回退基准）
+    list       []candidate // cycle 中的候选集
+    current    string      // 最近一次产出的文本（cycle 期间输入漂移即退出重算）
 }
 
-// complete 处理一次 Tab/Shift-Tab。返回补全后的文本与是否展示候选列表。
-func (c *completer) complete(input string, forward bool) (text string, showList []candidate)
+// complete 处理一次 Tab（forward）/Shift-Tab（反向）。
+// 返回结果类别（无匹配/唯一/cycle）、补全后的完整文本、候选列表与高亮下标。
+func (c *completer) complete(input string, forward bool) (tabOutcome, string, []candidate, int)
 ```
 
-editor 只做按键分派与渲染；匹配/循环状态机全部在 completer，单测不需要终端。
+editor 只做按键分派、资格判定（`tabEligible`）与渲染；匹配/循环状态机全部在 completer，单测不需要终端。
 
 ## 6. Phase 2（参数补全，本期仅设计）
 
