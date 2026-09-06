@@ -95,7 +95,9 @@ func (s *streamRenderer) finish() {
 				// 光标当前在栏行或最后内容行的下一行行首，上移 rows 行落到消息起始行
 				fmt.Fprintf(s.errOut, "\r\033[%dA\033[J", rows)
 				if !blank {
-					fmt.Fprint(s.out, rendered)
+					// raw mode 下裸 \n 只换行不回车（列位保持），多行块必须补 \r，
+					// 否则每行从上一行结束的列继续——阶梯状排版
+					fmt.Fprint(s.out, strings.ReplaceAll(rendered, "\n", rawNL))
 					fmt.Fprint(s.errOut, rawNL)
 				}
 				if s.f.sb.Active() && !s.f.isHITL() {

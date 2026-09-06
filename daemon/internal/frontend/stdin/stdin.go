@@ -124,17 +124,35 @@ func (f *StdinFrontend) handleToken(kind plugin.RenderKind, content string, done
 	}
 }
 
+// thinkingHeader 是 thinking 块的头行前缀，内容首行紧跟其后同行开始。
+const thinkingHeader = "✻ Thinking"
+
 // formatThinking 把 thinking 文本渲染成灰色弱化的定稿块（流式消息定稿复用）。
-// 与正文同构：✻ Thinking 头行 + 内容行对齐到锚点列，整体灰色。
+// 形态：内容首行紧跟 "✻ Thinking" 头行（空两格），续行悬挂对齐到锚点列，整体灰色。
 func formatThinking(content string, width int) string {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return ""
 	}
+	prefixCols := markerThinking.indent + len(thinkingHeader) + 2 // "✻ Thinking  "
 	// 先剥掉 glamour 的正文主题色再灰化，否则深色前景覆盖灰色，thinking 看起来和正文同色
-	rendered := stripANSI(RenderMarkdown(content, renderWidth(width, markerThinking.indent)))
-	lines := append([]string{"Thinking"}, normalizeRendered(rendered)...)
-	formatted := layoutBlock(markerThinking, lines)
+	rendered := stripANSI(RenderMarkdown(content, renderWidth(width, prefixCols)))
+	lines := normalizeRendered(rendered)
+	if len(lines) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(thinkingHeader + "  " + lines[0])
+	pad := strings.Repeat(" ", markerThinking.indent)
+	for _, l := range lines[1:] {
+		b.WriteString("\n")
+		if l != "" {
+			// 空行不垫缩进，避免行尾幽灵空白
+			b.WriteString(pad)
+		}
+		b.WriteString(l)
+	}
+	formatted := b.String()
 	formatted = strings.ReplaceAll(formatted, ansiReset, ansiReset+thinkingColor)
 	return thinkingColor + formatted + ansiReset
 }
