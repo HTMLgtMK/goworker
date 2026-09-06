@@ -108,3 +108,44 @@ func TestStreamRenderer_BlankLeadingLineNoOrphanMarker(t *testing.T) {
 		t.Errorf("note line missing: %q", got)
 	}
 }
+
+func TestStreamRenderer_WrappedLineRowCountsPhysicalRows(t *testing.T) {
+	s, out := newTestStream()
+	s.f.termWidth = 20 // 窄终端放大折行效果
+
+	// 首行：●(2) + 45 列 ASCII = 47 列 → 3 物理行；次行 5 列 → 1 行
+	s.append(plugin.KindText, strings.Repeat("a", 45)+"\nnext\n")
+	if s.rows != 4 {
+		t.Fatalf("rows = %d, want 4 (3 wrapped + 1)", s.rows)
+	}
+	out.Reset()
+	// CJK 宽字符按显示宽度算：10 个汉字 = 20 列，恰好占满 1 物理行（锚点只在
+	// 段落首行，本行无前缀）；空行边界 1 行。段落定稿擦除整段累计物理行：
+	// 3 + 1 + 1 + 1 = 6
+	s.append(plugin.KindText, strings.Repeat("长", 10)+"\n\n")
+	if s.rows != 0 {
+		t.Errorf("rows after paragraph finalize = %d, want 0", s.rows)
+	}
+	if !strings.Contains(out.String(), "\r\033[6A\033[J") {
+		t.Errorf("erase should cover 6 physical rows: %q", out.String())
+	}
+}
+
+func TestPhysicalRows(t *testing.T) {
+	cases := []struct {
+		cols, width, want int
+	}{
+		{0, 80, 1},   // 空行占一行
+		{1, 80, 1},   // 不满一行
+		{80, 80, 1},  // 恰好整行
+		{81, 80, 2},  // 折行
+		{161, 80, 3}, // 折两行
+		{47, 20, 3},  // 窄终端
+		{10, 0, 1},   // termWidth 未知兜底
+	}
+	for _, c := range cases {
+		if got := physicalRows(c.cols, c.width); got != c.want {
+			t.Errorf("physicalRows(%d, %d) = %d, want %d", c.cols, c.width, got, c.want)
+		}
+	}
+}

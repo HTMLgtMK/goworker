@@ -158,6 +158,10 @@ func (f *StdinFrontend) writeToolResult(content string) {
 // 将 HITLConsumer 压栈（栈顶，HITL 期间独占输入），会话结束弹出。
 // 用户按 Esc/Ctrl+C 取消时，一并取消整个 agent 执行。
 func (f *StdinFrontend) decide(req *hitl.InterruptRequest) hitl.Decision {
+	// 先定稿未完成的流式段落：HITL 提示会移动光标，悬挂的原始行会让
+	// 之后的擦除偏移错位（擦掉 HITL 输出或残留半截内容）
+	f.stream.finish()
+
 	f.stack.Push(f.hitlConsumer)
 	defer func() {
 		f.stack.Pop()

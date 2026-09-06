@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/rivo/uniseg"
+
 	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
@@ -29,7 +31,7 @@ type streamRenderer struct {
 	kind    plugin.RenderKind // 正在流式渲染的 token 类型
 	pending string            // 未凑齐整行的尾部增量（不上屏）
 	text    strings.Builder   // 当前段落累积的原始文本（含已上屏行与 pending）
-	rows    int               // 当前段落已上屏的原始文本行数
+	rows    int               // 当前段落已上屏的终端物理行数（含折行）
 	fresh   bool              // 当前段落尚未上屏任何内容
 	needSep bool              // 下一次上屏前是否需要分隔换行（提交行 → 内容区）
 	started bool              // 是否处于流式渲染中（两次 finish 之间）
@@ -119,14 +121,18 @@ func (s *streamRenderer) finalizeParagraph() {
 }
 
 // emitLine 上屏一行原始文本。段落首行带分隔换行与 ● 锚点。
+// rows 按"终端物理行"计数：超宽行会被终端折行成多个物理行，擦除的
+// 上移行数必须覆盖折行，否则定稿替换后残留折行的上半截。
 func (s *streamRenderer) emitLine(line string) {
 	var b strings.Builder
+	cols := 0
 	if s.needSep {
 		b.WriteString(rawNL)
 		s.needSep = false
 	}
 	if s.fresh {
 		b.WriteString(markerText.glyph)
+		cols += markerText.indent
 		s.fresh = false
 	}
 	if s.kind == plugin.KindThinking {
@@ -134,7 +140,7 @@ func (s *streamRenderer) emitLine(line string) {
 	} else {
 		b.WriteString(line)
 	}
-	s.rows++
+	s.rows += physicalRows(cols+uniseg.StringWidth(line), s.f.termWidth)
 	s.text.WriteString(line + "\n")
 	out := b.String()
 
@@ -148,6 +154,18 @@ func (s *streamRenderer) emitLine(line string) {
 			s.f.sb.Draw()
 		}
 	})
+}
+
+// physicalRows 换算显示宽度占用的终端物理行数（≥1，向上取整）。
+// termWidth 未知（0）时按 80 兜底，与 Run() 的取宽兜底一致。
+func physicalRows(cols, termWidth int) int {
+	if termWidth <= 0 {
+		termWidth = 80
+	}
+	if cols <= 0 {
+		return 1
+	}
+	return (cols + termWidth - 1) / termWidth
 }
 
 // renderParagraph 渲染当前段落的原始文本为带锚点的定稿块。
