@@ -19,7 +19,7 @@ func newTestStream() (*streamRenderer, *bytes.Buffer) {
 	return s, &out
 }
 
-func TestStreamRenderer_LineLevelFlushAndParagraphFinalize(t *testing.T) {
+func TestStreamRenderer_LineLevelFlushAndFinalizeAtEnd(t *testing.T) {
 	s, out := newTestStream()
 
 	s.append(plugin.KindText, "hello ")
@@ -35,19 +35,28 @@ func TestStreamRenderer_LineLevelFlushAndParagraphFinalize(t *testing.T) {
 	if !strings.Contains(got, "next"+rawNL) {
 		t.Errorf("second line output = %q", got)
 	}
-	if s.rows != 2 || s.pending != "" {
-		t.Fatalf("rows=%d pending=%q, want 2/\"\"", s.rows, s.pending)
-	}
 
-	// 空行触发段落定稿：擦除序列出现，渲染块替换
+	// 空行不再触发分段定稿（整段定稿语义）：只是内容里的一行，rows 继续累计
 	out.Reset()
 	s.append(plugin.KindText, "\n")
-	if s.rows != 0 || !s.fresh {
-		t.Errorf("paragraph not reset: rows=%d fresh=%v", s.rows, s.fresh)
+	if s.rows != 3 {
+		t.Errorf("rows after blank line = %d, want 3 (2 content + 1 blank)", s.rows)
 	}
-	// 空行本身也占一行：2 行内容 + 1 行边界 = 3 行擦除
+	if strings.Contains(out.String(), "\x1b[") {
+		t.Errorf("blank line must not trigger erase: %q", out.String())
+	}
+
+	// finish 才定稿：擦除全部 3 行，整条消息一次渲染替换
+	out.Reset()
+	s.finish()
 	if !strings.Contains(out.String(), "\r\033[3A\033[J") {
 		t.Errorf("missing erase sequence for 3 rows: %q", out.String())
+	}
+	if strings.Count(out.String(), markerText.glyph) != 1 {
+		t.Errorf("finalized message should carry exactly one ● anchor: %q", out.String())
+	}
+	if s.started || s.rows != 0 {
+		t.Errorf("state not reset: started=%v rows=%d", s.started, s.rows)
 	}
 }
 
@@ -84,15 +93,18 @@ func TestStreamRenderer_ThinkingGrayAndKindSwitch(t *testing.T) {
 		t.Errorf("thinking raw line should use ✻ anchor, not ●: %q", out.String())
 	}
 	out.Reset()
-	// kind 切换：先定稿 thinking 段落，text 重新开始（不需要分隔换行）
+	// kind 切换：定稿 thinking 块后，text 流重新开始，块间恰好空一行
 	s.append(plugin.KindText, "answer\n")
 	got := out.String()
-	if strings.HasPrefix(got, rawNL) {
-		t.Errorf("kind switch should not re-separate: %q", got)
+	if !strings.Contains(got, rawNL+rawNL+markerText.glyph+"answer") {
+		t.Errorf("text should start after a blank line below thinking block: %q", got)
 	}
-	// text 行本身不带灰色（thinking 段落的定稿块除外）
-	if idx := strings.Index(got, "● answer"); idx >= 0 && strings.Contains(got[idx:], thinkingColor) {
-		t.Errorf("text line should not be gray: %q", got)
+	// 定稿的 thinking 块整体灰化且不带 glamour 正文深色
+	if !strings.Contains(got, "✻ Thinking") {
+		t.Errorf("thinking block missing ✻ Thinking header: %q", got)
+	}
+	if strings.Contains(got, "\x1b[38;2;20;20;19m") {
+		t.Errorf("thinking block must not contain body text color: %q", got)
 	}
 	if s.kind != plugin.KindText {
 		t.Errorf("kind = %v, want text", s.kind)
@@ -101,7 +113,7 @@ func TestStreamRenderer_ThinkingGrayAndKindSwitch(t *testing.T) {
 
 func TestStreamRenderer_BlankLeadingLineNoOrphanMarker(t *testing.T) {
 	s, out := newTestStream()
-	// agent note 以 "\n" 开头：首行即空行 → 段落边界，无内容不得留下孤立 ●
+	// agent note 以 "\n" 开头：首行空行跳过不上屏，不得留下孤立 ●
 	s.append(plugin.KindText, "\n⚠ note\n")
 	got := out.String()
 	if strings.Contains(got, markerText.glyph+rawNL) {
@@ -116,18 +128,23 @@ func TestStreamRenderer_WrappedLineRowCountsPhysicalRows(t *testing.T) {
 	s, out := newTestStream()
 	s.f.termWidth = 20 // 窄终端放大折行效果
 
-	// 首行：●(2) + 45 列 ASCII = 47 列 → 3 物理行；次行 5 列 → 1 行
+	// 首行：●(2) + 45 列 ASCII = 47 列 → 3 物理行；次行 4 列 → 1 行
 	s.append(plugin.KindText, strings.Repeat("a", 45)+"\nnext\n")
 	if s.rows != 4 {
 		t.Fatalf("rows = %d, want 4 (3 wrapped + 1)", s.rows)
 	}
-	out.Reset()
 	// CJK 宽字符按显示宽度算：10 个汉字 = 20 列，恰好占满 1 物理行（锚点只在
-	// 段落首行，本行无前缀）；空行边界 1 行。段落定稿擦除整段累计物理行：
-	// 3 + 1 + 1 + 1 = 6
+	// 消息首行，本行无前缀）；空行 1 行
 	s.append(plugin.KindText, strings.Repeat("长", 10)+"\n\n")
+	if s.rows != 6 {
+		t.Errorf("rows = %d, want 6 (3+1+1+1)", s.rows)
+	}
+
+	// finish 定稿：擦除整条消息累计的 6 个物理行
+	out.Reset()
+	s.finish()
 	if s.rows != 0 {
-		t.Errorf("rows after paragraph finalize = %d, want 0", s.rows)
+		t.Errorf("rows after finalize = %d, want 0", s.rows)
 	}
 	if !strings.Contains(out.String(), "\r\033[6A\033[J") {
 		t.Errorf("erase should cover 6 physical rows: %q", out.String())

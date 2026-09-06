@@ -81,6 +81,16 @@ func trimBlankLines(s string) string {
 	return strings.Join(lines[start:end], "\n")
 }
 
+// ansiSGIPattern 匹配 SGR 颜色序列（\x1b[...m）。
+var ansiSGIPattern = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+// stripANSI 剥除文本中的 SGR 颜色序列。
+// thinking 定稿用：glamour 会输出正文主题色（深色前景），放在外层灰色之前
+// 会把灰化覆盖掉——先剥成无色纯文本，再统一上灰色。
+func stripANSI(s string) string {
+	return ansiSGIPattern.ReplaceAllString(s, "")
+}
+
 // RenderMarkdown 渲染 markdown 为带简约 ANSI 风格的终端输出。
 // termWidth 为终端列数，用于 word wrap 和水平分割线宽度。
 func RenderMarkdown(text string, termWidth int) string {

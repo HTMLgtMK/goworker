@@ -128,7 +128,8 @@ func formatThinking(content string, width int) string {
 	if content == "" {
 		return ""
 	}
-	rendered := RenderMarkdown(content, width)
+	// 先剥掉 glamour 的正文主题色再灰化，否则深色前景覆盖灰色，thinking 看起来和正文同色
+	rendered := stripANSI(RenderMarkdown(content, width))
 	formatted := block(markerThinking, "Thinking\n"+rendered)
 	formatted = strings.ReplaceAll(formatted, ansiReset, ansiReset+thinkingColor)
 	return thinkingColor + formatted + ansiReset
