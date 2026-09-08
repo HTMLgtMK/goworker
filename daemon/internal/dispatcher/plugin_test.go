@@ -243,6 +243,163 @@ func TestPlugin_GeneralTaskFullFlow(t *testing.T) {
 	waitForStatus(t, p, id, task.StatusDone)
 }
 
+func TestPlugin_ReviewGeneralTaskShowsResultAndUsage(t *testing.T) {
+	p, hub := newTestPlugin(t)
+	now := time.Now()
+	tk := &task.Task{
+		ID:        "task_review_general",
+		Source:    "test",
+		Kind:      task.KindGeneral,
+		Prompt:    "summarize this",
+		Worker:    "fake",
+		Status:    task.StatusQueued,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := p.store.Add(tk); err != nil {
+		t.Fatalf("store.Add: %v", err)
+	}
+	setReviewStatus(t, p, tk, task.StatusDispatching)
+	setReviewStatus(t, p, tk, task.StatusWorking)
+	setReviewStatus(t, p, tk, task.StatusAwaitingReview)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"final "}}`)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer"}}`)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"usage_update","used":48302,"size":200000,"cost":{"amount":0.202231,"currency":"USD"}}`)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"private thought"}}`)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"future_update","secret":"protocol noise"}`)
+
+	out := runCmd(t, p, hub, "/dispatch", "review", tk.ID)
+	for _, want := range []string{
+		"任务：task_review_general",
+		"状态：awaiting_review",
+		"final answer",
+		"上下文：48302 / 200000",
+		"成本：0.202231 USD",
+		"/dispatch approve task_review_general",
+		"/dispatch reject task_review_general",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("review output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "private thought") || strings.Contains(out, "protocol noise") {
+		t.Fatalf("review must exclude non-deliverable updates:\n%s", out)
+	}
+}
+
+func TestPlugin_ReviewUnknownTask(t *testing.T) {
+	p, hub := newTestPlugin(t)
+	out := runCmd(t, p, hub, "/dispatch", "review", "task_missing")
+	if !strings.Contains(out, "任务 task_missing 不存在") {
+		t.Fatalf("review output = %q", out)
+	}
+}
+
+func TestPlugin_ReviewRunningAndFailedTasks(t *testing.T) {
+	p, hub := newTestPlugin(t)
+	now := time.Now()
+	running := &task.Task{
+		ID: "task_review_running", Source: "test", Kind: task.KindGeneral, Prompt: "run", Worker: "fake",
+		Status: task.StatusQueued, CreatedAt: now, UpdatedAt: now,
+	}
+	failed := &task.Task{
+		ID: "task_review_failed", Source: "test", Kind: task.KindGeneral, Prompt: "fail", Worker: "fake",
+		Status: task.StatusQueued, Error: "worker timed out", CreatedAt: now, UpdatedAt: now,
+	}
+	for _, tk := range []*task.Task{running, failed} {
+		if err := p.store.Add(tk); err != nil {
+			t.Fatalf("store.Add %s: %v", tk.ID, err)
+		}
+	}
+	setReviewStatus(t, p, running, task.StatusDispatching)
+	setReviewStatus(t, p, running, task.StatusWorking)
+	setReviewStatus(t, p, failed, task.StatusFailed)
+
+	runningOut := runCmd(t, p, hub, "/dispatch", "review", running.ID)
+	if !strings.Contains(runningOut, "尚未收口") || !strings.Contains(runningOut, "/dispatch tail "+running.ID) {
+		t.Fatalf("running review = %q", runningOut)
+	}
+	failedOut := runCmd(t, p, hub, "/dispatch", "review", failed.ID)
+	if !strings.Contains(failedOut, "worker timed out") || !strings.Contains(failedOut, "任务失败") {
+		t.Fatalf("failed review = %q", failedOut)
+	}
+}
+
+func TestPlugin_ReviewCodeTaskShowsDiffEvidence(t *testing.T) {
+	p, hub := newTestPlugin(t)
+	now := time.Now()
+	tk := &task.Task{
+		ID: "task_review_code", Source: "test", Kind: task.KindCode, Prompt: "add feature", Worker: "fake",
+		Status: task.StatusQueued, Repo: "/repo", Worktree: "/worktree", Branch: "dispatch/task_review_code",
+		BaseCommit: "abc123", Commits: []string{"def456 worker commit"}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := p.store.Add(tk); err != nil {
+		t.Fatalf("store.Add: %v", err)
+	}
+	setReviewStatus(t, p, tk, task.StatusDispatching)
+	setReviewStatus(t, p, tk, task.StatusWorking)
+	setReviewStatus(t, p, tk, task.StatusAwaitingReview)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"implemented"}}`)
+
+	out := runCmd(t, p, hub, "/dispatch", "review", tk.ID)
+	for _, want := range []string{
+		"Worktree：/worktree",
+		"分支：dispatch/task_review_code",
+		"基线：abc123",
+		"def456 worker commit",
+		"git -C '/repo' diff 'abc123'..'dispatch/task_review_code'",
+		"worker 结论",
+		"implemented",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("review output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestPlugin_ReviewSanitizesTerminalTextAndQuotesDiff(t *testing.T) {
+	p, hub := newTestPlugin(t)
+	now := time.Now()
+	tk := &task.Task{
+		ID: "task_review_safe", Source: "test", Kind: task.KindCode, Prompt: "safe\x1b]8;;https://bad.example\a", Worker: "fake",
+		Status: task.StatusQueued, Repo: "/repo; touch pwned", Worktree: "/worktree\x1b[2J", Branch: "branch'; touch pwned; echo '",
+		BaseCommit: "base", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := p.store.Add(tk); err != nil {
+		t.Fatalf("store.Add: %v", err)
+	}
+	setReviewStatus(t, p, tk, task.StatusDispatching)
+	setReviewStatus(t, p, tk, task.StatusWorking)
+	setReviewStatus(t, p, tk, task.StatusAwaitingReview)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"result\u001b[31m"}}`)
+
+	out := runCmd(t, p, hub, "/dispatch", "review", tk.ID)
+	if strings.Contains(out, "\x1b") {
+		t.Fatalf("review leaked terminal control content:\n%s", out)
+	}
+	want := "git -C '/repo; touch pwned' diff 'base'..'branch'\"'\"'; touch pwned; echo '\"'\"''"
+	if !strings.Contains(out, want) {
+		t.Fatalf("quoted diff = %q, want %q", out, want)
+	}
+}
+
+func setReviewStatus(t *testing.T, p *DispatcherPlugin, tk *task.Task, status task.Status) {
+	t.Helper()
+	if err := tk.Transition(status); err != nil {
+		t.Fatalf("transition %s: %v", status, err)
+	}
+	if err := p.updateTask(tk); err != nil {
+		t.Fatalf("update task %s: %v", tk.ID, err)
+	}
+}
+
+func appendReviewEvent(t *testing.T, p *DispatcherPlugin, taskID, update string) {
+	t.Helper()
+	if err := p.eventLog.Append(task.TaskEvent{TaskID: taskID, Type: task.EventUpdate, Update: []byte(update)}); err != nil {
+		t.Fatalf("append review event: %v", err)
+	}
+}
+
 func TestPlugin_TailStreamsRunningTaskUpdates(t *testing.T) {
 	p, _ := newTestPlugin(t)
 	now := time.Now()

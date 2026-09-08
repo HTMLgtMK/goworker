@@ -354,6 +354,12 @@ func (p *DispatcherPlugin) handleDispatch(ctx *plugin.Context) error {
 			return nil
 		}
 		return p.handleTail(ctx, args[1])
+	case "review":
+		if len(args) < 2 {
+			ctx.Writer("用法: /dispatch review <task_id>\n")
+			return nil
+		}
+		return p.handleReview(ctx, args[1])
 	case "approve":
 		if len(args) < 2 {
 			ctx.Writer("用法: /dispatch approve <task_id>\n")
@@ -433,6 +439,7 @@ func (p *DispatcherPlugin) writeUsage(ctx *plugin.Context) {
   /dispatch ls [status]           ← 任务列表
   /dispatch show <id>             ← 任务详情
   /dispatch tail <id>             ← 实时查看任务输出
+  /dispatch review <id>           ← 查看可验收的任务产物
   /dispatch approve <id>          ← 审批通过（code 任务尝试 ff 合并）
   /dispatch complete <id>         ← 人工合并完成后收尾（清 worktree、标记 done）
   /dispatch reject <id>           ← 拒绝（弃置任务产物）
