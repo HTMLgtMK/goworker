@@ -231,11 +231,103 @@ func TestPlugin_GeneralTaskFullFlow(t *testing.T) {
 		t.Errorf("task = %+v", tk)
 	}
 
+	out = runCmd(t, p, hub, "/dispatch", "tail", id)
+	if !strings.Contains(out, "committing") {
+		t.Fatalf("tail output = %q, want worker message", out)
+	}
+
 	out = runCmd(t, p, hub, "/dispatch", "approve", id)
 	if !strings.Contains(out, "已完成") {
 		t.Fatalf("approve output = %q", out)
 	}
 	waitForStatus(t, p, id, task.StatusDone)
+}
+
+func TestPlugin_TailStreamsRunningTaskUpdates(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	now := time.Now()
+	tk := &task.Task{
+		ID:        "task_live",
+		Source:    "test",
+		Kind:      task.KindGeneral,
+		Prompt:    "stream",
+		Repo:      t.TempDir(),
+		Worker:    "fake",
+		Status:    task.StatusQueued,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := p.store.Add(tk); err != nil {
+		t.Fatalf("store.Add: %v", err)
+	}
+	if err := tk.Transition(task.StatusDispatching); err != nil {
+		t.Fatal(err)
+	}
+	if err := tk.Transition(task.StatusWorking); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.store.Update(tk); err != nil {
+		t.Fatalf("store.Update: %v", err)
+	}
+
+	if err := p.eventLog.Append(task.TaskEvent{
+		TaskID: tk.ID,
+		Type:   task.EventUpdate,
+		Update: []byte(`{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"history"}}`),
+	}); err != nil {
+		t.Fatalf("append history: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var mu sync.Mutex
+	var output strings.Builder
+	attached := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- p.handleTail(plugin.NewContext(ctx, func(text string) {
+			mu.Lock()
+			output.WriteString(text)
+			mu.Unlock()
+			if strings.Contains(text, "history") {
+				select {
+				case attached <- struct{}{}:
+				default:
+				}
+			}
+		}, nil, nil), tk.ID)
+	}()
+
+	select {
+	case <-attached:
+	case <-time.After(time.Second):
+		t.Fatal("tail did not replay history")
+	}
+
+	if err := p.eventLog.Append(task.TaskEvent{
+		TaskID: tk.ID,
+		Type:   task.EventUpdate,
+		Update: []byte(`{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live update"}}`),
+	}); err != nil {
+		t.Fatalf("append update: %v", err)
+	}
+	if err := p.eventLog.Append(task.TaskEvent{TaskID: tk.ID, Type: task.EventStatus, From: task.StatusWorking, To: task.StatusAwaitingReview}); err != nil {
+		t.Fatalf("append status: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handleTail: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tail did not stop at awaiting_review")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(output.String(), "live update") {
+		t.Fatalf("tail output = %q, want live update", output.String())
+	}
 }
 
 func TestPlugin_RejectCleansUpWorktree(t *testing.T) {

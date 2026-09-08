@@ -29,8 +29,9 @@ type DispatcherPlugin struct {
 	paths runtimeconfig.Paths
 	hub   *plugin.Hub
 
-	store *task.Store
-	orch  *dispatch.Orchestrator
+	store    *task.Store
+	eventLog *task.EventLog
+	orch     *dispatch.Orchestrator
 
 	// running 追踪在跑的任务：taskID → cancel。Stop 时统一取消并等待退出。
 	mu      sync.Mutex
@@ -68,12 +69,24 @@ func (p *DispatcherPlugin) Init(h *plugin.Hub) error {
 		return fmt.Errorf("dispatcher: open task store: %w", err)
 	}
 	p.store = store
+	eventLog, err := task.OpenEventLog(filepath.Join(p.paths.DispatchDir, "task-events.jsonl"))
+	if err != nil {
+		_ = store.Close()
+		return fmt.Errorf("dispatcher: open task event log: %w", err)
+	}
+	p.eventLog = eventLog
 	p.orch = dispatch.NewOrchestrator(store)
-	p.resumeInterrupted()
 	p.orch.SetStatusListener(func(t *task.Task, from, to task.Status) {
 		p.notifyStatus(t, from, to)
 	})
 	p.orch.SetProgress(func(taskID string, u protocol.SessionUpdateBody) {
+		if err := p.eventLog.Append(task.TaskEvent{
+			TaskID: taskID,
+			Type:   task.EventUpdate,
+			Update: updatePayload(u),
+		}); err != nil {
+			slog.Error("dispatch: append task update", "task", taskID, "error", err)
+		}
 		// ACP 提交方的任务：进度路由回对应连接；REPL 任务只留 debug 日志
 		p.mu.Lock()
 		route, ok := p.acpRoutes[taskID]
@@ -95,6 +108,7 @@ func (p *DispatcherPlugin) Init(h *plugin.Hub) error {
 			})
 		}
 	})
+	p.resumeInterrupted()
 
 	if err := h.RegisterCommand(plugin.Command{
 		Name:        "/dispatch",
@@ -171,6 +185,11 @@ func (p *DispatcherPlugin) Stop() error {
 	p.mu.Unlock()
 	p.wg.Wait()
 	_ = os.Remove(filepath.Join(p.paths.DispatchDir, "acp.sock"))
+	if p.eventLog != nil {
+		if err := p.eventLog.Close(); err != nil {
+			return err
+		}
+	}
 	if p.store != nil {
 		return p.store.Close()
 	}
@@ -329,6 +348,12 @@ func (p *DispatcherPlugin) handleDispatch(ctx *plugin.Context) error {
 			return nil
 		}
 		return p.handleShow(ctx, args[1])
+	case "tail":
+		if len(args) < 2 {
+			ctx.Writer("用法: /dispatch tail <task_id>\n")
+			return nil
+		}
+		return p.handleTail(ctx, args[1])
 	case "approve":
 		if len(args) < 2 {
 			ctx.Writer("用法: /dispatch approve <task_id>\n")
@@ -407,6 +432,7 @@ func (p *DispatcherPlugin) writeUsage(ctx *plugin.Context) {
   /dispatch @claude <prompt>      ← 指定 worker
   /dispatch ls [status]           ← 任务列表
   /dispatch show <id>             ← 任务详情
+  /dispatch tail <id>             ← 实时查看任务输出
   /dispatch approve <id>          ← 审批通过（code 任务尝试 ff 合并）
   /dispatch complete <id>         ← 人工合并完成后收尾（清 worktree、标记 done）
   /dispatch reject <id>           ← 拒绝（弃置任务产物）
@@ -462,6 +488,14 @@ func (p *DispatcherPlugin) addTask(ctx *plugin.Context, explicitWorker string, g
 func (p *DispatcherPlugin) notifyStatus(t *task.Task, from, to task.Status) {
 	if from == to {
 		return
+	}
+	if err := p.eventLog.Append(task.TaskEvent{
+		TaskID: t.ID,
+		Type:   task.EventStatus,
+		From:   from,
+		To:     to,
+	}); err != nil {
+		slog.Error("dispatch: append task status", "task", t.ID, "error", err)
 	}
 	p.hub.Notify(plugin.Event{
 		Type: plugin.EventType(task.EventTaskStatus),
@@ -572,6 +606,103 @@ func (p *DispatcherPlugin) doShow(id string, write func(string)) {
 	}
 	data, _ := json.MarshalIndent(t, "", "  ")
 	write(string(data) + "\n")
+}
+
+func (p *DispatcherPlugin) handleTail(ctx *plugin.Context, id string) error {
+	if _, ok := p.store.Get(id); !ok {
+		ctx.Writer(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
+		return nil
+	}
+
+	history, cursor, live, unsubscribe := p.eventLog.Subscribe(id)
+	defer unsubscribe()
+	for _, event := range history {
+		writeTaskEvent(ctx.Writer, event)
+	}
+	current, ok := p.store.Get(id)
+	if !ok || tailComplete(current.Status) || historyHasCompletion(history) {
+		if ok {
+			writeTaskError(ctx.Writer, current)
+		}
+		return nil
+	}
+
+	for {
+		select {
+		case <-ctx.Ctx.Done():
+			return nil
+		case <-live:
+			events, next := p.eventLog.EventsAfter(id, cursor)
+			cursor = next
+			for _, event := range events {
+				writeTaskEvent(ctx.Writer, event)
+				if event.Type == task.EventStatus && tailComplete(event.To) {
+					if current, ok := p.store.Get(id); ok {
+						writeTaskError(ctx.Writer, current)
+					}
+					return nil
+				}
+			}
+		}
+	}
+}
+
+func historyHasCompletion(history []task.TaskEvent) bool {
+	for _, event := range history {
+		if event.Type == task.EventStatus && tailComplete(event.To) {
+			return true
+		}
+	}
+	return false
+}
+
+func updatePayload(update protocol.SessionUpdateBody) json.RawMessage {
+	if len(update.Raw) > 0 {
+		return append(json.RawMessage(nil), update.Raw...)
+	}
+	data, err := json.Marshal(update)
+	if err != nil {
+		slog.Error("dispatch: encode task update", "kind", update.SessionUpdate, "error", err)
+		return nil
+	}
+	return data
+}
+
+func tailComplete(status task.Status) bool {
+	return status == task.StatusAwaitingReview || status.Terminal()
+}
+
+func writeTaskError(write func(string), t task.Task) {
+	if t.Error != "" {
+		write("✘ " + t.Error + "\n")
+	}
+}
+
+func writeTaskEvent(write func(string), event task.TaskEvent) {
+	if event.Type == task.EventStatus {
+		write(fmt.Sprintf("[%s → %s]\n", event.From, event.To))
+		return
+	}
+
+	var update protocol.SessionUpdateBody
+	if err := json.Unmarshal(event.Update, &update); err != nil {
+		write("[invalid update] " + string(event.Update) + "\n")
+		return
+	}
+	switch update.SessionUpdate {
+	case protocol.UpdateAgentMessageChunk:
+		if update.Content != nil {
+			write(update.Content.Text)
+		}
+	case protocol.UpdateAgentThoughtChunk:
+		if update.Content != nil {
+			write("[thought] " + update.Content.Text)
+		}
+	case protocol.UpdateToolCall, protocol.UpdateToolCallUpdate:
+		write(fmt.Sprintf("[tool %s %s %s]\n", update.Title, update.Status, update.ToolCallID))
+	default:
+		write(fmt.Sprintf("[%s] %s\n", update.SessionUpdate, event.Update))
+	}
 }
 
 // handleApprove 审批通过：code 任务尝试 ff 合并（失败则提示走人工 complete），

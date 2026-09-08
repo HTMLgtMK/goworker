@@ -183,6 +183,9 @@ func TestIngress_DetachAndCompensation(t *testing.T) {
 		protocol.NewSessionRequest{Cwd: repo}, &newResp); err != nil {
 		t.Fatal(err)
 	}
+	mu.Lock()
+	ingressUpdates = nil // 丢弃此前测试的通知残留
+	mu.Unlock()
 	var promptResp protocol.PromptResponse
 	if err := fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
 		SessionID: newResp.SessionID,
@@ -193,9 +196,6 @@ func TestIngress_DetachAndCompensation(t *testing.T) {
 	if promptResp.StopReason != protocol.StopEndTurn {
 		t.Fatalf("detach stop = %q", promptResp.StopReason)
 	}
-	mu.Lock()
-	ingressUpdates = nil // 丢弃此前测试的通知残留
-	mu.Unlock()
 	detachTexts := pollUpdatesText(t, func(text string) bool { return strings.Contains(text, "已异步入队") })
 	taskID := extractTaskID(t, detachTexts)
 	_ = fc.conn.Close() // 模拟提交方断连
