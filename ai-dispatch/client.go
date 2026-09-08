@@ -123,7 +123,10 @@ func (c *Client) Initialize(ctx context.Context) (protocol.InitializeResponse, e
 // NewSession 在 cwd 下开一个 worker 会话。
 func (c *Client) NewSession(ctx context.Context, cwd string) (string, error) {
 	var resp protocol.NewSessionResponse
-	req := protocol.NewSessionRequest{Cwd: cwd}
+	req := protocol.NewSessionRequest{
+		Cwd:        cwd,
+		McpServers: []map[string]any{},
+	}
 	if err := c.conn.Call(ctx, protocol.MethodSessionNew, req, &resp); err != nil {
 		return "", err
 	}
@@ -137,7 +140,11 @@ func (c *Client) NewSession(ctx context.Context, cwd string) (string, error) {
 // loadSession 能力。返回 worker 确认的 sessionID。
 func (c *Client) SessionLoad(ctx context.Context, sessionID, cwd string) (string, error) {
 	var resp protocol.NewSessionResponse
-	req := protocol.LoadSessionRequest{SessionID: sessionID, Cwd: cwd}
+	req := protocol.LoadSessionRequest{
+		SessionID:  sessionID,
+		Cwd:        cwd,
+		McpServers: []map[string]any{},
+	}
 	if err := c.conn.Call(ctx, protocol.MethodSessionLoad, req, &resp); err != nil {
 		return "", err
 	}

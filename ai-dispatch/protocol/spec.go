@@ -61,14 +61,14 @@ type AuthMethod struct {
 type LoadSessionRequest struct {
 	SessionID  string           `json:"sessionId"`
 	Cwd        string           `json:"cwd"`
-	McpServers []map[string]any `json:"mcpServers,omitempty"`
+	McpServers []map[string]any `json:"mcpServers"`
 }
 
 // ---- session/new ----
 
 type NewSessionRequest struct {
 	Cwd        string           `json:"cwd"`
-	McpServers []map[string]any `json:"mcpServers,omitempty"`
+	McpServers []map[string]any `json:"mcpServers"`
 }
 
 type NewSessionResponse struct {

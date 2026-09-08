@@ -17,15 +17,18 @@ import (
 type fakeAgent struct {
 	conn *protocol.Conn
 
-	mu          sync.Mutex
-	promptBody  string
-	gotOptionID string
+	mu                sync.Mutex
+	promptBody        string
+	newSessionParams  json.RawMessage
+	loadSessionParams json.RawMessage
+	gotOptionID       string
 }
 
 func newFakeAgent(rwc io.ReadWriteCloser) *fakeAgent {
 	a := &fakeAgent{conn: protocol.NewConn(rwc)}
 	a.conn.Handle(protocol.MethodInitialize, a.handleInitialize)
 	a.conn.Handle(protocol.MethodSessionNew, a.handleSessionNew)
+	a.conn.Handle(protocol.MethodSessionLoad, a.handleSessionLoad)
 	a.conn.Handle(protocol.MethodSessionPrompt, a.handlePrompt)
 	go func() { _ = a.conn.Serve() }()
 	return a
@@ -35,7 +38,17 @@ func (a *fakeAgent) handleInitialize(_ context.Context, _ json.RawMessage) (any,
 	return protocol.InitializeResponse{ProtocolVersion: protocol.Version}, nil
 }
 
-func (a *fakeAgent) handleSessionNew(_ context.Context, _ json.RawMessage) (any, error) {
+func (a *fakeAgent) handleSessionNew(_ context.Context, params json.RawMessage) (any, error) {
+	a.mu.Lock()
+	a.newSessionParams = append(a.newSessionParams[:0], params...)
+	a.mu.Unlock()
+	return protocol.NewSessionResponse{SessionID: "sess_fake"}, nil
+}
+
+func (a *fakeAgent) handleSessionLoad(_ context.Context, params json.RawMessage) (any, error) {
+	a.mu.Lock()
+	a.loadSessionParams = append(a.loadSessionParams[:0], params...)
+	a.mu.Unlock()
 	return protocol.NewSessionResponse{SessionID: "sess_fake"}, nil
 }
 
@@ -99,12 +112,59 @@ func clientToAgent(t *testing.T, agent *fakeAgent) *Client {
 	agent.conn = protocol.NewConn(agentEnd)
 	agent.conn.Handle(protocol.MethodInitialize, agent.handleInitialize)
 	agent.conn.Handle(protocol.MethodSessionNew, agent.handleSessionNew)
+	agent.conn.Handle(protocol.MethodSessionLoad, agent.handleSessionLoad)
 	agent.conn.Handle(protocol.MethodSessionPrompt, agent.handlePrompt)
 	go func() { _ = agent.conn.Serve() }()
 
 	c := NewClient("fake", clientEnd, clientEnd.Close)
 	t.Cleanup(func() { _ = c.Close() })
 	return c
+}
+
+func TestClient_SessionRequestsIncludeEmptyMCPServers(t *testing.T) {
+	agent := &fakeAgent{}
+	client := clientToAgent(t, agent)
+
+	if _, err := client.NewSession(context.Background(), "/repo"); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if _, err := client.SessionLoad(context.Background(), "sess_previous", "/repo"); err != nil {
+		t.Fatalf("SessionLoad: %v", err)
+	}
+
+	agent.mu.Lock()
+	newParams := append(json.RawMessage(nil), agent.newSessionParams...)
+	loadParams := append(json.RawMessage(nil), agent.loadSessionParams...)
+	agent.mu.Unlock()
+
+	for _, tc := range []struct {
+		name   string
+		params json.RawMessage
+	}{
+		{name: "session/new", params: newParams},
+		{name: "session/load", params: loadParams},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var request map[string]json.RawMessage
+			if err := json.Unmarshal(tc.params, &request); err != nil {
+				t.Fatalf("decode params: %v", err)
+			}
+			servers, ok := request["mcpServers"]
+			if !ok {
+				t.Fatal("mcpServers is missing")
+			}
+			if string(servers) == "null" {
+				t.Fatal("mcpServers must be an array, got null")
+			}
+			var values []json.RawMessage
+			if err := json.Unmarshal(servers, &values); err != nil {
+				t.Fatalf("mcpServers must be an array: %v", err)
+			}
+			if len(values) != 0 {
+				t.Errorf("mcpServers = %s, want []", servers)
+			}
+		})
+	}
 }
 
 func TestClient_PromptFlow(t *testing.T) {
