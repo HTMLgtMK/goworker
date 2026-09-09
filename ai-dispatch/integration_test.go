@@ -261,6 +261,18 @@ type recordingHandler struct {
 	blockDur time.Duration
 }
 
+type contextHandler struct {
+	entered   chan struct{}
+	cancelled chan struct{}
+}
+
+func (h *contextHandler) Run(ctx context.Context, _ string, _ string, _ Reporter) (string, error) {
+	close(h.entered)
+	<-ctx.Done()
+	close(h.cancelled)
+	return protocol.StopCancelled, nil
+}
+
 func (h *recordingHandler) Run(ctx context.Context, sessionID, prompt string, rep Reporter) (string, error) {
 	h.mu.Lock()
 	h.prompts = append(h.prompts, prompt)
@@ -364,6 +376,47 @@ func TestServer_TaskRoundtrip(t *testing.T) {
 			t.Fatalf("progress update not received: %+v", fc.collected())
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+func TestServer_ConnectionCloseCancelsPrompt(t *testing.T) {
+	handler := &contextHandler{
+		entered:   make(chan struct{}),
+		cancelled: make(chan struct{}),
+	}
+	server, fc := newServerWithFakeClient(t, handler)
+
+	var newResp protocol.NewSessionResponse
+	if err := fc.conn.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: "/repo"}, &newResp); err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		var resp protocol.PromptResponse
+		_ = fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+			SessionID: newResp.SessionID,
+			Prompt:    []protocol.ContentBlock{protocol.TextBlock("observe")},
+		}, &resp)
+	}()
+
+	select {
+	case <-handler.entered:
+	case <-time.After(time.Second):
+		t.Fatal("prompt did not enter handler")
+	}
+	if err := fc.close(); err != nil {
+		t.Fatalf("close client: %v", err)
+	}
+	select {
+	case <-handler.cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("connection close did not cancel prompt")
+	}
+	select {
+	case <-server.Done():
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop after client close")
 	}
 }
 

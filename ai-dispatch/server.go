@@ -41,6 +41,7 @@ type Server struct {
 	done chan struct{} // 读循环退出（对端断开）后关闭
 
 	mu      sync.Mutex
+	closed  bool
 	cancels map[string]context.CancelFunc // sessionID → prompt 执行的 cancel
 }
 
@@ -59,6 +60,7 @@ func ServeConn(rwc io.ReadWriteCloser, handler TaskHandler) *Server {
 	go func() {
 		defer close(s.done)
 		_ = s.conn.Serve()
+		s.cancelAll()
 	}()
 	return s
 }
@@ -117,6 +119,11 @@ func (s *Server) handlePrompt(ctx context.Context, params json.RawMessage) (any,
 
 	runCtx, cancel := context.WithCancel(ctx)
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		cancel()
+		return nil, protocol.ErrClosed
+	}
 	s.cancels[req.SessionID] = cancel
 	s.mu.Unlock()
 	defer func() {
@@ -134,6 +141,16 @@ func (s *Server) handlePrompt(ctx context.Context, params json.RawMessage) (any,
 		stop = protocol.StopEndTurn
 	}
 	return protocol.PromptResponse{StopReason: stop}, nil
+}
+
+func (s *Server) cancelAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	for sessionID, cancel := range s.cancels {
+		delete(s.cancels, sessionID)
+		cancel()
+	}
 }
 
 func (s *Server) handleCancel(params json.RawMessage) {

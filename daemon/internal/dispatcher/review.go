@@ -21,6 +21,46 @@ type reviewUsage struct {
 	Currency string
 }
 
+type reviewDTO struct {
+	Task     reviewTaskDTO   `json:"task"`
+	Statuses []string        `json:"statuses"`
+	Usage    *reviewUsageDTO `json:"usage,omitempty"`
+	Tools    []reviewToolDTO `json:"tools"`
+	Artifact string          `json:"artifact,omitempty"`
+	Code     *reviewCodeDTO  `json:"code,omitempty"`
+}
+
+type reviewTaskDTO struct {
+	ID        string `json:"id"`
+	Kind      string `json:"kind"`
+	Worker    string `json:"worker"`
+	Status    string `json:"status"`
+	Prompt    string `json:"prompt"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type reviewUsageDTO struct {
+	Used     json.Number `json:"used"`
+	Size     json.Number `json:"size"`
+	Cost     json.Number `json:"cost,omitempty"`
+	Currency string      `json:"currency,omitempty"`
+}
+
+type reviewToolDTO struct {
+	Title  string `json:"title"`
+	Status string `json:"status"`
+}
+
+type reviewCodeDTO struct {
+	Repo       string   `json:"repo"`
+	Worktree   string   `json:"worktree"`
+	Branch     string   `json:"branch"`
+	BaseCommit string   `json:"base_commit"`
+	Commits    []string `json:"commits"`
+	Conclusion string   `json:"conclusion,omitempty"`
+}
+
 type reviewTool struct {
 	Title  string
 	Status string
@@ -36,6 +76,60 @@ type taskReview struct {
 func (p *DispatcherPlugin) handleReview(ctx *plugin.Context, id string) error {
 	p.doReview(id, ctx.Writer)
 	return nil
+}
+
+func (p *DispatcherPlugin) review(id string) (reviewDTO, bool) {
+	t, ok := p.store.Get(id)
+	if !ok {
+		return reviewDTO{}, false
+	}
+	events, _ := p.eventLog.EventsAfter(id, 0)
+	review := summarizeTaskEvents(events)
+	return buildReviewDTO(t, review), true
+}
+
+func buildReviewDTO(t task.Task, review taskReview) reviewDTO {
+	result := reviewDTO{
+		Task: reviewTaskDTO{
+			ID:        cleanReviewText(t.ID),
+			Kind:      cleanReviewText(string(t.Kind)),
+			Worker:    cleanReviewText(t.Worker),
+			Status:    cleanReviewText(string(t.Status)),
+			Prompt:    cleanReviewText(t.Prompt),
+			CreatedAt: formatReviewTime(t.CreatedAt),
+			UpdatedAt: formatReviewTime(t.UpdatedAt),
+		},
+		Tools: make([]reviewToolDTO, 0, len(review.Tools)),
+	}
+	for _, status := range review.Statuses {
+		result.Statuses = append(result.Statuses, cleanReviewText(string(status)))
+	}
+	for _, tool := range review.Tools {
+		result.Tools = append(result.Tools, reviewToolDTO{
+			Title: cleanReviewText(tool.Title), Status: cleanReviewText(tool.Status),
+		})
+	}
+	if review.Usage != nil {
+		result.Usage = &reviewUsageDTO{
+			Used: review.Usage.Used, Size: review.Usage.Size,
+			Cost: review.Usage.Cost, Currency: cleanReviewText(review.Usage.Currency),
+		}
+	}
+	text := cleanReviewText(review.Text)
+	if t.Kind == task.KindCode {
+		commits := make([]string, 0, len(t.Commits))
+		for _, commit := range t.Commits {
+			commits = append(commits, cleanReviewText(commit))
+		}
+		result.Code = &reviewCodeDTO{
+			Repo: cleanReviewText(t.Repo), Worktree: cleanReviewText(t.Worktree),
+			Branch: cleanReviewText(t.Branch), BaseCommit: cleanReviewText(t.BaseCommit),
+			Commits: commits, Conclusion: text,
+		}
+		return result
+	}
+	result.Artifact = text
+	return result
 }
 
 func (p *DispatcherPlugin) doReview(id string, write func(string)) {

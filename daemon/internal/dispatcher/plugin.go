@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -249,6 +250,10 @@ func (h *acpIngress) Run(ctx context.Context, sessionID, prompt string, rep disp
 	case strings.HasPrefix(prompt, "--status "):
 		p.doShow(trim(strings.TrimPrefix(prompt, "--status ")), write)
 		return protocol.StopEndTurn, nil
+	case strings.HasPrefix(prompt, "--review "):
+		return h.review(sessionID, trim(strings.TrimPrefix(prompt, "--review ")), rep)
+	case strings.HasPrefix(prompt, "--events "):
+		return h.events(ctx, sessionID, trim(strings.TrimPrefix(prompt, "--events ")), rep)
 	case strings.HasPrefix(prompt, "--approve "):
 		p.doApprove(ctx, trim(strings.TrimPrefix(prompt, "--approve ")), write)
 		return protocol.StopEndTurn, nil
@@ -262,9 +267,123 @@ func (h *acpIngress) Run(ctx context.Context, sessionID, prompt string, rep disp
 		p.doCancel(ctx, trim(strings.TrimPrefix(prompt, "--cancel ")), write)
 		return protocol.StopEndTurn, nil
 	case strings.HasPrefix(trim(prompt), "--"):
-		return "", statusError(fmt.Sprintf("unknown directive %q (detach/ls/status/approve/complete/reject/cancel)", trim(prompt)))
+		return "", statusError(fmt.Sprintf("unknown directive %q (detach/ls/status/review/events/approve/complete/reject/cancel)", trim(prompt)))
 	}
 	return h.dispatchSync(ctx, sessionID, cwd, prompt, rep)
+}
+
+type ingressEnvelope struct {
+	Version    int             `json:"version"`
+	Type       string          `json:"type"`
+	Task       *reviewTaskDTO  `json:"task,omitempty"`
+	Review     *reviewDTO      `json:"review,omitempty"`
+	Event      *task.TaskEvent `json:"event,omitempty"`
+	Cursor     int             `json:"cursor,omitempty"`
+	NextCursor int             `json:"next_cursor,omitempty"`
+	Status     string          `json:"status,omitempty"`
+}
+
+func (h *acpIngress) review(sessionID, id string, rep dispatch.Reporter) (string, error) {
+	review, ok := h.plugin.review(id)
+	if !ok {
+		return "", statusError(fmt.Sprintf("task %q not found", id))
+	}
+	if err := writeIngressEnvelope(rep, sessionID, ingressEnvelope{
+		Version: 1, Type: "review", Task: &review.Task, Review: &review,
+	}); err != nil {
+		return "", err
+	}
+	return protocol.StopEndTurn, nil
+}
+
+func (h *acpIngress) events(ctx context.Context, sessionID, args string, rep dispatch.Reporter) (string, error) {
+	id, cursor, err := parseEventsArgs(args)
+	if err != nil {
+		return "", statusError(err.Error())
+	}
+	if _, ok := h.plugin.store.Get(id); !ok {
+		return "", statusError(fmt.Sprintf("task %q not found", id))
+	}
+
+	history, historyCursor, live, unsubscribe := h.plugin.eventLog.Subscribe(id)
+	defer unsubscribe()
+	if cursor > historyCursor {
+		return "", statusError(fmt.Sprintf("cursor %d exceeds task event history", cursor))
+	}
+	if err := h.writeEvents(rep, sessionID, id, cursor, history[cursor:]); err != nil {
+		return "", err
+	}
+	cursor = historyCursor
+	current, ok := h.plugin.store.Get(id)
+	if !ok {
+		return "", statusError(fmt.Sprintf("task %q not found", id))
+	}
+	if tailComplete(current.Status) {
+		return h.completeEvents(rep, sessionID, cursor, current.Status)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return protocol.StopEndTurn, nil
+		case <-live:
+			events, next := h.plugin.eventLog.EventsAfter(id, cursor)
+			if err := h.writeEvents(rep, sessionID, id, cursor, events); err != nil {
+				return "", err
+			}
+			cursor = next
+			for _, event := range events {
+				if event.Type == task.EventStatus && tailComplete(event.To) {
+					return h.completeEvents(rep, sessionID, cursor, event.To)
+				}
+			}
+		}
+	}
+}
+
+func parseEventsArgs(args string) (string, int, error) {
+	parts := strings.Fields(args)
+	if len(parts) == 0 || len(parts) > 2 {
+		return "", 0, fmt.Errorf("usage: --events <task_id> [cursor]")
+	}
+	if len(parts) == 1 {
+		return parts[0], 0, nil
+	}
+	cursor, err := strconv.Atoi(parts[1])
+	if err != nil || cursor < 0 {
+		return "", 0, fmt.Errorf("invalid event cursor %q", parts[1])
+	}
+	return parts[0], cursor, nil
+}
+
+func (h *acpIngress) writeEvents(rep dispatch.Reporter, sessionID, id string, cursor int, events []task.TaskEvent) error {
+	for index, event := range events {
+		event.TaskID = id
+		if err := writeIngressEnvelope(rep, sessionID, ingressEnvelope{
+			Version: 1, Type: "event", Event: &event, Cursor: cursor + index + 1,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *acpIngress) completeEvents(rep dispatch.Reporter, sessionID string, cursor int, status task.Status) (string, error) {
+	if err := writeIngressEnvelope(rep, sessionID, ingressEnvelope{
+		Version: 1, Type: "complete", NextCursor: cursor, Status: string(status),
+	}); err != nil {
+		return "", err
+	}
+	return protocol.StopEndTurn, nil
+}
+
+func writeIngressEnvelope(rep dispatch.Reporter, sessionID string, envelope ingressEnvelope) error {
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		return statusError(fmt.Sprintf("encode ingress envelope: %v", err))
+	}
+	rep.MessageChunk(sessionID, string(data))
+	return nil
 }
 
 // newTaskFromIngress 按 cwd 判型创建任务（不落盘，orchestrator 首次 save 负责）。

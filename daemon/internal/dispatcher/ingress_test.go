@@ -102,6 +102,294 @@ func TestIngress_ACPClientSubmitsTask(t *testing.T) {
 	_ = waitForStatus(t, p, tasks[0].ID, task.StatusAwaitingReview)
 }
 
+func TestIngress_ReviewReturnsStructuredArtifact(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	now := time.Now()
+	tk := &task.Task{
+		ID: "task_ingress_review", Source: "acp", Kind: task.KindGeneral, Prompt: "summarize", Worker: "fake",
+		Status: task.StatusQueued, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := p.store.Add(tk); err != nil {
+		t.Fatalf("store.Add: %v", err)
+	}
+	setReviewStatus(t, p, tk, task.StatusDispatching)
+	setReviewStatus(t, p, tk, task.StatusWorking)
+	setReviewStatus(t, p, tk, task.StatusAwaitingReview)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"# Final\n\n- delivered"}}`)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"private thought"}}`)
+
+	fc, sessionID := newIngressSession(t, p, t.TempDir())
+	clearIngressUpdates()
+	var promptResp protocol.PromptResponse
+	if err := fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+		SessionID: sessionID,
+		Prompt:    []protocol.ContentBlock{protocol.TextBlock("--review " + tk.ID)},
+	}, &promptResp); err != nil {
+		t.Fatalf("review prompt: %v", err)
+	}
+
+	envelope := waitIngressEnvelope(t, "review")
+	if envelope.Version != 1 || envelope.Task.ID != tk.ID || envelope.Task.Status != string(task.StatusAwaitingReview) {
+		t.Fatalf("review envelope = %+v", envelope)
+	}
+	if envelope.Review.Artifact != "# Final\n\n- delivered" {
+		t.Errorf("artifact = %q", envelope.Review.Artifact)
+	}
+	if strings.Contains(envelope.Review.Artifact, "private thought") {
+		t.Fatalf("review leaked thought: %+v", envelope)
+	}
+}
+
+func TestIngress_EventsReplayFromCursorAndComplete(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	now := time.Now()
+	tk := &task.Task{
+		ID: "task_ingress_events", Source: "acp", Kind: task.KindGeneral, Prompt: "observe", Worker: "fake",
+		Status: task.StatusQueued, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := p.store.Add(tk); err != nil {
+		t.Fatalf("store.Add: %v", err)
+	}
+	setReviewStatus(t, p, tk, task.StatusDispatching)
+	setReviewStatus(t, p, tk, task.StatusWorking)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"history"}}`)
+
+	fc, sessionID := newIngressSession(t, p, t.TempDir())
+	clearIngressUpdates()
+	result := make(chan error, 1)
+	go func() {
+		var promptResp protocol.PromptResponse
+		result <- fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+			SessionID: sessionID,
+			Prompt:    []protocol.ContentBlock{protocol.TextBlock("--events " + tk.ID + " 0")},
+		}, &promptResp)
+	}()
+
+	history := waitIngressUpdateEvent(t, "history")
+	if history.Cursor == 0 || history.Event.Update == nil {
+		t.Fatalf("history envelope = %+v", history)
+	}
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live"}}`)
+	setReviewStatus(t, p, tk, task.StatusAwaitingReview)
+
+	live := waitIngressUpdateEvent(t, "live")
+	completion := waitIngressEnvelope(t, "complete")
+	if live.Cursor <= history.Cursor || completion.NextCursor <= live.Cursor || completion.Status != string(task.StatusAwaitingReview) {
+		t.Fatalf("event cursors = history:%d live:%d completion:%+v", history.Cursor, live.Cursor, completion)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("events prompt: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events prompt did not complete")
+	}
+}
+
+func TestIngress_EventsStayOpenWhileCodeTaskMerges(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	now := time.Now()
+	tk := &task.Task{
+		ID: "task_ingress_merging", Source: "acp", Kind: task.KindCode, Prompt: "merge", Worker: "fake",
+		Status: task.StatusQueued, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := p.store.Add(tk); err != nil {
+		t.Fatalf("store.Add: %v", err)
+	}
+	setReviewStatus(t, p, tk, task.StatusDispatching)
+	setReviewStatus(t, p, tk, task.StatusWorking)
+	setReviewStatus(t, p, tk, task.StatusAwaitingReview)
+	setReviewStatus(t, p, tk, task.StatusMerging)
+
+	fc, sessionID := newIngressSession(t, p, t.TempDir())
+	clearIngressUpdates()
+	result := make(chan error, 1)
+	go func() {
+		var promptResp protocol.PromptResponse
+		result <- fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+			SessionID: sessionID,
+			Prompt:    []protocol.ContentBlock{protocol.TextBlock("--events " + tk.ID + " 0")},
+		}, &promptResp)
+	}()
+
+	waitIngressStatusEvent(t, task.StatusMerging)
+	select {
+	case err := <-result:
+		t.Fatalf("events prompt finished while merging: %v", err)
+	default:
+	}
+
+	setReviewStatus(t, p, tk, task.StatusDone)
+	completion := waitIngressEnvelope(t, "complete")
+	if completion.Status != string(task.StatusDone) {
+		t.Fatalf("completion status = %q, want done", completion.Status)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("events prompt: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events prompt did not complete")
+	}
+}
+
+func TestIngress_ObservationDirectivesReturnRPCErrors(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	fc, sessionID := newIngressSession(t, p, t.TempDir())
+
+	for _, prompt := range []string{
+		"--review task_missing",
+		"--events task_missing 0",
+		"--events task_missing not-a-cursor",
+	} {
+		var response protocol.PromptResponse
+		err := fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+			SessionID: sessionID,
+			Prompt:    []protocol.ContentBlock{protocol.TextBlock(prompt)},
+		}, &response)
+		if err == nil || !strings.Contains(err.Error(), "rpc -32000") {
+			t.Errorf("prompt %q error = %v, want RPC error", prompt, err)
+		}
+	}
+}
+
+type observedIngressEnvelope struct {
+	Version    int    `json:"version"`
+	Type       string `json:"type"`
+	Cursor     int    `json:"cursor"`
+	NextCursor int    `json:"next_cursor"`
+	Status     string `json:"status"`
+	Task       struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	} `json:"task"`
+	Review struct {
+		Artifact string `json:"artifact"`
+	} `json:"review"`
+	Event struct {
+		Update json.RawMessage `json:"update"`
+	} `json:"event"`
+}
+
+func newIngressSession(t *testing.T, p *DispatcherPlugin, cwd string) (*fakeACPTaskClient, string) {
+	t.Helper()
+	short, err := os.MkdirTemp("", "gwd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(short) })
+	p.paths.DispatchDir = short
+	if err := p.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	conn, err := net.Dial("unix", filepath.Join(short, "acp.sock"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	fc := newFakeACPTaskClient(conn)
+	t.Cleanup(func() { _ = fc.conn.Close() })
+
+	var newResp protocol.NewSessionResponse
+	if err := fc.conn.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: cwd}, &newResp); err != nil {
+		t.Fatalf("session/new: %v", err)
+	}
+	return fc, newResp.SessionID
+}
+
+func clearIngressUpdates() {
+	mu.Lock()
+	defer mu.Unlock()
+	ingressUpdates = nil
+}
+
+func waitIngressStatusEvent(t *testing.T, status task.Status) observedIngressEnvelope {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		updates := append([]protocol.SessionUpdate(nil), ingressUpdates...)
+		mu.Unlock()
+		for _, update := range updates {
+			if update.Update.Content == nil {
+				continue
+			}
+			var envelope observedIngressEnvelope
+			if err := json.Unmarshal([]byte(update.Update.Content.Text), &envelope); err != nil || envelope.Type != "event" {
+				continue
+			}
+			var event task.TaskEvent
+			if err := json.Unmarshal([]byte(update.Update.Content.Text), &struct {
+				Event *task.TaskEvent `json:"event"`
+			}{Event: &event}); err == nil && event.Type == task.EventStatus && event.To == status {
+				return envelope
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("did not receive status event %q", status)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+func waitIngressUpdateEvent(t *testing.T, text string) observedIngressEnvelope {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		updates := append([]protocol.SessionUpdate(nil), ingressUpdates...)
+		mu.Unlock()
+		for _, update := range updates {
+			if update.Update.Content == nil {
+				continue
+			}
+			var envelope observedIngressEnvelope
+			if err := json.Unmarshal([]byte(update.Update.Content.Text), &envelope); err != nil || envelope.Type != "event" || envelope.Event.Update == nil {
+				continue
+			}
+			var eventUpdate protocol.SessionUpdateBody
+			if err := json.Unmarshal(envelope.Event.Update, &eventUpdate); err == nil && eventUpdate.Content != nil && eventUpdate.Content.Text == text {
+				return envelope
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("did not receive event containing %q", text)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+func waitIngressEnvelope(t *testing.T, kind string) observedIngressEnvelope {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		updates := append([]protocol.SessionUpdate(nil), ingressUpdates...)
+		mu.Unlock()
+		for _, update := range updates {
+			if update.Update.Content == nil {
+				continue
+			}
+			var envelope observedIngressEnvelope
+			if err := json.Unmarshal([]byte(update.Update.Content.Text), &envelope); err == nil && envelope.Type == kind {
+				return envelope
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("did not receive %q envelope", kind)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 // pollUpdatesText 轮询累积所有 update 文本直到条件满足（通知与响应异步到达）。
 func pollUpdatesText(t *testing.T, done func(string) bool) string {
 	t.Helper()
