@@ -400,6 +400,25 @@ func appendReviewEvent(t *testing.T, p *DispatcherPlugin, taskID, update string)
 	}
 }
 
+func TestPlugin_ACPRoutesKeepOtherSessionsWhenRemovingOne(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	first := acpRoute{server: &dispatch.Server{}, sessionID: "first"}
+	second := acpRoute{server: &dispatch.Server{}, sessionID: "second"}
+
+	p.addACPRoute("task_routes", first)
+	p.addACPRoute("task_routes", second)
+	p.removeACPRoute("task_routes", first)
+
+	routes := p.snapshotACPRoutes("task_routes")
+	if len(routes) != 1 || routes[0] != second {
+		t.Fatalf("routes after removal = %+v, want only second", routes)
+	}
+	p.removeACPRoute("task_routes", second)
+	if routes := p.snapshotACPRoutes("task_routes"); len(routes) != 0 {
+		t.Fatalf("routes after final removal = %+v, want none", routes)
+	}
+}
+
 func TestPlugin_TailStreamsRunningTaskUpdates(t *testing.T) {
 	p, _ := newTestPlugin(t)
 	now := time.Now()

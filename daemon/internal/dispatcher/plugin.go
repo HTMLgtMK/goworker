@@ -42,12 +42,42 @@ type DispatcherPlugin struct {
 	// ACP 入口：socket listener、活跃连接与任务→连接的进度路由
 	listener   net.Listener
 	acpServers []*dispatch.Server
-	acpRoutes  map[string]acpRoute
+	acpRoutes  map[string][]acpRoute
 }
 
 type acpRoute struct {
 	server    *dispatch.Server
 	sessionID string
+}
+
+func (p *DispatcherPlugin) addACPRoute(taskID string, route acpRoute) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.acpRoutes[taskID] = append(p.acpRoutes[taskID], route)
+}
+
+func (p *DispatcherPlugin) removeACPRoute(taskID string, route acpRoute) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	routes := p.acpRoutes[taskID]
+	for index, current := range routes {
+		if current == route {
+			routes = append(routes[:index:index], routes[index+1:]...)
+			break
+		}
+	}
+	if len(routes) == 0 {
+		delete(p.acpRoutes, taskID)
+		return
+	}
+	p.acpRoutes[taskID] = routes
+}
+
+func (p *DispatcherPlugin) snapshotACPRoutes(taskID string) []acpRoute {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]acpRoute(nil), p.acpRoutes[taskID]...)
 }
 
 // NewPlugin 构造 dispatcher 插件。cfg.Dispatch.Enabled=false 时 main 不会注册本插件。
@@ -56,7 +86,7 @@ func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *Dispatcher
 		cfg:       cfg,
 		paths:     paths,
 		running:   make(map[string]context.CancelFunc),
-		acpRoutes: make(map[string]acpRoute),
+		acpRoutes: make(map[string][]acpRoute),
 	}
 }
 
@@ -89,11 +119,11 @@ func (p *DispatcherPlugin) Init(h *plugin.Hub) error {
 			slog.Error("dispatch: append task update", "task", taskID, "error", err)
 		}
 		// ACP 提交方的任务：进度路由回对应连接；REPL 任务只留 debug 日志
-		p.mu.Lock()
-		route, ok := p.acpRoutes[taskID]
-		p.mu.Unlock()
-		if ok {
-			route.server.Update(route.sessionID, u)
+		routes := p.snapshotACPRoutes(taskID)
+		if len(routes) > 0 {
+			for _, route := range routes {
+				route.server.Update(route.sessionID, u)
+			}
 		} else {
 			slog.Debug("dispatch progress", "task", taskID, "kind", u.SessionUpdate)
 		}
@@ -254,6 +284,8 @@ func (h *acpIngress) Run(ctx context.Context, sessionID, prompt string, rep disp
 		return h.review(sessionID, trim(strings.TrimPrefix(prompt, "--review ")), rep)
 	case strings.HasPrefix(prompt, "--events "):
 		return h.events(ctx, sessionID, trim(strings.TrimPrefix(prompt, "--events ")), rep)
+	case prompt == "--attach" || strings.HasPrefix(prompt, "--attach "):
+		return h.attach(ctx, sessionID, trim(strings.TrimPrefix(prompt, "--attach")), rep)
 	case strings.HasPrefix(prompt, "--approve "):
 		p.doApprove(ctx, trim(strings.TrimPrefix(prompt, "--approve ")), write)
 		return protocol.StopEndTurn, nil
@@ -267,7 +299,7 @@ func (h *acpIngress) Run(ctx context.Context, sessionID, prompt string, rep disp
 		p.doCancel(ctx, trim(strings.TrimPrefix(prompt, "--cancel ")), write)
 		return protocol.StopEndTurn, nil
 	case strings.HasPrefix(trim(prompt), "--"):
-		return "", statusError(fmt.Sprintf("unknown directive %q (detach/ls/status/review/events/approve/complete/reject/cancel)", trim(prompt)))
+		return "", statusError(fmt.Sprintf("unknown directive %q (detach/ls/status/review/events/attach/approve/complete/reject/cancel)", trim(prompt)))
 	}
 	return h.dispatchSync(ctx, sessionID, cwd, prompt, rep)
 }
@@ -339,6 +371,73 @@ func (h *acpIngress) events(ctx context.Context, sessionID, args string, rep dis
 			}
 		}
 	}
+}
+
+func (h *acpIngress) attach(ctx context.Context, sessionID, args string, rep dispatch.Reporter) (string, error) {
+	id, err := parseAttachArgs(args)
+	if err != nil {
+		return "", statusError(err.Error())
+	}
+	if _, ok := h.plugin.store.Get(id); !ok {
+		return "", statusError(fmt.Sprintf("task %q not found", id))
+	}
+
+	history, cursor, live, unsubscribe := h.plugin.eventLog.Subscribe(id)
+	defer unsubscribe()
+	h.writeAttachedUpdates(id, 0, rep, sessionID, history, false)
+	current, ok := h.plugin.store.Get(id)
+	if !ok {
+		return "", statusError(fmt.Sprintf("task %q not found", id))
+	}
+	if tailComplete(current.Status) {
+		return protocol.StopEndTurn, nil
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return protocol.StopEndTurn, nil
+		case <-live:
+			events, next := h.plugin.eventLog.EventsAfter(id, cursor)
+			complete := h.writeAttachedUpdates(id, cursor, rep, sessionID, events, true)
+			cursor = next
+			if complete {
+				return protocol.StopEndTurn, nil
+			}
+		}
+	}
+}
+
+func parseAttachArgs(args string) (string, error) {
+	parts := strings.Fields(args)
+	if len(parts) != 1 {
+		return "", fmt.Errorf("usage: --attach <task_id>")
+	}
+	return parts[0], nil
+}
+
+func (h *acpIngress) writeAttachedUpdates(taskID string, cursor int, rep dispatch.Reporter, sessionID string, events []task.TaskEvent, completeOnStatus bool) bool {
+	complete := false
+	for index, event := range events {
+		if event.Type == task.EventStatus {
+			complete = complete || completeOnStatus && tailComplete(event.To)
+			continue
+		}
+		if event.Type != task.EventUpdate {
+			continue
+		}
+
+		var update protocol.SessionUpdateBody
+		if err := json.Unmarshal(event.Update, &update); err != nil || update.SessionUpdate == "" {
+			if err == nil {
+				err = fmt.Errorf("missing sessionUpdate")
+			}
+			slog.Warn("dispatch: skip malformed task update", "task", taskID, "cursor", cursor+index, "error", err)
+			continue
+		}
+		rep.Update(sessionID, update)
+	}
+	return complete
 }
 
 func parseEventsArgs(args string) (string, int, error) {
@@ -427,14 +526,9 @@ func (h *acpIngress) dispatchSync(ctx context.Context, sessionID, cwd, prompt st
 
 	// 进度路由：orchestrator 的全局 ProgressFunc 按 taskID 转回本连接
 	if server, ok := rep.(*dispatch.Server); ok {
-		p.mu.Lock()
-		p.acpRoutes[t.ID] = acpRoute{server: server, sessionID: sessionID}
-		p.mu.Unlock()
-		defer func() {
-			p.mu.Lock()
-			delete(p.acpRoutes, t.ID)
-			p.mu.Unlock()
-		}()
+		route := acpRoute{server: server, sessionID: sessionID}
+		p.addACPRoute(t.ID, route)
+		defer p.removeACPRoute(t.ID, route)
 	}
 
 	p.audit("acp-submit", t.ID, cwd)

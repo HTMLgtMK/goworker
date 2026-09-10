@@ -243,6 +243,9 @@ func TestIngress_ObservationDirectivesReturnRPCErrors(t *testing.T) {
 		"--review task_missing",
 		"--events task_missing 0",
 		"--events task_missing not-a-cursor",
+		"--attach",
+		"--attach task_missing",
+		"--attach task_missing extra",
 	} {
 		var response protocol.PromptResponse
 		err := fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
@@ -252,6 +255,145 @@ func TestIngress_ObservationDirectivesReturnRPCErrors(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "rpc -32000") {
 			t.Errorf("prompt %q error = %v, want RPC error", prompt, err)
 		}
+	}
+}
+
+func TestIngress_AttachReplaysNativeUpdatesAndCompletes(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	now := time.Now()
+	tk := &task.Task{
+		ID: "task_ingress_attach", Source: "acp", Kind: task.KindGeneral, Prompt: "observe", Worker: "fake",
+		Status: task.StatusQueued, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := p.store.Add(tk); err != nil {
+		t.Fatalf("store.Add: %v", err)
+	}
+	setReviewStatus(t, p, tk, task.StatusDispatching)
+	setReviewStatus(t, p, tk, task.StatusWorking)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"inspect state"}}`)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"tool_call","toolCallId":"tool_1","title":"git status","status":"in_progress"}`)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"tool_call_update","toolCallId":"tool_1","status":"completed","rawOutput":"clean"}`)
+	setReviewStatus(t, p, tk, task.StatusAwaitingReview)
+
+	fc, sessionID := newIngressSession(t, p, t.TempDir())
+	clearIngressUpdates()
+	var promptResp protocol.PromptResponse
+	if err := fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+		SessionID: sessionID,
+		Prompt:    []protocol.ContentBlock{protocol.TextBlock("--attach " + tk.ID)},
+	}, &promptResp); err != nil {
+		t.Fatalf("attach prompt: %v", err)
+	}
+	if promptResp.StopReason != protocol.StopEndTurn {
+		t.Fatalf("stopReason = %q, want %q", promptResp.StopReason, protocol.StopEndTurn)
+	}
+
+	updates := waitIngressSessionUpdates(t, sessionID, 3)
+	var thought, toolCall, toolUpdate *protocol.SessionUpdate
+	for index := range updates {
+		update := &updates[index]
+		switch update.Update.SessionUpdate {
+		case protocol.UpdateAgentThoughtChunk:
+			thought = update
+		case protocol.UpdateToolCall:
+			toolCall = update
+		case protocol.UpdateToolCallUpdate:
+			toolUpdate = update
+		}
+	}
+	if thought == nil || thought.Update.Content == nil || thought.Update.Content.Text != "inspect state" {
+		t.Errorf("thought update = %+v", thought)
+	}
+	if toolCall == nil || toolCall.Update.ToolCallID != "tool_1" {
+		t.Errorf("tool call update = %+v", toolCall)
+	}
+	if toolUpdate == nil || !strings.Contains(string(toolUpdate.Update.Raw), `"rawOutput":"clean"`) {
+		t.Errorf("tool update = %+v", toolUpdate)
+	}
+}
+
+func TestIngress_AttachStreamsLiveUpdatesAndCompletes(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	now := time.Now()
+	tk := &task.Task{
+		ID: "task_ingress_attach_live", Source: "acp", Kind: task.KindGeneral, Prompt: "observe", Worker: "fake",
+		Status: task.StatusQueued, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := p.store.Add(tk); err != nil {
+		t.Fatalf("store.Add: %v", err)
+	}
+	setReviewStatus(t, p, tk, task.StatusDispatching)
+	setReviewStatus(t, p, tk, task.StatusWorking)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"history"}}`)
+
+	fc, sessionID := newIngressSession(t, p, t.TempDir())
+	clearIngressUpdates()
+	result := make(chan protocol.PromptResponse, 1)
+	errs := make(chan error, 1)
+	go func() {
+		var promptResp protocol.PromptResponse
+		errs <- fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+			SessionID: sessionID,
+			Prompt:    []protocol.ContentBlock{protocol.TextBlock("--attach " + tk.ID)},
+		}, &promptResp)
+		result <- promptResp
+	}()
+
+	history := waitIngressSessionUpdates(t, sessionID, 1)
+	if got := history[0].Update.Content.Text; got != "history" {
+		t.Fatalf("history = %q", got)
+	}
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live"}}`)
+	setReviewStatus(t, p, tk, task.StatusAwaitingReview)
+
+	updates := waitIngressSessionUpdates(t, sessionID, 2)
+	if got := updates[1].Update.Content.Text; got != "live" {
+		t.Errorf("live = %q", got)
+	}
+	select {
+	case err := <-errs:
+		if err != nil {
+			t.Fatalf("attach prompt: %v", err)
+		}
+		if response := <-result; response.StopReason != protocol.StopEndTurn {
+			t.Errorf("stopReason = %q", response.StopReason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("attach prompt did not complete")
+	}
+}
+
+func TestIngress_AttachSkipsMalformedStoredUpdate(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	now := time.Now()
+	tk := &task.Task{
+		ID: "task_ingress_attach_malformed", Source: "acp", Kind: task.KindGeneral, Prompt: "observe", Worker: "fake",
+		Status: task.StatusQueued, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := p.store.Add(tk); err != nil {
+		t.Fatalf("store.Add: %v", err)
+	}
+	setReviewStatus(t, p, tk, task.StatusDispatching)
+	setReviewStatus(t, p, tk, task.StatusWorking)
+	appendReviewEvent(t, p, tk.ID, `{}`)
+	appendReviewEvent(t, p, tk.ID, `{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"still here"}}`)
+	setReviewStatus(t, p, tk, task.StatusAwaitingReview)
+
+	fc, sessionID := newIngressSession(t, p, t.TempDir())
+	clearIngressUpdates()
+	var promptResp protocol.PromptResponse
+	if err := fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+		SessionID: sessionID,
+		Prompt:    []protocol.ContentBlock{protocol.TextBlock("--attach " + tk.ID)},
+	}, &promptResp); err != nil {
+		t.Fatalf("attach prompt: %v", err)
+	}
+	updates := waitIngressSessionUpdates(t, sessionID, 1)
+	if got := updates[0].Update.Content.Text; got != "still here" {
+		t.Errorf("replayed update = %q", got)
+	}
+	if promptResp.StopReason != protocol.StopEndTurn {
+		t.Errorf("stopReason = %q", promptResp.StopReason)
 	}
 }
 
@@ -300,6 +442,33 @@ func newIngressSession(t *testing.T, p *DispatcherPlugin, cwd string) (*fakeACPT
 		t.Fatalf("session/new: %v", err)
 	}
 	return fc, newResp.SessionID
+}
+
+func waitIngressSessionUpdates(t *testing.T, sessionID string, count int) []protocol.SessionUpdate {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		var matching []protocol.SessionUpdate
+		for _, update := range ingressUpdatesSnapshot() {
+			if update.SessionID == sessionID {
+				matching = append(matching, update)
+			}
+		}
+		if len(matching) >= count {
+			return matching
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("session %q updates = %d, want at least %d", sessionID, len(matching), count)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+func ingressUpdatesSnapshot() []protocol.SessionUpdate {
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]protocol.SessionUpdate(nil), ingressUpdates...)
 }
 
 func clearIngressUpdates() {
