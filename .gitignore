@@ -7,6 +7,7 @@
 daemon/goworker
 daemon/goworker.exe
 ai-runtime/fakeserver
+.goworker/
 
 # Test binary
 *.test
