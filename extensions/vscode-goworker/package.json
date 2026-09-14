@@ -1,0 +1,65 @@
+{
+  "name": "vscode-goworker",
+  "displayName": "GOWORKER",
+  "description": "GOWORKER task console and ACP trace observer for VS Code.",
+  "version": "0.1.0",
+  "private": true,
+  "engines": { "vscode": "^1.100.0" },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onView:goworker.tasks",
+    "onView:goworker.workers",
+    "onView:goworker.runtime",
+    "onCommand:goworker.refreshTasks",
+    "onCommand:goworker.openTask"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "goworker", "title": "GOWORKER", "icon": "media/goworker.svg" }
+      ]
+    },
+    "views": {
+      "goworker": [
+        { "id": "goworker.tasks", "name": "Tasks" },
+        { "id": "goworker.workers", "name": "Workers" },
+        { "id": "goworker.runtime", "name": "Runtime" }
+      ]
+    },
+    "commands": [
+      { "command": "goworker.refreshTasks", "title": "GOWORKER: Refresh Tasks" },
+      { "command": "goworker.openTask", "title": "GOWORKER: Open Task" },
+      { "command": "goworker.reconnect", "title": "GOWORKER: Reconnect" }
+    ],
+    "configuration": {
+      "title": "GOWORKER",
+      "properties": {
+        "goworker.socketPath": {
+          "type": "string",
+          "default": "",
+          "description": "Override the local GOWORKER dispatcher Unix socket path. TCP URLs are not supported."
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        { "command": "goworker.refreshTasks", "when": "view == goworker.tasks", "group": "navigation" },
+        { "command": "goworker.reconnect", "when": "view == goworker.runtime", "group": "navigation" }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/unit/**/*.test.ts",
+    "package": "npm run typecheck && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/vscode": "^1.100.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
