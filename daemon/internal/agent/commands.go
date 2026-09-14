@@ -32,6 +32,9 @@ func callbacksFromPlugin(ctx *plugin.Context) runtimeagent.RunCallbacks {
 		Decide:  ctx.Decide,
 		Publish: ctx.Publish,
 	}
+	if ctx.EmitToken != nil {
+		cb.EmitToken = ctx.EmitToken
+	}
 	if ctx.WriteToken != nil {
 		cb.WriteToken = func(kind runtimeagent.RenderKind, content string, done bool) {
 			ctx.WriteToken(plugin.RenderKind(kind), content, done)

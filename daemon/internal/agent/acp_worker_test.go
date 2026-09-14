@@ -7,10 +7,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
-	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 )
 
@@ -52,15 +52,20 @@ func TestACPWorker_ServesSessionOverACP(t *testing.T) {
 	conn := protocol.NewConn(clientEnd)
 	var mu sync.Mutex
 	var chunks []string
+	updates := make(chan struct{}, 1)
 	conn.HandleNotification(protocol.MethodSessionUpdate, func(params json.RawMessage) {
 		var u protocol.SessionUpdate
 		if err := json.Unmarshal(params, &u); err != nil {
 			return
 		}
-		if u.Update.Content != nil && u.Update.Content.Text != "" {
+		if u.Update.Content != nil && strings.Contains(u.Update.Content.Text, "agent error") {
 			mu.Lock()
 			chunks = append(chunks, u.Update.Content.Text)
 			mu.Unlock()
+			select {
+			case updates <- struct{}{}:
+			default:
+			}
 		}
 	})
 	go func() { _ = conn.Serve() }()
@@ -90,6 +95,11 @@ func TestACPWorker_ServesSessionOverACP(t *testing.T) {
 	}
 	if promptResp.StopReason != protocol.StopEndTurn {
 		t.Errorf("stopReason = %q", promptResp.StopReason)
+	}
+	select {
+	case <-updates:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for provider error update")
 	}
 
 	mu.Lock()
@@ -131,18 +141,36 @@ func errorsAsRPC(err error, target *protocol.RPCError) bool {
 	return false
 }
 
-// 编译期对齐：RunCallbacks 的 token 映射覆盖所有 RenderKind。
-func TestTokenToUpdate_Kinds(t *testing.T) {
-	cases := map[runtimeagent.RenderKind]string{
-		runtimeagent.KindText:       protocol.UpdateAgentMessageChunk,
-		runtimeagent.KindThinking:   protocol.UpdateAgentThoughtChunk,
-		runtimeagent.KindToolCall:   protocol.UpdateToolCall,
-		runtimeagent.KindToolResult: protocol.UpdateToolCallUpdate,
+func TestTokenToUpdate_PreservesToolCallCorrelation(t *testing.T) {
+	call := tokenToUpdate(core.Token{
+		Type:     core.TokenTypeToolCall,
+		Content:  "bash(\"echo ok\")",
+		ToolCall: core.ToolCall{ID: "call_1"},
+	})
+	result := tokenToUpdate(core.Token{
+		Type: core.TokenTypeToolResult, Content: "ok", ToolCallID: "call_1",
+	})
+
+	if call.ToolCallID != "call_1" {
+		t.Errorf("tool call ID = %q, want call_1", call.ToolCallID)
 	}
-	for kind, want := range cases {
-		body := tokenToUpdate(kind, "x")
+	if result.ToolCallID != call.ToolCallID {
+		t.Errorf("tool result ID = %q, want %q", result.ToolCallID, call.ToolCallID)
+	}
+}
+
+// Compile-time alignment: every user-visible core token maps to an ACP update.
+func TestTokenToUpdate_Types(t *testing.T) {
+	cases := map[string]string{
+		core.TokenTypeText:       protocol.UpdateAgentMessageChunk,
+		core.TokenTypeThinking:   protocol.UpdateAgentThoughtChunk,
+		core.TokenTypeToolCall:   protocol.UpdateToolCall,
+		core.TokenTypeToolResult: protocol.UpdateToolCallUpdate,
+	}
+	for tokenType, want := range cases {
+		body := tokenToUpdate(core.Token{Type: tokenType, Content: "x"})
 		if body.SessionUpdate != want {
-			t.Errorf("kind %s → %q, want %q", kind, body.SessionUpdate, want)
+			t.Errorf("token type %s → %q, want %q", tokenType, body.SessionUpdate, want)
 		}
 	}
 }

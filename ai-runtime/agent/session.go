@@ -138,6 +138,10 @@ func (s *Session) streamTokens(cb RunCallbacks, agentCtx context.Context, tokenC
 		// 先输出内容再检查 Done — Done token 也可能带内容（如错误信息）。
 		// 空 content 的 Done 也要转发：前端靠它定稿未完成的流式渲染。
 		showToken := tok.Type != core.TokenTypeThinking || s.deps.Config.LLM.Thinking.Show
+		isToolLifecycle := tok.Type == core.TokenTypeToolCall || tok.Type == core.TokenTypeToolResult
+		if showToken && cb.EmitToken != nil && (tok.Content != "" || tok.Done || isToolLifecycle) {
+			cb.EmitToken(tok)
+		}
 		if showToken && cb.WriteToken != nil && (tok.Content != "" || tok.Done) {
 			kind, c := renderKind(tok)
 			cb.WriteToken(kind, c, tok.Done)

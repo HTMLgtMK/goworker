@@ -30,11 +30,12 @@ const (
 
 type RunCallbacks struct {
 	Write func(string)
-	// WriteToken 按类型投递渲染 token。done 表示整个 agent 运行的输出已结束
-	// （空 content 的收尾标记），前端借此定稿未完成的流式渲染。
+	// WriteToken 是 terminal renderer 的兼容回调；新 frontend 应消费 EmitToken 的结构化语义。
 	WriteToken func(kind RenderKind, content string, done bool)
-	Decide     func(*hitl.InterruptRequest) hitl.Decision
-	Publish    func(event string, data any)
+	// EmitToken forwards a user-visible core token without discarding structured tool correlation.
+	EmitToken func(core.Token)
+	Decide    func(*hitl.InterruptRequest) hitl.Decision
+	Publish   func(event string, data any)
 }
 
 // Session 是一段会话：收敛会话状态（conversation/usage）与核心操作（Run/Compact/…）。

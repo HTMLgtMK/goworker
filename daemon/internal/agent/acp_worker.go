@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tinguo/goworker/ai-core/core"
 	dispatch "github.com/tinguo/goworker/ai-dispatch"
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
@@ -65,8 +66,8 @@ func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispa
 		Write: func(text string) {
 			rep.MessageChunk(sessionID, text)
 		},
-		WriteToken: func(kind runtimeagent.RenderKind, content string, done bool) {
-			rep.Update(sessionID, tokenToUpdate(kind, content))
+		EmitToken: func(token core.Token) {
+			rep.Update(sessionID, tokenToUpdate(token))
 		},
 		// 无人值守：HITL 请求一律拒绝（Session SDK 对 nil Decide 的默认行为）
 	}
@@ -76,30 +77,32 @@ func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispa
 	return protocol.StopEndTurn, nil
 }
 
-// tokenToUpdate 把 SDK 的 token 流映射为 ACP session/update 子类型。
-func tokenToUpdate(kind runtimeagent.RenderKind, content string) protocol.SessionUpdateBody {
-	switch kind {
-	case runtimeagent.KindThinking:
+// tokenToUpdate maps a structured runtime token to an ACP session update.
+func tokenToUpdate(token core.Token) protocol.SessionUpdateBody {
+	switch token.Type {
+	case core.TokenTypeThinking:
 		return protocol.SessionUpdateBody{
 			SessionUpdate: protocol.UpdateAgentThoughtChunk,
-			Content:       &protocol.ContentBlock{Type: "text", Text: content},
+			Content:       &protocol.ContentBlock{Type: "text", Text: token.Content},
 		}
-	case runtimeagent.KindToolCall:
+	case core.TokenTypeToolCall:
 		return protocol.SessionUpdateBody{
 			SessionUpdate: protocol.UpdateToolCall,
-			Title:         content,
+			ToolCallID:    token.ToolCall.ID,
+			Title:         token.Content,
 			Status:        "pending",
 		}
-	case runtimeagent.KindToolResult:
+	case core.TokenTypeToolResult:
 		return protocol.SessionUpdateBody{
 			SessionUpdate: protocol.UpdateToolCallUpdate,
-			Title:         content,
+			ToolCallID:    token.ToolCallID,
+			Title:         token.Content,
 			Status:        "completed",
 		}
-	default: // text
+	default:
 		return protocol.SessionUpdateBody{
 			SessionUpdate: protocol.UpdateAgentMessageChunk,
-			Content:       &protocol.ContentBlock{Type: "text", Text: content},
+			Content:       &protocol.ContentBlock{Type: "text", Text: token.Content},
 		}
 	}
 }

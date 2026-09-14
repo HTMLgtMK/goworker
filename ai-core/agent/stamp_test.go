@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -260,6 +261,14 @@ func TestAgentRun_FailedToolTokensKeepCallCorrelation(t *testing.T) {
 			mws:    []core.Middleware{abortToolMiddleware{}},
 			result: "blocked by policy",
 		},
+		{
+			name: "tool execution error",
+			call: core.ToolCall{ID: "failed_1", Type: "function", Function: core.ToolCallFunction{Name: "fail", Arguments: `{}`}},
+			tools: []core.Tool{{Name: "fail", Execute: func(context.Context, map[string]any) (string, error) {
+				return "", errors.New("execution failed")
+			}}},
+			result: "error: execution failed",
+		},
 	}
 
 	for _, tt := range tests {
@@ -292,6 +301,99 @@ func TestAgentRun_FailedToolTokensKeepCallCorrelation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAgentRun_MultipleToolCallsKeepIndependentCorrelation(t *testing.T) {
+	calls := []core.ToolCall{
+		{ID: "ok_1", Type: "function", Function: core.ToolCallFunction{Name: "ok", Arguments: `{}`}},
+		{ID: "unsupported_1", Type: "computer", Function: core.ToolCallFunction{Name: "click", Arguments: `{}`}},
+		{ID: "unknown_1", Type: "function", Function: core.ToolCallFunction{Name: "unknown", Arguments: `{}`}},
+		{ID: "invalid_1", Type: "function", Function: core.ToolCallFunction{Name: "ok", Arguments: `{`}},
+		{ID: "abort_1", Type: "function", Function: core.ToolCallFunction{Name: "abort", Arguments: `{}`}},
+		{ID: "error_1", Type: "function", Function: core.ToolCallFunction{Name: "error", Arguments: `{}`}},
+	}
+	tools := []core.Tool{
+		{Name: "ok", Execute: func(context.Context, map[string]any) (string, error) { return "ok", nil }},
+		{Name: "abort", Execute: func(context.Context, map[string]any) (string, error) { return "unexpected", nil }},
+		{Name: "error", Execute: func(context.Context, map[string]any) (string, error) { return "", errors.New("execution failed") }},
+	}
+	a := NewAgent(&multiToolThenFinalProvider{calls: calls}, "", tools, []core.Middleware{abortNamedToolMiddleware{name: "abort"}})
+	tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")
+	if err != nil {
+		t.Fatalf("Run err = %v", err)
+	}
+
+	seenCalls := make(map[string]int, len(calls))
+	results := make(map[string]core.Token, len(calls))
+	for tok := range tokenCh {
+		switch tok.Type {
+		case core.TokenTypeToolCall:
+			seenCalls[tok.ToolCall.ID]++
+		case core.TokenTypeToolResult:
+			if _, duplicate := results[tok.ToolCallID]; duplicate {
+				t.Errorf("duplicate tool result for %q", tok.ToolCallID)
+			}
+			results[tok.ToolCallID] = tok
+		}
+	}
+	<-msgCh
+
+	want := map[string]string{
+		"ok_1":          "ok",
+		"unsupported_1": "unsupported tool call type: computer",
+		"unknown_1":     "unknown tool: unknown",
+		"invalid_1":     "invalid args: unexpected end of JSON input",
+		"abort_1":       "blocked by policy",
+		"error_1":       "error: execution failed",
+	}
+	if len(seenCalls) != len(want) || len(results) != len(want) {
+		t.Fatalf("calls = %v, results = %v, want one of each for %d IDs", seenCalls, results, len(want))
+	}
+	for id, content := range want {
+		if seenCalls[id] != 1 {
+			t.Errorf("tool call count for %q = %d, want 1", id, seenCalls[id])
+		}
+		if got, ok := results[id]; !ok {
+			t.Errorf("missing tool result for %q", id)
+		} else if got.Content != content {
+			t.Errorf("tool result for %q = %q, want %q", id, got.Content, content)
+		}
+	}
+}
+
+type multiToolThenFinalProvider struct {
+	calls []core.ToolCall
+	runs  int
+}
+
+func (p *multiToolThenFinalProvider) Name() string  { return "multi-tool" }
+func (p *multiToolThenFinalProvider) Model() string { return "m" }
+func (p *multiToolThenFinalProvider) Chat(_ context.Context, _ *core.ChatRequest) (*core.ChatResponse, error) {
+	p.runs++
+	if p.runs == 1 {
+		return &core.ChatResponse{Choices: []core.ResponseChoice{{
+			Message: core.Message{Role: "assistant", ToolCalls: p.calls},
+		}}}, nil
+	}
+	return &core.ChatResponse{Choices: []core.ResponseChoice{{
+		Message: core.Message{Role: "assistant", Content: "final"},
+	}}}, nil
+}
+func (p *multiToolThenFinalProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	return nil, nil
+}
+
+type abortNamedToolMiddleware struct{ name string }
+
+func (mw abortNamedToolMiddleware) Name() string { return "abort-named-tool" }
+func (mw abortNamedToolMiddleware) OnBeforeTool(ev *core.BeforeToolEvent) *core.MiddlewareResponse {
+	if ev.Tool.Function.Name != mw.name {
+		return &core.MiddlewareResponse{}
+	}
+	ev.Abort = &core.ToolAbort{Messages: []core.Message{{
+		Role: "tool", Content: "blocked by policy", ToolCallID: ev.Tool.ID,
+	}}}
+	return &core.MiddlewareResponse{}
 }
 
 type singleToolThenFinalProvider struct {
