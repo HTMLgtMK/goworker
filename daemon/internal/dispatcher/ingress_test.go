@@ -258,6 +258,112 @@ func TestIngress_ObservationDirectivesReturnRPCErrors(t *testing.T) {
 	}
 }
 
+func TestIngress_ConsoleCatalogReturnsStructuredUpdates(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	created := time.Date(2026, time.September, 14, 12, 0, 0, 0, time.UTC)
+	code := &task.Task{
+		ID: "task_console_code", Source: "acp", Kind: task.KindCode, Prompt: "add observer", Repo: "/repo", Worker: "claude",
+		Status: task.StatusQueued, BaseCommit: "base", Worktree: "/worktree", Branch: "dispatch/task_console_code",
+		WorkerSession: "worker_session", Commits: []string{"abc implement observer"}, CreatedAt: created, UpdatedAt: created,
+	}
+	general := &task.Task{
+		ID: "task_console_general", Source: "repl", Kind: task.KindGeneral, Prompt: "summarize trace", Worker: "codex",
+		Status: task.StatusQueued, Error: "worker failed", CreatedAt: created.Add(100 * time.Millisecond), UpdatedAt: created.Add(100 * time.Millisecond),
+	}
+	for _, tk := range []*task.Task{code, general} {
+		if err := p.store.Add(tk); err != nil {
+			t.Fatalf("store.Add: %v", err)
+		}
+	}
+
+	fc, sessionID := newIngressSession(t, p, t.TempDir())
+	clearIngressUpdates()
+	var promptResp protocol.PromptResponse
+	if err := fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+		SessionID: sessionID,
+		Prompt:    []protocol.ContentBlock{protocol.TextBlock("--console/tasks")},
+	}, &promptResp); err != nil {
+		t.Fatalf("list catalog: %v", err)
+	}
+	if promptResp.StopReason != protocol.StopEndTurn {
+		t.Fatalf("list stop reason = %q", promptResp.StopReason)
+	}
+	list := waitIngressCustomUpdate(t, sessionID, "goworker_task_list")
+	if list.Version != 1 || len(list.Tasks) != 2 {
+		t.Fatalf("list update = %+v", list)
+	}
+	if list.Tasks[0].ID != general.ID || list.Tasks[0].Source != general.Source || list.Tasks[0].CreatedAt != general.CreatedAt.Format(time.RFC3339Nano) || list.Tasks[0].UpdatedAt != general.UpdatedAt.Format(time.RFC3339Nano) {
+		t.Fatalf("newest list task = %+v", list.Tasks[0])
+	}
+	if list.Tasks[0].Repo != "" || list.Tasks[0].BaseCommit != "" || list.Tasks[0].Worktree != "" || list.Tasks[0].Branch != "" || list.Tasks[0].WorkerSession != "" || len(list.Tasks[0].Commits) != 0 || list.Tasks[0].Error != "" {
+		t.Fatalf("list leaked detail metadata = %+v", list.Tasks[0])
+	}
+	if list.Tasks[1].ID != code.ID || list.Tasks[1].Source != code.Source || list.Tasks[1].CreatedAt != code.CreatedAt.Format(time.RFC3339Nano) || list.Tasks[1].UpdatedAt != code.UpdatedAt.Format(time.RFC3339Nano) {
+		t.Fatalf("older list task = %+v", list.Tasks[1])
+	}
+
+	clearIngressUpdates()
+	if err := fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+		SessionID: sessionID,
+		Prompt:    []protocol.ContentBlock{protocol.TextBlock("--console/task " + code.ID)},
+	}, &promptResp); err != nil {
+		t.Fatalf("detail catalog: %v", err)
+	}
+	detail := waitIngressCustomUpdate(t, sessionID, "goworker_task_detail")
+	if detail.Version != 1 || detail.Task == nil || detail.Task.ID != code.ID || detail.Task.Repo != code.Repo || detail.Task.BaseCommit != code.BaseCommit || detail.Task.Worktree != code.Worktree || detail.Task.Branch != code.Branch || detail.Task.WorkerSession != code.WorkerSession {
+		t.Fatalf("detail update = %+v", detail)
+	}
+	if got := detail.Task.Commits; len(got) != 1 || got[0] != code.Commits[0] {
+		t.Fatalf("detail commits = %v", got)
+	}
+}
+
+func TestIngress_ConsoleCatalogReturnsEmptyList(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	fc, sessionID := newIngressSession(t, p, t.TempDir())
+	clearIngressUpdates()
+
+	var response protocol.PromptResponse
+	if err := fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+		SessionID: sessionID,
+		Prompt:    []protocol.ContentBlock{protocol.TextBlock("--console/tasks")},
+	}, &response); err != nil {
+		t.Fatalf("list empty catalog: %v", err)
+	}
+	list := waitIngressCustomUpdate(t, sessionID, "goworker_task_list")
+	if list.Version != 1 || list.Tasks == nil || len(list.Tasks) != 0 {
+		t.Fatalf("empty list update = %+v", list)
+	}
+}
+
+func TestIngress_ConsoleCatalogRejectsInvalidArguments(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	fc, sessionID := newIngressSession(t, p, t.TempDir())
+
+	for _, test := range []struct {
+		prompt string
+		want   string
+	}{
+		{prompt: "--console/tasks extra", want: "usage: --console/tasks"},
+		{prompt: "--console/task", want: "usage: --console/task <task_id>"},
+		{prompt: "--console/task task_missing", want: "task \"task_missing\" not found"},
+		{prompt: "--console/task task_missing extra", want: "usage: --console/task <task_id>"},
+	} {
+		clearIngressUpdates()
+		var response protocol.PromptResponse
+		err := fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+			SessionID: sessionID,
+			Prompt:    []protocol.ContentBlock{protocol.TextBlock(test.prompt)},
+		}, &response)
+		if err == nil || !strings.Contains(err.Error(), "rpc -32000") || !strings.Contains(err.Error(), test.want) {
+			t.Errorf("prompt %q error = %v, want RPC error containing %q", test.prompt, err, test.want)
+		}
+		if updates := ingressUpdatesSnapshot(); len(updates) != 0 {
+			t.Errorf("prompt %q produced updates = %+v", test.prompt, updates)
+		}
+	}
+}
+
 func TestIngress_AttachReplaysNativeUpdatesAndCompletes(t *testing.T) {
 	p, _ := newTestPlugin(t)
 	now := time.Now()
@@ -415,6 +521,32 @@ type observedIngressEnvelope struct {
 	} `json:"event"`
 }
 
+type observedConsoleTask struct {
+	ID            string   `json:"id"`
+	Source        string   `json:"source"`
+	Status        string   `json:"status"`
+	Kind          string   `json:"kind"`
+	Prompt        string   `json:"prompt"`
+	Worker        string   `json:"worker"`
+	CreatedAt     string   `json:"created_at"`
+	UpdatedAt     string   `json:"updated_at"`
+	ExpiresAt     string   `json:"expires_at"`
+	Repo          string   `json:"repo"`
+	BaseCommit    string   `json:"base_commit"`
+	Worktree      string   `json:"worktree"`
+	Branch        string   `json:"branch"`
+	WorkerSession string   `json:"worker_session"`
+	Commits       []string `json:"commits"`
+	Error         string   `json:"error"`
+}
+
+type observedConsoleUpdate struct {
+	SessionUpdate string                `json:"sessionUpdate"`
+	Version       int                   `json:"version"`
+	Tasks         []observedConsoleTask `json:"tasks"`
+	Task          *observedConsoleTask  `json:"task"`
+}
+
 func newIngressSession(t *testing.T, p *DispatcherPlugin, cwd string) (*fakeACPTaskClient, string) {
 	t.Helper()
 	short, err := os.MkdirTemp("", "gwd")
@@ -442,6 +574,27 @@ func newIngressSession(t *testing.T, p *DispatcherPlugin, cwd string) (*fakeACPT
 		t.Fatalf("session/new: %v", err)
 	}
 	return fc, newResp.SessionID
+}
+
+func waitIngressCustomUpdate(t *testing.T, sessionID, kind string) observedConsoleUpdate {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		for _, update := range ingressUpdatesSnapshot() {
+			if update.SessionID != sessionID || update.Update.SessionUpdate != kind {
+				continue
+			}
+			var result observedConsoleUpdate
+			if err := json.Unmarshal(update.Update.Raw, &result); err == nil {
+				return result
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("did not receive custom update %q for session %q", kind, sessionID)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 }
 
 func waitIngressSessionUpdates(t *testing.T, sessionID string, count int) []protocol.SessionUpdate {

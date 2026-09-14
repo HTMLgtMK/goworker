@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -255,6 +256,8 @@ func (h *acpIngress) cwd(sessionID string) string {
 //
 //	--detach <prompt>       异步入队即返回（提交方断连不影响任务）
 //	--ls [status]           任务列表
+//	--console/tasks         结构化 task catalog
+//	--console/task <task_id> 结构化 task detail
 //	--status <task_id>      任务详情快照
 //	--approve <task_id>     审批通过（code 任务尝试 ff 合并）
 //	--complete <task_id>    人工合并后收尾
@@ -277,6 +280,10 @@ func (h *acpIngress) Run(ctx context.Context, sessionID, prompt string, rep disp
 	case prompt == "--ls" || strings.HasPrefix(prompt, "--ls "):
 		p.doList(trim(strings.TrimPrefix(prompt, "--ls")), write)
 		return protocol.StopEndTurn, nil
+	case prompt == "--console/tasks" || strings.HasPrefix(prompt, "--console/tasks "):
+		return h.consoleTasks(sessionID, trim(strings.TrimPrefix(prompt, "--console/tasks")), rep)
+	case prompt == "--console/task" || strings.HasPrefix(prompt, "--console/task "):
+		return h.consoleTask(sessionID, trim(strings.TrimPrefix(prompt, "--console/task")), rep)
 	case strings.HasPrefix(prompt, "--status "):
 		p.doShow(trim(strings.TrimPrefix(prompt, "--status ")), write)
 		return protocol.StopEndTurn, nil
@@ -299,7 +306,7 @@ func (h *acpIngress) Run(ctx context.Context, sessionID, prompt string, rep disp
 		p.doCancel(ctx, trim(strings.TrimPrefix(prompt, "--cancel ")), write)
 		return protocol.StopEndTurn, nil
 	case strings.HasPrefix(trim(prompt), "--"):
-		return "", statusError(fmt.Sprintf("unknown directive %q (detach/ls/status/review/events/attach/approve/complete/reject/cancel)", trim(prompt)))
+		return "", statusError(fmt.Sprintf("unknown directive %q (detach/ls/console/tasks/console/task/status/review/events/attach/approve/complete/reject/cancel)", trim(prompt)))
 	}
 	return h.dispatchSync(ctx, sessionID, cwd, prompt, rep)
 }
@@ -313,6 +320,108 @@ type ingressEnvelope struct {
 	Cursor     int             `json:"cursor,omitempty"`
 	NextCursor int             `json:"next_cursor,omitempty"`
 	Status     string          `json:"status,omitempty"`
+}
+
+type consoleTaskSummaryDTO struct {
+	ID        string `json:"id"`
+	Source    string `json:"source"`
+	Kind      string `json:"kind"`
+	Status    string `json:"status"`
+	Worker    string `json:"worker"`
+	Prompt    string `json:"prompt"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+}
+
+type consoleTaskDetailDTO struct {
+	consoleTaskSummaryDTO
+	Repo          string   `json:"repo,omitempty"`
+	BaseCommit    string   `json:"base_commit,omitempty"`
+	Worktree      string   `json:"worktree,omitempty"`
+	Branch        string   `json:"branch,omitempty"`
+	WorkerSession string   `json:"worker_session,omitempty"`
+	Commits       []string `json:"commits,omitempty"`
+	Error         string   `json:"error,omitempty"`
+}
+
+type consoleCatalogUpdate struct {
+	SessionUpdate string                  `json:"sessionUpdate"`
+	Version       int                     `json:"version"`
+	Tasks         []consoleTaskSummaryDTO `json:"tasks"`
+	Task          *consoleTaskDetailDTO   `json:"task,omitempty"`
+}
+
+func (h *acpIngress) consoleTasks(sessionID, args string, rep dispatch.Reporter) (string, error) {
+	if args != "" {
+		return "", statusError("usage: --console/tasks")
+	}
+	tasks := h.plugin.store.List()
+	sort.SliceStable(tasks, func(i, j int) bool {
+		return tasks[i].UpdatedAt.After(tasks[j].UpdatedAt)
+	})
+	summaries := make([]consoleTaskSummaryDTO, 0, len(tasks))
+	for _, item := range tasks {
+		summaries = append(summaries, consoleTaskSummary(item))
+	}
+	return h.writeConsoleUpdate(sessionID, rep, consoleCatalogUpdate{
+		SessionUpdate: "goworker_task_list", Version: 1, Tasks: summaries,
+	})
+}
+
+func (h *acpIngress) consoleTask(sessionID, args string, rep dispatch.Reporter) (string, error) {
+	id, err := parseConsoleTaskArgs(args)
+	if err != nil {
+		return "", statusError(err.Error())
+	}
+	item, ok := h.plugin.store.Get(id)
+	if !ok {
+		return "", statusError(fmt.Sprintf("task %q not found", id))
+	}
+	detail := consoleTaskDetail(item)
+	return h.writeConsoleUpdate(sessionID, rep, consoleCatalogUpdate{
+		SessionUpdate: "goworker_task_detail", Version: 1, Task: &detail,
+	})
+}
+
+func parseConsoleTaskArgs(args string) (string, error) {
+	parts := strings.Fields(args)
+	if len(parts) != 1 {
+		return "", fmt.Errorf("usage: --console/task <task_id>")
+	}
+	return parts[0], nil
+}
+
+func (h *acpIngress) writeConsoleUpdate(sessionID string, rep dispatch.Reporter, update consoleCatalogUpdate) (string, error) {
+	data, err := json.Marshal(update)
+	if err != nil {
+		return "", statusError(fmt.Sprintf("encode console catalog: %v", err))
+	}
+	rep.Update(sessionID, protocol.SessionUpdateBody{Raw: data})
+	return protocol.StopEndTurn, nil
+}
+
+func consoleTaskSummary(item task.Task) consoleTaskSummaryDTO {
+	return consoleTaskSummaryDTO{
+		ID: item.ID, Source: item.Source, Kind: string(item.Kind), Status: string(item.Status), Worker: item.Worker,
+		Prompt: item.Prompt, CreatedAt: formatConsoleTime(item.CreatedAt), UpdatedAt: formatConsoleTime(item.UpdatedAt),
+		ExpiresAt: formatConsoleTime(item.ExpiresAt),
+	}
+}
+
+func consoleTaskDetail(item task.Task) consoleTaskDetailDTO {
+	commits := append([]string(nil), item.Commits...)
+	return consoleTaskDetailDTO{
+		consoleTaskSummaryDTO: consoleTaskSummary(item), Repo: item.Repo, BaseCommit: item.BaseCommit,
+		Worktree: item.Worktree, Branch: item.Branch, WorkerSession: item.WorkerSession, Commits: commits, Error: item.Error,
+	}
+}
+
+func formatConsoleTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 func (h *acpIngress) review(sessionID, id string, rep dispatch.Reporter) (string, error) {
