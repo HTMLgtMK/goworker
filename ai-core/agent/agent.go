@@ -121,64 +121,43 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 			}
 
 			for _, tc := range msg.ToolCalls {
-				if tc.Type != "function" {
-					// 非 function 类型也要回填 tool 响应，保持 assistant tool_call 配对完整 ——
-					// 缺配对下轮被 OpenAI 兼容后端以 400/空 choices 拒，正是"莫名停止"诱因
-					messages = append(messages, core.Message{
-						Role: "tool", Content: fmt.Sprintf("unsupported tool call type: %s", tc.Type), ToolCallID: tc.ID,
-					})
-					continue
-				}
-
-				tool, ok := a.toolMap[tc.Function.Name]
-				if !ok {
-					messages = append(messages, core.Message{
-						Role: "tool", Content: fmt.Sprintf("unknown tool: %s", tc.Function.Name), ToolCallID: tc.ID,
-					})
-					continue
-				}
-
-				var args map[string]any
-				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-					messages = append(messages, core.Message{
-						Role: "tool", Content: fmt.Sprintf("invalid args: %v", err), ToolCallID: tc.ID,
-					})
-					continue
-				}
-
-				// BeforeTool — middleware 可修改 args 或设置 Abort
-				btEv := &core.BeforeToolEvent{
-					Ctx:       ctx,
-					Iteration: iter,
-					History:   messages,
-					Tool:      &tc,
-					Emit:      tokenEmitter{ch: ch},
-					Args:      args,
-				}
-				a.fireMiddlewareEvent(btEv)
-				if btEv.Abort != nil {
-					messages = append(messages, btEv.Abort.Messages...)
-					continue
-				}
-
-				sendToken(ctx, ch, core.Token{Type: core.TokenTypeToolCall, Content: fmt.Sprintf("%s(%s)", tool.Name, tc.Function.Arguments)})
-
-				toolCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-				result, execErr := tool.Execute(toolCtx, args)
-				cancel()
-				if execErr != nil {
-					result = fmt.Sprintf("error: %v", execErr)
-				}
-
-				a.fireMiddlewareEvent(&core.AfterToolEvent{
-					Ctx: ctx, Iteration: iter, History: messages, Tool: &tc, Args: args, Result: result, Err: execErr,
+				emitToken(ch, core.Token{
+					Type:     core.TokenTypeToolCall,
+					Content:  fmt.Sprintf("%s(%s)", tc.Function.Name, tc.Function.Arguments),
+					ToolCall: tc,
 				})
 
-				sendToken(ctx, ch, core.Token{Type: core.TokenTypeToolResult, Content: result})
+				result := ""
+				tool, known := a.toolMap[tc.Function.Name]
+				switch {
+				case tc.Type != "function":
+					result = fmt.Sprintf("unsupported tool call type: %s", tc.Type)
+				case !known:
+					result = fmt.Sprintf("unknown tool: %s", tc.Function.Name)
+				default:
+					var args map[string]any
+					if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+						result = fmt.Sprintf("invalid args: %v", err)
+					} else {
+						btEv := &core.BeforeToolEvent{Ctx: ctx, Iteration: iter, History: messages, Tool: &tc, Emit: tokenEmitter{ch: ch}, Args: args}
+						a.fireMiddlewareEvent(btEv)
+						if btEv.Abort != nil {
+							result = abortResult(btEv.Abort, tc.ID)
+						} else {
+							toolCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+							var execErr error
+							result, execErr = tool.Execute(toolCtx, args)
+							cancel()
+							if execErr != nil {
+								result = fmt.Sprintf("error: %v", execErr)
+							}
+							a.fireMiddlewareEvent(&core.AfterToolEvent{Ctx: ctx, Iteration: iter, History: messages, Tool: &tc, Args: args, Result: result, Err: execErr})
+						}
+					}
+				}
 
-				messages = append(messages, core.Message{
-					Role: "tool", Content: result, ToolCallID: tc.ID,
-				})
+				emitToken(ch, core.Token{Type: core.TokenTypeToolResult, Content: result, ToolCallID: tc.ID})
+				messages = append(messages, core.Message{Role: "tool", Content: result, ToolCallID: tc.ID})
 			}
 		}
 
@@ -286,6 +265,19 @@ func emitMessageTokens(ctx context.Context, ch chan<- core.Token, message core.M
 	if message.Content != "" {
 		sendToken(ctx, ch, core.Token{Type: core.TokenTypeText, Content: message.Content})
 	}
+}
+
+func abortResult(abort *core.ToolAbort, toolCallID string) string {
+	for _, message := range abort.Messages {
+		if message.Role == "tool" && message.ToolCallID == toolCallID {
+			return message.Content
+		}
+	}
+	return "tool execution aborted"
+}
+
+func emitToken(ch chan<- core.Token, tok core.Token) {
+	ch <- tok
 }
 
 func sendToken(ctx context.Context, ch chan<- core.Token, tok core.Token) {

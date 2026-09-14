@@ -152,6 +152,218 @@ func (p *toolThenFinalProvider) ChatStream(context.Context, *core.ChatRequest) (
 	return nil, nil
 }
 
+type unknownToolThenFinalProvider struct {
+	calls int
+}
+
+func (p *unknownToolThenFinalProvider) Name() string  { return "unknown-tool" }
+func (p *unknownToolThenFinalProvider) Model() string { return "m" }
+func (p *unknownToolThenFinalProvider) Chat(_ context.Context, _ *core.ChatRequest) (*core.ChatResponse, error) {
+	p.calls++
+	if p.calls == 1 {
+		return &core.ChatResponse{Choices: []core.ResponseChoice{{
+			Message: core.Message{Role: "assistant", ToolCalls: []core.ToolCall{{
+				ID: "missing_1", Type: "function",
+				Function: core.ToolCallFunction{Name: "missing", Arguments: `{}`},
+			}}},
+		}}}, nil
+	}
+	return &core.ChatResponse{Choices: []core.ResponseChoice{{
+		Message: core.Message{Role: "assistant", Content: "final"},
+	}}}, nil
+}
+func (p *unknownToolThenFinalProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	return nil, nil
+}
+
+func TestAgentRun_ToolTokensKeepCallCorrelation(t *testing.T) {
+	a := NewAgent(&toolThenFinalProvider{}, "", testTools(), nil)
+	tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")
+	if err != nil {
+		t.Fatalf("Run err = %v", err)
+	}
+
+	var call, result core.Token
+	for tok := range tokenCh {
+		switch tok.Type {
+		case core.TokenTypeToolCall:
+			call = tok
+		case core.TokenTypeToolResult:
+			result = tok
+		}
+	}
+	<-msgCh
+
+	if call.ToolCall.ID != "t1" {
+		t.Errorf("tool call ID = %q, want t1", call.ToolCall.ID)
+	}
+	if call.ToolCall.Function.Name != "bash" {
+		t.Errorf("tool call name = %q, want bash", call.ToolCall.Function.Name)
+	}
+	if result.ToolCallID != call.ToolCall.ID {
+		t.Errorf("tool result ID = %q, want %q", result.ToolCallID, call.ToolCall.ID)
+	}
+}
+
+func TestAgentRun_UnknownToolTokensKeepCallCorrelation(t *testing.T) {
+	a := NewAgent(&unknownToolThenFinalProvider{}, "", nil, nil)
+	tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")
+	if err != nil {
+		t.Fatalf("Run err = %v", err)
+	}
+
+	var call, result core.Token
+	for tok := range tokenCh {
+		switch tok.Type {
+		case core.TokenTypeToolCall:
+			call = tok
+		case core.TokenTypeToolResult:
+			result = tok
+		}
+	}
+	<-msgCh
+
+	if call.ToolCall.ID != "missing_1" {
+		t.Errorf("tool call ID = %q, want missing_1", call.ToolCall.ID)
+	}
+	if result.ToolCallID != call.ToolCall.ID {
+		t.Errorf("tool result ID = %q, want %q", result.ToolCallID, call.ToolCall.ID)
+	}
+	if result.Content != "unknown tool: missing" {
+		t.Errorf("tool result = %q, want unknown tool error", result.Content)
+	}
+}
+
+func TestAgentRun_FailedToolTokensKeepCallCorrelation(t *testing.T) {
+	tests := []struct {
+		name   string
+		call   core.ToolCall
+		tools  []core.Tool
+		mws    []core.Middleware
+		result string
+	}{
+		{
+			name:   "unsupported type",
+			call:   core.ToolCall{ID: "unsupported_1", Type: "computer", Function: core.ToolCallFunction{Name: "click", Arguments: `{}`}},
+			result: "unsupported tool call type: computer",
+		},
+		{
+			name:   "invalid arguments",
+			call:   core.ToolCall{ID: "invalid_1", Type: "function", Function: core.ToolCallFunction{Name: "bash", Arguments: `{`}},
+			tools:  testTools(),
+			result: "invalid args: unexpected end of JSON input",
+		},
+		{
+			name:   "middleware abort",
+			call:   core.ToolCall{ID: "aborted_1", Type: "function", Function: core.ToolCallFunction{Name: "bash", Arguments: `{"command":"echo ok"}`}},
+			tools:  testTools(),
+			mws:    []core.Middleware{abortToolMiddleware{}},
+			result: "blocked by policy",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := NewAgent(&singleToolThenFinalProvider{call: tt.call}, "", tt.tools, tt.mws)
+			tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")
+			if err != nil {
+				t.Fatalf("Run err = %v", err)
+			}
+
+			var calls, results []core.Token
+			for tok := range tokenCh {
+				switch tok.Type {
+				case core.TokenTypeToolCall:
+					calls = append(calls, tok)
+				case core.TokenTypeToolResult:
+					results = append(results, tok)
+				}
+			}
+			<-msgCh
+
+			if len(calls) != 1 || calls[0].ToolCall.ID != tt.call.ID {
+				t.Fatalf("tool calls = %+v, want one call for %q", calls, tt.call.ID)
+			}
+			if len(results) != 1 || results[0].ToolCallID != tt.call.ID {
+				t.Fatalf("tool results = %+v, want one result for %q", results, tt.call.ID)
+			}
+			if results[0].Content != tt.result {
+				t.Errorf("tool result = %q, want %q", results[0].Content, tt.result)
+			}
+		})
+	}
+}
+
+type singleToolThenFinalProvider struct {
+	call  core.ToolCall
+	calls int
+}
+
+func (p *singleToolThenFinalProvider) Name() string  { return "single-tool" }
+func (p *singleToolThenFinalProvider) Model() string { return "m" }
+func (p *singleToolThenFinalProvider) Chat(_ context.Context, _ *core.ChatRequest) (*core.ChatResponse, error) {
+	p.calls++
+	if p.calls == 1 {
+		return &core.ChatResponse{Choices: []core.ResponseChoice{{
+			Message: core.Message{Role: "assistant", ToolCalls: []core.ToolCall{p.call}},
+		}}}, nil
+	}
+	return &core.ChatResponse{Choices: []core.ResponseChoice{{
+		Message: core.Message{Role: "assistant", Content: "final"},
+	}}}, nil
+}
+func (p *singleToolThenFinalProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	return nil, nil
+}
+
+type abortToolMiddleware struct{}
+
+func (abortToolMiddleware) Name() string { return "abort-tool" }
+func (abortToolMiddleware) OnBeforeTool(ev *core.BeforeToolEvent) *core.MiddlewareResponse {
+	ev.Abort = &core.ToolAbort{Messages: []core.Message{{
+		Role: "tool", Content: "blocked by policy", ToolCallID: ev.Tool.ID,
+	}}}
+	return &core.MiddlewareResponse{}
+}
+
+func TestAgentRun_CancelledToolKeepsResultCorrelation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tool := core.Tool{
+		Name: "wait",
+		Execute: func(ctx context.Context, _ map[string]any) (string, error) {
+			cancel()
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	}
+	call := core.ToolCall{
+		ID: "cancelled_1", Type: "function",
+		Function: core.ToolCallFunction{Name: "wait", Arguments: `{}`},
+	}
+	a := NewAgent(&singleToolThenFinalProvider{call: call}, "", []core.Tool{tool}, nil)
+	tokenCh, msgCh, err := a.Run(ctx, nil, "do it")
+	if err != nil {
+		t.Fatalf("Run err = %v", err)
+	}
+
+	var result core.Token
+	for tok := range tokenCh {
+		if tok.Type == core.TokenTypeToolResult {
+			result = tok
+		}
+	}
+	<-msgCh
+
+	if result.ToolCallID != call.ID {
+		t.Errorf("tool result ID = %q, want %q", result.ToolCallID, call.ID)
+	}
+	if result.Content != "error: context canceled" {
+		t.Errorf("tool result = %q, want cancellation error", result.Content)
+	}
+}
+
 func TestAgentRun_MessagesAllStamped(t *testing.T) {
 	a := NewAgent(&toolThenFinalProvider{}, "", testTools(), nil)
 	tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")

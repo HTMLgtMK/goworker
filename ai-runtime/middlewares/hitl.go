@@ -75,7 +75,7 @@ func (mw *HITLMiddleware) checkBash(ev *core.BeforeToolEvent) *core.MiddlewareRe
 	case sandbox.DecisionDeny:
 		mw.recordAudit(out, "", "blocked")
 		reason := out.Error().Error()
-		return mw.block(ev, "⛔ "+reason, "⛔ "+reason)
+		return mw.block(ev, "⛔ "+reason)
 	default: // DecisionHitl
 		now := time.Now()
 		req := &hitl.InterruptRequest{
@@ -145,7 +145,7 @@ func (mw *HITLMiddleware) checkMCP(ev *core.BeforeToolEvent) *core.MiddlewareRes
 		return &core.MiddlewareResponse{}
 	case sandbox.ModeStrict, sandbox.ModeReadOnly:
 		reason := fmt.Sprintf("MCP tool %s executes outside the sandbox, blocked in %s mode", ev.Tool.Function.Name, mw.sandboxCfg.Mode)
-		return mw.block(ev, "⛔ "+reason, reason)
+		return mw.block(ev, reason)
 	default: // ModeNormal：外部进程需用户确认
 		args, _ := json.Marshal(ev.Args)
 		now := time.Now()
@@ -198,7 +198,7 @@ func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *hitl.InterruptR
 				re := sandbox.Evaluate(sandbox.CommandRequest{Command: edited}, &mw.sandboxCfg)
 				if re.Decision == sandbox.DecisionDeny {
 					mw.recordAudit(re, string(d.Type), "blocked")
-					return mw.block(ev, "⛔ "+re.Error().Error(), "⛔ "+re.Error().Error())
+					return mw.block(ev, "⛔ "+re.Error().Error())
 				}
 			}
 		}
@@ -209,9 +209,6 @@ func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *hitl.InterruptR
 		if msg == "" {
 			msg = "user declined to answer"
 		}
-		if ev.Emit != nil {
-			ev.Emit.Emit(ev.Ctx, core.Token{Type: core.TokenTypeToolResult, Content: "💬 " + msg})
-		}
 		ev.Abort = &core.ToolAbort{Messages: []core.Message{
 			{Role: "tool", Content: fmt.Sprintf("[tool not executed] user replied: %s", msg), ToolCallID: ev.Tool.ID},
 		}}
@@ -221,10 +218,7 @@ func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *hitl.InterruptR
 }
 
 // block 直接拒绝工具执行并回填会话历史。
-func (mw *HITLMiddleware) block(ev *core.BeforeToolEvent, tokenMsg, toolMsg string) *core.MiddlewareResponse {
-	if ev.Emit != nil {
-		ev.Emit.Emit(ev.Ctx, core.Token{Type: core.TokenTypeToolCall, Content: tokenMsg})
-	}
+func (mw *HITLMiddleware) block(ev *core.BeforeToolEvent, toolMsg string) *core.MiddlewareResponse {
 	ev.Abort = &core.ToolAbort{Messages: []core.Message{
 		{Role: "tool", Content: toolMsg, ToolCallID: ev.Tool.ID},
 	}}
@@ -233,9 +227,6 @@ func (mw *HITLMiddleware) block(ev *core.BeforeToolEvent, tokenMsg, toolMsg stri
 
 // reject 拒绝执行并回填 tool 结果消息。
 func (mw *HITLMiddleware) reject(ev *core.BeforeToolEvent, msg string) *core.MiddlewareResponse {
-	if ev.Emit != nil {
-		ev.Emit.Emit(ev.Ctx, core.Token{Type: core.TokenTypeToolResult, Content: msg})
-	}
 	ev.Abort = &core.ToolAbort{Messages: []core.Message{
 		{Role: "tool", Content: msg, ToolCallID: ev.Tool.ID},
 	}}

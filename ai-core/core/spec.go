@@ -150,6 +150,11 @@ type Token struct {
 	Done    bool
 	Event   *RuntimeEvent
 
+	// ToolCall preserves the structured call when Type is TokenTypeToolCall.
+	ToolCall ToolCall
+	// ToolCallID links a TokenTypeToolResult to its originating tool call.
+	ToolCallID string
+
 	// Response 由流式 provider 在流结束时填充：增量 content/thinking/tool_calls
 	// 重组出的完整响应，供 agent 回填历史与触发 AfterModel 中间件。其余 token 为 nil。
 	Response *ChatResponse
