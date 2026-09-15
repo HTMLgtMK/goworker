@@ -38,11 +38,12 @@ type Server struct {
 	closeFn func() error
 	handler TaskHandler
 
-	done chan struct{} // 读循环退出（对端断开）后关闭
+	done chan struct{} // 读循环和已开始的 prompt 都退出后关闭
 
 	mu      sync.Mutex
 	closed  bool
 	cancels map[string]context.CancelFunc // sessionID → prompt 执行的 cancel
+	prompts sync.WaitGroup
 }
 
 // ServeConn 在现有连接上服务（测试或自定义 transport）。
@@ -58,9 +59,10 @@ func ServeConn(rwc io.ReadWriteCloser, handler TaskHandler) *Server {
 	s.conn.HandleNotification(protocol.MethodSessionCancel, s.handleCancel)
 	s.done = make(chan struct{})
 	go func() {
-		defer close(s.done)
 		_ = s.conn.Serve()
 		s.cancelAll()
+		s.prompts.Wait()
+		close(s.done)
 	}()
 	return s
 }
@@ -124,8 +126,18 @@ func (s *Server) handlePrompt(ctx context.Context, params json.RawMessage) (any,
 		cancel()
 		return nil, protocol.ErrClosed
 	}
+	if _, active := s.cancels[req.SessionID]; active {
+		s.mu.Unlock()
+		cancel()
+		return nil, &protocol.RPCError{
+			Code:    -32000,
+			Message: fmt.Sprintf("dispatch: session %q already has an active prompt", req.SessionID),
+		}
+	}
 	s.cancels[req.SessionID] = cancel
+	s.prompts.Add(1)
 	s.mu.Unlock()
+	defer s.prompts.Done()
 	defer func() {
 		s.mu.Lock()
 		delete(s.cancels, req.SessionID)

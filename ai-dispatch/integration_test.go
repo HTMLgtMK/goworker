@@ -3,8 +3,10 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -417,6 +419,57 @@ func TestServer_ConnectionCloseCancelsPrompt(t *testing.T) {
 	case <-server.Done():
 	case <-time.After(time.Second):
 		t.Fatal("server did not stop after client close")
+	}
+}
+
+func TestServer_RejectsConcurrentPromptForSameSession(t *testing.T) {
+	handler := &contextHandler{
+		entered:   make(chan struct{}),
+		cancelled: make(chan struct{}),
+	}
+	_, fc := newServerWithFakeClient(t, handler)
+
+	var newResp protocol.NewSessionResponse
+	if err := fc.conn.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: "/repo"}, &newResp); err != nil {
+		t.Fatal(err)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		var resp protocol.PromptResponse
+		firstDone <- fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+			SessionID: newResp.SessionID,
+			Prompt:    []protocol.ContentBlock{protocol.TextBlock("first")},
+		}, &resp)
+	}()
+	select {
+	case <-handler.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first prompt did not enter handler")
+	}
+
+	var secondResp protocol.PromptResponse
+	err := fc.conn.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
+		SessionID: newResp.SessionID,
+		Prompt:    []protocol.ContentBlock{protocol.TextBlock("second")},
+	}, &secondResp)
+	var rpcErr *protocol.RPCError
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("second prompt error = %v, want RPCError", err)
+	}
+	if rpcErr.Code != -32000 || !strings.Contains(rpcErr.Message, "already has an active prompt") {
+		t.Errorf("second prompt RPC error = %+v", rpcErr)
+	}
+
+	_ = fc.conn.Notify(protocol.MethodSessionCancel, protocol.CancelNotification{SessionID: newResp.SessionID})
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first prompt: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancel did not release first prompt")
 	}
 }
 
