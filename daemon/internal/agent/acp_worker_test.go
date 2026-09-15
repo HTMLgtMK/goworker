@@ -142,12 +142,12 @@ func errorsAsRPC(err error, target *protocol.RPCError) bool {
 }
 
 func TestTokenToUpdate_PreservesToolCallCorrelation(t *testing.T) {
-	call := tokenToUpdate(core.Token{
+	call := TokenToUpdate(core.Token{
 		Type:     core.TokenTypeToolCall,
 		Content:  "bash(\"echo ok\")",
 		ToolCall: core.ToolCall{ID: "call_1"},
 	})
-	result := tokenToUpdate(core.Token{
+	result := TokenToUpdate(core.Token{
 		Type: core.TokenTypeToolResult, Content: "ok", ToolCallID: "call_1",
 	})
 
@@ -168,7 +168,7 @@ func TestTokenToUpdate_Types(t *testing.T) {
 		core.TokenTypeToolResult: protocol.UpdateToolCallUpdate,
 	}
 	for tokenType, want := range cases {
-		body := tokenToUpdate(core.Token{Type: tokenType, Content: "x"})
+		body := TokenToUpdate(core.Token{Type: tokenType, Content: "x"})
 		if body.SessionUpdate != want {
 			t.Errorf("token type %s → %q, want %q", tokenType, body.SessionUpdate, want)
 		}

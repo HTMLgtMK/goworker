@@ -21,6 +21,7 @@ export class StaticTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
       treeItem.description = item.description;
       treeItem.iconPath = new vscode.ThemeIcon(item.icon);
       treeItem.tooltip = item.tooltip ?? item.label;
+      treeItem.command = item.command;
       return treeItem;
     });
   }
@@ -31,4 +32,5 @@ export interface StaticItem {
   description?: string;
   tooltip?: string;
   icon: string;
+  command?: vscode.Command;
 }

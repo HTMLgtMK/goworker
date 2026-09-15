@@ -60,6 +60,57 @@ export interface ACPUpdate {
   [key: string]: unknown;
 }
 
+// ---------------------------------------------------------------------------
+// Agent（chat participant）流式更新：窄化类型与纯 guard，供 participant 映射与单测共用。
+// ---------------------------------------------------------------------------
+
+export interface AgentMessageChunkUpdate extends ACPUpdate {
+  sessionUpdate: 'agent_message_chunk';
+  content: ACPContentBlock & { text: string };
+}
+
+export interface AgentThoughtChunkUpdate extends ACPUpdate {
+  sessionUpdate: 'agent_thought_chunk';
+  content: ACPContentBlock & { text: string };
+}
+
+export interface AgentToolCallUpdate extends ACPUpdate {
+  sessionUpdate: 'tool_call';
+  toolCallId?: string;
+  title?: string;
+  status?: string;
+}
+
+// 'tool_call_update' 携带最新状态；字段与 'tool_call' 同形。
+export interface AgentToolCallStatusUpdate extends ACPUpdate {
+  sessionUpdate: 'tool_call_update';
+  toolCallId?: string;
+  title?: string;
+  status?: string;
+}
+
+export type AgentStreamUpdate =
+  | AgentMessageChunkUpdate
+  | AgentThoughtChunkUpdate
+  | AgentToolCallUpdate
+  | AgentToolCallStatusUpdate;
+
+export function isAgentMessageChunk(update: ACPUpdate): update is AgentMessageChunkUpdate {
+  return update.sessionUpdate === 'agent_message_chunk' && typeof update.content?.text === 'string';
+}
+
+export function isAgentThoughtChunk(update: ACPUpdate): update is AgentThoughtChunkUpdate {
+  return update.sessionUpdate === 'agent_thought_chunk' && typeof update.content?.text === 'string';
+}
+
+export function isToolCall(update: ACPUpdate): update is AgentToolCallUpdate {
+  return update.sessionUpdate === 'tool_call';
+}
+
+export function isToolCallUpdate(update: ACPUpdate): update is AgentToolCallStatusUpdate {
+  return update.sessionUpdate === 'tool_call_update';
+}
+
 export type HostMessage =
   | { type: 'connection-state'; state: 'connected' | 'connecting' | 'disconnected'; error?: string }
   | { type: 'catalog-list'; payload: TaskListUpdate }

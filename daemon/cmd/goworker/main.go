@@ -15,6 +15,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core"
 	"github.com/tinguo/goworker/daemon/internal/dispatcher"
 	"github.com/tinguo/goworker/daemon/internal/frontend/stdin"
+	"github.com/tinguo/goworker/daemon/internal/frontend/vscode"
 	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
@@ -114,6 +115,13 @@ func main() {
 		DispatchDir:   filepath.Join(config.DefaultDir(), "dispatch"),
 	}
 
+	// vscode ACP 前端 socket：未显式配置时按 DefaultDir 派生默认路径。
+	// 与 dispatcher 的 <DispatchDir>/acp.sock 完全分离：那是无人值守 worker 的
+	// 任务提交入口，这里只服务外部编辑器驱动主会话。
+	if runtimeCfg.Frontend.Vscode.Socket == "" {
+		runtimeCfg.Frontend.Vscode.Socket = filepath.Join(config.DefaultDir(), "frontend", "vscode.sock")
+	}
+
 	engine := core.NewEngine(cfg, runtimeCfg, log)
 	defer engine.StopAll()
 
@@ -145,6 +153,21 @@ func main() {
 
 	// 发送启动事件
 	engine.Notify(plugin.Event{Type: plugin.EventPluginStarted, Payload: "system"})
+
+	// vscode ACP 前端：vscode.enabled=true 时经本地 Unix socket 服务外部编辑器（ACP 协议）。
+	// 启动失败与 dispatcher 插件的 listener 启动失败一致：记录错误后终止启动，不静默降级。
+	if runtimeCfg.Frontend.Vscode.Enabled {
+		vscodeFrontend := vscode.New(runtimeCfg.Frontend.Vscode.Socket, func(ctx *plugin.Context, input string) error {
+			return engine.Eval(ctx, input)
+		})
+		if err := vscodeFrontend.Start(); err != nil {
+			log.Error("start vscode frontend failed", "error", err)
+			return
+		}
+		// defer 注册在 engine.StopAll 之后（LIFO）：退出时先停 frontend 再停 engine
+		defer vscodeFrontend.Stop()
+		log.Info("vscode frontend listening", "socket", runtimeCfg.Frontend.Vscode.Socket)
+	}
 
 	// 启动前端（goroutine，不阻塞）
 	frontend := stdin.NewStdinFrontend(engine, &cfg.Frontend.Stdin)

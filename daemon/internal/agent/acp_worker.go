@@ -67,7 +67,7 @@ func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispa
 			rep.MessageChunk(sessionID, text)
 		},
 		EmitToken: func(token core.Token) {
-			rep.Update(sessionID, tokenToUpdate(token))
+			rep.Update(sessionID, TokenToUpdate(token))
 		},
 		// 无人值守：HITL 请求一律拒绝（Session SDK 对 nil Decide 的默认行为）
 	}
@@ -77,8 +77,10 @@ func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispa
 	return protocol.StopEndTurn, nil
 }
 
-// tokenToUpdate maps a structured runtime token to an ACP session update.
-func tokenToUpdate(token core.Token) protocol.SessionUpdateBody {
+// TokenToUpdate 把结构化 runtime token 映射为 ACP session/update 的唯一映射：
+// stdio worker（acpWorker）与 vscode socket 前端（frontend/vscode）两处共用，
+// 保证两条 ACP 入口的工具生命周期/思考/正文渲染一致。
+func TokenToUpdate(token core.Token) protocol.SessionUpdateBody {
 	switch token.Type {
 	case core.TokenTypeThinking:
 		return protocol.SessionUpdateBody{

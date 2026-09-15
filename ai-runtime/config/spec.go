@@ -118,6 +118,24 @@ type Config struct {
 	Session  SessionConfig         `yaml:"session"`
 	MCP      MCPConfig             `yaml:"mcp"`
 	Dispatch DispatchConfig        `yaml:"dispatch"`
+	Frontend FrontendConfig        `yaml:"frontend"`
+}
+
+// FrontendConfig 是前端装配配置（当前仅 vscode ACP 入口）。
+// 与 DispatchConfig 完全分离：dispatch 的 <DispatchDir>/acp.sock 是无人值守 worker
+// 的任务提交入口；这里的 socket 是外部编辑器驱动 daemon 主会话的前端入口，
+// 路径与生命周期互不相干。
+type FrontendConfig struct {
+	Vscode VscodeFrontendConfig `yaml:"vscode"`
+}
+
+// VscodeFrontendConfig 是 VS Code ACP 前端入口配置。
+type VscodeFrontendConfig struct {
+	// Enabled=false 时宿主不装配 socket 前端（默认 true，由 daemon 侧 Defaults 兜底）。
+	Enabled bool `yaml:"enabled"`
+	// Socket 是完整的 Unix socket 文件路径，仅 net.Listen("unix", path) 使用，
+	// 不复用 DispatchDir/acp.sock；空 = 由宿主按其目录约定派生默认路径。
+	Socket string `yaml:"socket,omitempty"`
 }
 
 // DispatchConfig 是 commit dispatcher 的配置。
