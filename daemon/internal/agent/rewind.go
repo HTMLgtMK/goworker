@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 
@@ -26,6 +27,13 @@ func (p *AgentPlugin) registerRewindCommand(h *plugin.Hub) error {
 //	无参             → 列出最近 10 个 checkpoint（编号+时间+preview）
 //	/rewind <n>      → 回溯到编号为 n 的 checkpoint
 func (p *AgentPlugin) handleRewind(ctx *plugin.Context) error {
+	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+		runContext := withPluginContext(ctx, runCtx)
+		return p.handleRewindLocked(runContext)
+	})
+}
+
+func (p *AgentPlugin) handleRewindLocked(ctx *plugin.Context) error {
 	if p.store == nil {
 		ctx.Writer("会话持久化未启用，/rewind 不可用（检查 config.yaml 的 session.enabled）\n")
 		return nil

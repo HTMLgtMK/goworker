@@ -34,6 +34,11 @@ type AgentPlugin struct {
 	cfg   *runtimeconfig.Config
 	paths runtimeconfig.Paths
 	hub   *plugin.Hub
+	// runGate 是 agent 执行串行门禁（容量 1 的信号量）：/agent 与自然语言 fallback
+	// 共用 handleAgent 入口，gate 保证同一时刻只有一个命令回合在跑（session.Run 全程互斥）。
+	// 只 gate handleAgent —— /new /compact /task /memory 等 handler 绝不能获取它：
+	// collectTools 会在 agent 运行期间嵌套 hub.Eval 执行这些命令，重复取锁即死锁。
+	runGate chan struct{}
 	// deps 是 Session 的资源依赖，startSession 每次会话边界全量重建（含指令快照），
 	// /new 经同一路径刷新后以新 deps 创建新会话。
 	deps runtimeagent.SessionDeps
@@ -50,7 +55,7 @@ type AgentPlugin struct {
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
 // 插件不再从 plugin.Hub.Config 读配置（Hub.Config 已 any 化）——配置与路径全部构造函数注入。
 func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *AgentPlugin {
-	return &AgentPlugin{cfg: cfg, paths: paths}
+	return &AgentPlugin{cfg: cfg, paths: paths, runGate: make(chan struct{}, 1)}
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }

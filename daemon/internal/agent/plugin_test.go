@@ -50,7 +50,7 @@ func testHub(cfg *runtimeconfig.Config) (*plugin.Hub, *[]*runtimeconfig.Config) 
 // 需要固定 provider 的测试用 newAgentPluginP。
 func newAgentPlugin(hub *plugin.Hub) *AgentPlugin {
 	cfg, _ := hub.Config.(*runtimeconfig.Config)
-	p := &AgentPlugin{hub: hub, cfg: cfg}
+	p := &AgentPlugin{hub: hub, cfg: cfg, runGate: make(chan struct{}, 1)}
 	// 与 Init 编排一致：资源确认后组装 deps + 创建会话
 	p.deps = runtimeagent.SessionDeps{
 		Config:       cfg,
@@ -72,7 +72,7 @@ func newAgentPlugin(hub *plugin.Hub) *AgentPlugin {
 // newAgentPluginP 注入固定 provider：深播种测试不依赖真实 LLM 端点。
 func newAgentPluginP(hub *plugin.Hub, pv core.Provider) *AgentPlugin {
 	cfg, _ := hub.Config.(*runtimeconfig.Config)
-	p := &AgentPlugin{hub: hub, cfg: cfg}
+	p := &AgentPlugin{hub: hub, cfg: cfg, runGate: make(chan struct{}, 1)}
 	p.deps = runtimeagent.SessionDeps{
 		Config:       cfg,
 		AuditDir:     "",

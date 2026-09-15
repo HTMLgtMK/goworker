@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -20,8 +21,44 @@ import (
 
 // ---- /agent 命令 ----
 
+// acquireRun 获取主会话执行权：容量 1 的 runGate 满时阻塞，直到持有者释放或 ctx 取消。
+func (p *AgentPlugin) acquireRun(ctx context.Context) error {
+	select {
+	case p.runGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *AgentPlugin) releaseRun() {
+	<-p.runGate
+}
+
+type sessionGateKey struct{}
+
+func (p *AgentPlugin) withSession(ctx context.Context, run func(context.Context) error) error {
+	if owner, _ := ctx.Value(sessionGateKey{}).(*AgentPlugin); owner == p {
+		return run(ctx)
+	}
+	if err := p.acquireRun(ctx); err != nil {
+		return err
+	}
+	defer p.releaseRun()
+	return run(context.WithValue(ctx, sessionGateKey{}, p))
+}
+
+func withPluginContext(ctx *plugin.Context, runCtx context.Context) *plugin.Context {
+	copy := *ctx
+	copy.Ctx = runCtx
+	return &copy
+}
+
 func (p *AgentPlugin) handleAgent(ctx *plugin.Context) error {
-	return p.session.Run(ctx.Ctx, runtimeagent.RunRequest{Input: strings.Join(ctx.Args, " ")}, callbacksFromPlugin(ctx))
+	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+		runContext := withPluginContext(ctx, runCtx)
+		return p.session.Run(runCtx, runtimeagent.RunRequest{Input: strings.Join(ctx.Args, " ")}, callbacksFromPlugin(runContext))
+	})
 }
 
 // callbacksFromPlugin 把 plugin.Context 的 I/O 回调适配成 runtimeagent.RunCallbacks。
@@ -46,47 +83,50 @@ func callbacksFromPlugin(ctx *plugin.Context) runtimeagent.RunCallbacks {
 // ---- /new 命令 ----
 
 func (p *AgentPlugin) handleNew(ctx *plugin.Context) error {
-	// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
-	// 同步固化旧会话（阻塞，状态栏显示进度）；快照走只读，先取好再重建。
-	old := p.session
+	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+		runContext := withPluginContext(ctx, runCtx)
+		// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
+		// 同步固化旧会话（阻塞，状态栏显示进度）；快照走只读，先取好再重建。
+		old := p.session
 
-	// pending 快照（store 生效时用游标后的增量，否则全量）
-	var pending []core.Message
-	if p.store != nil {
-		pending = p.store.PendingAfterCursor()
-		if len(pending) == 0 {
-			pending = old.Conversation() // 兜底全量
+		// pending 快照（store 生效时用游标后的增量，否则全量）
+		var pending []core.Message
+		if p.store != nil {
+			pending = p.store.PendingAfterCursor()
+			if len(pending) == 0 {
+				pending = old.Conversation() // 兜底全量
+			}
+		} else {
+			pending = old.Conversation()
 		}
-	} else {
-		pending = old.Conversation()
-	}
-	consolidate := p.memory != nil && len(pending) > 0
+		consolidate := p.memory != nil && len(pending) > 0
 
-	if p.memory == nil {
-		ctx.Writer("✔ New session started (memory disabled)\n")
-	} else {
-		ctx.Writer("✔ New session started\n")
-	}
-
-	// 先归档旧 store，再开新会话（新 store 写新文件）
-	// pending 快照已在 Archive 前取出，不受归档影响
-	if p.store != nil {
-		if err := p.store.Archive(); err != nil {
-			slog.Warn("session: archive failed", "err", err)
+		if p.memory == nil {
+			runContext.Writer("✔ New session started (memory disabled)\n")
+		} else {
+			runContext.Writer("✔ New session started\n")
 		}
-	}
 
-	// 创建新会话（新对象 = 新会话，旧状态随对象回收）
-	p.startSession()
+		// 先归档旧 store，再开新会话（新 store 写新文件）
+		// pending 快照已在 Archive 前取出，不受归档影响
+		if p.store != nil {
+			if err := p.store.Archive(); err != nil {
+				slog.Warn("session: archive failed", "err", err)
+			}
+		}
 
-	ctx.Writer("✔ STM cleared, memory will be retrieved on every query\n")
+		// 创建新会话（新对象 = 新会话，旧状态随对象回收）
+		p.startSession()
 
-	// 同步固化旧会话：阻塞至完成（内部 120s 超时），进度经 ctx.Publish 进状态栏，
-	// 结果/警告经 ctx.Writer 回显。主 goroutine 执行，可直接读共享配置。
-	if consolidate {
-		old.CheckpointSync(ctx.Ctx, pending, callbacksFromPlugin(ctx))
-	}
-	return nil
+		runContext.Writer("✔ STM cleared, memory will be retrieved on every query\n")
+
+		// 同步固化旧会话：阻塞至完成（内部 120s 超时），进度经 ctx.Publish 进状态栏，
+		// 结果/警告经 ctx.Writer 回显。主 goroutine 执行，可直接读共享配置。
+		if consolidate {
+			old.CheckpointSync(runCtx, pending, callbacksFromPlugin(runContext))
+		}
+		return nil
+	})
 }
 
 // ---- /model 命令 ----
@@ -270,70 +310,76 @@ func selectedContextWindow(cfg *runtimeconfig.Config) int {
 // ---- /usage 命令 ----
 
 func (p *AgentPlugin) handleUsage(ctx *plugin.Context) error {
-	calls, comps, total := p.session.UsageSnapshot()
-	if len(calls) == 0 && len(comps) == 0 {
-		ctx.Writer("(no agent calls yet — run /agent first)\n")
-		return nil
-	}
+	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+		runContext := withPluginContext(ctx, runCtx)
+		calls, comps, total := p.session.UsageSnapshot()
+		if len(calls) == 0 && len(comps) == 0 {
+			runContext.Writer("(no agent calls yet — run /agent first)\n")
+			return nil
+		}
 
-	if len(calls) > 0 {
-		ctx.Writer(fmt.Sprintf("usage: %d model calls this session\n\n", len(calls)))
-		for i, c := range calls {
-			line := fmt.Sprintf("  #%-2d  in %-7s  out %-7s  (est %s)",
-				i+1, runtimeagent.Humanize(c.PromptTokens), runtimeagent.Humanize(c.CompletionTokens), runtimeagent.Humanize(c.EstimateTokens))
-			// 模型没返回 cache 字段时明细保持简洁，不挂一串 0
-			if c.PromptCacheHitTokens+c.PromptCacheMissTokens > 0 {
-				line += fmt.Sprintf("  hit: %-7s miss: %-7s / %s",
-					runtimeagent.Humanize(c.PromptCacheHitTokens), runtimeagent.Humanize(c.PromptCacheMissTokens), runtimeagent.Humanize(c.PromptCacheHitTokens+c.PromptCacheMissTokens))
+		if len(calls) > 0 {
+			runContext.Writer(fmt.Sprintf("usage: %d model calls this session\n\n", len(calls)))
+			for i, c := range calls {
+				line := fmt.Sprintf("  #%-2d  in %-7s  out %-7s  (est %s)",
+					i+1, runtimeagent.Humanize(c.PromptTokens), runtimeagent.Humanize(c.CompletionTokens), runtimeagent.Humanize(c.EstimateTokens))
+				// 模型没返回 cache 字段时明细保持简洁，不挂一串 0
+				if c.PromptCacheHitTokens+c.PromptCacheMissTokens > 0 {
+					line += fmt.Sprintf("  hit: %-7s miss: %-7s / %s",
+						runtimeagent.Humanize(c.PromptCacheHitTokens), runtimeagent.Humanize(c.PromptCacheMissTokens), runtimeagent.Humanize(c.PromptCacheHitTokens+c.PromptCacheMissTokens))
+				}
+				runContext.Writer(line + "\n")
 			}
-			ctx.Writer(line + "\n")
-		}
-		ctx.Writer("\n")
-		totalLine := fmt.Sprintf("  total: in %s  out %s  total %s",
-			runtimeagent.Humanize(total.PromptTokens), runtimeagent.Humanize(total.CompletionTokens), runtimeagent.Humanize(total.TotalTokens))
-		if rate, ok := total.CacheHitRate(); ok {
-			totalLine += fmt.Sprintf("  cache %.1f%% (%s hit / %s miss)",
-				rate, runtimeagent.Humanize(total.PromptCacheHitTokens), runtimeagent.Humanize(total.PromptCacheMissTokens))
-		}
-		ctx.Writer(totalLine + "\n")
+			runContext.Writer("\n")
+			totalLine := fmt.Sprintf("  total: in %s  out %s  total %s",
+				runtimeagent.Humanize(total.PromptTokens), runtimeagent.Humanize(total.CompletionTokens), runtimeagent.Humanize(total.TotalTokens))
+			if rate, ok := total.CacheHitRate(); ok {
+				totalLine += fmt.Sprintf("  cache %.1f%% (%s hit / %s miss)",
+					rate, runtimeagent.Humanize(total.PromptCacheHitTokens), runtimeagent.Humanize(total.PromptCacheMissTokens))
+			}
+			runContext.Writer(totalLine + "\n")
 
-		// context usage uses "last prompt / window" — the final ReAct request already holds all history
-		if w := selectedContextWindow(p.cfg); w > 0 && total.LastPromptTokens > 0 {
-			pct := float64(total.LastPromptTokens) / float64(w) * 100
-			ctx.Writer(fmt.Sprintf("  context: %.2f%% (last in %s / window %s)\n",
-				pct, runtimeagent.Humanize(total.LastPromptTokens), runtimeagent.Humanize(w)))
+			// context usage uses "last prompt / window" — the final ReAct request already holds all history
+			if w := selectedContextWindow(p.cfg); w > 0 && total.LastPromptTokens > 0 {
+				pct := float64(total.LastPromptTokens) / float64(w) * 100
+				runContext.Writer(fmt.Sprintf("  context: %.2f%% (last in %s / window %s)\n",
+					pct, runtimeagent.Humanize(total.LastPromptTokens), runtimeagent.Humanize(w)))
+			}
 		}
-	}
 
-	// 压缩记录：压缩是循环外的模型调用，消耗和效果都该看得见
-	if len(comps) > 0 {
-		var msgsIn, msgsOut, tokens int
-		for _, c := range comps {
-			msgsIn += c.BeforeMsgs
-			msgsOut += c.AfterMsgs
-			tokens += c.Tokens
+		// 压缩记录：压缩是循环外的模型调用，消耗和效果都该看得见
+		if len(comps) > 0 {
+			var msgsIn, msgsOut, tokens int
+			for _, c := range comps {
+				msgsIn += c.BeforeMsgs
+				msgsOut += c.AfterMsgs
+				tokens += c.Tokens
+			}
+			runContext.Writer(fmt.Sprintf("  compact: %d time(s), %d msgs → %d msgs (summarize %s)\n",
+				len(comps), msgsIn, msgsOut, runtimeagent.Humanize(tokens)))
 		}
-		ctx.Writer(fmt.Sprintf("  compact: %d time(s), %d msgs → %d msgs (summarize %s)\n",
-			len(comps), msgsIn, msgsOut, runtimeagent.Humanize(tokens)))
-	}
 
-	// 当前历史占用：压缩后的直观体现，不必等下一次模型调用。
-	conv := p.session.Conversation()
-	if convLen := len(conv); convLen > 0 {
-		convEst := core.EstimateTokens(conv)
-		line := fmt.Sprintf("  history: %s est (%d msgs)", runtimeagent.Humanize(convEst), convLen)
-		if w := selectedContextWindow(p.cfg); w > 0 {
-			line += fmt.Sprintf(", %.2f%% of window", float64(convEst)/float64(w)*100)
+		// 当前历史占用：压缩后的直观体现，不必等下一次模型调用。
+		conv := p.session.Conversation()
+		if convLen := len(conv); convLen > 0 {
+			convEst := core.EstimateTokens(conv)
+			line := fmt.Sprintf("  history: %s est (%d msgs)", runtimeagent.Humanize(convEst), convLen)
+			if w := selectedContextWindow(p.cfg); w > 0 {
+				line += fmt.Sprintf(", %.2f%% of window", float64(convEst)/float64(w)*100)
+			}
+			runContext.Writer(line + "\n")
 		}
-		ctx.Writer(line + "\n")
-	}
-	return nil
+		return nil
+	})
 }
 
 // ---- /compact 命令 ----
 
 func (p *AgentPlugin) handleCompact(ctx *plugin.Context) error {
-	return p.session.Compact(ctx.Ctx, callbacksFromPlugin(ctx))
+	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+		runContext := withPluginContext(ctx, runCtx)
+		return p.session.Compact(runCtx, callbacksFromPlugin(runContext))
+	})
 }
 
 // ---- /skills 命令 ----
@@ -353,17 +399,20 @@ func (p *AgentPlugin) handleSkills(ctx *plugin.Context) error {
 // ---- /history 命令 ----
 
 func (p *AgentPlugin) handleHistory(ctx *plugin.Context) error {
-	conv := p.session.Conversation()
-	if len(conv) == 0 {
-		ctx.Writer("(no conversation history yet — run /agent first)\n")
-		return nil
-	}
+	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+		runContext := withPluginContext(ctx, runCtx)
+		conv := p.session.Conversation()
+		if len(conv) == 0 {
+			runContext.Writer("(no conversation history yet — run /agent first)\n")
+			return nil
+		}
 
-	ctx.Writer(fmt.Sprintf("history: %d messages\n\n", len(conv)))
-	for i, m := range conv {
-		ctx.Writer(fmt.Sprintf("  #%-2d [%-9s] %s\n", i+1, m.Role, runtimeagent.DescribeMessage(m)))
-	}
-	return nil
+		runContext.Writer(fmt.Sprintf("history: %d messages\n\n", len(conv)))
+		for i, m := range conv {
+			runContext.Writer(fmt.Sprintf("  #%-2d [%-9s] %s\n", i+1, m.Role, runtimeagent.DescribeMessage(m)))
+		}
+		return nil
+	})
 }
 
 // ---- /rules 命令 ----

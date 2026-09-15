@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -167,6 +168,13 @@ func (p *AgentPlugin) memoryHelp(ctx *plugin.Context) {
 // ---- /task 命令 ----
 
 func (p *AgentPlugin) handleTask(ctx *plugin.Context) error {
+	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+		runContext := withPluginContext(ctx, runCtx)
+		return p.handleTaskLocked(runContext)
+	})
+}
+
+func (p *AgentPlugin) handleTaskLocked(ctx *plugin.Context) error {
 	if p.memory == nil {
 		ctx.Writer("memory 未启用（检查 config.yaml 的 memory.enabled 与存储目录权限）\n")
 		return nil
