@@ -1,4 +1,7 @@
 import * as vscode from 'vscode';
+import { openAgentChatPanel } from './acpUi/chatPanel';
+import { createAcpSessionHostRuntime, createGoworkerAgentSpawnConfig } from './acpUi/hostRuntime';
+import { AcpChatSessionRegistry } from './acpUi/sessionRegistry';
 import { ACPConnection } from './acp/connection';
 import { AgentClient } from './acp/agentClient';
 import { DispatcherClient } from './acp/dispatcherClient';
@@ -20,6 +23,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const runtime = new StaticTreeProvider([{ label: 'Dispatcher: connecting…', icon: 'sync~spin' }]);
   const client = new DispatcherClient(new ACPConnection(dispatcherSocketPath()), cwd);
   const agent = new AgentClient(new ACPConnection(agentSocketPath()), cwd);
+  const chatRegistry = new AcpChatSessionRegistry();
 
   // 原生 Chat participant（follower mode）：只经 ChatResponseStream 输出，
   // 不触碰 webview/DOM/文件系统，也不提供命令执行能力。
@@ -34,9 +38,11 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('goworker.refreshTasks', () => refresh()),
     vscode.commands.registerCommand('goworker.reconnect', () => reconnect()),
     vscode.commands.registerCommand('goworker.openTask', (taskId: string) => TaskPanel.open(context, client, taskId)),
+    vscode.commands.registerCommand('goworker.openAgentChat', () => openAgentChat(context, chatRegistry)),
     { dispose: () => client.disconnect() },
     participant,
     { dispose: () => agent.disconnect() },
+    { dispose: () => chatRegistry.disposeAll() },
   );
 
   void reconnect();
@@ -148,6 +154,26 @@ function renderAgentUpdate(update: ACPUpdate, response: vscode.ChatResponseStrea
 function dispatcherSocketPath(): string {
   const configured = vscode.workspace.getConfiguration('goworker').get<string>('socketPath', '');
   return resolveSocketPath(configured, 'dispatch/acp.sock');
+}
+
+// ACP 聊天面板：复用 agentSocketPath() 解析 daemon socket（goworker.agentSocketPath 配置，
+// fallback ~/.config/goworker/frontend/vscode.sock），transport 注入由 hostRuntime 完成。
+function openAgentChat(context: vscode.ExtensionContext, registry: AcpChatSessionRegistry): void {
+  let socketPath: string;
+  try {
+    socketPath = agentSocketPath();
+  } catch (error) {
+    void vscode.window.showErrorMessage(asError(error).message);
+    return;
+  }
+  openAgentChatPanel({
+    context,
+    registry,
+    agentConfig: createGoworkerAgentSpawnConfig(socketPath),
+    host: createAcpSessionHostRuntime({
+      getWorkspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+    }),
+  });
 }
 
 function agentSocketPath(): string {

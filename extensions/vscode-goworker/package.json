@@ -4,28 +4,46 @@
   "description": "GOWORKER task console and ACP trace observer for VS Code.",
   "version": "0.1.0",
   "private": true,
-  "engines": { "vscode": "^1.100.0" },
-  "categories": ["Other"],
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other"
+  ],
   "activationEvents": [
     "onView:goworker.tasks",
     "onView:goworker.workers",
     "onView:goworker.runtime",
     "onChatParticipant:goworker.chat",
     "onCommand:goworker.refreshTasks",
-    "onCommand:goworker.openTask"
+    "onCommand:goworker.openTask",
+    "onCommand:goworker.openAgentChat"
   ],
   "main": "./dist/extension.js",
   "contributes": {
     "viewsContainers": {
       "activitybar": [
-        { "id": "goworker", "title": "GOWORKER", "icon": "media/goworker.svg" }
+        {
+          "id": "goworker",
+          "title": "GOWORKER",
+          "icon": "media/goworker.svg"
+        }
       ]
     },
     "views": {
       "goworker": [
-        { "id": "goworker.tasks", "name": "Tasks" },
-        { "id": "goworker.workers", "name": "Workers" },
-        { "id": "goworker.runtime", "name": "Runtime" }
+        {
+          "id": "goworker.tasks",
+          "name": "Tasks"
+        },
+        {
+          "id": "goworker.workers",
+          "name": "Workers"
+        },
+        {
+          "id": "goworker.runtime",
+          "name": "Runtime"
+        }
       ]
     },
     "chatParticipants": [
@@ -37,9 +55,22 @@
       }
     ],
     "commands": [
-      { "command": "goworker.refreshTasks", "title": "GOWORKER: Refresh Tasks" },
-      { "command": "goworker.openTask", "title": "GOWORKER: Open Task" },
-      { "command": "goworker.reconnect", "title": "GOWORKER: Reconnect" }
+      {
+        "command": "goworker.refreshTasks",
+        "title": "GOWORKER: Refresh Tasks"
+      },
+      {
+        "command": "goworker.openTask",
+        "title": "GOWORKER: Open Task"
+      },
+      {
+        "command": "goworker.openAgentChat",
+        "title": "GOWORKER: Open Agent Chat"
+      },
+      {
+        "command": "goworker.reconnect",
+        "title": "GOWORKER: Reconnect"
+      }
     ],
     "configuration": {
       "title": "GOWORKER",
@@ -58,13 +89,22 @@
     },
     "menus": {
       "view/title": [
-        { "command": "goworker.refreshTasks", "when": "view == goworker.tasks", "group": "navigation" },
-        { "command": "goworker.reconnect", "when": "view == goworker.runtime", "group": "navigation" }
+        {
+          "command": "goworker.refreshTasks",
+          "when": "view == goworker.tasks",
+          "group": "navigation"
+        },
+        {
+          "command": "goworker.reconnect",
+          "when": "view == goworker.runtime",
+          "group": "navigation"
+        }
       ]
     }
   },
   "scripts": {
     "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/unit/**/*.test.ts",
     "package": "npm run typecheck && npm run build"
@@ -75,5 +115,8 @@
     "esbuild": "^0.25.0",
     "tsx": "^4.19.0",
     "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "@htmlgtmk/acp-ui": "file:../../../vscode-acp-ui/dist-sdk"
   }
 }

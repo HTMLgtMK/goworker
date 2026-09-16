@@ -1,0 +1,81 @@
+/* ACP Chat · 终端（glamour/stdin）风格覆盖层
+   取向：去容器框、回归文本流——❯ 前缀用户消息、无框 Thought、
+   $ 提示工具行、克制的代码底色。仅覆盖 SDK webview 既有类名。 */
+
+:root {
+  --acp-markdown-font-size: 13px;
+  --acp-markdown-line-height: 1.55;
+  --acp-markdown-h1-foreground: #d97757;
+  --acp-markdown-h2-foreground: #d97757;
+  --acp-markdown-inline-code-foreground: var(--vscode-terminal-ansiRed, #e06c75);
+  --acp-markdown-inline-code-border: transparent;
+  --acp-code-token-comment-foreground: var(--vscode-terminal-ansiGreen, #6a9955);
+}
+
+/* 标题：终端级克制字号，主题色只在 h1/h2 */
+.agent-markdown h1 { font-size: 1.3em; }
+.agent-markdown h2 { font-size: 1.18em; }
+.agent-markdown h3 { font-size: 1.05em; }
+
+/* 行内代码：去框着色 */
+.agent-markdown code {
+  border: none;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+/* 代码块：去边框圆角，保留浅底与拷贝按钮 */
+.agent-markdown-code-block > pre {
+  border: none;
+  border-radius: 0;
+  background-color: color-mix(in srgb, var(--vscode-editor-background) 92%, var(--vscode-foreground) 8%);
+}
+
+/* 用户消息：去气泡，❯ 前缀 */
+.user-prompt-bar {
+  border: none;
+  background: transparent;
+  border-radius: 0;
+  padding: 0 0 2px 0;
+  margin-bottom: 10px;
+}
+.user-prompt-bar::before {
+  content: "❯ ";
+  color: var(--vscode-terminal-ansiGreen, var(--vscode-textLink-foreground));
+  font-weight: 600;
+}
+
+/* Thought：新 details 结构已在 SDK 侧终端化；覆盖层只做轻量收敛 */
+.agent-thought-chunk-body {
+  font-style: italic;
+}
+/* 工具行：去边框底色（SDK caret 由 SDK 提供） */
+.agent-thought-chunk { border: none; background: transparent; padding: 0; }
+
+/* 工具行（terminal 变体）：去框，保留 $ 提示与状态点 */
+.tool-call-terminal {
+  border: none;
+  background: transparent;
+  border-radius: 0;
+  padding: 1px 0 2px 0;
+}
+
+/* Plan：去虚线框 */
+.agent-plan { border: none; padding: 0 0 2px 0; }
+
+/* 列表 marker 余量：ol/ul 的 1.35em padding 对宽字体渲染太窄，marker 会被裁半。
+   加大到 1.7em 并用 list-style-position: outside 保持悬挂缩进。 */
+.agent-markdown ul,
+.agent-markdown ol { padding-left: 1.7em; }
+.agent-markdown li::marker { color: var(--vscode-descriptionForeground); }
+
+/* 表格：SDK 规则是首列 nowrap、其余列 width:100%——数据列被挤成右侧窄条且竖排换行。
+   改为均匀自动列宽，单元格留横向 padding，长内容允许换行但不挤压。 */
+.agent-markdown table { table-layout: auto; }
+.agent-markdown th,
+.agent-markdown td { padding: 3px 18px 3px 0; }
+.agent-markdown th:first-child,
+.agent-markdown td:first-child { padding-right: 18px; }
+.agent-markdown th:not(:first-child),
+.agent-markdown td:not(:first-child) { width: auto; white-space: normal; }
