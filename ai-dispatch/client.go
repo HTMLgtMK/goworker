@@ -137,21 +137,19 @@ func (c *Client) NewSession(ctx context.Context, cwd string) (string, error) {
 }
 
 // SessionLoad 恢复 worker 上已有的会话（崩溃恢复路径）；worker 须声明
-// loadSession 能力。返回 worker 确认的 sessionID。
+// loadSession 能力。ACP 的 load 响应只含可选 modes（常序列化为 {}）、不回显
+// sessionId；Call 成功即视为 worker 接受了该会话，返回请求的 sessionID 作确认。
 func (c *Client) SessionLoad(ctx context.Context, sessionID, cwd string) (string, error) {
-	var resp protocol.NewSessionResponse
 	req := protocol.LoadSessionRequest{
 		SessionID:  sessionID,
 		Cwd:        cwd,
 		McpServers: []map[string]any{},
 	}
+	var resp protocol.LoadSessionResponse
 	if err := c.conn.Call(ctx, protocol.MethodSessionLoad, req, &resp); err != nil {
 		return "", err
 	}
-	if resp.SessionID == "" {
-		return "", fmt.Errorf("dispatch: worker %q returned empty sessionId on load", c.name)
-	}
-	return resp.SessionID, nil
+	return sessionID, nil
 }
 
 // Prompt 提交一回合任务，阻塞到 worker 返回 stop reason。

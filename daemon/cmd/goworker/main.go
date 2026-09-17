@@ -128,8 +128,10 @@ func main() {
 	// 注册拦截器
 	engine.Use(core.LoggingInterceptor(log))
 
-	// 注册插件（ai-runtime 的 agent 插件：配置与路径构造函数注入）
-	if err := engine.Register(agent.NewPlugin(runtimeCfg, paths)); err != nil {
+	// 注册插件（ai-runtime 的 agent 插件：配置与路径构造函数注入）。
+	// 实例保留引用：vscode 前端的会话清单/load 判定直接落在它上。
+	agentPlugin := agent.NewPlugin(runtimeCfg, paths)
+	if err := engine.Register(agentPlugin); err != nil {
 		log.Error("register AgentPlugin failed", "error", err)
 		return
 	}
@@ -159,7 +161,7 @@ func main() {
 	if runtimeCfg.Frontend.Vscode.Enabled {
 		vscodeFrontend := vscode.New(runtimeCfg.Frontend.Vscode.Socket, func(ctx *plugin.Context, input string) error {
 			return engine.Eval(ctx, input)
-		})
+		}, engine.Commands, agentPlugin)
 		if err := vscodeFrontend.Start(); err != nil {
 			log.Error("start vscode frontend failed", "error", err)
 			return

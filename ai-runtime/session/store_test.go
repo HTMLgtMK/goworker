@@ -842,6 +842,27 @@ func TestCheckpointLimit(t *testing.T) {
 	}
 }
 
+// TestCheckpointsUnlimited 验证 limit <= 0 返回全部检查点（历史全量重放依赖）。
+func TestCheckpointsUnlimited(t *testing.T) {
+	s := openStore(t)
+
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("m%02d", i)
+		_, _ = s.Commit([]core.Message{commMsg(id, "user", "c")})
+		_ = s.Checkpoint(fmt.Sprintf("ck_%d", i))
+	}
+
+	for _, limit := range []int{0, -1} {
+		cks := s.Checkpoints(limit)
+		if len(cks) != 5 {
+			t.Errorf("limit %d: expected all 5, got %d", limit, len(cks))
+		}
+		if len(cks) > 0 && cks[0].Preview != "ck_4" {
+			t.Errorf("limit %d: latest = %s, want ck_4", limit, cks[0].Preview)
+		}
+	}
+}
+
 // TestClearPendingBetweenCommitAndCursor 验证增量固化场景。
 func TestClearPendingBetweenCommitAndCursor(t *testing.T) {
 	s := openStore(t)

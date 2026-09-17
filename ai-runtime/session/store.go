@@ -110,6 +110,14 @@ func (s *Store) Close() error {
 	return nil
 }
 
+// Head 返回当前 head 节点 id（空会话返回空串）。只读访问器，供会话清单等
+// 外部扫描方识别当前活动会话，无需接触 recs 内部。
+func (s *Store) Head() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.head
+}
+
 // ActiveView 从 head 沿 parent 回溯，构建当前活跃视图。
 // compact 节点在视图里转为一条 Role="system" 的摘要消息。
 func (s *Store) ActiveView() []core.Message {
@@ -342,13 +350,17 @@ func (s *Store) Checkpoint(preview string) error {
 	return nil
 }
 
-// Checkpoints 返回最近 limit 个检查点（按时间倒序）。
+// Checkpoints 返回检查点列表，按记录追加顺序倒序（最新在前）。
+// limit > 0 时最多返回最近 limit 个；limit <= 0 返回全部。
 func (s *Store) Checkpoints(limit int) []Checkpoint {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cks := make([]Checkpoint, 0, limit)
-	for i := len(s.recs) - 1; i >= 0 && len(cks) < limit; i-- {
+	cks := make([]Checkpoint, 0, 8)
+	for i := len(s.recs) - 1; i >= 0; i-- {
+		if limit > 0 && len(cks) >= limit {
+			break
+		}
 		r := s.recs[i]
 		if r.Kind == kindCheckpoint && r.CK != nil {
 			cks = append(cks, Checkpoint{

@@ -2,10 +2,12 @@ package vscode
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/tinguo/goworker/ai-core/core"
@@ -17,10 +19,26 @@ import (
 // Evaluator delegates a raw frontend prompt to the daemon command engine.
 type Evaluator func(ctx *plugin.Context, input string) error
 
+// SessionSource 是 vscode frontend 对 daemon 会话元数据的最小消费接口（由 agent
+// 插件实现，结构化类型、agent 包无需感知本接口）：
+//   - ListSessions：session/list 数据源（当前会话置顶 + 归档，只读扫描）。
+//   - CurrentSessionID：当前活动会话的 head id（空 = 无活动会话）。
+//   - ReloadCurrentSession：load 命中当前会话时刷新会话视图（ReloadFromStore）。
+//   - CurrentSessionHistory：当前会话对话历史 → session/update 序列，load 成功
+//     路径上向客户端重放。
+type SessionSource interface {
+	ListSessions() []protocol.SessionInfo
+	CurrentSessionID() string
+	ReloadCurrentSession() error
+	CurrentSessionHistory() []protocol.SessionUpdateBody
+}
+
 // Frontend exposes the daemon's persistent main conversation over a local ACP socket.
 type Frontend struct {
 	path      string
 	evaluate  Evaluator
+	commands  func() []plugin.Command
+	sessions  SessionSource
 	listener  net.Listener
 	mu        sync.Mutex
 	lifecycle sync.Mutex
@@ -34,10 +52,14 @@ type Frontend struct {
 }
 
 // New creates a VS Code ACP frontend bound to one local Unix socket path.
-func New(path string, evaluate Evaluator) *Frontend {
+// commands 提供 daemon 命令清单，session/new 时下发给客户端做 slash 补全。
+// sessions 提供会话清单与 load 判定（nil = session/list 返回空、load 报不支持）。
+func New(path string, evaluate Evaluator, commands func() []plugin.Command, sessions SessionSource) *Frontend {
 	return &Frontend{
 		path:     path,
 		evaluate: evaluate,
+		commands: commands,
+		sessions: sessions,
 		servers:  make(map[*dispatch.Server]struct{}),
 	}
 }
@@ -183,7 +205,7 @@ func (f *Frontend) acceptLoop(listener net.Listener) {
 			f.acceptMu.Unlock()
 			return
 		}
-		handler := &ingress{evaluate: f.evaluate, sessions: make(map[string]struct{})}
+		handler := &ingress{evaluate: f.evaluate, commands: f.commands, sessionSource: f.sessions, sessions: make(map[string]struct{})}
 		server := dispatch.ServeConn(conn, handler)
 		f.mu.Lock()
 		f.servers[server] = struct{}{}
@@ -231,16 +253,133 @@ func tokenToUpdate(token core.Token) protocol.SessionUpdateBody {
 	}
 }
 
-type ingress struct {
-	evaluate Evaluator
-	mu       sync.Mutex
-	sessions map[string]struct{}
+// availableCommand 是 available_commands_update 里的一条命令补全项。
+// name 不带前导 /（UI 侧补全统一展示为 /name）。
+type availableCommand struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Source      string `json:"source,omitempty"` // 固定 "daemon"，标注命令来自 daemon 引擎
 }
 
-func (h *ingress) SetSession(sessionID, _ string) {
+// availableCommandsUpdate 是 ACP available_commands_update 的透传载荷，
+// 供 VS Code chat 面板做 slash command 补全。整体经 Raw 透传，不重组。
+type availableCommandsUpdate struct {
+	SessionUpdate     string             `json:"sessionUpdate"` // 固定 "available_commands_update"
+	AvailableCommands []availableCommand `json:"availableCommands"`
+}
+
+// availableCommandsUpdateBody 从命令清单构建完整透传载荷。
+// 别名展开为独立条目（description 标注 alias of /xxx），空清单也照发（清空旧状态）。
+func availableCommandsUpdateBody(cmds []plugin.Command) protocol.SessionUpdateBody {
+	out := make([]availableCommand, 0, len(cmds))
+	for _, cmd := range cmds {
+		out = append(out, availableCommand{
+			Name:        strings.TrimPrefix(cmd.Name, "/"),
+			Description: cmd.Description,
+			Source:      "daemon",
+		})
+		for _, alias := range cmd.Aliases {
+			out = append(out, availableCommand{
+				Name:        strings.TrimPrefix(alias, "/"),
+				Description: fmt.Sprintf("(alias of %s)", cmd.Name),
+				Source:      "daemon",
+			})
+		}
+	}
+	data, err := json.Marshal(availableCommandsUpdate{
+		SessionUpdate:     protocol.UpdateAvailableCommands,
+		AvailableCommands: out,
+	})
+	if err != nil {
+		// 这些字段都是字符串/切片，json.Marshal 不会失败；真失败就跳过本次下发。
+		return protocol.SessionUpdateBody{}
+	}
+	return protocol.SessionUpdateBody{Raw: data}
+}
+
+type ingress struct {
+	evaluate      Evaluator
+	commands      func() []plugin.Command
+	sessionSource SessionSource
+	mu            sync.Mutex
+	sessions      map[string]struct{}
+}
+
+func (h *ingress) remember(sessionID string) {
 	h.mu.Lock()
 	h.sessions[sessionID] = struct{}{}
 	h.mu.Unlock()
+}
+
+func (h *ingress) SetSession(sessionID, _ string) {
+	h.remember(sessionID)
+}
+
+// SetSessionServer 在 session/new 时立即把 daemon 命令清单作为 ACP
+// available_commands_update 下发给客户端，供 / 补全；随后才返回 session 响应。
+func (h *ingress) SetSessionServer(sessionID, _ string, server *dispatch.Server) {
+	h.remember(sessionID)
+	if h.commands == nil {
+		return
+	}
+	if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
+		server.Update(sessionID, body)
+	}
+}
+
+// ListSessions 实现 dispatch.SessionLister：转发给会话数据源；无数据源时返回
+// 空清单（非 nil，ACP 无 list 能力协商，空清单即「当前无可列会话」）。
+func (h *ingress) ListSessions() []protocol.SessionInfo {
+	if h.sessionSource == nil {
+		return []protocol.SessionInfo{}
+	}
+	return h.sessionSource.ListSessions()
+}
+
+// LoadSession 实现 dispatch.SessionLoader。daemon 的 agent 插件是单活动会话模型
+// （store 是唯一真相，当前会话始终处于已加载状态），load 的语义是「确认会话上下文已在」：
+//   - sessionId == 当前会话 head → 刷新会话视图后成功，并在响应前推送重放通知：
+//     先记住该 id（load 不走 session/new，不记住则后续 session/prompt 被本连接的
+//     known-session 检查拒掉）；再下发 available_commands_update（load 路径没有
+//     SetSessionServer，斜杠补全只能在此补齐，空清单也照发以清掉客户端旧状态）；
+//     最后逐条重放对话历史（user/assistant 消息 → message chunk，映射规则见
+//     agent.CurrentSessionHistory）。这些通知经同一连接顺序写出，先于 load 响应
+//     到达，客户端可在响应返回前渲染。
+//   - sessionId 是归档会话 → 明确报错（归档恢复为后续工作，诚实报错优于假成功）；
+//   - 其他 → 未知会话报错。
+//
+// 不为历史 sessionId 重建独立会话——daemon 模型不支持多活动会话。
+func (h *ingress) LoadSession(sessionID string, rep dispatch.Reporter) error {
+	if h.sessionSource == nil {
+		return &protocol.RPCError{Code: -32000, Message: "vscode frontend: session load not supported"}
+	}
+	if sessionID == h.sessionSource.CurrentSessionID() {
+		if err := h.sessionSource.ReloadCurrentSession(); err != nil {
+			return fmt.Errorf("vscode frontend: reload current session: %w", err)
+		}
+		h.remember(sessionID)
+		if h.commands != nil {
+			if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
+				rep.Update(sessionID, body)
+			}
+		}
+		for _, body := range h.sessionSource.CurrentSessionHistory() {
+			rep.Update(sessionID, body)
+		}
+		return nil
+	}
+	for _, info := range h.sessionSource.ListSessions() {
+		if info.SessionID == sessionID {
+			return &protocol.RPCError{
+				Code:    -32000,
+				Message: fmt.Sprintf("vscode frontend: archived session resume is not supported yet (session %q)", sessionID),
+			}
+		}
+	}
+	return &protocol.RPCError{
+		Code:    -32000,
+		Message: fmt.Sprintf("vscode frontend: unknown session %q", sessionID),
+	}
 }
 
 func (h *ingress) Run(ctx context.Context, sessionID, prompt string, rep dispatch.Reporter) (string, error) {

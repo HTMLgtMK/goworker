@@ -10,6 +10,7 @@ const (
 	// Client → Agent（requests）
 	MethodInitialize     = "initialize"
 	MethodAuthenticate   = "authenticate"
+	MethodSessionList    = "session/list"
 	MethodSessionNew     = "session/new"
 	MethodSessionLoad    = "session/load"
 	MethodSessionPrompt  = "session/prompt"
@@ -62,6 +63,32 @@ type LoadSessionRequest struct {
 	SessionID  string           `json:"sessionId"`
 	Cwd        string           `json:"cwd"`
 	McpServers []map[string]any `json:"mcpServers"`
+}
+
+// LoadSessionResponse 是 load 成功响应。按 ACP 只含可选的 modes；daemon 单活动
+// 会话模型没有可报的 modes，序列化为 {}。
+type LoadSessionResponse struct{}
+
+// ---- session/list ----
+
+// ListSessionsRequest 的 cwd/cursor 当前被清单方忽略：清单一次给全（有上限），
+// 不返回 nextCursor，客户端无需翻页。字段保留以对齐 @agentclientprotocol/sdk。
+type ListSessionsRequest struct {
+	Cwd    string `json:"cwd,omitempty"`
+	Cursor string `json:"cursor,omitempty"`
+}
+
+// SessionInfo 是清单里的一条会话摘要（字段名对齐 @agentclientprotocol/sdk）。
+type SessionInfo struct {
+	SessionID string `json:"sessionId"`
+	Cwd       string `json:"cwd"`
+	Title     string `json:"title,omitempty"`
+	UpdatedAt string `json:"updatedAt,omitempty"` // RFC3339
+}
+
+type ListSessionsResponse struct {
+	Sessions   []SessionInfo `json:"sessions"`
+	NextCursor string        `json:"nextCursor,omitempty"`
 }
 
 // ---- session/new ----
@@ -138,11 +165,13 @@ func (b *SessionUpdateBody) UnmarshalJSON(data []byte) error {
 
 // update 判别值（ACP REV_1 子集）。
 const (
+	UpdateUserMessageChunk  = "user_message_chunk"
 	UpdateAgentMessageChunk = "agent_message_chunk"
 	UpdateAgentThoughtChunk = "agent_thought_chunk"
 	UpdateToolCall          = "tool_call"
 	UpdateToolCallUpdate    = "tool_call_update"
 	UpdatePlan              = "plan"
+	UpdateAvailableCommands = "available_commands_update"
 )
 
 // ---- session/request_permission（Agent → Client request）----

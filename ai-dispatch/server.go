@@ -31,6 +31,31 @@ type SessionAware interface {
 	SetSession(sessionID, cwd string)
 }
 
+// SessionServerAware 是 handler 的可选扩展：session/new 时除 cwd 外再拿到
+// Server 引用，供 handler 在返回响应前立即向提交方下发 session/update
+// （如 available_commands_update）。实现本接口的 handler 优先于 SessionAware；
+// 未实现者保持原 SessionAware 行为不变。
+type SessionServerAware interface {
+	SetSessionServer(sessionID, cwd string, server *Server)
+}
+
+// SessionLoader 是 handler 的可选扩展：实现后 Server 在 initialize 能力协商中
+// 上报 loadSession=true，session/load 请求转发给 handler；未实现者保持
+// LoadSession:false（协议诚实：客户端只应对声明了能力的 agent 发 load）。
+// rep 供 handler 在返回响应前向提交方推送 session/update 通知（历史重放、命令
+// 清单等）——同一连接顺序写入保证这些通知先于 load 响应到达（对齐
+// @agentclientprotocol/sdk 语义：客户端可在 load 返回前就开始渲染重放内容）。
+type SessionLoader interface {
+	// LoadSession 确认会话上下文已在（daemon 单活动会话模型下即「当前会话」）。
+	LoadSession(sessionID string, rep Reporter) error
+}
+
+// SessionLister 是 handler 的可选扩展：实现后 session/list 返回 handler 给出的
+// 会话清单（当前 + 归档）。请求参数 cwd/cursor 不转发——清单方一次给全、不翻页。
+type SessionLister interface {
+	ListSessions() []protocol.SessionInfo
+}
+
 // Server 是 ACP Agent 角色：接受外部 ACP Client 的任务提交。
 // 一条连接一个 Server；session/prompt 的内容即任务。
 type Server struct {
@@ -54,7 +79,9 @@ func ServeConn(rwc io.ReadWriteCloser, handler TaskHandler) *Server {
 		cancels: make(map[string]context.CancelFunc),
 	}
 	s.conn.Handle(protocol.MethodInitialize, s.handleInitialize)
+	s.conn.Handle(protocol.MethodSessionList, s.handleSessionList)
 	s.conn.Handle(protocol.MethodSessionNew, s.handleSessionNew)
+	s.conn.Handle(protocol.MethodSessionLoad, s.handleSessionLoad)
 	s.conn.Handle(protocol.MethodSessionPrompt, s.handlePrompt)
 	s.conn.HandleNotification(protocol.MethodSessionCancel, s.handleCancel)
 	s.done = make(chan struct{})
@@ -83,10 +110,50 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, fmt.Errorf("dispatch: decode initialize: %w", err)
 	}
+	// 能力协商照实上报：只有 handler 真的实现 load 才声明 loadSession。
+	caps := protocol.AgentCapabilities{}
+	if _, ok := s.handler.(SessionLoader); ok {
+		caps.LoadSession = true
+	}
 	return protocol.InitializeResponse{
 		ProtocolVersion:   protocol.Version,
-		AgentCapabilities: protocol.AgentCapabilities{},
+		AgentCapabilities: caps,
 	}, nil
+}
+
+// handleSessionLoad 把 load 转发给实现了 SessionLoader 的 handler。成功响应按
+// ACP 序列化为 {}（modes 可省）。
+func (s *Server) handleSessionLoad(_ context.Context, params json.RawMessage) (any, error) {
+	var req protocol.LoadSessionRequest
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, fmt.Errorf("dispatch: decode session/load: %w", err)
+	}
+	if req.SessionID == "" {
+		return nil, fmt.Errorf("dispatch: session/load requires sessionId")
+	}
+	loader, ok := s.handler.(SessionLoader)
+	if !ok {
+		return nil, &protocol.RPCError{Code: -32000, Message: "dispatch: session load not supported"}
+	}
+	if err := loader.LoadSession(req.SessionID, s); err != nil {
+		return nil, err
+	}
+	return protocol.LoadSessionResponse{}, nil
+}
+
+// handleSessionList 把清单请求转发给实现了 SessionLister 的 handler；
+// cwd/cursor 暂无消费方（清单一次给全），不解码。
+func (s *Server) handleSessionList(_ context.Context, _ json.RawMessage) (any, error) {
+	lister, ok := s.handler.(SessionLister)
+	if !ok {
+		return nil, &protocol.RPCError{Code: -32000, Message: "dispatch: session list not supported"}
+	}
+	sessions := lister.ListSessions()
+	if sessions == nil {
+		// 空清单必须是 [] 而非 null（对齐 availableCommandsUpdate 的空清单语义）
+		sessions = []protocol.SessionInfo{}
+	}
+	return protocol.ListSessionsResponse{Sessions: sessions}, nil
 }
 
 func (s *Server) handleSessionNew(_ context.Context, params json.RawMessage) (any, error) {
@@ -95,7 +162,9 @@ func (s *Server) handleSessionNew(_ context.Context, params json.RawMessage) (an
 		return nil, fmt.Errorf("dispatch: decode session/new: %w", err)
 	}
 	sessionID := newHexID("sess")
-	if aware, ok := s.handler.(SessionAware); ok {
+	if aware, ok := s.handler.(SessionServerAware); ok {
+		aware.SetSessionServer(sessionID, req.Cwd, s)
+	} else if aware, ok := s.handler.(SessionAware); ok {
 		aware.SetSession(sessionID, req.Cwd)
 	}
 	return protocol.NewSessionResponse{SessionID: sessionID}, nil
