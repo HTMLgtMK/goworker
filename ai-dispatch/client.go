@@ -206,5 +206,5 @@ func (c *Client) handlePermission(ctx context.Context, params json.RawMessage) (
 	if err != nil {
 		return nil, err
 	}
-	return protocol.PermissionResponse{OptionID: optionID}, nil
+	return protocol.SelectedPermissionOutcome(optionID), nil
 }

@@ -3,12 +3,20 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
 )
+
+// ErrPermissionUnsupported 表示对端根本没有注册 session/request_permission
+// 处理器（RPC -32601）：不是"用户拒绝"，而是"这个客户端没能力回答"。
+//
+// 调用方必须区分这两者：用户拒绝是有效裁决，应当照常继续；没有能力回答意味着
+// 该客户端帮不上忙，可以换别的订阅者试，全都试完仍无人应答才按拒绝处理。
+var ErrPermissionUnsupported = errors.New("dispatch: peer does not support session/request_permission")
 
 // TaskHandler 是 Server 对任务执行方（daemon 插件）的回调。
 type TaskHandler interface {
@@ -23,6 +31,14 @@ type Reporter interface {
 	Update(sessionID string, body protocol.SessionUpdateBody)
 	// MessageChunk 快捷发送 agent_message_chunk 文本。
 	MessageChunk(sessionID, text string)
+	// RequestPermission 发起 session/request_permission 并阻塞到客户端应答
+	// （或 ctx 结束），返回选中的 optionId。sessionID 由 Server 填进请求，
+	// 调用方传的 req 无需自带。这是 HITL 的唯一出口：agent chat 与 task
+	// worker 两条路径共用同一实现。
+	//
+	// ctx 结束（连接关闭/session 取消）时返回错误，调用方应保守拒绝该工具调用
+	// ——绝不因为"问不到人"就默认放行。
+	RequestPermission(ctx context.Context, sessionID string, req protocol.PermissionRequest) (string, error)
 }
 
 // SessionAware 是 handler 的可选扩展：session/new 时收到提交方声明的 cwd，
@@ -289,4 +305,32 @@ func (s *Server) MessageChunk(sessionID, text string) {
 		SessionUpdate: protocol.UpdateAgentMessageChunk,
 		Content:       &protocol.ContentBlock{Type: "text", Text: text},
 	})
+}
+
+// RequestPermission 实现 Reporter：向提交方发起 session/request_permission
+// 并等待应答。
+//
+// 死锁安全性：jsonrpc.Conn 把每个入站请求的 handler 跑在独立 goroutine 里
+// （见 protocol.Conn.dispatch），因此这里在 handlePrompt 的调用栈上发起反向
+// 请求不会卡住连接读循环 —— 应答能正常被 deliver 唤醒。
+//
+// sessionID 以参数为准（覆盖 req.SessionID）：调用方持有的是 ACP session 的
+// 权威身份，不依赖调用点有没有填对。
+func (s *Server) RequestPermission(ctx context.Context, sessionID string, req protocol.PermissionRequest) (string, error) {
+	req.SessionID = sessionID
+	var resp protocol.PermissionResponse
+	if err := s.conn.Call(ctx, protocol.MethodSessionRequestPermission, req, &resp); err != nil {
+		// method-not-found 单独归类：客户端没实现这个能力，与"用户拒绝"是两回事。
+		var rpcErr *protocol.RPCError
+		if errors.As(err, &rpcErr) && rpcErr.Code == -32601 {
+			return "", ErrPermissionUnsupported
+		}
+		return "", fmt.Errorf("dispatch: request permission: %w", err)
+	}
+	// 只认 selected：cancelled（用户关掉对话框）与任何未知 outcome 都返回空
+	// optionId，由调用方按"问不到人"处理 —— 失败方向必须是拒绝，不是放行。
+	if resp.Outcome.Outcome != "selected" {
+		return "", nil
+	}
+	return resp.Outcome.OptionID, nil
 }

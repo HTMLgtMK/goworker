@@ -217,8 +217,33 @@ type PermissionOption struct {
 	Kind     string `json:"kind,omitempty"` // allow_once / allow_always / reject_once / reject_always
 }
 
+// PermissionResponse 是 session/request_permission 的应答。
+// ACP 规范里 outcome 是**嵌套**的判别联合（jsonrpc.ts / schema 的
+// RequestPermissionOutcome），线上形状是：
+//
+//	{"outcome":{"outcome":"selected","optionId":"allow_once"}}
+//	{"outcome":{"outcome":"cancelled"}}
+//
+// 不是扁平的 {"optionId":...} —— 后者对端 schema 校验不过，会当成取消/拒绝，
+// 表现成"用户明明点了允许，agent 那边收到的还是 reject"。
 type PermissionResponse struct {
-	OptionID string `json:"optionId"`
+	Outcome PermissionOutcome `json:"outcome"`
+}
+
+// PermissionOutcome 是用户的裁决：selected（选了某个 option）或 cancelled。
+type PermissionOutcome struct {
+	Outcome  string `json:"outcome"`            // selected / cancelled
+	OptionID string `json:"optionId,omitempty"` // 仅 selected 时有意义
+}
+
+// SelectedPermissionOutcome 构造"用户选了某个 option"的应答。
+func SelectedPermissionOutcome(optionID string) PermissionResponse {
+	return PermissionResponse{Outcome: PermissionOutcome{Outcome: "selected", OptionID: optionID}}
+}
+
+// CancelledPermissionOutcome 构造"用户未裁决"的应答（关闭对话框/取消）。
+func CancelledPermissionOutcome() PermissionResponse {
+	return PermissionResponse{Outcome: PermissionOutcome{Outcome: "cancelled"}}
 }
 
 // ---- session/cancel（Client → Agent notification）----
