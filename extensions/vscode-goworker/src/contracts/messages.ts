@@ -118,10 +118,21 @@ export type HostMessage =
   | { type: 'trace-reset'; taskId: string }
   | { type: 'trace-update'; update: ACPUpdate }
   | { type: 'trace-complete' }
-  | { type: 'trace-error'; error: string };
+  | { type: 'trace-error'; error: string }
+  | {
+      type: 'permission-request';
+      requestId: string;
+      toolTitle: string;
+      options: Array<{ optionId: string; name: string }>;
+      /** 裁决截止时刻（RFC3339）。daemon 到点自行判拒，UI 据此关掉对话框。 */
+      expiresAt?: string;
+    }
+  | { type: 'permission-dismiss'; requestId: string };
 
 export type WebviewMessage =
   | { type: 'ready' }
   | { type: 'refresh-tasks' }
   | { type: 'open-task'; taskId: string }
-  | { type: 'follow-live'; enabled: boolean };
+  | { type: 'follow-live'; enabled: boolean }
+  | { type: 'permission-response'; requestId: string; optionId: string }
+  | { type: 'permission-cancel'; requestId: string };

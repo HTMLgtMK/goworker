@@ -18,6 +18,7 @@ import (
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
 // ACPWorkerDeps 是 worker 模式的最小装配输入。
@@ -39,13 +40,22 @@ func ServeACPWorker(rwc io.ReadWriteCloser, deps ACPWorkerDeps) *dispatch.Server
 	return dispatch.ServeConn(rwc, &acpWorker{deps: deps, sessions: map[string]*runtimeagent.Session{}})
 }
 
-func (w *acpWorker) SetSession(sessionID, _ string) {
-	// worker 模式下 cwd 由调用方进程自行管理；预留参数对齐 SessionAware。
+// SetSession 建会话并落地提交方声明的 cwd。cwd 经 SessionDeps.CWD 渗透到
+// Session 的 sandbox 配置副本（bash 的 cmd.Dir 与 read/write 的相对路径基准都
+// 取自 AllowedWorkDir）—— orchestrator 在 session/new 传的是 t.Worktree/t.Repo，
+// 于是工具就跑在该任务的 worktree 里，而不是 daemon 进程的 cwd。
+//
+// 这里不做 sandbox 边界校验（对照 agent 插件侧 SetSession）：cwd 来自
+// orchestrator 自己算出的任务 worktree，与 worker 同属一个信任域，不是远程
+// 不可信输入；套上 cfg.Sandbox.AllowedWorkDir 前缀校验反而会把合法 worktree
+// （位于 <repo>/.goworker/dispatch/ 下）误拒。
+func (w *acpWorker) SetSession(sessionID, cwd string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.sessions[sessionID] = runtimeagent.NewSession(runtimeagent.SessionDeps{
 		Config:       w.deps.Config,
 		AuditDir:     w.deps.AuditDir,
+		CWD:          cwd,
 		Memory:       nil,
 		CollectTools: runtimeagent.DefaultTools,
 		NewProvider:  ProviderFactory(acpHTTPClient()),
@@ -69,7 +79,9 @@ func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispa
 		EmitToken: func(token core.Token) {
 			rep.Update(sessionID, TokenToUpdate(token))
 		},
-		// 无人值守：HITL 请求一律拒绝（Session SDK 对 nil Decide 的默认行为）
+		// HITL 经 ACP 授权请求回传提交方（dispatcher 侧按 worker 的 on_permission
+		// 策略决定是自动放行还是转给订阅者）。决策失败一律拒绝，见 DecideViaACP。
+		Decide: plugin.DecideViaACP(ctx, rep, sessionID),
 	}
 	if err := session.Run(ctx, runtimeagent.RunRequest{Input: prompt}, cb); err != nil {
 		return "", err

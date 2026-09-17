@@ -154,7 +154,9 @@ type WorkerConfig struct {
 	Command string   `yaml:"command"`
 	Args    []string `yaml:"args,omitempty"`
 	// OnPermission 无人值守时 worker 权限请求的应答策略：
-	// "deny"（默认，拒绝并记审计）| "allow"（自动选择首个 allow 类 option）。
+	//   - "deny"（默认，拒绝并记审计）
+	//   - "allow"（自动选择首个 allow 类 option）
+	//   - "ask"（转给订阅了该任务的 ACP client 由用户裁决；无订阅者时保守拒绝）
 	OnPermission string `yaml:"on_permission,omitempty"`
 }
 
@@ -188,9 +190,9 @@ func (c DispatchConfig) Validate() error {
 	}
 	for _, w := range c.Workers {
 		switch w.OnPermission {
-		case "", "deny", "allow":
+		case "", "deny", "allow", "ask":
 		default:
-			return fmt.Errorf("dispatch.workers[%s]: invalid on_permission %q (deny|allow)", w.Name, w.OnPermission)
+			return fmt.Errorf("dispatch.workers[%s]: invalid on_permission %q (deny|allow|ask)", w.Name, w.OnPermission)
 		}
 	}
 	for i, r := range c.Routes {

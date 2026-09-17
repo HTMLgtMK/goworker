@@ -481,6 +481,10 @@ func (h *ingress) Run(ctx context.Context, sessionID, prompt string, rep dispatc
 			EmitToken: func(token core.Token) {
 				rep.Update(sessionID, tokenToUpdate(token))
 			},
+			// Decide 之前一直是 nil：沙箱中间件对 nil 的默认行为是静默拒绝，
+			// 用户点不到任何东西、也看不到任何提示，危险命令就这么无声消失。
+			// 接上 ACP 授权请求，vscode 侧 PermissionDialog 已有现成渲染。
+			Decide: plugin.DecideViaACP(ctx, rep, sessionID),
 		},
 		Values: make(map[string]any),
 	}

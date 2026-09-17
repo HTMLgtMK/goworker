@@ -25,11 +25,36 @@ export interface TaskObserver {
   dispose(): void;
 }
 
+// session/request_permission 的请求形状（ACP）。只取渲染需要的字段，
+// 其余字段原样忽略——对端可能带 _meta 等扩展。
+export interface TaskPermissionRequest {
+  sessionId: string;
+  toolCall: { toolCallId?: string; title?: string };
+  options: Array<{ optionId: string; name?: string; kind?: string }>;
+}
+
+// 用户在 task detail 页对权限请求的裁决。形状对齐 ACP 的
+// RequestPermissionOutcome（嵌套判别联合），线上由 daemon 的
+// PermissionResponse 解析。
+export type TaskPermissionDecision =
+  | { outcome: 'selected'; optionId: string }
+  | { outcome: 'cancelled' };
+
+// 裁决回调：由上层（taskPanel）接 UI，返回用户的决定。
+export type TaskPermissionHandler = (request: TaskPermissionRequest) => Promise<TaskPermissionDecision>;
+
 export class DispatcherClient {
   private initialized = false;
   private initializing?: Promise<void>;
 
-  constructor(private readonly connection: ACPConnection, private readonly cwd: string) {}
+  constructor(
+    private readonly connection: ACPConnection,
+    private readonly cwd: string,
+    private readonly onPermission?: TaskPermissionHandler,
+  ) {
+    // 注册在构造时而非 connect 时：连接可能重连，处理器必须一直挂着。
+    this.connection.onRequest('session/request_permission', (params) => this.handlePermission(params));
+  }
 
   get connected(): boolean {
     return this.connection.connected;
@@ -91,6 +116,25 @@ export class DispatcherClient {
     this.initialized = false;
     this.initializing = undefined;
     this.connection.close();
+  }
+
+  // 服务端权限请求 → UI 裁决 → ACP 应答。任何无法完成裁决的路径（未接 UI、
+  // 载荷畸形、UI 抛错）都回 cancelled，绝不回 selected —— daemon 侧把 cancelled
+  // 与"问不到人"一律当拒绝处理，失败方向必须是拒绝。
+  private async handlePermission(params: unknown): Promise<unknown> {
+    const request = narrowPermissionRequest(params);
+    if (!request || !this.onPermission) {
+      return { outcome: { outcome: 'cancelled' } };
+    }
+    try {
+      const decision = await this.onPermission(request);
+      if (decision.outcome === 'selected' && decision.optionId) {
+        return { outcome: { outcome: 'selected', optionId: decision.optionId } };
+      }
+      return { outcome: { outcome: 'cancelled' } };
+    } catch {
+      return { outcome: { outcome: 'cancelled' } };
+    }
   }
 
   private async catalogQuery<T extends CatalogUpdate>(prompt: string, expectedType: T['sessionUpdate']): Promise<T> {
@@ -185,6 +229,33 @@ function isSessionUpdate(value: unknown): value is SessionUpdate {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+// 窄化服务端发来的 permission 请求：字段不合规就返回 undefined，由调用方
+// 回 cancelled（不猜、不补默认值）。
+export function narrowPermissionRequest(params: unknown): TaskPermissionRequest | undefined {
+  if (!isRecord(params)) return undefined;
+  if (typeof params.sessionId !== 'string' || params.sessionId.length === 0) return undefined;
+  const toolCall = params.toolCall;
+  if (!isRecord(toolCall)) return undefined;
+  if (!Array.isArray(params.options) || params.options.length === 0) return undefined;
+  const options: TaskPermissionRequest['options'] = [];
+  for (const option of params.options) {
+    if (!isRecord(option) || typeof option.optionId !== 'string' || option.optionId.length === 0) return undefined;
+    options.push({
+      optionId: option.optionId,
+      name: typeof option.name === 'string' ? option.name : undefined,
+      kind: typeof option.kind === 'string' ? option.kind : undefined,
+    });
+  }
+  return {
+    sessionId: params.sessionId,
+    toolCall: {
+      toolCallId: typeof toolCall.toolCallId === 'string' ? toolCall.toolCallId : undefined,
+      title: typeof toolCall.title === 'string' ? toolCall.title : undefined,
+    },
+    options,
+  };
 }
 
 function asError(value: unknown): Error {

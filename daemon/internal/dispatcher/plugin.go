@@ -6,6 +6,7 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -44,6 +45,13 @@ type DispatcherPlugin struct {
 	listener   net.Listener
 	acpServers []*dispatch.Server
 	acpRoutes  map[string][]acpRoute
+	// liveRoutes 是「观察者路由」：`--attach` 期间的连接。与 acpRoutes 的差别
+	// 在生命周期——acpRoutes 跟着同步派发的调用栈（defer 摘除），liveRoutes
+	// 跟着 attach 循环，任务跑完可能还在（用户仍停在详情页）。
+	//
+	// permission 请求必须两条都发：异步任务（detach / 重启恢复）只有 liveRoutes
+	// 有订阅者，而 attach 恰恰是唯一能在任务运行中看到它的入口。
+	liveRoutes map[string][]acpRoute
 }
 
 type acpRoute struct {
@@ -75,19 +83,66 @@ func (p *DispatcherPlugin) removeACPRoute(taskID string, route acpRoute) {
 	p.acpRoutes[taskID] = routes
 }
 
+// addLiveRoute 登记观察者路由（--attach 期间）。同一 route 重复登记会被忽略：
+// 一个连接可能反复 attach 同一任务，路由表不该跟着膨胀。
+func (p *DispatcherPlugin) addLiveRoute(taskID string, route acpRoute) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, existing := range p.liveRoutes[taskID] {
+		if existing == route {
+			return
+		}
+	}
+	p.liveRoutes[taskID] = append(p.liveRoutes[taskID], route)
+}
+
+func (p *DispatcherPlugin) removeLiveRoute(taskID string, route acpRoute) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	routes := p.liveRoutes[taskID]
+	for index, current := range routes {
+		if current == route {
+			routes = append(routes[:index:index], routes[index+1:]...)
+			break
+		}
+	}
+	if len(routes) == 0 {
+		delete(p.liveRoutes, taskID)
+		return
+	}
+	p.liveRoutes[taskID] = routes
+}
+
 func (p *DispatcherPlugin) snapshotACPRoutes(taskID string) []acpRoute {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]acpRoute(nil), p.acpRoutes[taskID]...)
 }
 
+// snapshotLiveRoutes 返回观察者路由的副本。
+func (p *DispatcherPlugin) snapshotLiveRoutes(taskID string) []acpRoute {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]acpRoute(nil), p.liveRoutes[taskID]...)
+}
+
+// hasAnyObserver 报告该任务此刻是否有任何 ACP 订阅者（同步路由或观察者路由）。
+// 用于区分"根本没人看"与"有人看但对端不会答"。
+func (p *DispatcherPlugin) hasAnyObserver(taskID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.acpRoutes[taskID]) > 0 || len(p.liveRoutes[taskID]) > 0
+}
+
 // NewPlugin 构造 dispatcher 插件。cfg.Dispatch.Enabled=false 时 main 不会注册本插件。
 func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *DispatcherPlugin {
 	return &DispatcherPlugin{
-		cfg:       cfg,
-		paths:     paths,
-		running:   make(map[string]context.CancelFunc),
-		acpRoutes: make(map[string][]acpRoute),
+		cfg:        cfg,
+		paths:      paths,
+		running:    make(map[string]context.CancelFunc),
+		acpRoutes:  make(map[string][]acpRoute),
+		liveRoutes: make(map[string][]acpRoute),
 	}
 }
 
@@ -165,7 +220,7 @@ func (p *DispatcherPlugin) resumeInterrupted() {
 			continue // awaiting_review 等人审批，不需要重派
 		}
 		slog.Info("dispatcher: resuming interrupted task", "task", t.ID, "status", t.Status)
-		p.launch(&t, p.runOptions(t.Worker)...)
+		p.launch(&t, p.runOptions(t.Worker, t.ID)...)
 	}
 }
 
@@ -491,6 +546,15 @@ func (h *acpIngress) attach(ctx context.Context, sessionID, args string, rep dis
 		return "", statusError(fmt.Sprintf("task %q not found", id))
 	}
 
+	// 观察者路由：attach 是唯一能在任务运行中看到它的入口，因此也是异步任务
+	// （detach / 重启恢复）唯一的权限裁决通道。登记后该连接的 permission 请求
+	// 才会被 askPermissionPolicy 扇出到这里。
+	if server, ok := rep.(*dispatch.Server); ok {
+		route := acpRoute{server: server, sessionID: sessionID}
+		h.plugin.addLiveRoute(id, route)
+		defer h.plugin.removeLiveRoute(id, route)
+	}
+
 	history, cursor, live, unsubscribe := h.plugin.eventLog.Subscribe(id)
 	defer unsubscribe()
 	h.writeAttachedUpdates(id, 0, rep, sessionID, history, false)
@@ -619,7 +683,7 @@ func (h *acpIngress) detach(ctx context.Context, sessionID, cwd, prompt string, 
 	}
 	t := p.newTaskFromIngress(cwd, worker, prompt)
 	p.audit("acp-submit", t.ID, cwd+" (detach)")
-	p.launch(t, p.runOptions(worker)...)
+	p.launch(t, p.runOptions(worker, t.ID)...)
 	rep.MessageChunk(sessionID, fmt.Sprintf("任务 %s 已异步入队（%s），可用 --status %s 查询", t.ID, t.Kind, t.ID))
 	return protocol.StopEndTurn, nil
 }
@@ -641,7 +705,7 @@ func (h *acpIngress) dispatchSync(ctx context.Context, sessionID, cwd, prompt st
 	}
 
 	p.audit("acp-submit", t.ID, cwd)
-	outcome, err := p.orch.Run(ctx, t, p.workerSpec(worker), p.runOptions(worker)...)
+	outcome, err := p.orch.Run(ctx, t, p.workerSpec(worker), p.runOptions(worker, t.ID)...)
 	if err != nil {
 		return "", err
 	}
@@ -807,7 +871,7 @@ func (p *DispatcherPlugin) addTask(ctx *plugin.Context, explicitWorker string, g
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	p.launch(t, p.runOptions(worker)...)
+	p.launch(t, p.runOptions(worker, t.ID)...)
 	// 入队落盘由 orchestrator 首次 save 完成（并触发 queued 状态事件）
 	ctx.Writer(fmt.Sprintf("⏳ 任务 %s 已入队（%s → %s worker）\n", t.ID, kind, worker))
 	return nil
@@ -845,24 +909,106 @@ func (p *DispatcherPlugin) updateTask(t *task.Task) error {
 }
 
 // runOptions 按 worker 配置生成派发选项：无人值守权限应答策略。
-func (p *DispatcherPlugin) runOptions(worker string) []dispatch.RunOption {
+// taskID 为空时 "ask" 退化为拒绝（ask 需要任务身份才能定位订阅者）。
+func (p *DispatcherPlugin) runOptions(worker, taskID string) []dispatch.RunOption {
 	w, ok := p.cfg.Dispatch.Worker(worker)
-	if !ok || w.OnPermission != "allow" {
-		return nil // 默认拒绝
+	if !ok {
+		return nil // 未知 worker：默认拒绝
 	}
-	return []dispatch.RunOption{dispatch.WithPermissionPolicy(
-		func(_ context.Context, req protocol.PermissionRequest) (string, error) {
-			for _, opt := range req.Options {
-				if strings.Contains(opt.Kind, "allow") {
-					return opt.OptionID, nil
+	switch w.OnPermission {
+	case "allow":
+		return []dispatch.RunOption{dispatch.WithPermissionPolicy(
+			func(_ context.Context, req protocol.PermissionRequest) (string, error) {
+				// 精确匹配 ACP 的 PermissionOptionKind 枚举，不用子串：Contains 会把
+				// 未来的 "disallow_*" 之类也判成 allow，静默放行。
+				for _, opt := range req.Options {
+					if opt.Kind == "allow_once" || opt.Kind == "allow_always" {
+						return opt.OptionID, nil
+					}
 				}
+				if len(req.Options) > 0 {
+					return req.Options[0].OptionID, nil
+				}
+				return "", fmt.Errorf("worker requested permission with no options")
+			},
+		)}
+	case "ask":
+		if taskID == "" {
+			return nil // 无任务身份 = 问不到人，保守拒绝
+		}
+		return []dispatch.RunOption{dispatch.WithPermissionPolicy(p.askPermissionPolicy(taskID))}
+	default:
+		return nil // "" / "deny"：默认拒绝
+	}
+}
+
+// askPermissionPolicy 把 worker 的权限请求扇出给订阅了该任务的 ACP client，
+// 由用户裁决。
+//
+// 扇出而非定向：一个任务可能同时被多个 client 观察（task detail 页 + 同步提交
+// 方），谁先答谁算数，不做去重与仲裁——重复弹框是可接受的，卡住任务不可接受。
+//
+// 「对端不会答」与「用户拒绝」必须区分：前者（-32601，客户端没实现这个能力）
+// 只说明该订阅者帮不上忙，要继续问下一个；把两者混为一谈会让一个不支持权限的
+// 观察者抢先"拒绝"掉整个请求。全都不会答时才算失败。
+//
+// 保守默认贯穿全路径：无订阅者、全都不支持、应答为空、对端报错，一律拒绝。
+// 任何一条路径都不允许"问不到人就放行"。
+func (p *DispatcherPlugin) askPermissionPolicy(taskID string) func(context.Context, protocol.PermissionRequest) (string, error) {
+	return func(ctx context.Context, req protocol.PermissionRequest) (string, error) {
+		// 同步路由（正在同步派发的提交方）与观察者路由（--attach 的详情页）
+		// 都要问：异步任务只有后者有订阅者。
+		routes := append(p.snapshotACPRoutes(taskID), p.snapshotLiveRoutes(taskID)...)
+		if len(routes) == 0 {
+			return "", fmt.Errorf("%s; denying %q", p.noObserverReason(taskID), req.ToolCall.Title)
+		}
+
+		type answer struct {
+			route    acpRoute
+			optionID string
+			err      error
+		}
+		answers := make(chan answer, len(routes))
+		askCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		for _, route := range routes {
+			go func(route acpRoute) {
+				optionID, err := route.server.RequestPermission(askCtx, route.sessionID, req)
+				answers <- answer{route: route, optionID: optionID, err: err}
+			}(route)
+		}
+
+		// 收到 len(routes) 个应答才收工：中间任何"对端不会答"都要让位给下一个。
+		// 第一个有效应答立刻采纳并取消其余（先到先得）。
+		var unsupported int
+		for range routes {
+			got := <-answers
+			if errors.Is(got.err, dispatch.ErrPermissionUnsupported) {
+				unsupported++
+				continue
 			}
-			if len(req.Options) > 0 {
-				return req.Options[0].OptionID, nil
+			if got.err != nil {
+				return "", fmt.Errorf("task %s permission request failed: %w", taskID, got.err)
 			}
-			return "", fmt.Errorf("worker requested permission with no options")
-		},
-	)}
+			if got.optionID == "" {
+				return "", fmt.Errorf("task %s permission request answered with empty option", taskID)
+			}
+			return got.optionID, nil
+		}
+		// 所有订阅者都不支持这个能力 —— 客户端实现缺口，不是用户拒绝。
+		return "", fmt.Errorf(
+			"task %s: %d observing ACP client(s) do not implement session/request_permission, so %q could not be approved",
+			taskID, unsupported, req.ToolCall.Title)
+	}
+}
+
+// noObserverReason 给出"没人能批准"的具体原因，用于日志与错误信息。
+// 区分"压根没订阅者"与"任务根本不在运行"，后者通常是重启恢复的窗口期。
+func (p *DispatcherPlugin) noObserverReason(taskID string) string {
+	if p.hasAnyObserver(taskID) {
+		return fmt.Sprintf("no ACP client is observing task %s", taskID)
+	}
+	return fmt.Sprintf("no ACP client is observing task %s (attach to it from the task detail view to approve)", taskID)
 }
 
 // launch 后台执行任务。orchestrator 负责状态机流转与 worktree 清理。

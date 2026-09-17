@@ -21,7 +21,27 @@ interface JSONRPCNotification {
   params?: unknown;
 }
 
-type JSONRPCMessage = JSONRPCResponse | JSONRPCNotification;
+// 服务端发来的请求：同时带 id 与 method（区别于通知，也区别于响应）。
+interface JSONRPCIncomingRequest {
+  jsonrpc: '2.0';
+  id: string;
+  method: string;
+  params?: unknown;
+}
+
+interface JSONRPCResult {
+  jsonrpc: '2.0';
+  id: string;
+  result: unknown;
+}
+
+interface JSONRPCFailure {
+  jsonrpc: '2.0';
+  id: string;
+  error: { code: number; message: string };
+}
+
+type JSONRPCMessage = JSONRPCResponse | JSONRPCNotification | JSONRPCIncomingRequest;
 
 export class ACPConnection {
   private socket?: Socket;
@@ -31,6 +51,7 @@ export class ACPConnection {
   private buffer = '';
   private readonly pending = new Map<string, { resolve(value: unknown): void; reject(reason: Error): void }>();
   private readonly listeners = new Set<(method: string, params: unknown) => void>();
+  private readonly requestHandlers = new Map<string, (params: unknown) => Promise<unknown>>();
 
   constructor(private readonly socketPath: string) {}
 
@@ -81,6 +102,18 @@ export class ACPConnection {
   onNotification(listener: (method: string, params: unknown) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * 注册服务端→客户端的请求处理器（如 session/request_permission）。
+   * 返回值即回给对端的 result；抛错则回成 RPC error。
+   *
+   * 未注册的请求方法会被显式回以 -32601（method not found），不是静默丢弃：
+   * 对端正阻塞等这个应答，丢掉会让它一直挂着。
+   */
+  onRequest(method: string, handler: (params: unknown) => Promise<unknown>): () => void {
+    this.requestHandlers.set(method, handler);
+    return () => this.requestHandlers.delete(method);
   }
 
   async request<T>(method: string, params?: unknown): Promise<T> {
@@ -138,6 +171,13 @@ export class ACPConnection {
   }
 
   private dispatch(message: JSONRPCMessage): void {
+    // 服务端发来的请求：带 id 且带 method。必须与"响应"分开判断——旧代码只看
+    // 有没有 id，于是把这类请求当响应处理、在 pending 表里查不到就丢弃，对端
+    // 于是永远等不到应答（daemon 侧的 permission 请求就是这样挂住的）。
+    if (isIncomingRequest(message)) {
+      void this.handleIncomingRequest(message);
+      return;
+    }
     if ('id' in message && typeof message.id === 'string') {
       const pending = this.pending.get(message.id);
       if (!pending) return;
@@ -151,7 +191,39 @@ export class ACPConnection {
     }
   }
 
-  private write(value: JSONRPCRequest | JSONRPCNotification): void {
+  private async handleIncomingRequest(request: JSONRPCIncomingRequest): Promise<void> {
+    const handler = this.requestHandlers.get(request.method);
+    if (!handler) {
+      // 显式回 -32601：对端正阻塞等应答，静默丢弃会让它一直挂着。
+      // daemon 侧把 -32601 解释为"该客户端没有这个能力"，据此换下一个订阅者。
+      this.write({
+        jsonrpc: '2.0',
+        id: request.id,
+        error: { code: -32601, message: `method not found: ${request.method}` },
+      } satisfies JSONRPCFailure);
+      return;
+    }
+    try {
+      const result = await handler(request.params);
+      this.write({ jsonrpc: '2.0', id: request.id, result } satisfies JSONRPCResult);
+    } catch (error) {
+      this.write({
+        jsonrpc: '2.0',
+        id: request.id,
+        error: { code: -32000, message: error instanceof Error ? error.message : String(error) },
+      } satisfies JSONRPCFailure);
+    }
+  }
+
+  private write(value: JSONRPCRequest | JSONRPCNotification | JSONRPCResult | JSONRPCFailure): void {
     this.socket?.write(`${JSON.stringify(value)}\n`);
   }
+}
+
+// 服务端请求 = 同时带 id 与 method。单看 id 会把请求误判成响应（旧 bug）。
+function isIncomingRequest(message: JSONRPCMessage): message is JSONRPCIncomingRequest {
+  return 'id' in message
+    && typeof message.id === 'string'
+    && 'method' in message
+    && typeof message.method === 'string';
 }

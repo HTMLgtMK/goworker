@@ -25,7 +25,13 @@ export function activate(context: vscode.ExtensionContext): void {
   const tasks = new TaskTreeProvider();
   const workers = new StaticTreeProvider([{ label: 'Configured workers load with task catalog', icon: 'server-process' }]);
   const runtime = new StaticTreeProvider([{ label: 'Dispatcher: connecting…', icon: 'sync~spin' }]);
-  const client = new DispatcherClient(new ACPConnection(dispatcherSocketPath()), cwd);
+  // 权限裁决经 TaskPanel 路由：daemon 的 ask 策略会把 worker 的
+  // session/request_permission 转给订阅了该任务的连接，这里接住弹给用户。
+  const client = new DispatcherClient(
+    new ACPConnection(dispatcherSocketPath()),
+    cwd,
+    (request) => TaskPanel.handlePermission(request),
+  );
   const agent = new AgentClient(new ACPConnection(agentSocketPath()), cwd);
   const chatRegistry = new AcpChatSessionRegistry();
   const chats = new ChatsTreeProvider(listAgentSessions, () => readLastSessionId(context.workspaceState));

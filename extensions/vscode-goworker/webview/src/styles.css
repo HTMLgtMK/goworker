@@ -26,3 +26,25 @@ body {
 .composer input { box-sizing: border-box; width: 100%; padding: 8px; color: var(--vscode-disabledForeground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); }
 .new-events { position: fixed; right: 24px; bottom: 72px; padding: 6px 10px; border: 0; border-radius: 4px; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
 .error { color: var(--vscode-errorForeground); }
+
+.permission-dialog {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--vscode-editorWarning-foreground);
+  border-radius: 6px;
+  background: var(--vscode-editor-background);
+}
+.permission-tool {
+  margin: 0;
+  padding: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--vscode-editor-font-family);
+  background: var(--vscode-textCodeBlock-background);
+}
+.permission-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.permission-actions button { padding: 6px 12px; border: 0; border-radius: 4px; color: var(--vscode-button-foreground); background: var(--vscode-button-background); cursor: pointer; }
+.permission-actions button:hover { background: var(--vscode-button-hoverBackground); }
+.permission-actions button.permission-dismiss { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }

@@ -551,6 +551,10 @@ func (s *fakeSessionSource) setSessionCalls() [][2]string {
 type recordingReporter struct {
 	mu      sync.Mutex
 	updates []protocol.SessionUpdate
+	// permissionOption 是 RequestPermission 的固定应答（默认空 = 无选项，
+	// 调用方按需设置）。permissions 记录收到的授权请求供断言。
+	permissionOption string
+	permissions      []protocol.PermissionRequest
 }
 
 func (r *recordingReporter) Update(sessionID string, body protocol.SessionUpdateBody) {
@@ -566,10 +570,25 @@ func (r *recordingReporter) MessageChunk(sessionID, text string) {
 	})
 }
 
+// RequestPermission 记录请求并返回预设应答（未预设时空 optionId，等价于拒绝）。
+func (r *recordingReporter) RequestPermission(_ context.Context, sessionID string, req protocol.PermissionRequest) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	req.SessionID = sessionID
+	r.permissions = append(r.permissions, req)
+	return r.permissionOption, nil
+}
+
 func (r *recordingReporter) all() []protocol.SessionUpdate {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]protocol.SessionUpdate(nil), r.updates...)
+}
+
+func (r *recordingReporter) allPermissions() []protocol.PermissionRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]protocol.PermissionRequest(nil), r.permissions...)
 }
 
 // dialACP 连接 socket 并返回已开始 Serve 的裸协议 Conn：session/list 与

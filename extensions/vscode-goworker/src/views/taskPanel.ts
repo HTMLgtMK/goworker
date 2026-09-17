@@ -1,12 +1,37 @@
 import * as vscode from 'vscode';
-import type { DispatcherClient, TaskObserver } from '../acp/dispatcherClient';
+import type {
+  DispatcherClient,
+  TaskObserver,
+  TaskPermissionDecision,
+  TaskPermissionRequest,
+} from '../acp/dispatcherClient';
 import type { HostMessage, WebviewMessage } from '../contracts/messages';
+
+// UI 侧对话框的存活上限，略长于 daemon 的 HITL 窗口（2min），避免两边
+// 同时收口时抢着裁决——daemon 先到点判拒，这里只是兜底清理。
+const PERMISSION_UI_TIMEOUT_MS = 150_000;
+
+// 一条挂起的权限请求：webview 里显示着对话框，等用户点。
+interface PendingPermission {
+  resolve: (decision: TaskPermissionDecision) => void;
+  timer?: ReturnType<typeof setTimeout>;
+}
 
 export class TaskPanel {
   private static current?: TaskPanel;
   private observer?: TaskObserver;
   private requestVersion = 0;
   private disposed = false;
+  private readonly pendingPermissions = new Map<string, PendingPermission>();
+  private nextPermissionId = 0;
+
+  // 权限请求的静态入口：DispatcherClient 在面板之前构造，处理器必须一直有效，
+  // 因此经这里路由到"当前打开的面板"。没有面板时回 cancelled（失败方向=拒绝）。
+  static handlePermission(request: TaskPermissionRequest): Promise<TaskPermissionDecision> {
+    const panel = TaskPanel.current;
+    if (!panel || panel.disposed) return Promise.resolve({ outcome: 'cancelled' });
+    return panel.requestPermission(request);
+  }
 
   static async open(context: vscode.ExtensionContext, client: DispatcherClient, taskId: string): Promise<void> {
     if (TaskPanel.current) {
@@ -68,8 +93,54 @@ export class TaskPanel {
     return !this.disposed && requestVersion === this.requestVersion;
   }
 
+  // 服务端权限请求 → 弹给 webview 等用户点。超时与"面板已关"都回 cancelled：
+  // 失败方向必须是拒绝，不能因为没人答就放行。
+  private async requestPermission(request: TaskPermissionRequest): Promise<TaskPermissionDecision> {
+    if (this.disposed) return { outcome: 'cancelled' };
+    const requestId = `perm-${this.nextPermissionId++}`;
+    const decision = new Promise<TaskPermissionDecision>((resolve) => {
+      const pending: PendingPermission = { resolve };
+      // UI 侧的截止提示用；裁决本身由 daemon 到点判拒，这里只是别让对话框
+      // 在已经失效之后还挂着。
+      pending.timer = setTimeout(() => {
+        this.settlePermission(requestId, { outcome: 'cancelled' });
+      }, PERMISSION_UI_TIMEOUT_MS);
+      this.pendingPermissions.set(requestId, pending);
+    });
+    this.post({
+      type: 'permission-request',
+      requestId,
+      toolTitle: request.toolCall.title ?? 'Tool',
+      options: request.options.map((option) => ({
+        optionId: option.optionId,
+        name: option.name ?? option.optionId,
+      })),
+    });
+    return decision;
+  }
+
+  private settlePermission(requestId: string, decision: TaskPermissionDecision): void {
+    const pending = this.pendingPermissions.get(requestId);
+    if (!pending) return;
+    this.pendingPermissions.delete(requestId);
+    if (pending.timer) clearTimeout(pending.timer);
+    pending.resolve(decision);
+  }
+
   private receive(message: WebviewMessage): void {
-    if (message.type === 'refresh-tasks') void vscode.commands.executeCommand('goworker.refreshTasks');
+    switch (message.type) {
+      case 'refresh-tasks':
+        void vscode.commands.executeCommand('goworker.refreshTasks');
+        return;
+      case 'permission-response':
+        this.settlePermission(message.requestId, { outcome: 'selected', optionId: message.optionId });
+        return;
+      case 'permission-cancel':
+        this.settlePermission(message.requestId, { outcome: 'cancelled' });
+        return;
+      default:
+        return;
+    }
   }
 
   private post(message: HostMessage): void {
@@ -81,6 +152,10 @@ export class TaskPanel {
     this.requestVersion += 1;
     this.observer?.dispose();
     this.observer = undefined;
+    // 面板关了：所有挂起的请求回 cancelled，否则 daemon 会一直等到超时。
+    for (const requestId of [...this.pendingPermissions.keys()]) {
+      this.settlePermission(requestId, { outcome: 'cancelled' });
+    }
     TaskPanel.current = undefined;
   }
 
