@@ -69,23 +69,11 @@ export function activate(context: vscode.ExtensionContext): void {
     });
   }
 
-  // Chats 树点击：当前会话直接 load 重放；归档会话先确认（daemon 暂不支持归档重放，
-  // load 必失败回落新会话），避免误点静默丢上下文。
-  async function openChatSession(raw: unknown): Promise<void> {
+  // Chats 树点击：当前会话与归档会话都直接 load 重放（daemon 现支持归档只读重放；
+  // 对归档会话发消息会被拒，错误经面板既有 error 通道显示）。保留窄化与空值保护。
+  function openChatSession(raw: unknown): void {
     const click = toChatEntryClick(raw);
     if (click === undefined) return;
-    if (!click.isCurrent) {
-      const choice = await vscode.window.showQuickPick(
-        [
-          { label: 'Open as new chat', description: 'Archived chats cannot be replayed yet' },
-          { label: 'Cancel' },
-        ],
-        {
-          placeHolder: 'This chat is archived; GOWORKER can only resume the current session.',
-        },
-      );
-      if (choice?.label !== 'Open as new chat') return;
-    }
     openChat({ runtimeSessionId: click.sessionId });
   }
 

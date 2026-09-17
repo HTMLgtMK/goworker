@@ -494,13 +494,18 @@ func TestFrontend_StartRemovesStaleSocket(t *testing.T) {
 }
 
 // fakeSessionSource 是 SessionSource 的测试桩：注入当前会话 id、清单、重放历史
-// 与 reload 错误。
+// 与 reload 错误，并记录 SetSession 的 cwd 落地调用与 archive load 的请求。
 type fakeSessionSource struct {
 	current   string
 	list      []protocol.SessionInfo
 	history   []protocol.SessionUpdateBody
+	archives  map[string][]protocol.SessionUpdateBody
 	reloaded  int
 	reloadErr error
+
+	mu          sync.Mutex
+	setSessions [][2]string // sessionID, cwd（按调用序）
+	archiveReqs []string
 }
 
 func (s *fakeSessionSource) ListSessions() []protocol.SessionInfo { return s.list }
@@ -510,6 +515,36 @@ func (s *fakeSessionSource) ReloadCurrentSession() error {
 	return s.reloadErr
 }
 func (s *fakeSessionSource) CurrentSessionHistory() []protocol.SessionUpdateBody { return s.history }
+
+func (s *fakeSessionSource) SetSession(sessionID, cwd string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.setSessions = append(s.setSessions, [2]string{sessionID, cwd})
+}
+
+func (s *fakeSessionSource) ArchivedSessionHistory(sessionID string) ([]protocol.SessionUpdateBody, error) {
+	s.mu.Lock()
+	s.archiveReqs = append(s.archiveReqs, sessionID)
+	s.mu.Unlock()
+	if bodies, ok := s.archives[sessionID]; ok {
+		return bodies, nil
+	}
+	return []protocol.SessionUpdateBody{}, nil
+}
+
+func (s *fakeSessionSource) SessionModes() *protocol.SessionModeState {
+	return &protocol.SessionModeState{
+		CurrentModeID:  "deepseek",
+		AvailableModes: []protocol.SessionMode{{ID: "deepseek", Name: "deepseek (deepseek-chat)"}},
+	}
+}
+
+// setSessionCalls 返回 SetSession 调用序列快照。
+func (s *fakeSessionSource) setSessionCalls() [][2]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([][2]string(nil), s.setSessions...)
+}
 
 // recordingReporter 记录 ingress 经 dispatch.Reporter 推送的全部更新（顺序即
 // 推送顺序）。
@@ -620,20 +655,24 @@ func TestFrontend_LoadSessionResumesOnlyTheCurrentSession(t *testing.T) {
 		t.Errorf("reloaded = %d, want exactly one view refresh", source.reloaded)
 	}
 
-	// 归档会话：明确报错，不得假成功
-	err := client.Call(context.Background(), protocol.MethodSessionLoad,
-		protocol.LoadSessionRequest{SessionID: "1735689600000000000", Cwd: "/work"}, &resp)
-	var rpcErr *protocol.RPCError
-	if !errors.As(err, &rpcErr) || !strings.Contains(rpcErr.Message, "archived session resume is not supported yet") {
-		t.Errorf("archived load error = %v, want RPCError mentioning archived session resume", err)
+	// 归档会话：只读查看（方案 B）→ load 成功重放，但 cwd 不得落地到当前会话
+	if err := client.Call(context.Background(), protocol.MethodSessionLoad,
+		protocol.LoadSessionRequest{SessionID: "1735689600000000000", Cwd: "/work"}, &resp); err != nil {
+		t.Fatalf("session/load archived: %v", err)
 	}
 	if source.reloaded != 1 {
-		t.Errorf("reloaded = %d after archived load, want unchanged", source.reloaded)
+		t.Errorf("reloaded = %d after archived load, want unchanged (归档不触碰当前会话)", source.reloaded)
+	}
+	for _, call := range source.setSessionCalls() {
+		if call[0] == "1735689600000000000" {
+			t.Errorf("archived load applied cwd via SetSession(%q, %q), want none (归档不改当前会话 cwd)", call[0], call[1])
+		}
 	}
 
 	// 未知会话：点名报错
-	err = client.Call(context.Background(), protocol.MethodSessionLoad,
+	err := client.Call(context.Background(), protocol.MethodSessionLoad,
 		protocol.LoadSessionRequest{SessionID: "sess_nope", Cwd: "/work"}, &resp)
+	var rpcErr *protocol.RPCError
 	if !errors.As(err, &rpcErr) || !strings.Contains(rpcErr.Message, "unknown session") {
 		t.Errorf("unknown load error = %v, want RPCError mentioning unknown session", err)
 	}
@@ -659,7 +698,7 @@ func TestIngress_LoadSessionReplaysCommandsThenHistory(t *testing.T) {
 	}
 	rep := &recordingReporter{}
 
-	if err := h.LoadSession("sess_live", rep); err != nil {
+	if err := h.LoadSession("sess_live", "/work", rep); err != nil {
 		t.Fatalf("LoadSession: %v", err)
 	}
 
@@ -789,10 +828,144 @@ func TestIngress_SessionCapabilitiesWithoutSource(t *testing.T) {
 	if got := h.ListSessions(); got == nil || len(got) != 0 {
 		t.Errorf("ListSessions = %#v, want non-nil empty", got)
 	}
-	err := h.LoadSession("sess_any", &recordingReporter{})
+	err := h.LoadSession("sess_any", "", &recordingReporter{})
 	var rpcErr *protocol.RPCError
 	if !errors.As(err, &rpcErr) || !strings.Contains(rpcErr.Message, "not supported") {
 		t.Errorf("LoadSession = %v, want RPCError mentioning not supported", err)
+	}
+	if got := h.SessionModes(); got != nil {
+		t.Errorf("SessionModes = %+v without source, want nil", got)
+	}
+}
+
+// TestIngress_SetSessionAppliesCwd 验证 session/new 路径把声明的 cwd 记入 ingress
+// 台账并落地到会话数据源（sessionID→cwd 对齐 acpIngress 模式）。
+func TestIngress_SetSessionAppliesCwd(t *testing.T) {
+	source := &fakeSessionSource{current: "sess_live"}
+	h := &ingress{evaluate: func(*plugin.Context, string) error { return nil }, sessionSource: source}
+
+	h.SetSession("sess_new", "/workspace")
+
+	calls := source.setSessionCalls()
+	if len(calls) != 1 || calls[0] != ([2]string{"sess_new", "/workspace"}) {
+		t.Errorf("SetSession calls = %v, want [sess_new /workspace] forwarded to source", calls)
+	}
+	if promptable, _ := h.knownSession("sess_new"); !promptable {
+		t.Error("session/new 的 id 应进可 prompt 集合")
+	}
+	h.mu.Lock()
+	cwd := h.cwds["sess_new"]
+	h.mu.Unlock()
+	if cwd != "/workspace" {
+		t.Errorf("ingress cwd 台账 = %q, want /workspace", cwd)
+	}
+}
+
+// TestIngress_LoadSessionArchivedReplaysReadOnly 断言归档 load（方案 B）：
+// 推 available_commands_update + 归档重放，返回成功；该 id 记入只读集合而非
+// 可 prompt 集合，prompt 时明确报 read-only（不报 unknown transport session）。
+func TestIngress_LoadSessionArchivedReplaysReadOnly(t *testing.T) {
+	source := &fakeSessionSource{
+		current: "sess_live",
+		list: []protocol.SessionInfo{
+			{SessionID: "sess_live", IsCurrent: true},
+			{SessionID: "1735689600000000000"},
+		},
+		archives: map[string][]protocol.SessionUpdateBody{
+			"1735689600000000000": {
+				{SessionUpdate: protocol.UpdateUserMessageChunk, Content: &protocol.ContentBlock{Type: "text", Text: "归档问题"}},
+				{
+					SessionUpdate: protocol.UpdateToolCall,
+					ToolCallID:    "call_old",
+					Title:         "read_file(a.go)",
+					Status:        "in_progress",
+				},
+				{SessionUpdate: protocol.UpdateAgentMessageChunk, Content: &protocol.ContentBlock{Type: "text", Text: "归档回答"}},
+			},
+		},
+	}
+	h := &ingress{
+		evaluate:      func(*plugin.Context, string) error { return nil },
+		commands:      func() []plugin.Command { return []plugin.Command{{Name: "/help", Description: "帮助"}} },
+		sessionSource: source,
+	}
+	rep := &recordingReporter{}
+
+	if err := h.LoadSession("1735689600000000000", "/work", rep); err != nil {
+		t.Fatalf("LoadSession(archived): %v", err)
+	}
+
+	updates := rep.all()
+	if len(updates) != 4 {
+		t.Fatalf("updates = %+v, want [commands, user, tool_call, agent]", updates)
+	}
+	var commands availableCommandsUpdate
+	if err := json.Unmarshal(updates[0].Update.Raw, &commands); err != nil {
+		t.Fatalf("unmarshal availableCommands payload: %v", err)
+	}
+	if commands.SessionUpdate != protocol.UpdateAvailableCommands {
+		t.Errorf("first update = %+v, want available_commands_update", commands)
+	}
+	if updates[1].Update.Content == nil || updates[1].Update.Content.Text != "归档问题" {
+		t.Errorf("second update = %+v, want user chunk 归档问题", updates[1])
+	}
+	if updates[2].Update.ToolCallID != "call_old" {
+		t.Errorf("third update = %+v, want tool_call call_old", updates[2])
+	}
+	if updates[3].Update.Content == nil || updates[3].Update.Content.Text != "归档回答" {
+		t.Errorf("fourth update = %+v, want agent chunk 归档回答", updates[3])
+	}
+
+	// 归档 id 不进可 prompt 集合，prompt 明确报 read-only
+	promptable, readOnly := h.knownSession("1735689600000000000")
+	if promptable || !readOnly {
+		t.Errorf("knownSession(archived) = (promptable=%v, readOnly=%v), want (false, true)", promptable, readOnly)
+	}
+	_, err := h.Run(context.Background(), "1735689600000000000", "续写", rep)
+	var rpcErr *protocol.RPCError
+	if !errors.As(err, &rpcErr) || !strings.Contains(rpcErr.Message, "read-only") {
+		t.Errorf("Run(archived) error = %v, want RPCError mentioning read-only", err)
+	}
+	if !strings.Contains(err.Error(), "1735689600000000000") {
+		t.Errorf("Run(archived) error = %v, want session id echoed", err)
+	}
+
+	// 归档 load 不落地 cwd（不改当前会话），也未触发 reload
+	if calls := source.setSessionCalls(); len(calls) != 0 {
+		t.Errorf("SetSession calls = %v after archived load, want none", calls)
+	}
+	if source.reloaded != 0 {
+		t.Errorf("reloaded = %d after archived load, want 0", source.reloaded)
+	}
+}
+
+// TestFrontend_SessionModesForwardedFromSource 验证 modes 探测经 ingress 委托到
+// 会话数据源：session/new 响应携带 modes（只显示不切换）。
+func TestFrontend_SessionModesForwardedFromSource(t *testing.T) {
+	path := newSocketPath(t)
+	source := &fakeSessionSource{current: "sess_live"}
+	frontend := New(path, func(*plugin.Context, string) error { return nil }, nil, source)
+	if err := frontend.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = frontend.Stop() })
+
+	client := dialACP(t, path)
+	if err := client.Call(context.Background(), protocol.MethodInitialize,
+		protocol.InitializeRequest{ProtocolVersion: protocol.Version}, &protocol.InitializeResponse{}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	var resp protocol.NewSessionResponse
+	if err := client.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: "/work"}, &resp); err != nil {
+		t.Fatalf("session/new: %v", err)
+	}
+	if resp.Modes == nil || resp.Modes.CurrentModeID != "deepseek" ||
+		len(resp.Modes.AvailableModes) != 1 || resp.Modes.AvailableModes[0].Name != "deepseek (deepseek-chat)" {
+		t.Errorf("session/new modes = %+v, want source-provided deepseek state", resp.Modes)
+	}
+	if calls := source.setSessionCalls(); len(calls) != 1 || calls[0][1] != "/work" {
+		t.Errorf("SetSession calls = %v, want cwd /work forwarded on session/new", calls)
 	}
 }
 

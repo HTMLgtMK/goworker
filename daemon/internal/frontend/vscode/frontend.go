@@ -23,14 +23,20 @@ type Evaluator func(ctx *plugin.Context, input string) error
 // 插件实现，结构化类型、agent 包无需感知本接口）：
 //   - ListSessions：session/list 数据源（当前会话置顶 + 归档，只读扫描）。
 //   - CurrentSessionID：当前活动会话的 head id（空 = 无活动会话）。
+//   - SetSession：把 ACP 提交方声明的会话 cwd 落到 daemon（校验与生效在实现方）。
 //   - ReloadCurrentSession：load 命中当前会话时刷新会话视图（ReloadFromStore）。
 //   - CurrentSessionHistory：当前会话对话历史 → session/update 序列，load 成功
 //     路径上向客户端重放。
+//   - ArchivedSessionHistory：归档会话只读解析 → 重放序列（归档 load 用）。
+//   - SessionModes：session/new|load 响应的 models 状态（nil = 不带 modes）。
 type SessionSource interface {
 	ListSessions() []protocol.SessionInfo
 	CurrentSessionID() string
+	SetSession(sessionID, cwd string)
 	ReloadCurrentSession() error
 	CurrentSessionHistory() []protocol.SessionUpdateBody
+	ArchivedSessionHistory(sessionID string) ([]protocol.SessionUpdateBody, error)
+	SessionModes() *protocol.SessionModeState
 }
 
 // Frontend exposes the daemon's persistent main conversation over a local ACP socket.
@@ -205,7 +211,14 @@ func (f *Frontend) acceptLoop(listener net.Listener) {
 			f.acceptMu.Unlock()
 			return
 		}
-		handler := &ingress{evaluate: f.evaluate, commands: f.commands, sessionSource: f.sessions, sessions: make(map[string]struct{})}
+		handler := &ingress{
+			evaluate:      f.evaluate,
+			commands:      f.commands,
+			sessionSource: f.sessions,
+			sessions:      make(map[string]struct{}),
+			readOnly:      make(map[string]struct{}),
+			cwds:          make(map[string]string),
+		}
 		server := dispatch.ServeConn(conn, handler)
 		f.mu.Lock()
 		f.servers[server] = struct{}{}
@@ -302,29 +315,79 @@ type ingress struct {
 	commands      func() []plugin.Command
 	sessionSource SessionSource
 	mu            sync.Mutex
-	sessions      map[string]struct{}
+	sessions      map[string]struct{} // 可 prompt 集合：session/new 与当前会话 load 记入
+	readOnly      map[string]struct{} // 只读集合：归档 load 记入，prompt 诚实报错
+	cwds          map[string]string   // ACP sessionID → 提交方声明的工作目录（对齐 acpIngress）
 }
 
 func (h *ingress) remember(sessionID string) {
 	h.mu.Lock()
+	if h.sessions == nil {
+		h.sessions = make(map[string]struct{})
+	}
 	h.sessions[sessionID] = struct{}{}
 	h.mu.Unlock()
 }
 
-func (h *ingress) SetSession(sessionID, _ string) {
+// rememberReadOnly 把归档会话 id 记入只读集合：与可 prompt 集合（h.sessions）分离，
+// load 归档成功但 prompt 该 id 会被 Run 明确拒绝（归档只读，不进可 prompt 集合）。
+func (h *ingress) rememberReadOnly(sessionID string) {
+	h.mu.Lock()
+	if h.readOnly == nil {
+		h.readOnly = make(map[string]struct{})
+	}
+	h.readOnly[sessionID] = struct{}{}
+	h.mu.Unlock()
+}
+
+// rememberCwd 记录 sessionID → cwd（ingress 侧的会话上下文台账，对齐 dispatcher
+// 的 acpIngress 模式；对 daemon 的生效经 sessionSource.SetSession 落地）。
+func (h *ingress) rememberCwd(sessionID, cwd string) {
+	h.mu.Lock()
+	if h.cwds == nil {
+		h.cwds = make(map[string]string)
+	}
+	h.cwds[sessionID] = cwd
+	h.mu.Unlock()
+}
+
+// knownSession 返回 sessionID 的集合归属（可 prompt / 只读）。
+func (h *ingress) knownSession(sessionID string) (promptable, readOnly bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, promptable = h.sessions[sessionID]
+	_, readOnly = h.readOnly[sessionID]
+	return promptable, readOnly
+}
+
+// SetSession 实现 dispatch.SessionAware：session/new 时记住会话并声明 cwd 落地。
+func (h *ingress) SetSession(sessionID, cwd string) {
 	h.remember(sessionID)
+	h.rememberCwd(sessionID, cwd)
+	if h.sessionSource != nil {
+		h.sessionSource.SetSession(sessionID, cwd)
+	}
 }
 
 // SetSessionServer 在 session/new 时立即把 daemon 命令清单作为 ACP
 // available_commands_update 下发给客户端，供 / 补全；随后才返回 session 响应。
-func (h *ingress) SetSessionServer(sessionID, _ string, server *dispatch.Server) {
-	h.remember(sessionID)
+func (h *ingress) SetSessionServer(sessionID, cwd string, server *dispatch.Server) {
+	h.SetSession(sessionID, cwd)
 	if h.commands == nil {
 		return
 	}
 	if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
 		server.Update(sessionID, body)
 	}
+}
+
+// SessionModes 实现 dispatch.SessionModesProvider：转发给会话数据源
+// （无数据源 = 无 modes，响应省略该字段）。
+func (h *ingress) SessionModes() *protocol.SessionModeState {
+	if h.sessionSource == nil {
+		return nil
+	}
+	return h.sessionSource.SessionModes()
 }
 
 // ListSessions 实现 dispatch.SessionLister：转发给会话数据源；无数据源时返回
@@ -339,21 +402,24 @@ func (h *ingress) ListSessions() []protocol.SessionInfo {
 // LoadSession 实现 dispatch.SessionLoader。daemon 的 agent 插件是单活动会话模型
 // （store 是唯一真相，当前会话始终处于已加载状态），load 的语义是「确认会话上下文已在」：
 //   - sessionId == 当前会话 head → 刷新会话视图后成功，并在响应前推送重放通知：
-//     先记住该 id（load 不走 session/new，不记住则后续 session/prompt 被本连接的
-//     known-session 检查拒掉）；再下发 available_commands_update（load 路径没有
-//     SetSessionServer，斜杠补全只能在此补齐，空清单也照发以清掉客户端旧状态）；
-//     最后逐条重放对话历史（user/assistant 消息 → message chunk，映射规则见
-//     agent.CurrentSessionHistory）。这些通知经同一连接顺序写出，先于 load 响应
-//     到达，客户端可在响应返回前渲染。
-//   - sessionId 是归档会话 → 明确报错（归档恢复为后续工作，诚实报错优于假成功）；
+//     先把声明的 cwd 落到 daemon（SetSession），再记住该 id（load 不走 session/new，
+//     不记住则后续 session/prompt 被本连接的 known-session 检查拒掉）；然后下发
+//     available_commands_update（load 路径没有 SetSessionServer，斜杠补全只能在
+//     此补齐，空清单也照发以清掉客户端旧状态）；最后逐条重放对话历史（user/
+//     assistant 消息 → message chunk，映射规则见 agent.CurrentSessionHistory）。
+//     这些通知经同一连接顺序写出，先于 load 响应到达，客户端可在响应返回前渲染。
+//   - sessionId 是归档会话 → 只读查看（方案 B）：只读解析归档并重放（不进可
+//     prompt 集合，记入只读集合；归档 cwd 不改变当前会话），响应前先推
+//     available_commands_update（如命令清单可用）再推归档历史；
 //   - 其他 → 未知会话报错。
 //
 // 不为历史 sessionId 重建独立会话——daemon 模型不支持多活动会话。
-func (h *ingress) LoadSession(sessionID string, rep dispatch.Reporter) error {
+func (h *ingress) LoadSession(sessionID, cwd string, rep dispatch.Reporter) error {
 	if h.sessionSource == nil {
 		return &protocol.RPCError{Code: -32000, Message: "vscode frontend: session load not supported"}
 	}
 	if sessionID == h.sessionSource.CurrentSessionID() {
+		h.sessionSource.SetSession(sessionID, cwd)
 		if err := h.sessionSource.ReloadCurrentSession(); err != nil {
 			return fmt.Errorf("vscode frontend: reload current session: %w", err)
 		}
@@ -368,13 +434,25 @@ func (h *ingress) LoadSession(sessionID string, rep dispatch.Reporter) error {
 		}
 		return nil
 	}
+	// 归档会话：只读重放。先解析成功再入只读集合，解析失败保持未知会话语义。
 	for _, info := range h.sessionSource.ListSessions() {
-		if info.SessionID == sessionID {
-			return &protocol.RPCError{
-				Code:    -32000,
-				Message: fmt.Sprintf("vscode frontend: archived session resume is not supported yet (session %q)", sessionID),
+		if info.SessionID != sessionID {
+			continue
+		}
+		history, err := h.sessionSource.ArchivedSessionHistory(sessionID)
+		if err != nil {
+			return fmt.Errorf("vscode frontend: load archived session %q: %w", sessionID, err)
+		}
+		h.rememberReadOnly(sessionID)
+		if h.commands != nil {
+			if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
+				rep.Update(sessionID, body)
 			}
 		}
+		for _, body := range history {
+			rep.Update(sessionID, body)
+		}
+		return nil
 	}
 	return &protocol.RPCError{
 		Code:    -32000,
@@ -383,10 +461,15 @@ func (h *ingress) LoadSession(sessionID string, rep dispatch.Reporter) error {
 }
 
 func (h *ingress) Run(ctx context.Context, sessionID, prompt string, rep dispatch.Reporter) (string, error) {
-	h.mu.Lock()
-	_, known := h.sessions[sessionID]
-	h.mu.Unlock()
-	if !known {
+	promptable, readOnly := h.knownSession(sessionID)
+	if readOnly {
+		// 归档会话续写防护：诚实报错，优于报 unknown transport session 掩盖真相
+		return "", &protocol.RPCError{
+			Code:    -32000,
+			Message: fmt.Sprintf("vscode frontend: archived session %q is read-only", sessionID),
+		}
+	}
+	if !promptable {
 		return "", fmt.Errorf("vscode frontend: unknown transport session %q", sessionID)
 	}
 	commandContext := &plugin.Context{

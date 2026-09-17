@@ -8,8 +8,9 @@ import {
 } from './chatEntries';
 
 // Chats 树（GOWORKER 容器顶部第一棵）：数据源 = 每次刷新开一条轻量 ACP 连接拉
-// daemon session/list，展示层只保留置顶的当前会话（归档条目隐藏，见 toChatEntries），
-// 不做实时监听。树可见首次 getChildren 与树顶刷新按钮触发拉取；失败保留旧清单并置错误条目。
+// daemon session/list，展示完整清单（当前会话置顶 + 归档会话按 mtime 倒序，见
+// toChatEntries），不做实时监听。树可见首次 getChildren 与树顶刷新按钮触发拉取；
+// 失败保留旧清单并置错误条目。
 export class ChatsTreeProvider implements vscode.TreeDataProvider<ChatEntryItem> {
   private readonly changed = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this.changed.event;
@@ -83,14 +84,21 @@ export class ChatEntryItem extends vscode.TreeItem {
     }
     this.id = entry.sessionId;
     this.description = chatEntryDescription(entry, new Date());
-    this.tooltip = [entry.title, entry.updatedAt, entry.sessionId].filter(Boolean).join('\n');
+    this.tooltip = [
+      entry.title,
+      entry.updatedAt,
+      entry.sessionId,
+      // 归档行克制提示：可回看历史，但 prompt 只读。
+      ...(entry.isCurrent ? [] : ['Archived · read-only']),
+    ]
+      .filter(Boolean)
+      .join('\n');
     this.command = {
       command: 'goworker.openChatSession',
       title: 'Open GOWORKER Chat Session',
       arguments: [{ sessionId: entry.sessionId, isCurrent: entry.isCurrent }],
     };
-    // 当前会话用主题 codicon（不设文本圆点，TreeItem 无法做圆角背景）；
-    // 归档条目当前被展示层隐藏，恢复展示时归档行继续用 history。
+    // 当前会话用主题 codicon（不设文本圆点，TreeItem 无法做圆角背景）；归档行用 history。
     this.iconPath = new vscode.ThemeIcon(entry.isCurrent ? 'comment-draft' : 'history');
     this.contextValue = entry.isCurrent ? 'goworker.chat.current' : 'goworker.chat.archived';
   }

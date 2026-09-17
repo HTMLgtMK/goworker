@@ -55,6 +55,11 @@ func withPluginContext(ctx *plugin.Context, runCtx context.Context) *plugin.Cont
 }
 
 func (p *AgentPlugin) handleAgent(ctx *plugin.Context) error {
+	// 最近一次会话 cwd 声明未通过 sandbox 边界校验 → 明确报错（无效标记语义，
+	// 见 SetSession）。/new /compact 等维护命令不受影响，只有真正的 prompt 被挡。
+	if err := p.sessionCWDError(); err != nil {
+		return err
+	}
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
 		return p.session.Run(runCtx, runtimeagent.RunRequest{Input: strings.Join(ctx.Args, " ")}, callbacksFromPlugin(runContext))

@@ -15,20 +15,27 @@ import (
 )
 
 // listingHandler 实现 TaskHandler + SessionLoader + SessionLister：具备 load/list 能力。
-type listingHandler struct{}
+// loadCwd 非 nil 时记录最近一次 load 收到的 cwd，供「req.Cwd 透传给 loader」断言
+// （值接收器 + 共享指针：serveWith 持结构体副本也能把观测结果带出来）。
+type listingHandler struct {
+	loadCwd *string
+}
 
-func (listingHandler) Run(_ context.Context, _, _ string, _ Reporter) (string, error) {
+func (h listingHandler) Run(_ context.Context, _, _ string, _ Reporter) (string, error) {
 	return protocol.StopEndTurn, nil
 }
 
-func (listingHandler) LoadSession(sessionID string, _ Reporter) error {
+func (h listingHandler) LoadSession(sessionID, cwd string, _ Reporter) error {
+	if h.loadCwd != nil {
+		*h.loadCwd = cwd
+	}
 	if sessionID != "sess_current" {
 		return &protocol.RPCError{Code: -32000, Message: "dispatch: no such session " + sessionID}
 	}
 	return nil
 }
 
-func (listingHandler) ListSessions() []protocol.SessionInfo {
+func (h listingHandler) ListSessions() []protocol.SessionInfo {
 	return []protocol.SessionInfo{{SessionID: "sess_current", Title: "current work"}}
 }
 
@@ -42,6 +49,18 @@ type plainHandler struct{}
 
 func (plainHandler) Run(_ context.Context, _, _ string, _ Reporter) (string, error) {
 	return protocol.StopEndTurn, nil
+}
+
+// modesHandler 在 listingHandler 之上实现 SessionModesProvider：new/load 响应携带 modes。
+type modesHandler struct{ listingHandler }
+
+func (modesHandler) SessionModes() *protocol.SessionModeState {
+	return &protocol.SessionModeState{
+		CurrentModeID: "deepseek",
+		AvailableModes: []protocol.SessionMode{
+			{ID: "deepseek", Name: "deepseek (deepseek-chat)"},
+		},
+	}
 }
 
 // serveWith 在 net.Pipe 上启动 Server，返回已开始 Serve 的客户端侧 Conn。
@@ -128,7 +147,8 @@ func TestServer_SessionListRejectedWithoutLister(t *testing.T) {
 }
 
 func TestServer_SessionLoadDelegatesToHandler(t *testing.T) {
-	conn := serveWith(t, listingHandler{})
+	var gotCwd string
+	conn := serveWith(t, listingHandler{loadCwd: &gotCwd})
 	initialize(t, conn)
 
 	// 成功路径：result 按 ACP 序列化为 {}（modes 可省）
@@ -139,6 +159,9 @@ func TestServer_SessionLoadDelegatesToHandler(t *testing.T) {
 	}
 	if strings.TrimSpace(string(raw)) != "{}" {
 		t.Errorf("session/load result = %s, want {}", raw)
+	}
+	if gotCwd != "/repo" {
+		t.Errorf("loader cwd = %q, want req.Cwd 透传 /repo", gotCwd)
 	}
 
 	// handler 拒绝的错误原样透传给客户端
@@ -176,7 +199,7 @@ func (replayHandler) Run(_ context.Context, _, _ string, _ Reporter) (string, er
 	return protocol.StopEndTurn, nil
 }
 
-func (replayHandler) LoadSession(sessionID string, rep Reporter) error {
+func (replayHandler) LoadSession(sessionID, _ string, rep Reporter) error {
 	rep.Update(sessionID, protocol.SessionUpdateBody{
 		SessionUpdate: protocol.UpdateUserMessageChunk,
 		Content:       &protocol.ContentBlock{Type: "text", Text: "历史问题"},
@@ -238,5 +261,50 @@ func TestServer_SessionLoadReplaysNotificationsBeforeResponse(t *testing.T) {
 	response := readFrame()
 	if string(response.ID) != "1" || response.Error != nil {
 		t.Errorf("load response = %+v, want success response for id 1", response)
+	}
+}
+
+// TestServer_ModesFilledOnlyWhenHandlerImplementsProvider 验证 modes 探测：
+// 实现 SessionModesProvider 的 handler 在 session/new 与 session/load 响应携带
+// modes；未实现者响应不含 modes 字段（new）或序列化为 {}（load）。
+func TestServer_ModesFilledOnlyWhenHandlerImplementsProvider(t *testing.T) {
+	// 实现方：new 与 load 响应都带 modes
+	conn := serveWith(t, modesHandler{})
+	initialize(t, conn)
+	var newResp protocol.NewSessionResponse
+	if err := conn.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: "/repo"}, &newResp); err != nil {
+		t.Fatalf("session/new: %v", err)
+	}
+	if newResp.Modes == nil || newResp.Modes.CurrentModeID != "deepseek" ||
+		len(newResp.Modes.AvailableModes) != 1 || newResp.Modes.AvailableModes[0].ID != "deepseek" {
+		t.Errorf("session/new modes = %+v, want deepseek mode state", newResp.Modes)
+	}
+	var loadResp protocol.LoadSessionResponse
+	if err := conn.Call(context.Background(), protocol.MethodSessionLoad,
+		protocol.LoadSessionRequest{SessionID: "sess_current"}, &loadResp); err != nil {
+		t.Fatalf("session/load: %v", err)
+	}
+	if loadResp.Modes == nil || loadResp.Modes.CurrentModeID != "deepseek" {
+		t.Errorf("session/load modes = %+v, want deepseek mode state", loadResp.Modes)
+	}
+
+	// 未实现方：new 响应 modes 缺省，load 响应仍序列化为 {}
+	plain := serveWith(t, listingHandler{})
+	initialize(t, plain)
+	var raw json.RawMessage
+	if err := plain.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: "/repo"}, &raw); err != nil {
+		t.Fatalf("session/new: %v", err)
+	}
+	if strings.Contains(string(raw), "modes") {
+		t.Errorf("session/new result = %s, want no modes without SessionModesProvider", raw)
+	}
+	if err := plain.Call(context.Background(), protocol.MethodSessionLoad,
+		protocol.LoadSessionRequest{SessionID: "sess_current"}, &raw); err != nil {
+		t.Fatalf("session/load: %v", err)
+	}
+	if strings.TrimSpace(string(raw)) != "{}" {
+		t.Errorf("session/load result = %s, want {} without SessionModesProvider", raw)
 	}
 }

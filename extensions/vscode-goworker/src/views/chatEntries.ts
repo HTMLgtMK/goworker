@@ -14,7 +14,7 @@ export type ChatEntry = {
   sessionId: string;
   title?: string;
   updatedAt?: string;
-  /** daemon 清单置顶的第一条 = 当前活动会话（单活动会话模型）。 */
+  /** daemon 标记的当前活动会话（单活动会话模型下至多一条）；缺失时回退 index 0 约定。 */
   isCurrent: boolean;
   /** 与扩展记录的「上次会话」id 相同。 */
   isLast: boolean;
@@ -27,27 +27,30 @@ export type ChatEntryClick = {
 };
 
 /**
- * session/list 响应条目 → 展示行：daemon 保证当前会话置顶，index 0 即当前会话；
+ * session/list 响应条目 → 展示行：遍历完整清单（当前会话 + 归档会话）生成行。
+ * 归档会话现在可查看：load 会重放历史，prompt 会被 daemon 拒绝（只读归档错误，
+ * 由面板既有 error 通道显示）。isCurrent 优先用条目自身的 isCurrent === true
+ * （daemon 对当前会话置 true、归档按 omitempty 省略），缺失时回退现约定
+ * （index 0 为当前，兼容不带该字段的旧 wire 数据）；其余行一律 isCurrent: false。
  * lastSessionId 命中时加 isLast 标记。
- *
- * 归档条目暂不展示：daemon 尚不支持归档重放（session/load 对归档 id 必报错），
- * 这里只保留置顶的当前会话，避免用户点开注定失败的条目。归档重放支持后在此
- * 恢复完整清单（遍历全部条目、仅 index 0 标 isCurrent）。
  */
 export function toChatEntries(raw: unknown, lastSessionId?: string): ChatEntry[] {
   const items = Array.isArray(raw) ? raw : [];
   const last = lastSessionId?.trim() ?? '';
   const out: ChatEntry[] = [];
-  const current = items[0];
-  const sessionId = readString(current, 'sessionId');
-  if (!sessionId) return out; // index 0 非法时不往后补位：不把归档条目伪装成当前会话
-  out.push({
-    sessionId,
-    title: readString(current, 'title'),
-    updatedAt: readString(current, 'updatedAt'),
-    isCurrent: true,
-    isLast: sessionId === last,
-  });
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const sessionId = readString(item, 'sessionId');
+    if (!sessionId) continue; // 非法条目跳过；回退判定按 wire 位置，不把归档条目补位成当前会话
+    const flagged = readBoolean(item, 'isCurrent');
+    out.push({
+      sessionId,
+      title: readString(item, 'title'),
+      updatedAt: readString(item, 'updatedAt'),
+      isCurrent: flagged ?? index === 0,
+      isLast: sessionId === last,
+    });
+  }
   return out;
 }
 
@@ -109,4 +112,11 @@ function readString(source: unknown, key: string): string | undefined {
   if (typeof source !== 'object' || source === null) return undefined;
   const value = (source as Record<string, unknown>)[key];
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+// 严格布尔窄化：非布尔返回 undefined，让调用方走各自的缺省约定。
+function readBoolean(source: unknown, key: string): boolean | undefined {
+  if (typeof source !== 'object' || source === null) return undefined;
+  const value = (source as Record<string, unknown>)[key];
+  return typeof value === 'boolean' ? value : undefined;
 }

@@ -6,6 +6,8 @@ export type AcpSessionListEntry = {
   cwd?: string;
   title?: string;
   updatedAt?: string;
+  /** 当前活动会话标记；Go 侧 omitempty，false/缺省窄化为 undefined。 */
+  isCurrent?: boolean;
 };
 
 export type FetchAcpSessionListOptions = {
@@ -55,6 +57,8 @@ export function narrowSessionListEntries(result: unknown): AcpSessionListEntry[]
       const value = source[key];
       if (typeof value === 'string' && value.length > 0) entry[key] = value;
     }
+    // isCurrent 与 Go 侧 omitempty 对齐：仅 true 保留，false/缺省均为 undefined。
+    if (source['isCurrent'] === true) entry.isCurrent = true;
     out.push(entry);
   }
   return out;

@@ -123,45 +123,7 @@ func (s *Store) Head() string {
 func (s *Store) ActiveView() []core.Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if s.head == "" {
-		return nil
-	}
-
-	// 内存中有完整记录时优先用内存（性能更好），否则从文件加载。
-	// 但为了保持一致性，始终从内存记录构建（追加时 recs 未被更新，需要 reload）。
-	// 折中方案：从 recs 构建 id 索引，若 head 不在索引里则重新加载。
-	byID := make(map[string]Record, len(s.recs))
-	for _, r := range s.recs {
-		if r.Kind == kindMsg || r.Kind == kindCompact {
-			byID[r.NodeID()] = r
-		}
-	}
-
-	// 沿 parent 链回溯，收集节点（反向）
-	var chain []Record
-	cur := s.head
-	visited := make(map[string]bool) // 防循环
-	for cur != "" && !visited[cur] {
-		visited[cur] = true
-		r, ok := byID[cur]
-		if !ok {
-			slog.Warn("session: head points to unknown node", "head", s.head, "missing", cur)
-			break
-		}
-		chain = append(chain, r)
-		cur = r.ParentID()
-	}
-
-	// 反转得正向顺序
-	slices.Reverse(chain)
-
-	// 转换为 core.Message
-	var msgs []core.Message
-	for _, r := range chain {
-		msgs = append(msgs, recordToMessage(r))
-	}
-	return msgs
+	return buildActiveView(s.recs, s.head)
 }
 
 // Commit 将一批消息追加落盘。已存在的 id 跳过（幂等）。
@@ -355,23 +317,7 @@ func (s *Store) Checkpoint(preview string) error {
 func (s *Store) Checkpoints(limit int) []Checkpoint {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	cks := make([]Checkpoint, 0, 8)
-	for i := len(s.recs) - 1; i >= 0; i-- {
-		if limit > 0 && len(cks) >= limit {
-			break
-		}
-		r := s.recs[i]
-		if r.Kind == kindCheckpoint && r.CK != nil {
-			cks = append(cks, Checkpoint{
-				ID:        r.CK.ID,
-				At:        r.CK.At,
-				Preview:   r.CK.Preview,
-				CreatedAt: r.CK.CreatedAt,
-			})
-		}
-	}
-	return cks
+	return checkpointsFromRecords(s.recs, limit)
 }
 
 // PendingAfterCursor 返回活跃路径上 cursor 之后（不含 cursor 自身）的真实消息。
@@ -498,6 +444,63 @@ func (s *Store) Archive() error {
 
 // ── 内部辅助 ──────────────────────────────────────────────────────────
 
+// buildActiveView 从记录集与 head 构建活跃视图：沿 parent 链回溯到根（带 visited
+// 防环），反转得正向顺序，compact 节点转为 system 摘要消息（链穿过它继续回溯，
+// compact 只替换覆盖段、不截断更早历史）。Store.ActiveView / activeViewLocked 与
+// 归档只读视图（ArchiveView.ActiveView）共用同一实现，语义天然一致。
+func buildActiveView(recs []Record, head string) []core.Message {
+	if head == "" {
+		return nil
+	}
+	byID := make(map[string]Record, len(recs))
+	for _, r := range recs {
+		if r.Kind == kindMsg || r.Kind == kindCompact {
+			byID[r.NodeID()] = r
+		}
+	}
+	var chain []Record
+	cur := head
+	visited := make(map[string]bool) // 防循环
+	for cur != "" && !visited[cur] {
+		visited[cur] = true
+		r, ok := byID[cur]
+		if !ok {
+			slog.Warn("session: head points to unknown node", "head", head, "missing", cur)
+			break
+		}
+		chain = append(chain, r)
+		cur = r.ParentID()
+	}
+	slices.Reverse(chain)
+	var msgs []core.Message
+	for _, r := range chain {
+		msgs = append(msgs, recordToMessage(r))
+	}
+	return msgs
+}
+
+// checkpointsFromRecords 从记录集提取检查点摘要，按记录追加顺序倒序（最新在前）。
+// limit > 0 时最多返回最近 limit 个；limit <= 0 返回全部。
+// Store.Checkpoints 与 ArchiveView.Checkpoints 共用。
+func checkpointsFromRecords(recs []Record, limit int) []Checkpoint {
+	cks := make([]Checkpoint, 0, 8)
+	for i := len(recs) - 1; i >= 0; i-- {
+		if limit > 0 && len(cks) >= limit {
+			break
+		}
+		r := recs[i]
+		if r.Kind == kindCheckpoint && r.CK != nil {
+			cks = append(cks, Checkpoint{
+				ID:        r.CK.ID,
+				At:        r.CK.At,
+				Preview:   r.CK.Preview,
+				CreatedAt: r.CK.CreatedAt,
+			})
+		}
+	}
+	return cks
+}
+
 func restrictArchivePermissions(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
@@ -577,33 +580,7 @@ func (s *Store) activePathIDs() (ids []string, parentOf map[string]string) {
 
 // activeViewLocked 同 ActiveView 但不加锁（调用方持锁）。
 func (s *Store) activeViewLocked() []core.Message {
-	if s.head == "" {
-		return nil
-	}
-	byID := make(map[string]Record, len(s.recs))
-	for _, r := range s.recs {
-		if r.Kind == kindMsg || r.Kind == kindCompact {
-			byID[r.NodeID()] = r
-		}
-	}
-	var chain []Record
-	cur := s.head
-	visited := make(map[string]bool)
-	for cur != "" && !visited[cur] {
-		visited[cur] = true
-		r, ok := byID[cur]
-		if !ok {
-			break
-		}
-		chain = append(chain, r)
-		cur = r.ParentID()
-	}
-	slices.Reverse(chain)
-	var msgs []core.Message
-	for _, r := range chain {
-		msgs = append(msgs, recordToMessage(r))
-	}
-	return msgs
+	return buildActiveView(s.recs, s.head)
 }
 
 // remapCursor 在 compact 时映射游标：保留段原消息 → 对应副本。

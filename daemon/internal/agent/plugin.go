@@ -6,11 +6,14 @@ package agent
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
@@ -50,6 +53,13 @@ type AgentPlugin struct {
 	mcpClients map[string]mcp.Client // server name → 连接，Stop 时统一关闭
 	mcpTools   []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
 	memory     *memory.Client        // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
+
+	// 会话工作目录状态（mu 保护）。ACP 提交方经 session/new|load 声明的 cwd 经
+	// sandbox 边界校验后落到这里并应用到当前会话；非法声明只记 cwdErr（无效标记），
+	// session/prompt 时明确报错，绝不静默生效或回落旧值。
+	mu         sync.Mutex
+	sessionCwd string // 最近一次有效声明的会话 cwd（绝对路径；空 = 未声明）
+	cwdErr     error  // 最近一次声明的校验错误（nil = 无声明或已通过）
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
@@ -246,6 +256,82 @@ func (p *AgentPlugin) startSession() {
 		p.deps.Instruction = p.loadInstructions()
 	}
 	p.session = runtimeagent.NewSession(p.deps)
+
+	// 会话重建 = 新的会话边界。无效 cwd 标记随旧会话作废（否则会毒化新会话的
+	// 每个 prompt）；有效声明跨会话保留并应用到新会话 —— 工作区没变，/new 不该
+	// 让工具悄悄回退到别的目录。取舍：不追踪「声明了 cwd 的 transport 会话与
+	// store 会话的对应关系」，单活动会话模型下一律落当前会话。
+	p.mu.Lock()
+	p.cwdErr = nil
+	cwd := p.sessionCwd
+	p.mu.Unlock()
+	p.session.SetCWD(cwd)
+}
+
+// SetSession 记录 ACP 提交方声明的会话工作目录并应用到当前会话（单活动会话模型：
+// transport sessionID 与 store 的 head id 不同源，cwd 一律落当前活动会话）。
+//
+// sandbox 边界在插件侧校验：cfg.Sandbox.AllowedWorkDir 非空时，声明的 cwd 必须
+// 落在它之下（Abs + EvalSymlinks 解析后判断前缀，符号链接与相对路径钉到真实
+// 位置）；非法声明存为无效标记，session/prompt 时返回明确错误，不让越界目录
+// 静默生效。AllowedWorkDir 为空 = 不限制，接受任意 cwd；cwd 为空 = 未声明，
+// 清空会话目录回退现行为。
+func (p *AgentPlugin) SetSession(sessionID, cwd string) {
+	cwd = strings.TrimSpace(cwd)
+	if cwd != "" {
+		if abs, err := filepath.Abs(cwd); err == nil {
+			cwd = abs // cmd.Dir 要求绝对路径；SessionInfo.Cwd 也回显规范化值
+		}
+	}
+	if err := p.validateSessionCWD(cwd); err != nil {
+		p.mu.Lock()
+		p.sessionCwd, p.cwdErr = "", err
+		p.mu.Unlock()
+		slog.Warn("agent: reject session cwd", "session", sessionID, "cwd", cwd, "err", err)
+		return
+	}
+	p.mu.Lock()
+	p.sessionCwd, p.cwdErr = cwd, nil
+	p.mu.Unlock()
+	if p.session != nil {
+		p.session.SetCWD(cwd)
+	}
+}
+
+// validateSessionCWD 校验声明的 cwd 是否落在 sandbox 边界内。
+// allowed 为空 = 不限制；cwd 为空 = 未声明，均直接放行。
+func (p *AgentPlugin) validateSessionCWD(cwd string) error {
+	allowed := ""
+	if p.cfg != nil {
+		allowed = p.cfg.Sandbox.AllowedWorkDir
+	}
+	if allowed == "" || cwd == "" {
+		return nil
+	}
+	resolvedCwd, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return fmt.Errorf("invalid session cwd %q: %w", cwd, err)
+	}
+	absAllowed, err := filepath.Abs(allowed)
+	if err != nil {
+		return fmt.Errorf("invalid session cwd %q: sandbox boundary %q: %w", cwd, allowed, err)
+	}
+	resolvedAllowed, err := filepath.EvalSymlinks(absAllowed)
+	if err != nil {
+		return fmt.Errorf("invalid session cwd %q: sandbox boundary %q: %w", cwd, allowed, err)
+	}
+	if resolvedCwd != resolvedAllowed && !strings.HasPrefix(resolvedCwd, resolvedAllowed+string(os.PathSeparator)) {
+		return fmt.Errorf("invalid session cwd %q: outside sandbox boundary %q", cwd, allowed)
+	}
+	return nil
+}
+
+// sessionCWDError 返回最近一次会话 cwd 声明的校验错误（无声明或已通过 = nil）。
+// session/prompt 入口（handleAgent）先查它：无效声明下不执行任何工具。
+func (p *AgentPlugin) sessionCWDError() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cwdErr
 }
 
 /**

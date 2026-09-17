@@ -65,9 +65,29 @@ type LoadSessionRequest struct {
 	McpServers []map[string]any `json:"mcpServers"`
 }
 
-// LoadSessionResponse 是 load 成功响应。按 ACP 只含可选的 modes；daemon 单活动
-// 会话模型没有可报的 modes，序列化为 {}。
-type LoadSessionResponse struct{}
+// LoadSessionResponse 是 load 成功响应。按 ACP 只含可选的 modes；handler 未提供
+// modes（SessionModesProvider 未实现或返回 nil）时序列化为 {}。
+type LoadSessionResponse struct {
+	Modes *SessionModeState `json:"modes,omitempty"`
+}
+
+// ---- session/modes（只显示不切换）----
+
+// SessionMode 是一个可选模式条目（对齐 @agentclientprotocol/sdk 的 SessionMode）。
+// daemon 数据源是 cfg.LLM：id = provider 名，name = 人类可读（provider (model)）。
+type SessionMode struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// SessionModeState 是 session/new 与 session/load 响应携带的 modes 状态。
+// daemon 只显示不切换：session/set_mode 未实现，客户端切换请求以
+// method-not-found 诚实失败。
+type SessionModeState struct {
+	CurrentModeID  string        `json:"currentModeId"`
+	AvailableModes []SessionMode `json:"availableModes"`
+}
 
 // ---- session/list ----
 
@@ -79,11 +99,14 @@ type ListSessionsRequest struct {
 }
 
 // SessionInfo 是清单里的一条会话摘要（字段名对齐 @agentclientprotocol/sdk）。
+// IsCurrent 标记当前活动会话（单活动会话模型下清单里至多一条为 true），前端据此
+// 区分可续接条目与只读归档条目。
 type SessionInfo struct {
 	SessionID string `json:"sessionId"`
 	Cwd       string `json:"cwd"`
 	Title     string `json:"title,omitempty"`
 	UpdatedAt string `json:"updatedAt,omitempty"` // RFC3339
+	IsCurrent bool   `json:"isCurrent,omitempty"`
 }
 
 type ListSessionsResponse struct {
@@ -99,7 +122,8 @@ type NewSessionRequest struct {
 }
 
 type NewSessionResponse struct {
-	SessionID string `json:"sessionId"`
+	SessionID string            `json:"sessionId"`
+	Modes     *SessionModeState `json:"modes,omitempty"`
 }
 
 // ---- session/prompt ----

@@ -42,18 +42,27 @@ type SessionServerAware interface {
 // SessionLoader 是 handler 的可选扩展：实现后 Server 在 initialize 能力协商中
 // 上报 loadSession=true，session/load 请求转发给 handler；未实现者保持
 // LoadSession:false（协议诚实：客户端只应对声明了能力的 agent 发 load）。
-// rep 供 handler 在返回响应前向提交方推送 session/update 通知（历史重放、命令
-// 清单等）——同一连接顺序写入保证这些通知先于 load 响应到达（对齐
-// @agentclientprotocol/sdk 语义：客户端可在 load 返回前就开始渲染重放内容）。
+// cwd 是提交方声明的工作目录（会话级上下文，取值与落地在 handler 侧）；rep 供
+// handler 在返回响应前向提交方推送 session/update 通知（历史重放、命令清单等）
+// ——同一连接顺序写入保证这些通知先于 load 响应到达（对齐 @agentclientprotocol/sdk
+// 语义：客户端可在 load 返回前就开始渲染重放内容）。
 type SessionLoader interface {
 	// LoadSession 确认会话上下文已在（daemon 单活动会话模型下即「当前会话」）。
-	LoadSession(sessionID string, rep Reporter) error
+	LoadSession(sessionID, cwd string, rep Reporter) error
 }
 
 // SessionLister 是 handler 的可选扩展：实现后 session/list 返回 handler 给出的
 // 会话清单（当前 + 归档）。请求参数 cwd/cursor 不转发——清单方一次给全、不翻页。
 type SessionLister interface {
 	ListSessions() []protocol.SessionInfo
+}
+
+// SessionModesProvider 是 handler 的可选扩展：实现后 session/new 与 session/load
+// 响应携带 modes 状态（ACP SessionModeState，客户端据此渲染模型选择器）。
+// daemon 只显示不切换：session/set_mode 未注册，客户端切换请求以
+// method-not-found 诚实失败。返回 nil 时响应省略 modes。
+type SessionModesProvider interface {
+	SessionModes() *protocol.SessionModeState
 }
 
 // Server 是 ACP Agent 角色：接受外部 ACP Client 的任务提交。
@@ -121,8 +130,8 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 	}, nil
 }
 
-// handleSessionLoad 把 load 转发给实现了 SessionLoader 的 handler。成功响应按
-// ACP 序列化为 {}（modes 可省）。
+// handleSessionLoad 把 load 转发给实现了 SessionLoader 的 handler；cwd 随请求
+// 交给 handler 落地。成功响应按 ACP 序列化为 {}（handler 未提供 modes 时）。
 func (s *Server) handleSessionLoad(_ context.Context, params json.RawMessage) (any, error) {
 	var req protocol.LoadSessionRequest
 	if err := json.Unmarshal(params, &req); err != nil {
@@ -135,10 +144,14 @@ func (s *Server) handleSessionLoad(_ context.Context, params json.RawMessage) (a
 	if !ok {
 		return nil, &protocol.RPCError{Code: -32000, Message: "dispatch: session load not supported"}
 	}
-	if err := loader.LoadSession(req.SessionID, s); err != nil {
+	if err := loader.LoadSession(req.SessionID, req.Cwd, s); err != nil {
 		return nil, err
 	}
-	return protocol.LoadSessionResponse{}, nil
+	resp := protocol.LoadSessionResponse{}
+	if provider, ok := s.handler.(SessionModesProvider); ok {
+		resp.Modes = provider.SessionModes()
+	}
+	return resp, nil
 }
 
 // handleSessionList 把清单请求转发给实现了 SessionLister 的 handler；
@@ -167,7 +180,11 @@ func (s *Server) handleSessionNew(_ context.Context, params json.RawMessage) (an
 	} else if aware, ok := s.handler.(SessionAware); ok {
 		aware.SetSession(sessionID, req.Cwd)
 	}
-	return protocol.NewSessionResponse{SessionID: sessionID}, nil
+	resp := protocol.NewSessionResponse{SessionID: sessionID}
+	if provider, ok := s.handler.(SessionModesProvider); ok {
+		resp.Modes = provider.SessionModes()
+	}
+	return resp, nil
 }
 
 func (s *Server) handlePrompt(ctx context.Context, params json.RawMessage) (any, error) {

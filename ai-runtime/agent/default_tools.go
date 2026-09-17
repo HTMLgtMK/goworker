@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -13,8 +14,20 @@ import (
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
+// resolveToolPath 把相对路径锚定到工具执行目录（与 bash 的 cmd.Dir 同源：
+// cfg.AllowedWorkDir，会话级 cwd 注入后即会话工作目录）。绝对路径原样返回；
+// cfg 为 nil 或目录为空时保持原样（进程 cwd 语义），与旧行为兼容。
+func resolveToolPath(cfg *sandbox.Config, path string) string {
+	if cfg == nil || cfg.AllowedWorkDir == "" || filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(cfg.AllowedWorkDir, path)
+}
+
 // DefaultTools 返回 Agent 的默认工具集。
-// cfg 为沙箱配置，nil 表示不启用沙箱。
+// cfg 为沙箱配置，nil 表示不启用沙箱。cfg.AllowedWorkDir 是工具执行目录基准
+// （bash 的 cmd.Dir 与 read/write 相对路径锚点）；会话级 cwd 由 Session.Run
+// 注入本配置副本实现优先。
 func DefaultTools(cfg *sandbox.Config) []core.Tool {
 	return []core.Tool{
 		{
@@ -82,6 +95,8 @@ func DefaultTools(cfg *sandbox.Config) []core.Tool {
 				if path == "" {
 					return "", fmt.Errorf("read_file: empty path")
 				}
+				// 相对路径锚定到工具执行目录（会话 cwd 优先，见 resolveToolPath）
+				path = resolveToolPath(cfg, path)
 				// os.ReadFile 是同步 syscall，不认 ctx —— goroutine + select 包装让取消
 				// 能提前返回。极端（如 NFS 永久挂起）泄漏一个 goroutine，但比整个 ReAct
 				// 循环无限挂住可接受。
@@ -151,6 +166,8 @@ func DefaultTools(cfg *sandbox.Config) []core.Tool {
 				if path == "" {
 					return "", fmt.Errorf("write_file: empty path")
 				}
+				// 相对路径锚定到工具执行目录（会话 cwd 优先，见 resolveToolPath）
+				path = resolveToolPath(cfg, path)
 				if idx := strings.LastIndex(path, "/"); idx > 0 {
 					if err := os.MkdirAll(path[:idx], 0755); err != nil {
 						return "", fmt.Errorf("write_file: mkdir: %w", err)

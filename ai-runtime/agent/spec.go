@@ -45,6 +45,7 @@ type Session struct {
 	conversation []core.Message
 	usage        *core.UsageTracker
 	audit        *sandbox.AuditLogger // 命令决策审计：配置开启 + 首次 Run 惰性打开，会话生命周期复用
+	workDir      string               // 会话工作目录（SessionDeps.CWD 的运行时可变副本，锁内读写）
 
 	deps SessionDeps
 }
@@ -54,6 +55,7 @@ type Session struct {
 type SessionDeps struct {
 	Config       *runtimeconfig.Config                                  // 运行配置（含 Sandbox 段）
 	AuditDir     string                                                 // sandbox 审计落盘目录
+	CWD          string                                                 // 会话工作目录（client 经 wire 声明、宿主校验后注入）；空 = 未声明，工具回退 cfg.AllowedWorkDir
 	Memory       *memory.Client                                         // nil = 禁用
 	CollectTools func(cfg *sandbox.Config) []core.Tool                  // 方法值捕获 p，按需收集工具
 	NewProvider  func(cfg *runtimeconfig.Config) (core.Provider, error) // 按当前 default_provider 构造协议适配器

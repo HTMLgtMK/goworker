@@ -105,7 +105,7 @@ test('fetchAcpSessionList runs initialize + session/list over one short connecti
         id: message.id,
         result: {
           sessions: [
-            { sessionId: 'current-1', cwd: '', title: 'fix the bug', updatedAt: '2026-09-16T10:00:00Z' },
+            { sessionId: 'current-1', cwd: '', title: 'fix the bug', updatedAt: '2026-09-16T10:00:00Z', isCurrent: true },
             { sessionId: 'archive-9', title: 'older chat' },
           ],
         },
@@ -121,8 +121,9 @@ test('fetchAcpSessionList runs initialize + session/list over one short connecti
     );
     assert.equal(daemon.received[0]?.params !== undefined, true); // initialize 带 params
     assert.deepEqual(sessions, [
-      // daemon 的 cwd 恒为空串（jsonl 不落 cwd），窄化时丢弃空字段。
-      { sessionId: 'current-1', title: 'fix the bug', updatedAt: '2026-09-16T10:00:00Z' },
+      // daemon 的 cwd 恒为空串（jsonl 不落 cwd），窄化时丢弃空字段；当前会话保留 isCurrent: true。
+      { sessionId: 'current-1', title: 'fix the bug', updatedAt: '2026-09-16T10:00:00Z', isCurrent: true },
+      // 归档会话按 omitempty 不带 isCurrent，窄化后同样缺省。
       { sessionId: 'archive-9', title: 'older chat' },
     ]);
 
@@ -181,6 +182,25 @@ test('fetchAcpSessionList times out when the daemon never answers', async () => 
 test('fetchAcpSessionList rejects when the daemon socket does not exist', async () => {
   const missing = join(mkdtempSync(join(tmpdir(), 'goworker-missing-')), 'nope.sock');
   await assert.rejects(fetchAcpSessionList(missing), /Failed to connect to ACP daemon socket/);
+});
+
+test('narrowSessionListEntries keeps isCurrent only when true (Go omitempty alignment)', () => {
+  assert.deepEqual(
+    narrowSessionListEntries({
+      sessions: [
+        { sessionId: 'live', isCurrent: true },
+        { sessionId: 'off', isCurrent: false },
+        { sessionId: 'str', isCurrent: 'true' },
+        { sessionId: 'absent' },
+      ],
+    }),
+    [
+      { sessionId: 'live', isCurrent: true },
+      { sessionId: 'off' },
+      { sessionId: 'str' },
+      { sessionId: 'absent' },
+    ],
+  );
 });
 
 test('narrowSessionListEntries keeps only entries with a usable sessionId', () => {

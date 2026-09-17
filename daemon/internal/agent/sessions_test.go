@@ -13,6 +13,8 @@ import (
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/session"
+	"github.com/tinguo/goworker/ai-sandbox"
+	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
 
 // sessionFixture 用真实 Store 生成 current + archive 数据：归档 archives 条
@@ -322,7 +324,7 @@ func TestAgentPlugin_CurrentSessionHistoryReplaysRoundsWithToolPairing(t *testin
 	if _, has := call1["kind"]; has {
 		t.Errorf("history[1] carries kind %v, want none (kind is semantic, folding is length-driven)", call1["kind"])
 	}
-input1, ok := call1["rawInput"].(map[string]any)
+	input1, ok := call1["rawInput"].(map[string]any)
 	if !ok || input1["path"] != "a.go" {
 		t.Errorf("history[1].rawInput = %v, want object {path: a.go}", call1["rawInput"])
 	}
@@ -497,5 +499,314 @@ func TestAgentPlugin_CurrentSessionHistoryEmpty(t *testing.T) {
 	disabled := &AgentPlugin{cfg: &runtimeconfig.Config{}}
 	if got := disabled.CurrentSessionHistory(); got == nil || len(got) != 0 {
 		t.Errorf("disabled CurrentSessionHistory = %#v, want non-nil empty", got)
+	}
+}
+
+// archiveFixture 在 current 提交一整轮（user → assistant(2 tool_calls + thinking)
+// → tool → assistant 收尾）并打 checkpoint，随后 Archive 归档，再为 current 提交
+// 一条新消息。返回插件、store、归档文件 id 与归档前视图。
+func archiveFixture(t *testing.T) (*AgentPlugin, *session.Store, string, []core.Message) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := session.Open(dir)
+	if err != nil {
+		t.Fatalf("session open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	if _, err := st.Commit([]core.Message{
+		core.Message{Role: "user", Content: "归档里的问题", MsgID: session.NewMsgID()},
+		core.Message{
+			Role: "assistant",
+			ToolCalls: []core.ToolCall{
+				{ID: "call_arch_1", Type: "function", Function: core.ToolCallFunction{Name: "read_file", Arguments: `{"path":"a.go"}`}},
+			},
+			Thinking: core.Thinking{Text: "归档里的思考"},
+			MsgID:    session.NewMsgID(),
+		},
+		core.Message{Role: "tool", Content: "归档里的工具输出", ToolCallID: "call_arch_1", MsgID: session.NewMsgID()},
+		core.Message{Role: "assistant", Content: "归档里的回答", MsgID: session.NewMsgID()},
+	}); err != nil {
+		t.Fatalf("commit archive round: %v", err)
+	}
+	if err := st.Checkpoint("archive round"); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	want := st.ActiveView()
+	if err := st.Archive(); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	// 归档后 current 提交新消息，保证清单有「当前会话」条目可断言
+	if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
+		t.Fatalf("commit current: %v", err)
+	}
+
+	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
+	return &AgentPlugin{cfg: cfg, store: st}, st, archiveIDs(t, dir)[0], want
+}
+
+// TestAgentPlugin_ArchivedSessionHistoryReplaysArchive 对真实归档文件做重放映射：
+// user/assistant/tool 各至少一条，顺序与落盘一致；解析为只读，不触碰 store 与文件。
+func TestAgentPlugin_ArchivedSessionHistoryReplaysArchive(t *testing.T) {
+	p, st, archiveID, wantView := archiveFixture(t)
+	headBefore := st.Head()
+	archiveFile := filepath.Join(p.cfg.Session.Dir, "archive", archiveID+".jsonl")
+	rawBefore, err := os.ReadFile(archiveFile)
+	if err != nil {
+		t.Fatalf("read archive file: %v", err)
+	}
+
+	got, err := p.ArchivedSessionHistory(archiveID)
+	if err != nil {
+		t.Fatalf("ArchivedSessionHistory: %v", err)
+	}
+	// 期望序列：user chunk → thought → tool_call → tool_call_update → agent chunk
+	wantKinds := []string{
+		protocol.UpdateUserMessageChunk,
+		protocol.UpdateAgentThoughtChunk,
+		protocol.UpdateToolCall,
+		protocol.UpdateToolCallUpdate,
+		protocol.UpdateAgentMessageChunk,
+	}
+	bodyKind := func(body protocol.SessionUpdateBody) string {
+		if len(body.Raw) > 0 {
+			fields := rawBodyFields(t, body)
+			return fields["sessionUpdate"].(string)
+		}
+		return body.SessionUpdate
+	}
+	if len(got) != len(wantKinds) {
+		t.Fatalf("ArchivedSessionHistory = %d bodies, want %d: %+v", len(got), len(wantKinds), got)
+	}
+	for i, kind := range wantKinds {
+		if gotKind := bodyKind(got[i]); gotKind != kind {
+			t.Errorf("history[%d].sessionUpdate = %q, want %q", i, gotKind, kind)
+		}
+	}
+	// 文本与 tool 配对保真
+	if got[0].Content == nil || got[0].Content.Text != "归档里的问题" {
+		t.Errorf("history[0] = %+v, want user chunk 归档里的问题", got[0])
+	}
+	if got[1].Content == nil || got[1].Content.Text != "归档里的思考" {
+		t.Errorf("history[1] = %+v, want thought chunk", got[1])
+	}
+	call := rawBodyFields(t, got[2])
+	if call["toolCallId"] != "call_arch_1" || call["status"] != "in_progress" {
+		t.Errorf("history[2] = %v, want tool_call call_arch_1 in_progress", call)
+	}
+	result := rawBodyFields(t, got[3])
+	if result["toolCallId"] != "call_arch_1" || result["status"] != "completed" || result["rawOutput"] != "归档里的工具输出" {
+		t.Errorf("history[3] = %v, want completed tool_call_update with rawOutput", result)
+	}
+	if got[4].Content == nil || got[4].Content.Text != "归档里的回答" {
+		t.Errorf("history[4] = %+v, want agent chunk 归档里的回答", got[4])
+	}
+
+	// 只读：store head 不变、归档文件字节不变（wantView 长度与归档前视图一致仅作夹具自检）
+	if after := st.Head(); after != headBefore {
+		t.Errorf("store head changed by archive replay: %q → %q", headBefore, after)
+	}
+	rawAfter, err := os.ReadFile(archiveFile)
+	if err != nil {
+		t.Fatalf("re-read archive file: %v", err)
+	}
+	if string(rawBefore) != string(rawAfter) {
+		t.Error("archive file changed by replay (must be read-only)")
+	}
+	if len(wantView) != 4 {
+		t.Errorf("fixture view = %d messages, want 4 (自检)", len(wantView))
+	}
+}
+
+// TestAgentPlugin_ArchivedSessionHistoryErrors 断言非法 id 与缺失归档的报错路径。
+func TestAgentPlugin_ArchivedSessionHistoryErrors(t *testing.T) {
+	p, _, archiveID, _ := archiveFixture(t)
+
+	// 不存在的归档 id → 报错（含 OpenArchiveView 的文件缺失错误）
+	if _, err := p.ArchivedSessionHistory("9999999999999999999"); err == nil {
+		t.Error("missing archive id = nil error, want error")
+	} else if !strings.Contains(err.Error(), "open archive") {
+		t.Errorf("missing archive error = %v, want open archive failure", err)
+	}
+
+	// traversal id：路径分隔符 / 「.」前缀一律拒绝（防穿越）
+	for _, bad := range []string{"../escape", "a/b", `a\b`, "..", ".", ".hidden"} {
+		if _, err := p.ArchivedSessionHistory(bad); err == nil {
+			t.Errorf("traversal id %q = nil error, want error", bad)
+		} else if strings.Contains(err.Error(), "open archive") {
+			t.Errorf("traversal id %q rejected too late (reached file open): %v", bad, err)
+		}
+	}
+
+	// 持久化目录未配置 → 明确报错
+	disabled := &AgentPlugin{cfg: &runtimeconfig.Config{}}
+	if _, err := disabled.ArchivedSessionHistory(archiveID); err == nil || !strings.Contains(err.Error(), "persistence disabled") {
+		t.Errorf("disabled persistence error = %v, want persistence disabled", err)
+	}
+}
+
+// TestAgentPlugin_ListSessionsMarksCurrentAndCwd 验证 IsCurrent 标记与当前会话
+// cwd 回显：当前条目 isCurrent=true（TS 侧据此禁用归档输入框），SetSession 声明
+// 的 cwd 规范化为绝对路径后回显；归档条目两项皆空。
+func TestAgentPlugin_ListSessionsMarksCurrentAndCwd(t *testing.T) {
+	p, st, dir := sessionFixture(t, 2)
+	head := st.Head()
+
+	got := p.ListSessions()
+	if len(got) != 3 {
+		t.Fatalf("ListSessions = %+v, want 3 entries", got)
+	}
+	if !got[0].IsCurrent || got[1].IsCurrent || got[2].IsCurrent {
+		t.Errorf("isCurrent flags = [%v %v %v], want [true false false]", got[0].IsCurrent, got[1].IsCurrent, got[2].IsCurrent)
+	}
+	if got[0].SessionID != head {
+		t.Errorf("sessions[0].sessionId = %q, want head %q", got[0].SessionID, head)
+	}
+	if got[0].Cwd != "" {
+		t.Errorf("sessions[0].cwd = %q before SetSession, want empty", got[0].Cwd)
+	}
+
+	// AllowedWorkDir 为空 = 不限制：任意 cwd 接受并回显（绝对路径）
+	p.SetSession("sess_transport", filepath.Join(dir, "workspace"))
+	got = p.ListSessions()
+	wantCwd, err := filepath.Abs(filepath.Join(dir, "workspace"))
+	if err != nil {
+		t.Fatalf("abs: %v", err)
+	}
+	if got[0].Cwd != wantCwd {
+		t.Errorf("sessions[0].cwd = %q, want declared %q", got[0].Cwd, wantCwd)
+	}
+	if got[1].Cwd != "" || got[2].Cwd != "" {
+		t.Errorf("archived cwds = [%q %q], want empty", got[1].Cwd, got[2].Cwd)
+	}
+}
+
+// TestAgentPlugin_SetSessionValidatesSandboxBoundary 验证 cwd 声明的 sandbox 边界：
+// AllowedWorkDir 非空时界内接受、界外存无效标记（handleAgent prompt 报
+// invalid session cwd），无效标记随 startSession 重建作废。
+func TestAgentPlugin_SetSessionValidatesSandboxBoundary(t *testing.T) {
+	boundary := t.TempDir()
+	inside := filepath.Join(boundary, "project")
+	if err := os.MkdirAll(inside, 0o700); err != nil {
+		t.Fatalf("mkdir inside: %v", err)
+	}
+	outside := t.TempDir()
+
+	dir := t.TempDir()
+	st, err := session.Open(dir)
+	if err != nil {
+		t.Fatalf("session open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	cfg := &runtimeconfig.Config{
+		Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir},
+		Sandbox: sandbox.SandboxConfig{AllowedWorkDir: boundary},
+	}
+	p := &AgentPlugin{cfg: cfg, store: st}
+	p.session = runtimeagent.NewSession(runtimeagent.SessionDeps{Config: cfg, Store: st})
+
+	// 界内：接受，cwd 落到插件与会话
+	p.SetSession("sess_a", inside)
+	if err := p.sessionCWDError(); err != nil {
+		t.Fatalf("inside cwd rejected: %v", err)
+	}
+	if got := p.currentSessionCwd(); got != inside {
+		t.Errorf("sessionCwd = %q, want %q", got, inside)
+	}
+
+	// 符号链接指向界内目录：EvalSymlinks 解析后放行
+	link := filepath.Join(boundary, "link-to-project")
+	if err := os.Symlink(inside, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	p.SetSession("sess_link", link)
+	if err := p.sessionCWDError(); err != nil {
+		t.Fatalf("symlinked inside cwd rejected: %v", err)
+	}
+
+	// 界外：存为无效标记，sessionCwd 清空
+	p.SetSession("sess_b", outside)
+	if err := p.sessionCWDError(); err == nil || !strings.Contains(err.Error(), "invalid session cwd") {
+		t.Fatalf("outside cwd error = %v, want invalid session cwd", err)
+	}
+	if got := p.currentSessionCwd(); got != "" {
+		t.Errorf("sessionCwd after invalid = %q, want empty", got)
+	}
+	// 无效标记下 prompt 被挡（handleAgent 首查 cwdErr）
+	perr := p.handleAgent(&plugin.Context{Args: []string{"hi"}})
+	if perr == nil || !strings.Contains(perr.Error(), "invalid session cwd") {
+		t.Errorf("handleAgent under invalid cwd = %v, want invalid session cwd", perr)
+	}
+
+	// 不存在的 cwd：EvalSymlinks 失败 → 无效
+	p.SetSession("sess_c", filepath.Join(boundary, "missing-dir"))
+	if err := p.sessionCWDError(); err == nil || !strings.Contains(err.Error(), "invalid session cwd") {
+		t.Errorf("missing cwd error = %v, want invalid session cwd", err)
+	}
+
+	// 重新声明界内 cwd：无效标记清除
+	p.SetSession("sess_d", inside)
+	if err := p.sessionCWDError(); err != nil {
+		t.Errorf("cwd error after redeclare = %v, want nil", err)
+	}
+
+	// /new（startSession 重建）：无效标记不跨会话保留，最后声明无效 → 新会话无 cwd
+	p.SetSession("sess_e", outside) // 置无效
+	p.startSession()
+	if err := p.sessionCWDError(); err != nil {
+		t.Errorf("cwdErr after startSession = %v, want nil (无效标记随旧会话作废)", err)
+	}
+	if got := p.currentSessionCwd(); got != "" {
+		t.Errorf("sessionCwd after startSession = %q, want empty", got)
+	}
+
+	// 有效声明跨会话保留：重新声明界内 cwd 后重建，新会话继续生效
+	p.SetSession("sess_f", inside)
+	p.startSession()
+	if err := p.sessionCWDError(); err != nil {
+		t.Errorf("cwdErr after redeclare+startSession = %v, want nil", err)
+	}
+	if got := p.currentSessionCwd(); got != inside {
+		t.Errorf("sessionCwd after redeclare+startSession = %q, want %q", got, inside)
+	}
+}
+
+// TestAgentPlugin_SessionModesFromConfig 验证 modes 数据源：providers 按名字排序、
+// name = "provider (model)"、currentModeId = default_provider；无 providers 返回 nil。
+func TestAgentPlugin_SessionModesFromConfig(t *testing.T) {
+	p := &AgentPlugin{cfg: &runtimeconfig.Config{
+		LLM: runtimeconfig.LLMConfig{
+			DefaultProvider: "deepseek",
+			Providers: map[string]runtimeconfig.ProviderConfig{
+				"anthropic": {Model: "claude-sonnet"},
+				"deepseek":  {Model: "deepseek-chat"},
+				"kimi":      {Model: "kimi-k2"},
+			},
+		},
+	}}
+	got := p.SessionModes()
+	if got == nil {
+		t.Fatal("SessionModes = nil, want state")
+	}
+	if got.CurrentModeID != "deepseek" {
+		t.Errorf("currentModeId = %q, want deepseek", got.CurrentModeID)
+	}
+	wantIDs := []string{"anthropic", "deepseek", "kimi"}
+	wantNames := []string{"anthropic (claude-sonnet)", "deepseek (deepseek-chat)", "kimi (kimi-k2)"}
+	if len(got.AvailableModes) != len(wantIDs) {
+		t.Fatalf("availableModes = %+v, want %d entries", got.AvailableModes, len(wantIDs))
+	}
+	for i, mode := range got.AvailableModes {
+		if mode.ID != wantIDs[i] || mode.Name != wantNames[i] || mode.Description != "" {
+			t.Errorf("availableModes[%d] = {%s %s %s}, want {%s %s }", i, mode.ID, mode.Name, mode.Description, wantIDs[i], wantNames[i])
+		}
+	}
+
+	// 无 providers：nil（响应省略 modes）
+	if empty := (&AgentPlugin{cfg: &runtimeconfig.Config{}}).SessionModes(); empty != nil {
+		t.Errorf("SessionModes without providers = %+v, want nil", empty)
 	}
 }

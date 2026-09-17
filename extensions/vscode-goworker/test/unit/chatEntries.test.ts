@@ -17,28 +17,54 @@ function secondsAgo(seconds: number): string {
   return new Date(NOW.getTime() - seconds * 1000).toISOString();
 }
 
-test('toChatEntries keeps only the pinned current session and hides archived ones', () => {
+test('toChatEntries keeps the full list and marks the daemon-flagged current session', () => {
   const entries = toChatEntries(
     [
-      { sessionId: 'current-1', title: 'fix the bug', updatedAt: secondsAgo(10) },
+      { sessionId: 'current-1', title: 'fix the bug', updatedAt: secondsAgo(10), isCurrent: true },
       { sessionId: 'archive-1', title: 'older chat', updatedAt: secondsAgo(3600) },
     ],
     'current-1',
   );
 
-  // daemon 归档重放未支持前，归档条目不展示（点了 load 必报错），只保留置顶的当前会话。
+  // daemon 现支持归档只读重放：完整清单展示；归档行 isCurrent:false（wire 上按 omitempty 缺省）。
   assert.deepEqual(entries, [
     { sessionId: 'current-1', title: 'fix the bug', updatedAt: secondsAgo(10), isCurrent: true, isLast: true },
+    { sessionId: 'archive-1', title: 'older chat', updatedAt: secondsAgo(3600), isCurrent: false, isLast: false },
+  ]);
+
+  // 「上次会话」命中归档行同样标 last。
+  const withLastArchive = toChatEntries(
+    [
+      { sessionId: 'current-1', isCurrent: true },
+      { sessionId: 'archive-1', title: 'older chat' },
+    ],
+    'archive-1',
+  );
+  assert.equal(withLastArchive[1]?.isLast, true);
+  assert.equal(withLastArchive[0]?.isLast, false);
+});
+
+test('toChatEntries falls back to the index-0 convention when isCurrent is missing', () => {
+  // 旧 wire 数据不带 isCurrent：沿用现约定（index 0 为当前会话）。
+  assert.deepEqual(toChatEntries([{ sessionId: 'current-1' }, { sessionId: 'archive-1' }]), [
+    { sessionId: 'current-1', title: undefined, updatedAt: undefined, isCurrent: true, isLast: false },
+    { sessionId: 'archive-1', title: undefined, updatedAt: undefined, isCurrent: false, isLast: false },
+  ]);
+  // 显式 isCurrent:false 即使在 index 0 也按归档行处理。
+  assert.deepEqual(toChatEntries([{ sessionId: 'archived', isCurrent: false }]), [
+    { sessionId: 'archived', title: undefined, updatedAt: undefined, isCurrent: false, isLast: false },
   ]);
 });
 
-test('toChatEntries never promotes an archived entry to current', () => {
-  // index 0 非法（缺 sessionId）时宁缺毋滥：不把后面的归档条目伪装成当前会话。
-  assert.deepEqual(toChatEntries([{ title: 'no id' }, { sessionId: 'archive-1' }]), []);
+test('toChatEntries never promotes a later entry to current when index 0 is malformed', () => {
+  // index 0 非法（缺 sessionId）时宁缺毋滥：回退判定按 wire 位置，不把归档条目补位成当前会话。
+  assert.deepEqual(toChatEntries([{ title: 'no id' }, { sessionId: 'archive-1' }]), [
+    { sessionId: 'archive-1', title: undefined, updatedAt: undefined, isCurrent: false, isLast: false },
+  ]);
 });
 
 test('toChatEntries drops malformed wire data and tolerates non-arrays', () => {
-  assert.deepEqual(toChatEntries([null, 'nope', { title: 'no id' }, { sessionId: 'keep-1' }]), []);
+  assert.deepEqual(toChatEntries([null, 'nope', { title: 'no id' }]), []);
   assert.deepEqual(toChatEntries(undefined), []);
   assert.deepEqual(toChatEntries('not an array'), []);
 });

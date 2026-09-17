@@ -1,6 +1,7 @@
-// sessions.go 提供 agent 插件的会话清单能力：扫描 Session.Dir（current.jsonl +
-// archive/*.jsonl）产出 ACP session/list 的会话摘要，供 vscode ACP 前端做会话
-// 列表与 load 判定。只读扫描：不取 store.mu、不触发 Archive、归档文件只读打开
+// sessions.go 提供 agent 插件的会话清单与元数据能力：扫描 Session.Dir（current.jsonl +
+// archive/*.jsonl）产出 ACP session/list 的会话摘要、session/new|load 响应的 modes
+// 状态与归档只读重放，供 vscode ACP 前端做会话列表、load 判定与模型显示。
+// 只读扫描：不取 store.mu、不触发 Archive、归档文件只读打开
 // ——清单绝不干扰运行中的 store（追加中的半行按坏行跳过，与 store.loadRecords 同策略）。
 package agent
 
@@ -34,7 +35,8 @@ const (
 //   - sessionId：当前会话 = store 当前 head id（与 session/load 的「当前会话」
 //     判定同源，保证列表给出的 id 可直接 load）；归档会话 = 归档文件名去
 //     .jsonl（归档时的 UnixNano 时间戳，稳定且唯一）。
-//   - cwd：空字符串（jsonl 记录不含 cwd；Session.Dir 是存储目录而非项目目录）。
+//   - cwd：当前会话填最近一次有效声明的会话 cwd（未声明为空）；归档会话为空。
+//   - isCurrent：当前会话条目置 true，前端据此区分可续接条目与只读归档条目。
 //   - title：文件内首条 user 消息内容，空白折叠为单行后截断到 titleMaxRunes。
 //   - updatedAt：文件 mtime（RFC3339）。
 func (p *AgentPlugin) ListSessions() []protocol.SessionInfo {
@@ -46,6 +48,8 @@ func (p *AgentPlugin) ListSessions() []protocol.SessionInfo {
 
 	if head := p.store.Head(); head != "" {
 		if m := describeSessionFile(filepath.Join(dir, "current.jsonl"), head); m != nil {
+			m.info.IsCurrent = true
+			m.info.Cwd = p.currentSessionCwd()
 			out = append(out, m.info)
 		}
 	}
@@ -56,6 +60,39 @@ func (p *AgentPlugin) ListSessions() []protocol.SessionInfo {
 		out = out[:maxListSessions]
 	}
 	return out
+}
+
+// SessionModes 实现 modes 探测（经 vscode ingress 委托给 dispatch.Server）：
+// 数据源 cfg.LLM，只显示不切换 —— currentModeId = default_provider，
+// availableModes = providers 按名字排序（id = provider 名，name = "名 (model)"，
+// description 留空）。无 providers 或无配置返回 nil（响应省略 modes）。
+func (p *AgentPlugin) SessionModes() *protocol.SessionModeState {
+	if p.cfg == nil || len(p.cfg.LLM.Providers) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(p.cfg.LLM.Providers))
+	for name := range p.cfg.LLM.Providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	modes := make([]protocol.SessionMode, 0, len(names))
+	for _, name := range names {
+		modes = append(modes, protocol.SessionMode{
+			ID:   name,
+			Name: fmt.Sprintf("%s (%s)", name, p.cfg.LLM.Providers[name].Model),
+		})
+	}
+	return &protocol.SessionModeState{
+		CurrentModeID:  p.cfg.LLM.DefaultProvider,
+		AvailableModes: modes,
+	}
+}
+
+// currentSessionCwd 返回最近一次有效声明的会话 cwd（锁内快照，未声明为空）。
+func (p *AgentPlugin) currentSessionCwd() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.sessionCwd
 }
 
 // CurrentSessionID 返回当前活动会话的 head id（空 = 无活动会话/持久化未启用）。
@@ -79,47 +116,79 @@ func (p *AgentPlugin) ReloadCurrentSession() error {
 
 // CurrentSessionHistory 导出当前会话的完整对话历史，映射为 ACP session/update
 // 通知序列，供 vscode 前端在 session/load 返回响应前向客户端重放。数据源
-// store.ActiveView()（store 锁内取只读快照，单活动会话模型下即当前视图）。
+// store.ActiveView()（store 锁内取只读快照，单活动会话模型下即当前视图），
+// 经 replayUpdates 管线（与归档只读查看共用）输出。
 //
-// 分段：每轮 Run 提交后 store 自动打 checkpoint（at = 该轮最后一条消息 id）。
-// 这里取全部 checkpoint 的 at 作轮次锚点，按 ActiveView 顺序切分；锚点不在当前
-// 视图内（rewind/compact 后失效）自然不命中即跳过，checkpoint 漏打的结尾消息
-// 如实并入最后一段。checkpoint 只作边界，不进重放流。
-//
-// 段内映射（wire 形状对齐 vscode-acp-ui 的 sessionUpdateMapping）：
-//   - user → user_message_chunk（全文一条）；
-//   - assistant 带 ToolCalls → 每个 tool call 一条 tool_call（toolCallId=call id，
-//     title=function 名，status=in_progress；rawInput 带调用参数供 UI 副标题）；
-//   - tool（有 ToolCallID）→ tool_call_update（同 id，status=completed，输出文本
-//     走 rawOutput——mapping 在无 content 数组时以 rawOutput 为折叠内容来源；
-//     配不到 tool_call 的孤立 tool 消息同样降级为 completed 更新，id 用消息自带
-//     ToolCallID，webview 对未知 id 会新建行）；
-//   - assistant 有正文无 tool_calls → agent_message_chunk（全文一条）；空正文且
-//     无 tool_calls 跳过；
-//   - system（compact 摘要）与其余角色跳过。
+// 分段：每轮 Run 提交后 store 自动打 checkpoint（at = 该轮最后一条消息 id），
+// 取全部 checkpoint 的 at 作轮次锚点，按 ActiveView 顺序切分；锚点不在当前视图
+// 内（rewind/compact 后失效）自然不命中即跳过，checkpoint 漏打的结尾消息如实
+// 并入最后一段。checkpoint 只作边界，不进重放流。
 //
 // 全量重放，不设轮次/条数上限。无持久化（store 为 nil）或空会话返回非 nil 空切片。
 func (p *AgentPlugin) CurrentSessionHistory() []protocol.SessionUpdateBody {
-	out := []protocol.SessionUpdateBody{}
 	if p.store == nil {
-		return out
+		return []protocol.SessionUpdateBody{}
 	}
 	view := p.store.ActiveView()
 	if len(view) == 0 {
-		return out
+		return []protocol.SessionUpdateBody{}
 	}
-	anchors := checkpointAnchors(p.store)
+	return replayUpdates(view, checkpointAnchors(p.store))
+}
+
+// ArchivedSessionHistory 只读解析归档会话并映射为 ACP 重放通知序列（方案 B
+// 「归档只读查看」的数据面）：按 archiveId 定位归档文件（Session.Dir/archive/<id>.jsonl，
+// id 校验防 traversal），OpenArchiveView 构建 ActiveView 与 checkpoint 锚点，
+// 经与 CurrentSessionHistory 相同的 segmentByCheckpoints + roundUpdates 管线输出。
+// 不持写句柄、不 rename、不触碰 current 与 store。
+func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]protocol.SessionUpdateBody, error) {
+	if p.cfg == nil || p.cfg.Session.Dir == "" {
+		return nil, fmt.Errorf("agent: session persistence disabled")
+	}
+	path, ok := archiveFilePath(p.cfg.Session.Dir, sessionID)
+	if !ok {
+		return nil, fmt.Errorf("agent: invalid archive session id %q", sessionID)
+	}
+	view, err := session.OpenArchiveView(path)
+	if err != nil {
+		return nil, fmt.Errorf("agent: open archive %q: %w", sessionID, err)
+	}
+	return replayUpdates(view.ActiveView(), anchorSet(view.Checkpoints(0))), nil
+}
+
+// archiveFilePath 按 archiveId 定位归档文件路径。id 必须是不含路径分隔符、
+// 不以「.」开头的纯文件名（归档 id = UnixNano 时间戳），其余一律拒绝防 traversal。
+func archiveFilePath(sessionDir, archiveID string) (string, bool) {
+	if archiveID == "" || strings.HasPrefix(archiveID, ".") {
+		return "", false
+	}
+	if strings.ContainsAny(archiveID, `/\`) || strings.ContainsRune(archiveID, os.PathSeparator) {
+		return "", false
+	}
+	return filepath.Join(sessionDir, "archive", archiveID+".jsonl"), true
+}
+
+// replayUpdates 是重放映射管线：活跃视图 + checkpoint 锚点 → session/update 序列。
+// 当前会话导出（CurrentSessionHistory）与归档只读查看（ArchivedSessionHistory）共用。
+// 无命中锚点时整个视图一段（checkpoint 漏打的结尾消息并入最后一段）。
+func replayUpdates(view []core.Message, anchors map[string]bool) []protocol.SessionUpdateBody {
+	out := []protocol.SessionUpdateBody{}
 	for _, round := range segmentByCheckpoints(view, anchors) {
 		out = append(out, roundUpdates(round)...)
 	}
 	return out
 }
 
-// checkpointAnchors 汇总全部 checkpoint 的 at 锚点 id 集合。Checkpoints 以
-// limit<=0 请求全部（返回按时间倒序，这里只用集合，顺序无关）。
+// checkpointAnchors 汇总 store 全部 checkpoint 的 at 锚点 id 集合。
 func checkpointAnchors(st *session.Store) map[string]bool {
-	anchors := make(map[string]bool)
-	for _, ck := range st.Checkpoints(0) {
+	return anchorSet(st.Checkpoints(0))
+}
+
+// anchorSet 把检查点列表折成 at 锚点集合。Checkpoints 以 limit<=0 请求全部
+// （返回按时间倒序，这里只用集合，顺序无关）。
+func anchorSet(cks []session.Checkpoint) map[string]bool {
+	anchors := make(map[string]bool, len(cks))
+	for _, ck := range cks {
 		if ck.At != "" {
 			anchors[ck.At] = true
 		}
@@ -147,7 +216,18 @@ func segmentByCheckpoints(view []core.Message, anchors map[string]bool) [][]core
 }
 
 // roundUpdates 把一个轮次映射为重放通知序列，严格保持消息顺序（同一 assistant
-// 的多个 tool_calls 依次发出）。
+// 的多个 tool_calls 依次发出）。段内映射（wire 形状对齐 vscode-acp-ui 的
+// sessionUpdateMapping）：
+//   - user → user_message_chunk（全文一条）；
+//   - assistant 带 ToolCalls → 每个 tool call 一条 tool_call（toolCallId=call id，
+//     title=function 名，status=in_progress；rawInput 带调用参数供 UI 副标题）；
+//   - tool（有 ToolCallID）→ tool_call_update（同 id，status=completed，输出文本
+//     走 rawOutput——mapping 在无 content 数组时以 rawOutput 为折叠内容来源；
+//     配不到 tool_call 的孤立 tool 消息同样降级为 completed 更新，id 用消息自带
+//     ToolCallID，webview 对未知 id 会新建行）；
+//   - assistant 有正文无 tool_calls → agent_message_chunk（全文一条）；空正文且
+//     无 tool_calls 跳过；
+//   - system（compact 摘要）与其余角色跳过。
 func roundUpdates(round []core.Message) []protocol.SessionUpdateBody {
 	out := make([]protocol.SessionUpdateBody, 0, len(round))
 	for _, msg := range round {
