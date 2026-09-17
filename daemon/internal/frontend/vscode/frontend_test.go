@@ -161,7 +161,8 @@ func TestFrontend_ServesPromptWithoutGivingTransportSessionToEvaluator(t *testin
 	if _, err := client.Prompt(context.Background(), secondSession, []protocol.ContentBlock{protocol.TextBlock("and this")}); err != nil {
 		t.Fatalf("Prompt second: %v", err)
 	}
-	for range 6 {
+	// 每轮：命令输出 3 条（开围栏 + 内容 + 闭围栏）+ 工具生命周期 2 条 = 5。
+	for range 10 {
 		select {
 		case <-updated:
 		case <-time.After(time.Second):
@@ -174,8 +175,21 @@ func TestFrontend_ServesPromptWithoutGivingTransportSessionToEvaluator(t *testin
 	if got, want := inputs, []string{"remember this", "and this"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Errorf("evaluator inputs = %#v, want %#v", got, want)
 	}
-	if len(updates) != 6 {
-		t.Fatalf("updates = %+v, want six message and tool lifecycle updates", updates)
+	if len(updates) != 10 {
+		t.Fatalf("updates = %+v, want ten (每轮 3 条围栏输出 + 2 条工具生命周期)", updates)
+	}
+	// 命令输出必须是围栏代码块：webview 靠它保住等宽对齐。
+	var fenced int
+	for _, update := range updates {
+		if update.Update.Content == nil {
+			continue
+		}
+		if update.Update.Content.Text == commandFence+"\n" {
+			fenced++
+		}
+	}
+	if fenced != 4 {
+		t.Errorf("围栏标记 = %d, want 4（每轮开/闭各一条）", fenced)
 	}
 	var toolUpdates []protocol.SessionUpdate
 	for _, update := range updates {

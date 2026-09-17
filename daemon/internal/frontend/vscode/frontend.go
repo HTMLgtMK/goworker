@@ -266,6 +266,63 @@ func tokenToUpdate(token core.Token) protocol.SessionUpdateBody {
 	}
 }
 
+// commandFence 是命令输出代码块的围栏。用 4 个反引号而非 3 个：命令输出会回显
+// 用户内容（/history 回显对话、/rules 回显指令文件），其中出现 ``` 完全可能，
+// 4 个反引号能让这些内容原样保留而不提前闭合代码块。
+const commandFence = "````"
+
+// commandOutput 把命令的预格式化输出包成一个 Markdown 代码块并流式发出。
+//
+// 为什么要包：命令输出是为等宽终端手工排版过的（`fmt.Sprintf("%-14s")` 那类
+// 手工补的列），而 webview 按 Markdown 渲染、比例字体，不包的话对齐全塌。代码块
+// 在两端都是等宽字体（webview 的 pre 用 --vscode-editor-font-family /
+// ui-monospace），等于把「这段别重排」显式告诉渲染器。规则与具体命令无关 ——
+// 任何经 Writer 出来的输出一视同仁。
+//
+// 为什么能流式：CommonMark 规定未闭合的围栏代码块延伸到文档末尾，所以中途每次
+// 增量渲染看到的都是一段合法的（尚未闭合的）代码块 —— 长命令的进度实时可见，
+// 收尾补上闭合围栏定稿。不必先攒完再发。
+//
+// 围栏惰性开启：命令没有任何输出时不留空块。开启前只认「有实质内容」的写入
+// （见 Write），开启后一律原样透传 —— 围栏内的空行是表格排版的一部分，不能吞。
+type commandOutput struct {
+	rep       dispatch.Reporter
+	sessionID string
+	opened    bool
+	trailing  byte // 已写出内容的最后一个字节，收尾时据此决定要不要补换行
+}
+
+// Write 实现 plugin.FrontendContext.Writer。
+//
+// 围栏开启前忽略纯空白：这条通道被 agent 路径共用（callbacksFromPlugin 的
+// Write 就是 ctx.Writer），而 session.Run 每轮结束都会无条件 cb.Write("\n")。
+// 不拦的话每次对话都会多出一个空代码块 —— /agent 和裸输入都走这条路。
+func (w *commandOutput) Write(text string) {
+	if text == "" {
+		return
+	}
+	if !w.opened {
+		if strings.TrimSpace(text) == "" {
+			return
+		}
+		w.rep.MessageChunk(w.sessionID, commandFence+"\n")
+		w.opened = true
+	}
+	w.rep.MessageChunk(w.sessionID, text)
+	w.trailing = text[len(text)-1]
+}
+
+// Close 闭合围栏；未写入过任何内容时不发，避免留下一个空代码块。
+func (w *commandOutput) Close() {
+	if !w.opened {
+		return
+	}
+	if w.trailing != '\n' {
+		w.rep.MessageChunk(w.sessionID, "\n")
+	}
+	w.rep.MessageChunk(w.sessionID, commandFence+"\n")
+}
+
 // availableCommand 是 available_commands_update 里的一条命令补全项。
 // name 不带前导 /（UI 侧补全统一展示为 /name）。
 type availableCommand struct {
@@ -472,12 +529,13 @@ func (h *ingress) Run(ctx context.Context, sessionID, prompt string, rep dispatc
 	if !promptable {
 		return "", fmt.Errorf("vscode frontend: unknown transport session %q", sessionID)
 	}
+	output := &commandOutput{rep: rep, sessionID: sessionID}
 	commandContext := &plugin.Context{
 		Ctx: ctx,
 		FrontendContext: plugin.FrontendContext{
-			Writer: func(text string) {
-				rep.MessageChunk(sessionID, text)
-			},
+			// 命令输出统一包成代码块（见 commandOutput）：命令侧仍按等宽终端排版，
+			// 由这里告诉渲染器「这段别重排」。
+			Writer: output.Write,
 			EmitToken: func(token core.Token) {
 				rep.Update(sessionID, tokenToUpdate(token))
 			},
@@ -488,8 +546,12 @@ func (h *ingress) Run(ctx context.Context, sessionID, prompt string, rep dispatc
 		},
 		Values: make(map[string]any),
 	}
-	if err := h.evaluate(commandContext, prompt); err != nil {
-		return "", err
+	// evaluate 内部的报错也经 Writer 写出（命令自己格式化 ✘ 前缀），因此先闭合
+	// 代码块再返回错误，否则已经流出去的内容会留一个未闭合的围栏。
+	evalErr := h.evaluate(commandContext, prompt)
+	output.Close()
+	if evalErr != nil {
+		return "", evalErr
 	}
 	return protocol.StopEndTurn, nil
 }
