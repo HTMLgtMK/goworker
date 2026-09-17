@@ -14,10 +14,13 @@
     "onView:goworker.tasks",
     "onView:goworker.workers",
     "onView:goworker.runtime",
+    "onView:goworker.chats",
     "onChatParticipant:goworker.chat",
     "onCommand:goworker.refreshTasks",
     "onCommand:goworker.openTask",
-    "onCommand:goworker.openAgentChat"
+    "onCommand:goworker.openAgentChat",
+    "onCommand:goworker.refreshChats",
+    "onCommand:goworker.openChatSession"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -32,6 +35,10 @@
     },
     "views": {
       "goworker": [
+        {
+          "id": "goworker.chats",
+          "name": "Chats"
+        },
         {
           "id": "goworker.tasks",
           "name": "Tasks"
@@ -68,6 +75,15 @@
         "title": "GOWORKER: Open Agent Chat"
       },
       {
+        "command": "goworker.refreshChats",
+        "title": "GOWORKER: Refresh Chats",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "goworker.openChatSession",
+        "title": "GOWORKER: Open Chat Session"
+      },
+      {
         "command": "goworker.reconnect",
         "title": "GOWORKER: Reconnect"
       }
@@ -84,6 +100,11 @@
           "type": "string",
           "default": "",
           "description": "Override the GOWORKER agent chat Unix socket path. TCP is not supported. Leave empty to derive ~/.config/goworker/frontend/vscode.sock."
+        },
+        "goworker.autoOpenChat": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the GOWORKER Agent Chat panel automatically when a workspace opens."
         }
       }
     },
@@ -98,6 +119,17 @@
           "command": "goworker.reconnect",
           "when": "view == goworker.runtime",
           "group": "navigation"
+        },
+        {
+          "command": "goworker.refreshChats",
+          "when": "view == goworker.chats",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "goworker.openChatSession",
+          "when": "false"
         }
       ]
     }

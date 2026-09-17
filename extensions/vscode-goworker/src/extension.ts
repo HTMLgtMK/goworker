@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import { openAgentChatPanel } from './acpUi/chatPanel';
 import { createAcpSessionHostRuntime, createGoworkerAgentSpawnConfig } from './acpUi/hostRuntime';
+import { fetchAcpSessionList } from './acpUi/sessionListClient';
+import { readLastSessionId, writeLastSessionId } from './acpUi/sessionRecord';
 import { AcpChatSessionRegistry } from './acpUi/sessionRegistry';
 import { ACPConnection } from './acp/connection';
 import { AgentClient } from './acp/agentClient';
@@ -12,6 +14,8 @@ import {
   isToolCallUpdate,
   type ACPUpdate,
 } from './contracts/messages';
+import { toChatEntryClick, type AcpSessionInfoUpdate } from './views/chatEntries';
+import { ChatsTreeProvider } from './views/chatsTree';
 import { TaskTreeProvider } from './views/taskTree';
 import { StaticTreeProvider } from './views/staticTree';
 import { TaskPanel } from './views/taskPanel';
@@ -24,6 +28,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const client = new DispatcherClient(new ACPConnection(dispatcherSocketPath()), cwd);
   const agent = new AgentClient(new ACPConnection(agentSocketPath()), cwd);
   const chatRegistry = new AcpChatSessionRegistry();
+  const chats = new ChatsTreeProvider(listAgentSessions, () => readLastSessionId(context.workspaceState));
 
   // 原生 Chat participant（follower mode）：只经 ChatResponseStream 输出，
   // 不触碰 webview/DOM/文件系统，也不提供命令执行能力。
@@ -35,10 +40,17 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.registerTreeDataProvider('goworker.tasks', tasks),
     vscode.window.registerTreeDataProvider('goworker.workers', workers),
     vscode.window.registerTreeDataProvider('goworker.runtime', runtime),
+    vscode.window.registerTreeDataProvider('goworker.chats', chats),
     vscode.commands.registerCommand('goworker.refreshTasks', () => refresh()),
     vscode.commands.registerCommand('goworker.reconnect', () => reconnect()),
     vscode.commands.registerCommand('goworker.openTask', (taskId: string) => TaskPanel.open(context, client, taskId)),
-    vscode.commands.registerCommand('goworker.openAgentChat', () => openAgentChat(context, chatRegistry)),
+    vscode.commands.registerCommand('goworker.refreshChats', () => void chats.refresh()),
+    vscode.commands.registerCommand('goworker.openAgentChat', (options?: { runtimeSessionId?: string }) =>
+      openChat({ runtimeSessionId: options?.runtimeSessionId }),
+    ),
+    vscode.commands.registerCommand('goworker.openChatSession', (raw: unknown) =>
+      void openChatSession(raw),
+    ),
     { dispose: () => client.disconnect() },
     participant,
     { dispose: () => agent.disconnect() },
@@ -46,6 +58,44 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   void reconnect();
+  void chats.refresh();
+
+  // 打开聊天面板的统一入口（命令/树点击/启动自动打开共用）：会话记录与
+  // session_info_update 的接线在这里闭包，openAgentChat 保持纯参数。
+  function openChat(options: { runtimeSessionId?: string } = {}): void {
+    openAgentChat(context, chatRegistry, {
+      runtimeSessionId: options.runtimeSessionId,
+      onSessionInfoUpdate: (update) => chats.noteSessionInfoUpdate(update),
+    });
+  }
+
+  // Chats 树点击：当前会话直接 load 重放；归档会话先确认（daemon 暂不支持归档重放，
+  // load 必失败回落新会话），避免误点静默丢上下文。
+  async function openChatSession(raw: unknown): Promise<void> {
+    const click = toChatEntryClick(raw);
+    if (click === undefined) return;
+    if (!click.isCurrent) {
+      const choice = await vscode.window.showQuickPick(
+        [
+          { label: 'Open as new chat', description: 'Archived chats cannot be replayed yet' },
+          { label: 'Cancel' },
+        ],
+        {
+          placeHolder: 'This chat is archived; GOWORKER can only resume the current session.',
+        },
+      );
+      if (choice?.label !== 'Open as new chat') return;
+    }
+    openChat({ runtimeSessionId: click.sessionId });
+  }
+
+  // 启动默认打开 Agent Chat：异步触发不阻塞激活；无 workspace folder 的窗口不开。
+  const autoOpen = vscode.workspace.getConfiguration('goworker').get<boolean>('autoOpenChat', true);
+  if (autoOpen && vscode.workspace.workspaceFolders?.length) {
+    setTimeout(() => {
+      openChat({ runtimeSessionId: readLastSessionId(context.workspaceState) });
+    }, 0);
+  }
 
   async function reconnect(): Promise<void> {
     client.disconnect();
@@ -158,7 +208,15 @@ function dispatcherSocketPath(): string {
 
 // ACP 聊天面板：复用 agentSocketPath() 解析 daemon socket（goworker.agentSocketPath 配置，
 // fallback ~/.config/goworker/frontend/vscode.sock），transport 注入由 hostRuntime 完成。
-function openAgentChat(context: vscode.ExtensionContext, registry: AcpChatSessionRegistry): void {
+// runtimeSessionId 有值时首连走 session/load（重连重放），失败由 bridge 回落 session/new。
+function openAgentChat(
+  context: vscode.ExtensionContext,
+  registry: AcpChatSessionRegistry,
+  options: {
+    runtimeSessionId?: string;
+    onSessionInfoUpdate?: (update: AcpSessionInfoUpdate) => void;
+  } = {},
+): void {
   let socketPath: string;
   try {
     socketPath = agentSocketPath();
@@ -173,7 +231,18 @@ function openAgentChat(context: vscode.ExtensionContext, registry: AcpChatSessio
     host: createAcpSessionHostRuntime({
       getWorkspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
     }),
+    runtimeSessionId: options.runtimeSessionId,
+    // 会话记录：connect 成功（load 不变 / 回落新 id）与面板关闭时回写 workspaceState。
+    onSessionIdResolved: (sessionId) => writeLastSessionId(context.workspaceState, sessionId),
+    // daemon session_info_update → Chats 树清单缓存就地更新（接线在 openChat 闭包）。
+    onSessionInfoUpdate: options.onSessionInfoUpdate,
   });
+}
+
+// Chats 树数据源：每次刷新一条轻量 daemon 连接（initialize + session/list 后即断）。
+// socket 配置非法时抛错，由树侧转为错误态。
+function listAgentSessions(): Promise<unknown> {
+  return fetchAcpSessionList(agentSocketPath());
 }
 
 function agentSocketPath(): string {

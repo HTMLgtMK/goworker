@@ -10,6 +10,7 @@ import * as vscode from 'vscode';
 import { wireAcpChatMessagePlumbing, type AcpChatInitPayload } from './messagePlumbing';
 import * as path from 'node:path';
 import type { AcpChatSessionRegistry } from './sessionRegistry';
+import type { AcpSessionInfoUpdate } from '../views/chatEntries';
 
 // ACP 聊天面板薄壳：webview 托管 + HTML 组装 + 会话注册；bridge 逻辑全在 SDK。
 export function openAgentChatPanel(options: {
@@ -17,6 +18,12 @@ export function openAgentChatPanel(options: {
   registry: AcpChatSessionRegistry;
   agentConfig: AcpAgentSpawnConfig;
   host: AcpSessionHostRuntime;
+  /** 传入时首连走 session/load（重连重放）；失败由 bridge 自动回落 session/new。 */
+  runtimeSessionId?: string;
+  /** 实际 sessionId（load 不变 / 回落新 id）回写点：记录「上次会话」。 */
+  onSessionIdResolved?: (sessionId: string) => void;
+  /** daemon session_info_update → sidebar 清单缓存。 */
+  onSessionInfoUpdate?: (update: AcpSessionInfoUpdate) => void;
 }): vscode.WebviewPanel {
   const { context, registry, agentConfig, host } = options;
   const webviewDir = join(context.extensionPath, 'node_modules', '@htmlgtmk', 'acp-ui', 'webview');
@@ -45,6 +52,9 @@ export function openAgentChatPanel(options: {
     postToWebview: (message) => {
       void panel.webview.postMessage(message);
     },
+    connectOptions: options.runtimeSessionId ? { runtimeSessionId: options.runtimeSessionId } : undefined,
+    onSessionIdResolved: options.onSessionIdResolved,
+    onSessionInfoUpdate: options.onSessionInfoUpdate,
   });
 
   wireAcpChatMessagePlumbing({ panel, session, initPayload: buildInitPayload(context, agentConfig) });
