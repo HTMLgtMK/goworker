@@ -51,6 +51,10 @@ omc/
 .codegraph
 .zcode/
 
+# Python（.github/scripts 下的 CI 脚本）
+__pycache__/
+*.pyc
+
 # Claude local config (keep CLAUDE.md in repo, skip the rest)
 .claude/settings.local.json
 .claude/skills/

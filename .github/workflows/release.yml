@@ -1,0 +1,183 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+# 发布不能并发。cancel-in-progress 会让打到一半的 tag 变成孤儿，
+# 所以这里明确设 false——排队等着，别取消。
+concurrency:
+  group: release-master
+  cancel-in-progress: false
+
+jobs:
+  # ---- 第一段：自动打 tag ----
+  # 合并进 master 就 bump 一个 patch 版本并推 tag。真发布在下一段等你批。
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      skipped: ${{ steps.bump.outputs.skipped }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 必须全量：要读历史 tag 才能算下一个版本号
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: 计算并推送下一个 tag
+        id: bump
+        run: |
+          set -euo pipefail
+
+          # 只认严格的 vX.Y.Z。注意 git 的 glob 拦不住预发布 tag——
+          # `v1.2.4-rc1` 同样匹配 `[0-9]*`，所以这里再 grep 一道，
+          # 把带后缀的彻底排除在版本比较之外。
+          latest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+
+          # 版本号计算抽到脚本里，好让它能被测。tag 推错了很难收回。
+          next=$(.github/scripts/next-version.sh "$latest")
+
+          echo "上一个 tag: ${latest:-（无）}  →  本次: $next"
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+
+          # 当前 commit 已经有 tag 就别重复打（比如 revert 后又 merge 回来）
+          if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
+            echo "::warning::tag $next 已存在，跳过"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$next" -m "Release $next"
+          git push origin "$next"
+
+  # ---- 第二段：人工审批闸门 ----
+  # 单独抽成一个 job 而不是把 environment 挂在下面的矩阵上：
+  # 矩阵展开成 4 个实例，environment 会逐个触发审批，弹四次。
+  # 闸门只审批一次，批准后 4 个平台并行构建。
+  approve:
+    needs: tag
+    if: needs.tag.outputs.skipped != 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      # GitHub 对不存在的 environment 会静默自动创建一个空的（无保护规则），
+      # 审批闸门就凭空消失、发布链路变全自动。靠人记住 README 不靠谱，
+      # 这里主动校验 required reviewers 真的配置过。
+      # 注意：environment 存在且配置正确时，本步骤在审批通过后才执行——
+      # 没卡审批 = 环境配置有问题 = 恰好该失败的场景。
+      - name: 校验 release 环境保护规则
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          resp=$(gh api "/repos/${{ github.repository }}/environments/release") || {
+            echo "::error::release environment 不存在。到 Settings → Environments 创建它并配置 Required reviewers，否则审批闸门形同虚设。"
+            exit 1
+          }
+          reviewers=$(echo "$resp" | jq '[.protection_rules[]? | select(.type == "required_reviewers")] | length')
+          if [ "$reviewers" -eq 0 ]; then
+            echo "::error::release environment 没有配置 Required reviewers。Settings → Environments → release → Required reviewers。"
+            exit 1
+          fi
+          echo "审批保护规则已确认，发布 ${{ needs.tag.outputs.version }}"
+
+  # ---- 第三段：构建并发布 ----
+  release:
+    needs: [tag, approve]
+    if: needs.tag.outputs.skipped != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,  goarch: amd64 }
+          - { goos: linux,  goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+          cache-dependency-path: |
+            ai-core/go.sum
+            ai-memory/go.sum
+            ai-runtime/go.sum
+            ai-sandbox/go.sum
+            daemon/go.sum
+
+      - name: 构建
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # 多模块仓库：checkout 必须整仓，go.work 才能解析 ai-* 的本地路径。
+          # 单独 checkout daemon 子目录会直接炸。
+          out="goworker-${VERSION}-${GOOS}-${GOARCH}"
+          mkdir -p dist
+
+          cd daemon
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X github.com/tinguo/goworker/daemon/internal/version.version=${VERSION}" \
+            -o "../dist/${out}" \
+            ./cmd/goworker
+
+          cd ..
+          chmod +x "dist/${out}"
+
+          # 产物格式校验对所有平台都做——file 只读文件头，不执行。
+          file "dist/${out}"
+
+          # 但真正跑起来只有和 runner 同平台的才行。
+          # darwin 产物在 ubuntu 上执行会 exec format error，
+          # 拿它当冒烟测试等于给 CI 埋雷。
+          if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "amd64" ]; then
+            ./"dist/${out}" -version
+          else
+            echo "跳过执行（${GOOS}/${GOARCH} 与 runner 不同平台）"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: goworker-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [tag, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验和
+        run: |
+          cd dist
+          sha256sum goworker-* > checksums.txt
+          cat checksums.txt
+
+      - name: 发布 release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          gh release create "$VERSION" dist/* \
+            --title "$VERSION" \
+            --generate-notes \
+            --verify-tag
