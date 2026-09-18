@@ -183,7 +183,7 @@ go build -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version
 |----------|---------|------|
 | `ci.yml` | push / PR to `master` | gofmt, `go vet`, `go test -race`, build — module list read live from `go.work` |
 | `release.yml` | push to `master` | auto-bump patch tag → **manual approval gate** → build linux/darwin × amd64/arm64 → publish release + checksums |
-| `pr-review.yml` | PR opened / updated | fetch diff → LLM review → one review comment (overall verdict up top) with inline comments on the changed lines; findings that can't be anchored collapse into the review body |
+| `pr-review.yml` | PR opened / updated | fetch diff → LLM review → one review comment with a 修改点 / 是否准入 breakdown plus inline comments on the changed lines; findings that can't be anchored collapse at the bottom |
 
 Release needs a `release` environment with required reviewers configured (the
 approval gate), plus a `LLM_API_KEY` secret for PR review. `LLM_BASE_URL` and

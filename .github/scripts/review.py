@@ -27,6 +27,14 @@ import urllib.request
 # 降级路径的 upsert_comment 也靠它做重入。改这行会让旧评论变孤儿。
 MARKER = "<!-- goworker-llm-review -->"
 
+# 准入结论徽章。verdict 非法值回落到 approve_with_comments——
+# 宁可保守附意见，也不要把没校验的输出渲染成 ✅。
+VERDICT_BADGE = {
+    "approve": "✅ **准入**",
+    "approve_with_comments": "⚠️ **准入（附意见）**",
+    "request_changes": "⛔ **暂缓准入**",
+}
+
 # diff 字符上限。约合 15k token，再大就得考虑分片评审了。
 MAX_DIFF_CHARS = 60_000
 
@@ -46,19 +54,25 @@ SYSTEM_PROMPT = """你是一位资深 Go 工程师，正在给同事的 pull req
 只输出一个 JSON 对象，不要输出任何其它文字：
 
 {
-  "summary": "评审总评",
+  "changes": ["修改点概括，每条一项"],
+  "verdict": "approve_with_comments",
+  "verdict_reason": "准入结论的一句话理由",
   "findings": [
     {"path": "daemon/internal/core/commands.go", "line": 42,
      "severity": "HIGH", "body": "行级评审意见"}
   ]
 }
 
-summary（总评，作为评审意见置顶展示）：
-- 像资深同事的开场评审：代码整体质量、设计取舍、有没有阻塞性问题，2~5 句
-- 直接给判断和理由。不写客套话，不复述"这个 PR 做了什么"
-- 只谈整体与最重要的取舍，具体问题留给行级评论，不要在总评里重复罗列
-- 禁止自我指涉：不出现"作为 AI""本机器人""LLM 评审"之类字眼
-- 确实没什么可说，就一句明确的结论（如"未发现阻塞性问题"），不要硬凑
+changes（修改点，会以列表展示在「修改点」板块）：
+- 按主题概括这个 PR 改了什么，3~6 条，每条格式："改了什么 — 在哪个模块、为什么"
+- 面向 reviewer 抓重点，不复述 commit message，不写"更新了若干文件"式空话
+
+verdict（准入结论）与 verdict_reason（一句话理由）：
+- approve：无实质问题，可直接合入
+- approve_with_comments：可合入，但有值得跟进的点
+- request_changes：存在必须先修才能合入的阻塞问题
+- 结论要和 findings 一致：存在 CRITICAL 通常应为 request_changes
+- 理由直说依据（最重要的那条发现或最大的风险点），禁止自我指涉
 
 findings（行级评论，逐条挂到对应代码行）：
 - body 像同事留的行内评论：什么问题、为什么、建议怎么改，1~3 句
@@ -275,12 +289,16 @@ def call_llm(base_url: str, api_key: str, model: str, user_prompt: str) -> str:
     raise RuntimeError(f"LLM 请求重试 {RETRY_ATTEMPTS} 次仍失败: {last_err}")
 
 
-def parse_findings(raw: str) -> tuple[str, list[dict]]:
-    """把 LLM 的 JSON 输出解析成 (summary, findings)。
+def parse_review(raw: str) -> dict:
+    """把 LLM 的 JSON 输出解析成评审结构。
 
+    返回 {"changes", "verdict", "reason", "findings", "raw"}。
+    raw 非 None 表示 JSON 解析失败——调用方拿原文降级发布，评审内容不能丢。
     有些模型即使要求了 json_object 也爱裹 ```json 围栏，这里剥掉。
-    解析不了就当整段是 summary —— 丢一次评审好过让 job 红。
     """
+    fail = {"changes": [], "verdict": "approve_with_comments",
+            "reason": "", "findings": [], "raw": raw}
+
     text = raw.strip()
     fence = re.match(r"^```(?:json)?\s*\n(.*?)\n```$", text, re.DOTALL)
     if fence:
@@ -289,18 +307,32 @@ def parse_findings(raw: str) -> tuple[str, list[dict]]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        print("LLM 输出不是合法 JSON，降级为纯文本汇总", file=sys.stderr)
-        return raw.strip(), []
-
+        print("LLM 输出不是合法 JSON，降级为原文发布", file=sys.stderr)
+        return fail
     if not isinstance(data, dict):
-        return raw.strip(), []
+        return fail
 
-    summary = str(data.get("summary") or "").strip()
+    changes_raw = data.get("changes")
+    changes = (
+        [str(c).strip() for c in changes_raw if str(c).strip()]
+        if isinstance(changes_raw, list) else []
+    )
+
+    verdict = str(data.get("verdict") or "").strip().lower()
+    if verdict not in VERDICT_BADGE:
+        verdict = "approve_with_comments"
+
     findings = data.get("findings")
     if not isinstance(findings, list):
         findings = []
-    # 只留结构正确的条目，脏数据在后面会再过滤一次
-    return summary, [f for f in findings if isinstance(f, dict)]
+
+    return {
+        "changes": changes,
+        "verdict": verdict,
+        "reason": str(data.get("verdict_reason") or "").strip(),
+        "findings": [f for f in findings if isinstance(f, dict)],
+        "raw": None,
+    }
 
 
 # ---- GitHub API ----
@@ -405,16 +437,32 @@ def build_inline_comments(
     return inline, unanchored
 
 
-def build_review_body(summary: str, unanchored: list[dict], dropped: int) -> str:
-    """评审正文，面向 reviewer 的形态：总评置顶，定位不了的发现收进折叠区。
+def build_review_body(
+    changes: list[str],
+    verdict: str,
+    reason: str,
+    unanchored: list[dict],
+    dropped: int,
+) -> str:
+    """评审正文：修改点 → 是否准入，两个板块、列表化排版。
 
-    不加任何标题和徽章——读起来就该像一段人写的评审意见。
     MARKER 是隐藏的 HTML 注释，渲染不可见，只用于识别这条评审是谁发的。
+    定位不了的发现折叠在最后——是评审证据，但不该抢两个主板块的视线。
     """
-    parts = [MARKER, "", summary.strip() or "（评审未给出总评）", ""]
+    parts = [MARKER, "", "## 修改点", ""]
+    if changes:
+        parts += [f"- {c}" for c in changes]
+    else:
+        parts.append("_（评审未给出修改点概括）_")
+
+    parts += ["", "## 是否准入", "", VERDICT_BADGE.get(verdict, VERDICT_BADGE["approve_with_comments"])]
+    if reason:
+        parts.append(f"\n{reason}")
 
     if unanchored:
-        parts.append(f"<details>\n<summary>另有 {len(unanchored)} 条发现未能定位到 diff 中的代码行</summary>\n")
+        parts.append(
+            f"\n<details>\n<summary>另有 {len(unanchored)} 条发现未能定位到 diff 中的代码行</summary>\n"
+        )
         for f in unanchored:
             sev = str(f.get("severity") or "MEDIUM").upper()
             path = str(f.get("path") or "?").strip()
@@ -533,7 +581,21 @@ def main() -> int:
         )
 
     print(f"调用 LLM: {base_url} model={model} diff={len(diff)} 字符", file=sys.stderr)
-    summary, findings = parse_findings(call_llm(base_url, api_key, model, user_prompt))
+    parsed = parse_review(call_llm(base_url, api_key, model, user_prompt))
+
+    # 模型没守 JSON 约定——原始输出折叠后照发。评审内容比格式体面更重要。
+    if parsed["raw"] is not None:
+        upsert_comment(
+            os.environ["GITHUB_TOKEN"],
+            os.environ["PR_NUMBER"],
+            MARKER
+            + "\n<details>\n<summary>评审输出解析失败，原始内容如下</summary>\n\n"
+            + parsed["raw"].strip()
+            + "\n\n</details>\n",
+        )
+        return 0
+
+    findings = parsed["findings"]
     print(f"LLM 给出 {len(findings)} 条 finding")
 
     inline, unanchored = build_inline_comments(findings, anchors)
@@ -543,12 +605,14 @@ def main() -> int:
     dropped = max(0, len(inline) - MAX_INLINE_COMMENTS)
     inline = [c for _, c in inline[:MAX_INLINE_COMMENTS]]
 
-    # 总评、行级、折叠区全空就没有可发布的了，别发空评论
-    if not summary.strip() and not inline and not unanchored:
+    # 两个板块都没内容、也没有任何发现，就别发空评论了
+    if not parsed["changes"] and not inline and not unanchored and not parsed["reason"]:
         print("评审无内容，跳过发布")
         return 0
 
-    body = build_review_body(summary, unanchored, dropped)
+    body = build_review_body(
+        parsed["changes"], parsed["verdict"], parsed["reason"], unanchored, dropped
+    )
     print(f"行级 {len(inline)} 条 / 折叠 {len(unanchored)} 条 / 超限丢弃 {dropped} 条")
 
     post_review(
