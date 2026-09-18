@@ -54,18 +54,22 @@ SYSTEM_PROMPT = """你是一位资深 Go 工程师，正在给同事的 pull req
 只输出一个 JSON 对象，不要输出任何其它文字：
 
 {
-  "changes": ["修改点概括，每条一项"],
+  "changes": [
+    {"title": "模块或主题短语", "detail": "展开说明"}
+  ],
   "verdict": "approve_with_comments",
   "verdict_reason": "准入结论的一句话理由",
   "findings": [
     {"path": "daemon/internal/core/commands.go", "line": 42,
-     "severity": "HIGH", "body": "行级评审意见"}
+     "severity": "HIGH", "title": "一句话主题", "body": "展开说明"}
   ]
 }
 
-changes（修改点，会以列表展示在「修改点」板块）：
-- 按主题概括这个 PR 改了什么，3~6 条，每条格式："改了什么 — 在哪个模块、为什么"
-- 面向 reviewer 抓重点，不复述 commit message，不写"更新了若干文件"式空话
+changes（修改点，每个渲染成"标题 + 详情"的条目）：
+- title：模块或主题的短语（如「版本信息收敛」「评审链路」），不要完整句子
+- detail：展开——改了什么、为什么、怎么做的，1~3 句
+- 按主题归并成 3~6 条，面向 reviewer 抓重点，不复述 commit message，
+  不写"更新了若干文件"式空话
 
 verdict（准入结论）与 verdict_reason（一句话理由）：
 - approve：无实质问题，可直接合入
@@ -75,7 +79,8 @@ verdict（准入结论）与 verdict_reason（一句话理由）：
 - 理由直说依据（最重要的那条发现或最大的风险点），禁止自我指涉
 
 findings（行级评论，逐条挂到对应代码行）：
-- body 像同事留的行内评论：什么问题、为什么、建议怎么改，1~3 句
+- title：一句话点出这条发现的主题；body 展开：什么问题、为什么、
+  建议怎么改，1~3 句
 - 用建议口吻（"建议…"、"这里…，因为…"），不要机器腔（"检测到""发现异常"）
 - `path` 必须与 diff 里的文件路径完全一致，不要加 a/ 或 b/ 前缀
 - `line` 是**改动后**文件里的行号，必须是 diff 里出现过的行（新增行或上下文行）；
@@ -313,24 +318,39 @@ def parse_review(raw: str) -> dict:
         return fail
 
     changes_raw = data.get("changes")
-    changes = (
-        [str(c).strip() for c in changes_raw if str(c).strip()]
-        if isinstance(changes_raw, list) else []
-    )
+    changes: list[dict] = []
+    if isinstance(changes_raw, list):
+        for c in changes_raw:
+            if isinstance(c, dict):
+                title = str(c.get("title") or "").strip()
+                if title:
+                    changes.append({"title": title, "detail": str(c.get("detail") or "").strip()})
+            elif str(c).strip():
+                # 宽容旧契约：纯字符串条目当只有标题
+                changes.append({"title": str(c).strip(), "detail": ""})
 
     verdict = str(data.get("verdict") or "").strip().lower()
     if verdict not in VERDICT_BADGE:
         verdict = "approve_with_comments"
 
     findings = data.get("findings")
-    if not isinstance(findings, list):
-        findings = []
+    norm_findings: list[dict] = []
+    if isinstance(findings, list):
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            body = str(f.get("body") or "").strip()
+            title = str(f.get("title") or "").strip()
+            if not title and body:
+                # 模型没给主题就从 body 抠第一句，别让行级评论糊成一团
+                title = re.split(r"[。！？\n]", body)[0].strip()
+            norm_findings.append({**f, "title": title, "body": body})
 
     return {
         "changes": changes,
         "verdict": verdict,
         "reason": str(data.get("verdict_reason") or "").strip(),
-        "findings": [f for f in findings if isinstance(f, dict)],
+        "findings": norm_findings,
         "raw": None,
     }
 
@@ -422,6 +442,8 @@ def build_inline_comments(
 
         severity = str(f.get("severity") or "MEDIUM").upper()
         body = str(f.get("body") or "").strip()
+        title = str(f.get("title") or "").strip()
+        head = f"**[{severity}] {title}**" if title else f"**[{severity}]**"
         inline.append(
             (
                 severity,
@@ -429,7 +451,7 @@ def build_inline_comments(
                     "path": path,
                     "line": anchor,
                     "side": "RIGHT",  # 新文件侧，对应 parse_anchors 的行号口径
-                    "body": f"**[{severity}]** {body}",
+                    "body": f"{head}\n\n{body}",
                 },
             )
         )
@@ -438,38 +460,53 @@ def build_inline_comments(
 
 
 def build_review_body(
-    changes: list[str],
+    changes: list[dict],
     verdict: str,
     reason: str,
     unanchored: list[dict],
     dropped: int,
 ) -> str:
-    """评审正文：修改点 → 是否准入，两个板块、列表化排版。
+    """评审正文：修改点 → 是否准入，两个板块。
 
+    标题用 ### 不用 ##：GitHub 的 markdown 样式给 h2 自带下边框横线，
+    且字号过于雷霆。每点按"加粗主题 + 缩进详情"两段式渲染。
     MARKER 是隐藏的 HTML 注释，渲染不可见，只用于识别这条评审是谁发的。
-    定位不了的发现折叠在最后——是评审证据，但不该抢两个主板块的视线。
     """
-    parts = [MARKER, "", "## 修改点", ""]
+    parts = [MARKER, "", "### 修改点", ""]
+
     if changes:
-        parts += [f"- {c}" for c in changes]
+        items = []
+        for c in changes:
+            item = f"- **{c['title']}**"
+            if c.get("detail"):
+                item += f"\n\n  {c['detail']}"
+            items.append(item)
+        parts.append("\n\n".join(items))
     else:
         parts.append("_（评审未给出修改点概括）_")
 
-    parts += ["", "## 是否准入", "", VERDICT_BADGE.get(verdict, VERDICT_BADGE["approve_with_comments"])]
+    parts += ["", "### 是否准入", "", VERDICT_BADGE.get(verdict, VERDICT_BADGE["approve_with_comments"])]
     if reason:
         parts.append(f"\n{reason}")
 
     if unanchored:
-        parts.append(
-            f"\n<details>\n<summary>另有 {len(unanchored)} 条发现未能定位到 diff 中的代码行</summary>\n"
-        )
+        items = []
         for f in unanchored:
             sev = str(f.get("severity") or "MEDIUM").upper()
             path = str(f.get("path") or "?").strip()
             line = f.get("line")
             loc = f"`{path}:{line}`" if line is not None else f"`{path}`"
-            parts.append(f"- **{sev}** {loc} — {str(f.get('body') or '').strip()}")
-        parts.append("\n</details>\n")
+            title = str(f.get("title") or "").strip()
+            head = f"- **{sev} · {title}**" if title else f"- **{sev}**"
+            item = f"{head} {loc}"
+            if str(f.get("body") or "").strip():
+                item += f"\n\n  {str(f['body']).strip()}"
+            items.append(item)
+        parts.append(
+            f"\n<details>\n<summary>另有 {len(unanchored)} 条发现未能定位到 diff 中的代码行</summary>\n\n"
+            + "\n\n".join(items)
+            + "\n\n</details>\n"
+        )
 
     if dropped:
         parts.append(f"> 另有 {dropped} 条发现超出行级评论条数上限，未逐一展示。")
