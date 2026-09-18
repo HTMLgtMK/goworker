@@ -19,6 +19,7 @@ import (
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/mcp"
+	runtimeopenai "github.com/tinguo/goworker/ai-runtime/provider/openai"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/ai-sandbox"
 	"github.com/tinguo/goworker/daemon/internal/plugin"
@@ -30,9 +31,14 @@ func testHub(cfg *runtimeconfig.Config) (*plugin.Hub, *[]*runtimeconfig.Config) 
 	hub := &plugin.Hub{
 		Config: cfg,
 		SaveConfig: func(c any) error {
-			if rc, ok := c.(*runtimeconfig.Config); ok {
-				saved = append(saved, rc)
+			rc, ok := c.(*runtimeconfig.Config)
+			if !ok {
+				return errors.New("unexpected config type")
 			}
+			next := *rc
+			next.LLM = rc.LLM.Clone()
+			*cfg = next
+			saved = append(saved, rc)
 			return nil
 		},
 		Tools: func() []plugin.Tool { return nil }, // collectTools 依赖，缺了会 nil 函数 panic
@@ -40,7 +46,7 @@ func testHub(cfg *runtimeconfig.Config) (*plugin.Hub, *[]*runtimeconfig.Config) 
 	return hub, &saved
 }
 
-// newAgentPlugin 构造带完整依赖的插件：NewProvider 走真实 OpenAI 端点（cfg.LLM.Endpoint）。
+// newAgentPlugin 构造带完整依赖的插件：NewProvider 走当前默认的 OpenAI provider。
 // 需要固定 provider 的测试用 newAgentPluginP。
 func newAgentPlugin(hub *plugin.Hub) *AgentPlugin {
 	cfg, _ := hub.Config.(*runtimeconfig.Config)
@@ -51,8 +57,12 @@ func newAgentPlugin(hub *plugin.Hub) *AgentPlugin {
 		AuditDir:     "",
 		Memory:       p.memory,
 		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
-		NewProvider: func(cfg *runtimeconfig.Config) core.Provider {
-			return runtimeagent.NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
+		NewProvider: func(cfg *runtimeconfig.Config) (core.Provider, error) {
+			_, provider, err := cfg.LLM.ResolveDefault()
+			if err != nil {
+				return nil, err
+			}
+			return runtimeopenai.NewProvider("mock", provider.Endpoint, provider.APIKey, provider.Model, &http.Client{}), nil
 		},
 	}
 	p.refreshSession()
@@ -68,7 +78,9 @@ func newAgentPluginP(hub *plugin.Hub, pv core.Provider) *AgentPlugin {
 		AuditDir:     "",
 		Memory:       p.memory,
 		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
-		NewProvider:  func(*runtimeconfig.Config) core.Provider { return pv },
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			return pv, nil
+		},
 	}
 	p.refreshSession()
 	return p
@@ -120,34 +132,129 @@ func newContext(args ...string) (*plugin.Context, *strings.Builder) {
 		Args: args,
 		FrontendContext: plugin.FrontendContext{
 			Writer:     func(s string) { buf.WriteString(s) },
-			WriteToken: func(_ plugin.RenderKind, s string) { buf.WriteString(s) },
+			WriteToken: func(_ plugin.RenderKind, s string, _ bool) { buf.WriteString(s) },
 		},
 	}, &buf
 }
 
-func TestHandleModel_SetCompressionKeys(t *testing.T) {
+func TestHandleModel_SetProviderAndGlobalKeys(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	hub, saved := testHub(cfg)
 	p := newAgentPlugin(hub)
 
-	ctx, _ := newContext("set", "compress_at=0.9")
-	if err := p.handleModel(ctx); err != nil {
-		t.Fatalf("handleModel: %v", err)
+	for _, setting := range []string{
+		"global.compress_at=0.9",
+		"global.compact_keep=25",
+		"global.thinking_show=false",
+		"thinking_request_mode=reasoning_effort",
+		"thinking_effort=high",
+	} {
+		ctx, buf := newContext("set", setting)
+		if err := p.handleModel(ctx); err != nil {
+			t.Fatalf("handleModel(%s): %v", setting, err)
+		}
+		if !strings.Contains(buf.String(), "✔") {
+			t.Errorf("handleModel(%s) output = %q, want success", setting, buf.String())
+		}
 	}
-	if cfg.LLM.CompressAt != 0.9 {
-		t.Errorf("CompressAt = %v, want 0.9", cfg.LLM.CompressAt)
+	provider := cfg.LLM.Providers[cfg.LLM.DefaultProvider]
+	if cfg.LLM.CompressAt != 0.9 || cfg.LLM.CompactKeep != 25 || cfg.LLM.Thinking.Show {
+		t.Errorf("global LLM config = %+v", cfg.LLM)
+	}
+	if provider.Thinking.RequestMode != runtimeconfig.ThinkingRequestEffort {
+		t.Errorf("RequestMode = %q, want reasoning_effort", provider.Thinking.RequestMode)
+	}
+	if provider.Thinking.Effort != runtimeconfig.ThinkingEffortHigh {
+		t.Errorf("Effort = %q, want high", provider.Thinking.Effort)
+	}
+	if len(*saved) != 5 {
+		t.Errorf("SaveConfig called %d times, want 5", len(*saved))
+	}
+}
+
+func TestHandleModel_ListUseAndFailedSaveRollback(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	cfg.LLM.Providers["cc-switch"] = runtimeconfig.ProviderConfig{
+		Type:          runtimeconfig.ProviderTypeAnthropic,
+		Endpoint:      "http://127.0.0.1:15721",
+		Model:         "claude-sonnet-4-6",
+		APIKey:        "PROXY_MANAGED",
+		AuthType:      runtimeconfig.AnthropicAuthBearer,
+		MaxTokens:     8192,
+		ContextWindow: 1048576,
+	}
+	hub, _ := testHub(cfg)
+	p := newAgentPlugin(hub)
+
+	ctx, list := newContext("list")
+	if err := p.handleModel(ctx); err != nil {
+		t.Fatalf("handleModel(list): %v", err)
+	}
+	if !strings.Contains(list.String(), "* openai") || !strings.Contains(list.String(), "cc-switch") || strings.Contains(list.String(), "PROXY_MANAGED") {
+		t.Errorf("list output = %q", list.String())
 	}
 
-	ctx, _ = newContext("set", "compact_keep=25")
+	ctx, out := newContext("use", "cc-switch")
 	if err := p.handleModel(ctx); err != nil {
-		t.Fatalf("handleModel: %v", err)
+		t.Fatalf("handleModel(use): %v", err)
 	}
-	if cfg.LLM.CompactKeep != 25 {
-		t.Errorf("CompactKeep = %d, want 25", cfg.LLM.CompactKeep)
+	if cfg.LLM.DefaultProvider != "cc-switch" || !strings.Contains(out.String(), "已切换") {
+		t.Errorf("use output = %q, default = %q", out.String(), cfg.LLM.DefaultProvider)
 	}
 
-	if len(*saved) != 2 {
-		t.Errorf("SaveConfig called %d times, want 2", len(*saved))
+	originalModel := cfg.LLM.Providers["cc-switch"].Model
+	p.hub.SaveConfig = func(any) error { return errors.New("disk full") }
+	ctx, out = newContext("set", "model=changed")
+	if err := p.handleModel(ctx); err != nil {
+		t.Fatalf("handleModel(set): %v", err)
+	}
+	if cfg.LLM.Providers["cc-switch"].Model != originalModel || !strings.Contains(out.String(), "保存失败") {
+		t.Errorf("failed save mutated live config or missed error: %q", out.String())
+	}
+}
+
+func TestHandleModel_ThinkingHelpStatusAndValidation(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	hub, _ := testHub(cfg)
+	p := newAgentPlugin(hub)
+
+	ctx, help := newContext("help")
+	if err := p.handleModel(ctx); err != nil {
+		t.Fatalf("handleModel(help): %v", err)
+	}
+	for _, key := range []string{"thinking_show", "thinking_request_mode", "thinking_effort"} {
+		if !strings.Contains(help.String(), key) {
+			t.Errorf("help missing %q:\n%s", key, help.String())
+		}
+	}
+
+	ctx, status := newContext()
+	if err := p.handleModel(ctx); err != nil {
+		t.Fatalf("handleModel(status): %v", err)
+	}
+	for _, value := range []string{"Thinking Show:", "Thinking Mode:", "Thinking Effort:"} {
+		if !strings.Contains(status.String(), value) {
+			t.Errorf("status missing %q:\n%s", value, status.String())
+		}
+	}
+
+	for _, setting := range []string{
+		"global.thinking_show=sometimes",
+		"thinking_request_mode=guess",
+		"thinking_effort=extreme",
+	} {
+		beforeGlobal := cfg.LLM.Thinking
+		beforeProvider := cfg.LLM.Providers[cfg.LLM.DefaultProvider]
+		ctx, out := newContext("set", setting)
+		if err := p.handleModel(ctx); err != nil {
+			t.Fatalf("handleModel(%s): %v", setting, err)
+		}
+		if !strings.Contains(out.String(), "✘") {
+			t.Errorf("handleModel(%s) output = %q, want rejection", setting, out.String())
+		}
+		if cfg.LLM.Thinking != beforeGlobal || cfg.LLM.Providers[cfg.LLM.DefaultProvider] != beforeProvider {
+			t.Errorf("handleModel(%s) mutated config after rejection", setting)
+		}
 	}
 }
 
@@ -662,7 +769,9 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	defer srv.Close()
 
 	cfg := runtimeconfig.Default()
-	cfg.LLM.Endpoint = srv.URL
+	provider := cfg.LLM.Providers[cfg.LLM.DefaultProvider]
+	provider.Endpoint = srv.URL
+	cfg.LLM.Providers[cfg.LLM.DefaultProvider] = provider
 	cfg.Session.Enabled = false // 避免 handleNew 走真实 store 路径，污染用户会话目录
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
@@ -822,7 +931,9 @@ func TestHandleNew_LtmExtractDisabledSkipsFacts(t *testing.T) {
 	defer srv.Close()
 
 	cfg := runtimeconfig.Default()
-	cfg.LLM.Endpoint = srv.URL
+	provider := cfg.LLM.Providers[cfg.LLM.DefaultProvider]
+	provider.Endpoint = srv.URL
+	cfg.LLM.Providers[cfg.LLM.DefaultProvider] = provider
 	cfg.Memory.LtmExtract = false
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)

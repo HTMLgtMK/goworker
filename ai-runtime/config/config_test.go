@@ -1,6 +1,103 @@
 package config
 
-import "testing"
+import (
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestDefaultLLMRegistry(t *testing.T) {
+	llm := DefaultLLM()
+	name, provider, err := llm.ResolveDefault()
+	if err != nil {
+		t.Fatalf("ResolveDefault: %v", err)
+	}
+	if name != "openai" {
+		t.Errorf("default provider = %q, want openai", name)
+	}
+	if provider.Type != ProviderTypeOpenAI || provider.Endpoint != "http://localhost:8000/v1" || provider.Model != "gpt-4o" || provider.ContextWindow != 128000 {
+		t.Errorf("default provider = %#v", provider)
+	}
+	if !llm.Thinking.Show {
+		t.Error("thinking should be shown by default")
+	}
+	if provider.Thinking.RequestMode != ThinkingRequestAuto || provider.Thinking.Effort != ThinkingEffortMedium {
+		t.Errorf("provider thinking = %#v", provider.Thinking)
+	}
+}
+
+func TestLLMConfigResolveValidateAndClone(t *testing.T) {
+	llm := DefaultLLM()
+	if err := llm.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	for name, cfg := range map[string]LLMConfig{
+		"missing default": {DefaultProvider: "missing", Providers: llm.Providers, CompressAt: llm.CompressAt, CompactKeep: llm.CompactKeep, MaxIterations: llm.MaxIterations, Thinking: llm.Thinking},
+		"unknown type":    {DefaultProvider: "bad", Providers: map[string]ProviderConfig{"bad": {Type: "wat", Endpoint: "http://localhost", Model: "x", ContextWindow: 1}}, CompressAt: 0.8, CompactKeep: 1, MaxIterations: 1},
+		"invalid name":    {DefaultProvider: "bad.name", Providers: map[string]ProviderConfig{"bad.name": llm.Providers["openai"]}, CompressAt: 0.8, CompactKeep: 1, MaxIterations: 1},
+		"anthropic auth":  {DefaultProvider: "anthropic", Providers: map[string]ProviderConfig{"anthropic": {Type: ProviderTypeAnthropic, Endpoint: "http://localhost", Model: "claude", APIKey: "key", ContextWindow: 1, MaxTokens: 1}}, CompressAt: 0.8, CompactKeep: 1, MaxIterations: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("Validate should reject invalid registry")
+			}
+		})
+	}
+
+	clone := llm.Clone()
+	clone.Providers["openai"] = ProviderConfig{Model: "changed"}
+	if reflect.DeepEqual(clone.Providers, llm.Providers) {
+		t.Fatal("Clone shares provider map with original")
+	}
+}
+
+func TestLLMConfigResolveDefaultErrorsAreActionable(t *testing.T) {
+	_, _, err := (LLMConfig{}).ResolveDefault()
+	if err == nil || !strings.Contains(err.Error(), "default provider") {
+		t.Fatalf("ResolveDefault error = %v", err)
+	}
+}
+
+func TestParseThinkingShow(t *testing.T) {
+	for _, tt := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "true", want: true},
+		{value: "false", want: false},
+	} {
+		got, err := ParseThinkingShow(tt.value)
+		if err != nil || got != tt.want {
+			t.Errorf("ParseThinkingShow(%q) = %v, %v; want %v, nil", tt.value, got, err, tt.want)
+		}
+	}
+	if _, err := ParseThinkingShow("sometimes"); err == nil {
+		t.Error("unknown thinking show value should fail")
+	}
+}
+
+func TestParseThinkingRequestMode(t *testing.T) {
+	for _, value := range []string{"auto", "enable_thinking", "reasoning_effort"} {
+		if _, err := ParseThinkingRequestMode(value); err != nil {
+			t.Errorf("ParseThinkingRequestMode(%q): %v", value, err)
+		}
+	}
+	if _, err := ParseThinkingRequestMode("guess"); err == nil {
+		t.Error("unknown thinking request mode should fail")
+	}
+}
+
+func TestParseThinkingEffort(t *testing.T) {
+	for _, value := range []string{"low", "medium", "high"} {
+		if _, err := ParseThinkingEffort(value); err != nil {
+			t.Errorf("ParseThinkingEffort(%q): %v", value, err)
+		}
+	}
+	if _, err := ParseThinkingEffort("extreme"); err == nil {
+		t.Error("unknown thinking effort should fail")
+	}
+}
 
 func TestParseContextWindow(t *testing.T) {
 	cases := []struct {

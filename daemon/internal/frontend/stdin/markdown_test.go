@@ -29,6 +29,32 @@ func borderCols(s string) []int {
 	return pos
 }
 
+func TestFormatThinking(t *testing.T) {
+	SetTheme("light")
+	out := formatThinking("  **inspect**\n\nthen decide  ", 80)
+	plain := ansiStripper.ReplaceAllString(out, "")
+	if !strings.Contains(plain, "Thinking  inspect") {
+		t.Errorf("thinking marker missing: %q", plain)
+	}
+	if !strings.Contains(plain, "inspect") || !strings.Contains(plain, "then decide") {
+		t.Errorf("thinking content missing: %q", plain)
+	}
+	if !strings.Contains(out, thinkingColor) {
+		t.Errorf("thinking weak color missing: %q", out)
+	}
+	if !strings.HasSuffix(out, ansiReset) {
+		t.Errorf("thinking output must reset terminal style: %q", out)
+	}
+}
+
+func TestFormatThinking_Empty(t *testing.T) {
+	for _, content := range []string{"", "  \n\t "} {
+		if got := formatThinking(content, 80); got != "" {
+			t.Errorf("formatThinking(%q) = %q, want empty", content, got)
+		}
+	}
+}
+
 func TestRenderMarkdown_TableAligned(t *testing.T) {
 	SetTheme("light")
 	out := RenderMarkdown("| a | b | 城市 |\n|---|---|---|\n| 1 | 2 | 北京 |\n| long | x | 深 |\n", 80)

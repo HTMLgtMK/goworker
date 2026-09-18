@@ -3,21 +3,146 @@ package config
 import (
 	"fmt"
 	"math"
+	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
-// DefaultLLM 返回默认 LLM 配置（不含 APIKey）。
+// DefaultLLM 返回默认 LLM 注册表（不含 APIKey）。
 func DefaultLLM() LLMConfig {
 	return LLMConfig{
-		Endpoint:      "http://localhost:8000/v1",
-		Model:         "gpt-4o",
-		CompressAt:    0.8, // 用量达窗口 80% 自动压缩，留余量给压缩调用和新输入
-		CompactKeep:   10,  // 最近 10 条原文保留，更早的才压缩
-		MaxIterations: 15,  // ReAct 最大迭代数，模型连续调工具不至于无限烧 token
+		DefaultProvider: "openai",
+		Providers: map[string]ProviderConfig{
+			"openai": {
+				Type:          ProviderTypeOpenAI,
+				Endpoint:      "http://localhost:8000/v1",
+				Model:         "gpt-4o",
+				ContextWindow: 128000,
+				Thinking: ProviderThinkingConfig{
+					RequestMode: ThinkingRequestAuto,
+					Effort:      ThinkingEffortMedium,
+				},
+			},
+		},
+		CompressAt:    0.8,
+		CompactKeep:   10,
+		MaxIterations: 15,
+		Thinking:      ThinkingConfig{Show: true},
 	}
+}
+
+// Clone 返回不共享 Provider map 的 LLM 配置副本。
+func (c LLMConfig) Clone() LLMConfig {
+	clone := c
+	clone.Providers = make(map[string]ProviderConfig, len(c.Providers))
+	for name, provider := range c.Providers {
+		clone.Providers[name] = provider
+	}
+	return clone
+}
+
+// ResolveDefault 返回当前默认 Provider 的稳定名称和配置。
+func (c LLMConfig) ResolveDefault() (string, ProviderConfig, error) {
+	if c.DefaultProvider == "" {
+		return "", ProviderConfig{}, fmt.Errorf("default provider is not configured")
+	}
+	provider, ok := c.Providers[c.DefaultProvider]
+	if !ok {
+		return "", ProviderConfig{}, fmt.Errorf("default provider %q does not exist", c.DefaultProvider)
+	}
+	if err := validateProvider(c.DefaultProvider, provider); err != nil {
+		return "", ProviderConfig{}, err
+	}
+	return c.DefaultProvider, provider, nil
+}
+
+// Validate 确保全局策略和每个命名 Provider 在请求前可用。
+func (c LLMConfig) Validate() error {
+	if _, _, err := c.ResolveDefault(); err != nil {
+		return err
+	}
+	if c.CompressAt < 0 || c.CompressAt > 1 || math.IsNaN(c.CompressAt) {
+		return fmt.Errorf("invalid compress_at %v", c.CompressAt)
+	}
+	if c.CompactKeep <= 0 {
+		return fmt.Errorf("compact_keep must be positive")
+	}
+	if c.MaxIterations <= 0 {
+		return fmt.Errorf("max_iterations must be positive")
+	}
+	for name, provider := range c.Providers {
+		if err := validateProvider(name, provider); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateProvider(name string, provider ProviderConfig) error {
+	if !validProviderName(name) {
+		return fmt.Errorf("invalid provider name %q", name)
+	}
+	if provider.Endpoint == "" {
+		return fmt.Errorf("provider %q endpoint is required", name)
+	}
+	endpoint, err := url.ParseRequestURI(provider.Endpoint)
+	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
+		return fmt.Errorf("provider %q endpoint is invalid", name)
+	}
+	if provider.Model == "" {
+		return fmt.Errorf("provider %q model is required", name)
+	}
+	if provider.ContextWindow <= 0 {
+		return fmt.Errorf("provider %q context_window must be positive", name)
+	}
+	switch provider.Type {
+	case ProviderTypeOpenAI:
+		if provider.AuthType != "" || provider.MaxTokens != 0 {
+			return fmt.Errorf("openai provider %q has Anthropic-only fields", name)
+		}
+		if provider.Thinking.RequestMode == "" {
+			return fmt.Errorf("openai provider %q thinking request_mode is required", name)
+		}
+		if _, err := ParseThinkingRequestMode(string(provider.Thinking.RequestMode)); err != nil {
+			return fmt.Errorf("openai provider %q: %w", name, err)
+		}
+		if _, err := ParseThinkingEffort(string(provider.Thinking.Effort)); err != nil {
+			return fmt.Errorf("openai provider %q: %w", name, err)
+		}
+	case ProviderTypeAnthropic:
+		if provider.APIKey == "" {
+			return fmt.Errorf("anthropic provider %q api_key is required", name)
+		}
+		if provider.MaxTokens <= 0 {
+			return fmt.Errorf("anthropic provider %q max_tokens must be positive", name)
+		}
+		switch provider.AuthType {
+		case AnthropicAuthBearer, AnthropicAuthAPIKey:
+		default:
+			return fmt.Errorf("anthropic provider %q auth_type is invalid", name)
+		}
+		if provider.Thinking.RequestMode != "" || provider.Thinking.Effort != "" {
+			return fmt.Errorf("anthropic provider %q has OpenAI-only thinking fields", name)
+		}
+	default:
+		return fmt.Errorf("provider %q has unsupported type %q", name, provider.Type)
+	}
+	return nil
+}
+
+func validProviderName(name string) bool {
+	if name == "" || strings.Contains(name, ".") {
+		return false
+	}
+	for _, r := range name {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 // DefaultMemory 返回默认记忆配置。Dir 留空，由宿主按配置目录派生。
@@ -43,6 +168,34 @@ func Default() *Config {
 			Mode: "normal",
 		},
 		Session: SessionConfig{Enabled: true},
+	}
+}
+
+func ParseThinkingShow(value string) (bool, error) {
+	show, err := strconv.ParseBool(strings.TrimSpace(value))
+	if err != nil {
+		return false, fmt.Errorf("无效 thinking show: %s（应为 true/false）", value)
+	}
+	return show, nil
+}
+
+func ParseThinkingRequestMode(value string) (ThinkingRequestMode, error) {
+	mode := ThinkingRequestMode(strings.TrimSpace(value))
+	switch mode {
+	case ThinkingRequestAuto, ThinkingRequestEnable, ThinkingRequestEffort:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("无效 thinking request_mode: %s（可用: auto/enable_thinking/reasoning_effort）", value)
+	}
+}
+
+func ParseThinkingEffort(value string) (ThinkingEffort, error) {
+	effort := ThinkingEffort(strings.TrimSpace(value))
+	switch effort {
+	case ThinkingEffortLow, ThinkingEffortMedium, ThinkingEffortHigh:
+		return effort, nil
+	default:
+		return "", fmt.Errorf("无效 thinking effort: %s（可用: low/medium/high）", value)
 	}
 }
 

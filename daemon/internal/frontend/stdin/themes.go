@@ -17,7 +17,9 @@ var (
 				//（包括标题内容），放 Document 才能在标题里用 Heading 自己的颜色。
 				Color: strPtr("#141413"),
 			},
-			Margin: uintPtr(2),
+			// Margin 0：排版缩进统一由前端的锚点列负责，glamour 只做内容渲染。
+			// 主题自带 margin 会在锚点列之上叠加第二层缩进（内容看起来悬浮/居中）。
+			Margin: uintPtr(0),
 		},
 		// Text 必须留空，否则标题内容会被强制染成正文色，Heading.Color 形同虚设。
 		Text: ansi.StylePrimitive{},

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/logger"
@@ -123,7 +124,7 @@ func fromSandbox(s sandbox.SandboxConfig) SandboxConfig {
 // ToRuntime 复制出 ai-runtime 的聚合配置，供插件消费。
 func (c *Config) ToRuntime() *runtimeconfig.Config {
 	return &runtimeconfig.Config{
-		LLM:     c.LLM,
+		LLM:     c.LLM.Clone(),
 		Memory:  c.Memory,
 		Sandbox: c.Sandbox.ToSandbox(),
 		Session: c.Session,
@@ -133,7 +134,7 @@ func (c *Config) ToRuntime() *runtimeconfig.Config {
 
 // ApplyRuntime 把插件持有的 ai-runtime 配置回写到解析层（SaveConfig 双向同步）。
 func (c *Config) ApplyRuntime(r *runtimeconfig.Config) {
-	c.LLM = r.LLM
+	c.LLM = r.LLM.Clone()
 	c.Memory = r.Memory
 	c.Session = r.Session
 	c.MCP = r.MCP
@@ -196,50 +197,27 @@ func DefaultPath() string {
 
 // Display 返回 YAML 格式的配置文本（API Key 自动脱敏）。
 func (c *Config) Display() string {
-	cfg := *c // 浅拷贝，不修改原对象
-	if cfg.LLM.APIKey != "" {
-		cfg.LLM.APIKey = "***"
+	cfg := *c
+	cfg.LLM = c.LLM.Clone()
+	for name, provider := range cfg.LLM.Providers {
+		if provider.APIKey != "" {
+			provider.APIKey = "***"
+			cfg.LLM.Providers[name] = provider
+		}
 	}
-	// 忽略序列化错误，Marshal 基本不会失败
 	data, _ := yaml.Marshal(cfg)
 	return string(data)
 }
 
 // SetField 按点分 key 设置配置项（如 "llm.endpoint"、"sandbox.mode"）。
 func (c *Config) SetField(key, value string) error {
+	if strings.HasPrefix(key, "llm.") {
+		return c.setLLMField(strings.TrimPrefix(key, "llm."), value)
+	}
+
 	switch key {
 	case "frontend.stdin.theme":
 		c.Frontend.Stdin.Theme = value
-	case "llm.endpoint":
-		c.LLM.Endpoint = value
-	case "llm.model":
-		c.LLM.Model = value
-	case "llm.api_key":
-		c.LLM.APIKey = value
-	case "llm.context_window":
-		n, err := runtimeconfig.ParseContextWindow(value)
-		if err != nil {
-			return err
-		}
-		c.LLM.ContextWindow = n
-	case "llm.compress_at":
-		f, err := runtimeconfig.ParseCompressAt(value)
-		if err != nil {
-			return err
-		}
-		c.LLM.CompressAt = f
-	case "llm.compact_keep":
-		n, err := runtimeconfig.ParseCompactKeep(value)
-		if err != nil {
-			return err
-		}
-		c.LLM.CompactKeep = n
-	case "llm.max_iterations":
-		n, err := runtimeconfig.ParseMaxIterations(value)
-		if err != nil {
-			return err
-		}
-		c.LLM.MaxIterations = n
 	case "sandbox.mode":
 		c.Sandbox.Mode = value
 	case "sandbox.allowed_work_dir":
@@ -310,25 +288,215 @@ func (c *Config) SetField(key, value string) error {
 		}
 		c.Session.Enabled = b
 	default:
-		valid := "frontend.stdin.theme, llm.endpoint, llm.model, llm.api_key, llm.context_window, llm.compress_at, llm.compact_keep, llm.max_iterations, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days, memory.dir, memory.enabled, memory.task_keep, memory.task_inject_n, memory.ltm_inject_top_k, memory.ltm_extract, session.dir, session.enabled, memory.inject_budget_ratio"
+		valid := "frontend.stdin.theme, llm.default_provider, llm.providers.<name>.{type,endpoint,model,api_key,context_window,max_tokens,auth_type,thinking.request_mode,thinking.effort}, llm.compress_at, llm.compact_keep, llm.max_iterations, llm.thinking.show, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days, memory.dir, memory.enabled, memory.task_keep, memory.task_inject_n, memory.ltm_inject_top_k, memory.ltm_extract, session.dir, session.enabled, memory.inject_budget_ratio"
 		return fmt.Errorf("未知配置项: %s（可用: %s）", key, valid)
 	}
 	return nil
 }
 
-// Load 读取 YAML 配置文件，返回合并默认值后的 Config。
-// 文件不存在或解析失败时返回默认配置（不报错）。
-func Load(path string) *Config {
-	cfg := Default()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return cfg
+func (c *Config) setLLMField(key, value string) error {
+	if key == "default_provider" {
+		candidate := c.LLM.Clone()
+		candidate.DefaultProvider = value
+		if _, _, err := candidate.ResolveDefault(); err != nil {
+			return err
+		}
+		c.LLM = candidate
+		return nil
 	}
+	if key == "compress_at" {
+		parsed, err := runtimeconfig.ParseCompressAt(value)
+		if err != nil {
+			return err
+		}
+		c.LLM.CompressAt = parsed
+		return nil
+	}
+	if key == "compact_keep" {
+		parsed, err := runtimeconfig.ParseCompactKeep(value)
+		if err != nil {
+			return err
+		}
+		c.LLM.CompactKeep = parsed
+		return nil
+	}
+	if key == "max_iterations" {
+		parsed, err := runtimeconfig.ParseMaxIterations(value)
+		if err != nil {
+			return err
+		}
+		c.LLM.MaxIterations = parsed
+		return nil
+	}
+	if key == "thinking.show" {
+		parsed, err := runtimeconfig.ParseThinkingShow(value)
+		if err != nil {
+			return err
+		}
+		c.LLM.Thinking.Show = parsed
+		return nil
+	}
+
+	parts := strings.Split(key, ".")
+	if len(parts) < 3 || parts[0] != "providers" {
+		return fmt.Errorf("未知 LLM 配置项: llm.%s", key)
+	}
+	provider, ok := c.LLM.Providers[parts[1]]
+	if !ok {
+		return fmt.Errorf("provider %q does not exist", parts[1])
+	}
+	field := strings.Join(parts[2:], ".")
+	switch field {
+	case "type":
+		provider.Type = runtimeconfig.ProviderType(value)
+	case "endpoint":
+		provider.Endpoint = value
+	case "model":
+		provider.Model = value
+	case "api_key":
+		provider.APIKey = value
+	case "context_window":
+		parsed, err := runtimeconfig.ParseContextWindow(value)
+		if err != nil {
+			return err
+		}
+		provider.ContextWindow = parsed
+	case "auth_type":
+		provider.AuthType = runtimeconfig.AnthropicAuthType(value)
+	case "max_tokens":
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			return fmt.Errorf("无效 max_tokens: %s（应为正整数）", value)
+		}
+		provider.MaxTokens = parsed
+	case "thinking.request_mode":
+		parsed, err := runtimeconfig.ParseThinkingRequestMode(value)
+		if err != nil {
+			return err
+		}
+		provider.Thinking.RequestMode = parsed
+	case "thinking.effort":
+		parsed, err := runtimeconfig.ParseThinkingEffort(value)
+		if err != nil {
+			return err
+		}
+		provider.Thinking.Effort = parsed
+	default:
+		return fmt.Errorf("未知 Provider 配置项: %s", field)
+	}
+	candidate := c.LLM.Clone()
+	candidate.Providers[parts[1]] = provider
+	if err := candidate.Validate(); err != nil {
+		return err
+	}
+	c.LLM = candidate
+	return nil
+}
+
+// Load 读取 YAML 配置文件，返回合并默认值后的 Config。
+// 文件不存在时返回默认配置；无效配置返回 nil，调用方必须停止启动而不是带着默认值瞎跑。
+func Load(path string) *Config {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return Default()
+	}
+	if err != nil {
+		slog.Error("config: read failed", "err", err)
+		return nil
+	}
+	if hasMixedLLMFormats(data) {
+		slog.Error("config: legacy LLM fields and providers cannot be mixed")
+		return nil
+	}
+	cfg := Default()
 	if err := yaml.Unmarshal(data, cfg); err != nil {
-		// 解析失败别静默：坏配置 + 默认值混合跑起来最难排查
-		slog.Warn("config: parse failed, using defaults", "err", err)
+		slog.Error("config: parse failed", "err", err)
+		return nil
+	}
+	if !hasProviders(data) {
+		var legacy struct {
+			LLM struct {
+				Endpoint      string `yaml:"endpoint"`
+				Model         string `yaml:"model"`
+				APIKey        string `yaml:"api_key"`
+				ContextWindow int    `yaml:"context_window"`
+				Thinking      struct {
+					Show        *bool                             `yaml:"show"`
+					RequestMode runtimeconfig.ThinkingRequestMode `yaml:"request_mode"`
+					Effort      runtimeconfig.ThinkingEffort      `yaml:"effort"`
+				} `yaml:"thinking"`
+			} `yaml:"llm"`
+		}
+		if err := yaml.Unmarshal(data, &legacy); err != nil {
+			slog.Error("config: parse legacy LLM failed", "err", err)
+			return nil
+		}
+		provider := cfg.LLM.Providers["openai"]
+		if legacy.LLM.Endpoint != "" {
+			provider.Endpoint = legacy.LLM.Endpoint
+		}
+		if legacy.LLM.Model != "" {
+			provider.Model = legacy.LLM.Model
+		}
+		if legacy.LLM.APIKey != "" {
+			provider.APIKey = legacy.LLM.APIKey
+		}
+		if legacy.LLM.ContextWindow > 0 {
+			provider.ContextWindow = legacy.LLM.ContextWindow
+		}
+		if legacy.LLM.Thinking.RequestMode != "" {
+			provider.Thinking.RequestMode = legacy.LLM.Thinking.RequestMode
+		}
+		if legacy.LLM.Thinking.Effort != "" {
+			provider.Thinking.Effort = legacy.LLM.Thinking.Effort
+		}
+		if legacy.LLM.Thinking.Show != nil {
+			cfg.LLM.Thinking.Show = *legacy.LLM.Thinking.Show
+		}
+		cfg.LLM.Providers = map[string]runtimeconfig.ProviderConfig{"openai": provider}
+		cfg.LLM.DefaultProvider = "openai"
+	}
+	if err := cfg.LLM.Validate(); err != nil {
+		slog.Error("config: invalid LLM configuration", "err", err)
+		return nil
 	}
 	return cfg
+}
+
+func hasProviders(data []byte) bool {
+	return llmYAMLKeys(data)["providers"]
+}
+
+func hasMixedLLMFormats(data []byte) bool {
+	keys := llmYAMLKeys(data)
+	if !keys["providers"] {
+		return false
+	}
+	for _, key := range []string{"endpoint", "model", "api_key", "context_window"} {
+		if keys[key] {
+			return true
+		}
+	}
+	return false
+}
+
+func llmYAMLKeys(data []byte) map[string]bool {
+	var root yaml.Node
+	if yaml.Unmarshal(data, &root) != nil || len(root.Content) == 0 {
+		return nil
+	}
+	keys := make(map[string]bool)
+	mapping := root.Content[0]
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value != "llm" || mapping.Content[i+1].Kind != yaml.MappingNode {
+			continue
+		}
+		llm := mapping.Content[i+1]
+		for j := 0; j+1 < len(llm.Content); j += 2 {
+			keys[llm.Content[j].Value] = true
+		}
+	}
+	return keys
 }
 
 // Save 原子写入配置文件：先写临时文件再 rename，避免 crash 丢数据。

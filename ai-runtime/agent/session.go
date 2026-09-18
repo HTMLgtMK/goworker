@@ -57,7 +57,13 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 		}
 	}
 
-	provider := s.deps.NewProvider(cfg)
+	provider, err := s.deps.NewProvider(cfg)
+	if err != nil {
+		if cb.Write != nil {
+			cb.Write(fmt.Sprintf("✘ Provider 配置错误: %v\n", err))
+		}
+		return nil
+	}
 	decisions := make(chan hitl.Decision, 1)
 	mws := s.buildMiddlewareChain(cb, provider, &sandboxCfg, cfg, decisions)
 	systemPrompt := s.buildSystemPrompt(cfg, tools)
@@ -129,10 +135,12 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 // HITL 决策由前端按 spec 契约完成，plugin 只负责转交；agentCtx 取消时决策投递放弃。
 func (s *Session) streamTokens(cb RunCallbacks, agentCtx context.Context, tokenCh <-chan core.Token, decisions chan hitl.Decision) {
 	for tok := range tokenCh {
-		// 先输出内容再检查 Done — Done token 也可能带内容（如错误信息）
-		if tok.Content != "" && cb.WriteToken != nil {
+		// 先输出内容再检查 Done — Done token 也可能带内容（如错误信息）。
+		// 空 content 的 Done 也要转发：前端靠它定稿未完成的流式渲染。
+		showToken := tok.Type != core.TokenTypeThinking || s.deps.Config.LLM.Thinking.Show
+		if showToken && cb.WriteToken != nil && (tok.Content != "" || tok.Done) {
 			kind, c := renderKind(tok)
-			cb.WriteToken(kind, c)
+			cb.WriteToken(kind, c, tok.Done)
 		}
 		if tok.Done {
 			break
@@ -175,7 +183,7 @@ func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, 
 	usageMw := middlewares.NewUsageMiddleware(s.usage, func(u core.Usage) {
 		publish(runtimeconfig.EventUsage, runtimeconfig.UsageEvent{
 			Usage:         u,
-			ContextWindow: cfg.LLM.ContextWindow,
+			ContextWindow: contextWindow(cfg),
 		})
 	})
 	// iteration：每轮迭代发一个计数事件
@@ -185,16 +193,24 @@ func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, 
 	// compress：自动压缩，protectSystem=true —— 保护本轮注入的系统提示
 	compressMw := middlewares.NewCompressionMiddleware(
 		s.newCompressor(provider, true),
-		cfg.LLM.ContextWindow,
+		contextWindow(cfg),
 		cfg.LLM.CompressAt,
 	)
 
 	mws := []core.Middleware{hitlMw, usageMw, iterationMw}
 	if s.deps.Memory != nil {
-		memMw := middlewares.NewMemoryMiddleware(&memoryClientAdapter{s.deps.Memory}, cfg.Memory, cfg.LLM.ContextWindow)
+		memMw := middlewares.NewMemoryMiddleware(&memoryClientAdapter{s.deps.Memory}, cfg.Memory, contextWindow(cfg))
 		mws = append(mws, memMw)
 	}
 	return append(mws, compressMw)
+}
+
+func contextWindow(cfg *runtimeconfig.Config) int {
+	_, provider, err := cfg.LLM.ResolveDefault()
+	if err != nil {
+		return 0
+	}
+	return provider.ContextWindow
 }
 
 // newCompressor 构造压缩器，onCompress 统一记进 token 账本（/usage 能看到压缩）。
@@ -225,6 +241,7 @@ func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks) error {
 
 	// 压缩会丢原文，先固化到任务档案 —— 这是原文丢失前的最后一次机会。
 	if s.deps.Memory != nil {
+		publishStage(cb, "固化记忆中")
 		sum, err := s.checkpoint(ctx, history, s.deps.Config)
 		if err != nil {
 			if cb.Write != nil {
@@ -243,8 +260,15 @@ func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks) error {
 	}
 
 	cfg := s.deps.Config
-	provider := s.deps.NewProvider(cfg)
+	provider, err := s.deps.NewProvider(cfg)
+	if err != nil {
+		if cb.Write != nil {
+			cb.Write(fmt.Sprintf("✘ Provider 配置错误: %v\n", err))
+		}
+		return nil
+	}
 	compressor := s.newCompressor(provider, false)
+	publishStage(cb, "压缩会话历史中")
 
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -274,6 +298,7 @@ func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks) error {
 // compactStore store 持久化模式压缩：ActiveView 先固化 → 压缩 → detectCompact → 落 compact。
 func (s *Session) compactStore(ctx context.Context, cb RunCallbacks) error {
 	// 先固化再折叠（原文丢失前最后一次机会）
+	publishStage(cb, "固化记忆中")
 	_, _ = s.Consolidate(ctx)
 
 	view := s.deps.Store.ActiveView()
@@ -286,9 +311,16 @@ func (s *Session) compactStore(ctx context.Context, cb RunCallbacks) error {
 	before := len(view)
 
 	cfg := s.deps.Config
-	provider := s.deps.NewProvider(cfg)
+	provider, err := s.deps.NewProvider(cfg)
+	if err != nil {
+		if cb.Write != nil {
+			cb.Write(fmt.Sprintf("✘ Provider 配置错误: %v\n", err))
+		}
+		return nil
+	}
 	// protectSystem=false：conversation 不含系统提示，首位可能是上次的摘要，允许被再次滚动
 	compressor := s.newCompressor(provider, false)
+	publishStage(cb, "压缩会话历史中")
 
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()

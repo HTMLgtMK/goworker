@@ -2,12 +2,45 @@ package core
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
+
+func TestSaveConfig_RollsBackOnWriteFailure(t *testing.T) {
+	cfg := config.Default()
+	runtimeCfg := cfg.ToRuntime()
+	engine := NewEngine(cfg, runtimeCfg, nil)
+	candidate := *runtimeCfg
+	candidate.LLM = runtimeCfg.LLM.Clone()
+	candidate.LLM.Providers["openai"] = runtimeconfig.ProviderConfig{
+		Type:          runtimeconfig.ProviderTypeOpenAI,
+		Endpoint:      "http://localhost:8000/v1",
+		Model:         "changed",
+		ContextWindow: 128000,
+		Thinking: runtimeconfig.ProviderThinkingConfig{
+			RequestMode: runtimeconfig.ThinkingRequestAuto,
+			Effort:      runtimeconfig.ThinkingEffortMedium,
+		},
+	}
+
+	beforeRuntime := *runtimeCfg
+	beforeRuntime.LLM = runtimeCfg.LLM.Clone()
+	beforeDaemon := cfg.LLM.Clone()
+	if err := engine.saveConfig(&candidate, func(*config.Config, string) error { return errors.New("disk full") }); err == nil {
+		t.Fatal("saveConfig should return write error")
+	}
+	if !reflect.DeepEqual(runtimeCfg.LLM, beforeRuntime.LLM) {
+		t.Errorf("runtime config mutated after failed write: %#v", runtimeCfg.LLM)
+	}
+	if !reflect.DeepEqual(cfg.LLM, beforeDaemon) {
+		t.Errorf("daemon config mutated after failed write: %#v", cfg.LLM)
+	}
+}
 
 func TestRegisterPluginInitializesAndRejectsInvalidRegistrations(t *testing.T) {
 	e := newTestEngine()

@@ -6,18 +6,73 @@ package config
 
 import (
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-sandbox"
+	sandbox "github.com/tinguo/goworker/ai-sandbox"
 )
 
-// LLMConfig 是 LLM 提供商连接配置。
+// ThinkingRequestMode 指定 OpenAI-compatible 请求启用推理的方言。
+type ThinkingRequestMode string
+
+const (
+	ThinkingRequestAuto   ThinkingRequestMode = "auto"
+	ThinkingRequestEnable ThinkingRequestMode = "enable_thinking"
+	ThinkingRequestEffort ThinkingRequestMode = "reasoning_effort"
+)
+
+// ThinkingEffort 是 reasoning_effort 方言的推理强度。
+type ThinkingEffort string
+
+const (
+	ThinkingEffortLow    ThinkingEffort = "low"
+	ThinkingEffortMedium ThinkingEffort = "medium"
+	ThinkingEffortHigh   ThinkingEffort = "high"
+)
+
+type ThinkingConfig struct {
+	Show bool `yaml:"show"`
+}
+
+// ProviderThinkingConfig 是 OpenAI-compatible 请求侧的推理方言配置。
+type ProviderThinkingConfig struct {
+	RequestMode ThinkingRequestMode `yaml:"request_mode"`
+	Effort      ThinkingEffort      `yaml:"effort"`
+}
+
+// ProviderType 标识 Provider 使用的协议适配器。
+type ProviderType string
+
+const (
+	ProviderTypeOpenAI    ProviderType = "openai"
+	ProviderTypeAnthropic ProviderType = "anthropic"
+)
+
+// AnthropicAuthType 明确 Anthropic Messages 的认证头方言。
+type AnthropicAuthType string
+
+const (
+	AnthropicAuthBearer AnthropicAuthType = "bearer"
+	AnthropicAuthAPIKey AnthropicAuthType = "x-api-key"
+)
+
+// ProviderConfig 是一个命名 Provider 的连接与协议配置。
+type ProviderConfig struct {
+	Type          ProviderType           `yaml:"type"`
+	Endpoint      string                 `yaml:"endpoint"`
+	Model         string                 `yaml:"model"`
+	APIKey        string                 `yaml:"api_key"`
+	ContextWindow int                    `yaml:"context_window"`
+	Thinking      ProviderThinkingConfig `yaml:"thinking,omitempty"`
+	AuthType      AnthropicAuthType      `yaml:"auth_type,omitempty"`
+	MaxTokens     int                    `yaml:"max_tokens,omitempty"`
+}
+
+// LLMConfig 保存 Provider 注册表与全局 Agent/UI 策略。
 type LLMConfig struct {
-	Endpoint      string  `yaml:"endpoint"`
-	Model         string  `yaml:"model"`
-	APIKey        string  `yaml:"api_key"`
-	ContextWindow int     `yaml:"context_window"` // 模型上下文窗口（token），0 = 未知
-	CompressAt    float64 `yaml:"compress_at"`    // 历史压缩触发阈值（0-1）：估算用量达窗口该比例时自动压缩，0 = 关闭
-	CompactKeep   int     `yaml:"compact_keep"`   // 滚动压缩保留的最近消息条数（原文不压，只压更早的）
-	MaxIterations int     `yaml:"max_iterations"` // ReAct 循环最大迭代数（模型往返次数），0 = 默认 15
+	DefaultProvider string                    `yaml:"default_provider"`
+	Providers       map[string]ProviderConfig `yaml:"providers"`
+	CompressAt      float64                   `yaml:"compress_at"`
+	CompactKeep     int                       `yaml:"compact_keep"`
+	MaxIterations   int                       `yaml:"max_iterations"`
+	Thinking        ThinkingConfig            `yaml:"thinking"`
 }
 
 // MemoryConfig 是 agent 记忆模块（MTM 任务档案 + LTM 事实条目）的配置。
@@ -73,10 +128,27 @@ type Paths struct {
 const (
 	EventUsage     = "usage"
 	EventIteration = "iteration"
+	EventPhase     = "phase"
 )
 
 // UsageEvent 是 EventUsage 的载荷：usage 快照 + 上下文窗口。
 type UsageEvent struct {
 	Usage         core.Usage
 	ContextWindow int
+}
+
+// PhaseKind 标记 PhaseEvent 的语义。
+type PhaseKind int
+
+const (
+	PhaseBegin PhaseKind = iota // 命令开始执行：addon 据此激活状态栏
+	PhaseStage                  // 阶段切换：Label 为阶段名（如"固化记忆中"）
+	PhaseEnd                    // 命令执行结束：addon 据此定格并落行
+)
+
+// PhaseEvent 是 EventPhase 的载荷：长耗时命令（/compact /new /agent）的阶段进度。
+// 命令框架负责 begin/end，命令内部在切换阶段时发 stage。
+type PhaseEvent struct {
+	Kind  PhaseKind
+	Label string
 }

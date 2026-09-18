@@ -5,19 +5,32 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
 	"log/slog"
-	"sync"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-memory"
+	memory "github.com/tinguo/goworker/ai-memory"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/mcp"
+	runtimeprovider "github.com/tinguo/goworker/ai-runtime/provider"
+	runtimeanthropic "github.com/tinguo/goworker/ai-runtime/provider/anthropic"
+	runtimeopenai "github.com/tinguo/goworker/ai-runtime/provider/openai"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/daemon/internal/plugin"
 )
+
+// defaultHTTPTimeout 是 HTTP 客户端总超时。检查点/压缩是非流式全量调用，
+// 上下文一大（用户 config 里 compress_at 没开，会话无界累积）响应可能很慢，
+// 30s 太紧，2min 起步。
+const defaultHTTPTimeout = 2 * time.Minute
 
 // AgentPlugin 是 /agent 插件入口，只负责三件事：持有会话状态、注册命令、管理生命周期。
 // 配置与路径由 NewPlugin 构造函数注入（plugin.Hub.Config 已 any 化，插件不再从 hub 读配置）。
@@ -36,10 +49,6 @@ type AgentPlugin struct {
 	mcpClients map[string]mcp.Client // server name → 连接，Stop 时统一关闭
 	mcpTools   []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
 	memory     *memory.Client        // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
-	// bgWg 追踪 /new 后台固化 goroutine：Stop 关 memory 前必须等它结束，
-	// 否则后台固化往正在关闭的 badger 写（崩溃/部分写）。命令主 goroutine 串行派发，
-	// Add/Wait 无并发问题。
-	bgWg sync.WaitGroup
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
@@ -167,9 +176,6 @@ func (p *AgentPlugin) Stop() error {
 			slog.Warn("memory: stop checkpoint failed", "err", err)
 		}
 		cancel()
-		// 等 /new 后台固化收尾：它可能还在写同一 badger，Close 会跟它抢（崩溃/部分写）。
-		// 后台固化自带 120s 超时，Wait 有界。
-		p.bgWg.Wait()
 		if err := p.memory.Close(); err != nil {
 			slog.Warn("memory close error", "err", err)
 		}
@@ -218,10 +224,43 @@ func (p *AgentPlugin) startSession() {
 	// 连接 MCP server 并拉取工具清单。坏 server 只降级不阻塞插件启动
 	p.loadMCP()
 
+	// 创建 httpclient
+	client := p.createhHttpClient()
+
 	// 会话层组装：资源就绪后构造 deps 与首会话。
 
-	modelProvider := func(cfg *runtimeconfig.Config) core.Provider {
-		return runtimeagent.NewOpenAIProvider(cfg.LLM.Endpoint, cfg.LLM.APIKey, cfg.LLM.Model)
+	modelProvider := func(cfg *runtimeconfig.Config) (core.Provider, error) {
+		name, provider, err := cfg.LLM.ResolveDefault()
+		if err != nil {
+			return nil, err
+		}
+		switch provider.Type {
+		case runtimeconfig.ProviderTypeOpenAI:
+			return runtimeopenai.NewProvider(
+				name,
+				provider.Endpoint,
+				provider.APIKey,
+				provider.Model,
+				client,
+				runtimeopenai.WithThinkingOptions(runtimeprovider.ThinkingOptions{
+					RequestMode: provider.Thinking.RequestMode,
+					Effort:      provider.Thinking.Effort,
+				}),
+			), nil
+
+		case runtimeconfig.ProviderTypeAnthropic:
+			return runtimeanthropic.NewProvider(
+				name,
+				provider.Endpoint,
+				provider.APIKey,
+				provider.Model,
+				client,
+				runtimeanthropic.AnthropicAuthType(provider.AuthType),
+				runtimeanthropic.WithAnthropicMaxTokens(provider.MaxTokens),
+			), nil
+		default:
+			return nil, fmt.Errorf("unsupported provider type %q", provider.Type)
+		}
 	}
 
 	p.deps = runtimeagent.SessionDeps{
@@ -238,4 +277,34 @@ func (p *AgentPlugin) startSession() {
 		p.deps.Instruction = p.loadInstructions()
 	}
 	p.session = runtimeagent.NewSession(p.deps)
+}
+
+/**
+ * 创建 http.Client：GOWORKER_PROXY 显式指定抓包代理时走它，否则回退 http.ProxyFromEnvironment。
+ */
+func (p *AgentPlugin) createhHttpClient() *http.Client {
+	// GOWORKER_PROXY 显式指定抓包代理（如 whistle）时走它，否则回退
+	// http.ProxyFromEnvironment：尊重系统 HTTP(S)_PROXY，没配就直连，
+	// 行为跟不设置 Transport 的默认 http.Client 一致。
+	// 抓包代理是 MITM，证书链必然校验不过，所以代理一旦显式配置就跳过
+	// TLS 校验——只在这条调试路径生效，生产不设 GOWORKER_PROXY 保持严格校验。
+	proxyFn := http.ProxyFromEnvironment
+	tlsConfig := &tls.Config{}
+	if proxyURL := strings.TrimSpace(os.Getenv("GOWORKER_PROXY")); proxyURL != "" {
+		u, err := url.Parse(proxyURL)
+		if err != nil {
+			slog.Warn("GOWORKER_PROXY 解析失败，回退系统代理", "proxy", proxyURL, "err", err)
+		} else {
+			proxyFn = http.ProxyURL(u)
+			tlsConfig = &tls.Config{InsecureSkipVerify: true}
+		}
+	}
+
+	return &http.Client{
+		Timeout: defaultHTTPTimeout,
+		Transport: &http.Transport{
+			Proxy:           proxyFn,
+			TLSClientConfig: tlsConfig,
+		},
+	}
 }

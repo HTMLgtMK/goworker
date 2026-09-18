@@ -13,6 +13,7 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 	"github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	runtimeopenai "github.com/tinguo/goworker/ai-runtime/provider/openai"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-sandbox"
 	"github.com/tinguo/goworker/daemon/internal/config"
@@ -35,7 +36,9 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := config.Default()
-	cfg.LLM.Endpoint = srv.URL
+	provider := cfg.LLM.Providers[cfg.LLM.DefaultProvider]
+	provider.Endpoint = srv.URL
+	cfg.LLM.Providers[cfg.LLM.DefaultProvider] = provider
 	cfg.Session.Enabled = true
 	cfg.Session.Dir = filepath.Join(dir, "sessions")
 	cfg.Memory.Enabled = false // 专注会话链路
@@ -54,8 +57,10 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 		AuditDir:     filepath.Join(dir, "audit"),
 		Memory:       nil,
 		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
-		NewProvider:  func(*runtimeconfig.Config) core.Provider { return agent.NewOpenAIProvider(srv.URL, "", "mock") },
-		Store:        st,
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			return runtimeopenai.NewProvider("mock", srv.URL, "", "mock", srv.Client()), nil
+		},
+		Store: st,
 	})
 
 	jsonl := filepath.Join(cfg.Session.Dir, "current.jsonl")
@@ -126,7 +131,7 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 func e2eRunCallbacks(buf *strings.Builder) agent.RunCallbacks {
 	return agent.RunCallbacks{
 		Write: func(s string) { buf.WriteString(s) },
-		WriteToken: func(_ agent.RenderKind, content string) {
+		WriteToken: func(_ agent.RenderKind, content string, _ bool) {
 			buf.WriteString(content)
 		},
 	}

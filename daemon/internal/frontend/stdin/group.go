@@ -11,8 +11,9 @@ type blockMarker struct {
 }
 
 var (
-	markerText = blockMarker{glyph: "● ", indent: 2}
-	markerTool = blockMarker{glyph: "  ⎿  ", indent: 5}
+	markerText     = blockMarker{glyph: "● ", indent: 2}
+	markerTool     = blockMarker{glyph: "  ⎿  ", indent: 5}
+	markerThinking = blockMarker{glyph: "✻ ", indent: 2} // thinking 专用锚点，与正文 ● 区分
 )
 
 // block 将 content 编组成带锚点标记的文本块：

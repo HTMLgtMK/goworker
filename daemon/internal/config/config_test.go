@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 )
 
 func TestDefault_IncludesLog(t *testing.T) {
@@ -23,6 +25,102 @@ func TestDefault_IncludesLog(t *testing.T) {
 	}
 	if !strings.HasPrefix(cfg.Log.File, os.TempDir()) {
 		t.Errorf("Log.File = %q, want under temp dir %q", cfg.Log.File, os.TempDir())
+	}
+}
+
+func TestLoad_NamedProvidersAndLegacyMigration(t *testing.T) {
+	dir := t.TempDir()
+
+	namedPath := filepath.Join(dir, "named.yaml")
+	if err := os.WriteFile(namedPath, []byte(`
+llm:
+  default_provider: cc-switch
+  providers:
+    cc-switch:
+      type: anthropic
+      endpoint: http://127.0.0.1:15721
+      model: claude-sonnet-4-6
+      api_key: PROXY_MANAGED
+      auth_type: bearer
+      max_tokens: 8192
+      context_window: 1048576
+  compress_at: 0.8
+  compact_keep: 10
+  max_iterations: 15
+  thinking:
+    show: true
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	named := Load(namedPath)
+	name, provider, err := named.LLM.ResolveDefault()
+	if err != nil || name != "cc-switch" || provider.Type != runtimeconfig.ProviderTypeAnthropic {
+		t.Fatalf("named provider = %q %#v, %v", name, provider, err)
+	}
+	if strings.Contains(named.Display(), "PROXY_MANAGED") {
+		t.Fatal("Display leaked provider api key")
+	}
+
+	legacyPath := filepath.Join(dir, "legacy.yaml")
+	if err := os.WriteFile(legacyPath, []byte(`
+llm:
+  endpoint: http://localhost:8000/v1
+  model: legacy
+  api_key: local-key
+  context_window: 32768
+  thinking:
+    show: false
+    request_mode: reasoning_effort
+    effort: high
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacy := Load(legacyPath)
+	legacyProvider := legacy.LLM.Providers["openai"]
+	if legacy.LLM.DefaultProvider != "openai" || legacyProvider.Model != "legacy" || legacyProvider.Thinking.Effort != runtimeconfig.ThinkingEffortHigh || legacy.LLM.Thinking.Show {
+		t.Fatalf("legacy migration = %#v", legacy.LLM)
+	}
+}
+
+func TestSetField_ProviderPaths(t *testing.T) {
+	cfg := Default()
+	if err := cfg.SetField("llm.default_provider", "openai"); err != nil {
+		t.Fatalf("SetField default_provider: %v", err)
+	}
+	if err := cfg.SetField("llm.providers.openai.model", "gpt-test"); err != nil {
+		t.Fatalf("SetField provider model: %v", err)
+	}
+	if got := cfg.LLM.Providers["openai"].Model; got != "gpt-test" {
+		t.Errorf("provider model = %q", got)
+	}
+	if err := cfg.SetField("llm.providers.openai.context_window", "64k"); err != nil {
+		t.Fatalf("SetField context window: %v", err)
+	}
+	if got := cfg.LLM.Providers["openai"].ContextWindow; got != 65536 {
+		t.Errorf("context window = %d", got)
+	}
+}
+
+func TestLoad_MixedLegacyAndProvidersRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mixed.yaml")
+	if err := os.WriteFile(path, []byte(`
+llm:
+  endpoint: http://localhost:8000/v1
+  default_provider: openai
+  providers:
+    openai:
+      type: openai
+      endpoint: http://localhost:8000/v1
+      model: gpt-4o
+      context_window: 128000
+      thinking:
+        request_mode: auto
+        effort: medium
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := Load(path); cfg != nil {
+		t.Fatal("mixed legacy and registry configuration should fail")
 	}
 }
 
@@ -94,6 +192,77 @@ func TestSetField_LogRejectsBadValues(t *testing.T) {
 	}
 	if err := cfg.SetField("log.max_size_mb", "abc"); err == nil {
 		t.Error("SetField(log.max_size_mb, abc) should error")
+	}
+}
+
+func TestSetField_Thinking(t *testing.T) {
+	cfg := Default()
+	tests := []struct {
+		key, value string
+		check      func(*Config) bool
+	}{
+		{"llm.thinking.show", "false", func(c *Config) bool { return !c.LLM.Thinking.Show }},
+		{"llm.providers.openai.thinking.request_mode", "enable_thinking", func(c *Config) bool {
+			return c.LLM.Providers["openai"].Thinking.RequestMode == runtimeconfig.ThinkingRequestEnable
+		}},
+		{"llm.providers.openai.thinking.effort", "high", func(c *Config) bool {
+			return c.LLM.Providers["openai"].Thinking.Effort == runtimeconfig.ThinkingEffortHigh
+		}},
+	}
+	for _, tt := range tests {
+		if err := cfg.SetField(tt.key, tt.value); err != nil {
+			t.Fatalf("SetField(%q, %q): %v", tt.key, tt.value, err)
+		}
+		if !tt.check(cfg) {
+			t.Errorf("SetField(%q, %q) not applied", tt.key, tt.value)
+		}
+	}
+}
+
+func TestThinkingYAMLRoundtripAndMissingDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	cfg := Default()
+	cfg.LLM.Thinking.Show = false
+	provider := cfg.LLM.Providers["openai"]
+	provider.Thinking.RequestMode = runtimeconfig.ThinkingRequestEffort
+	provider.Thinking.Effort = runtimeconfig.ThinkingEffortHigh
+	cfg.LLM.Providers["openai"] = provider
+	if err := Save(cfg, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded := Load(path)
+	if loaded.LLM.Thinking != cfg.LLM.Thinking || loaded.LLM.Providers["openai"].Thinking != provider.Thinking {
+		t.Errorf("loaded thinking = %#v/%#v, want %#v/%#v", loaded.LLM.Thinking, loaded.LLM.Providers["openai"].Thinking, cfg.LLM.Thinking, provider.Thinking)
+	}
+
+	legacyPath := filepath.Join(dir, "legacy.yaml")
+	if err := os.WriteFile(legacyPath, []byte("llm:\n  model: legacy\n"), 0o600); err != nil {
+		t.Fatalf("write legacy config: %v", err)
+	}
+	legacy := Load(legacyPath)
+	want := runtimeconfig.DefaultLLM()
+	if legacy.LLM.Thinking != want.Thinking || legacy.LLM.Providers["openai"].Thinking != want.Providers["openai"].Thinking {
+		t.Errorf("legacy thinking = %#v/%#v, want defaults %#v/%#v", legacy.LLM.Thinking, legacy.LLM.Providers["openai"].Thinking, want.Thinking, want.Providers["openai"].Thinking)
+	}
+}
+
+func TestSetField_ThinkingRejectsBadValuesWithoutMutation(t *testing.T) {
+	for _, tt := range []struct {
+		key, value string
+	}{
+		{"llm.thinking.show", "sometimes"},
+		{"llm.providers.openai.thinking.request_mode", "guess"},
+		{"llm.providers.openai.thinking.effort", "extreme"},
+	} {
+		cfg := Default()
+		before := cfg.LLM.Thinking
+		if err := cfg.SetField(tt.key, tt.value); err == nil {
+			t.Errorf("SetField(%q, %q) should error", tt.key, tt.value)
+		}
+		if cfg.LLM.Thinking != before {
+			t.Errorf("SetField(%q, %q) mutated config after error", tt.key, tt.value)
+		}
 	}
 }
 

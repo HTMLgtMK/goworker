@@ -21,14 +21,16 @@ const (
 
 // msgFields 真实消息（含 compact 时的保留段副本）。
 type msgFields struct {
-	ID         string          `json:"id,omitempty"`
-	Parent     string          `json:"parent,omitempty"`
-	Role       string          `json:"role,omitempty"`
-	Content    string          `json:"content,omitempty"`
-	ToolCalls  []core.ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
-	CloneOf    string          `json:"clone_of,omitempty"` // 副本标记：从哪个原消息复制而来
-	CreatedAt  time.Time       `json:"created_at"`
+	ID         string                     `json:"id,omitempty"`
+	Parent     string                     `json:"parent,omitempty"`
+	Role       string                     `json:"role,omitempty"`
+	Content    string                     `json:"content,omitempty"`
+	ToolCalls  []core.ToolCall            `json:"tool_calls,omitempty"`
+	ToolCallID string                     `json:"tool_call_id,omitempty"`
+	Thinking   string                     `json:"thinking,omitempty"`
+	Custom     map[string]json.RawMessage `json:"custom,omitempty"`
+	CloneOf    string                     `json:"clone_of,omitempty"` // 副本标记：从哪个原消息复制而来
+	CreatedAt  time.Time                  `json:"created_at"`
 }
 
 // compactFields 摘要节点。
@@ -142,22 +144,24 @@ func (r Record) Created() time.Time {
 // record_format_test.go 的字节级断言会兜底抓漏。
 func (r Record) MarshalJSON() ([]byte, error) {
 	type flat struct {
-		Kind        string          `json:"kind"`
-		ID          string          `json:"id,omitempty"`
-		Parent      string          `json:"parent,omitempty"`
-		Summary     string          `json:"summary,omitempty"`
-		Role        string          `json:"role,omitempty"`
-		Content     string          `json:"content,omitempty"`
-		ToolCalls   []core.ToolCall `json:"tool_calls,omitempty"`
-		ToolCallID  string          `json:"tool_call_id,omitempty"`
-		CoveredFrom string          `json:"covered_from,omitempty"`
-		CoveredTo   string          `json:"covered_to,omitempty"`
-		CloneOf     string          `json:"clone_of,omitempty"`
-		Tail        string          `json:"tail,omitempty"`
-		At          string          `json:"at,omitempty"`
-		Preview     string          `json:"preview,omitempty"`
-		MsgID       string          `json:"msg_id,omitempty"`
-		CreatedAt   time.Time       `json:"created_at"`
+		Kind        string                     `json:"kind"`
+		ID          string                     `json:"id,omitempty"`
+		Parent      string                     `json:"parent,omitempty"`
+		Summary     string                     `json:"summary,omitempty"`
+		Role        string                     `json:"role,omitempty"`
+		Content     string                     `json:"content,omitempty"`
+		ToolCalls   []core.ToolCall            `json:"tool_calls,omitempty"`
+		ToolCallID  string                     `json:"tool_call_id,omitempty"`
+		Thinking    string                     `json:"thinking,omitempty"`
+		Custom      map[string]json.RawMessage `json:"custom,omitempty"`
+		CoveredFrom string                     `json:"covered_from,omitempty"`
+		CoveredTo   string                     `json:"covered_to,omitempty"`
+		CloneOf     string                     `json:"clone_of,omitempty"`
+		Tail        string                     `json:"tail,omitempty"`
+		At          string                     `json:"at,omitempty"`
+		Preview     string                     `json:"preview,omitempty"`
+		MsgID       string                     `json:"msg_id,omitempty"`
+		CreatedAt   time.Time                  `json:"created_at"`
 	}
 
 	f := flat{Kind: r.Kind, CreatedAt: r.Created()}
@@ -167,6 +171,7 @@ func (r Record) MarshalJSON() ([]byte, error) {
 			f.ID, f.Parent = r.Msg.ID, r.Msg.Parent
 			f.Role, f.Content = r.Msg.Role, r.Msg.Content
 			f.ToolCalls, f.ToolCallID, f.CloneOf = r.Msg.ToolCalls, r.Msg.ToolCallID, r.Msg.CloneOf
+			f.Thinking, f.Custom = r.Msg.Thinking, r.Msg.Custom
 		}
 	case kindCompact:
 		if r.Comp != nil {
@@ -289,15 +294,22 @@ func recordToMessage(r Record) core.Message {
 			Content:    r.Msg.Content,
 			ToolCalls:  r.Msg.ToolCalls,
 			ToolCallID: r.Msg.ToolCallID,
-			MsgID:      r.Msg.ID,
-			CreatedAt:  r.Msg.CreatedAt,
+			Thinking: core.Thinking{
+				Text: r.Msg.Thinking,
+			},
+			MsgID:     r.Msg.ID,
+			CreatedAt: r.Msg.CreatedAt,
+			Custom:    r.Msg.Custom,
 		}
 	}
 	return core.Message{}
 }
 
 func messageToRecord(m core.Message) Record {
-	return newMsgRecord(m.MsgID, "", m.Role, m.Content, m.ToolCalls, m.ToolCallID, "", m.CreatedAt)
+	record := newMsgRecord(m.MsgID, "", m.Role, m.Content, m.ToolCalls, m.ToolCallID, "", m.CreatedAt)
+	record.Msg.Thinking = m.Thinking.Text
+	record.Msg.Custom = m.Custom
+	return record
 }
 
 // isRealMessage 判断 Message 是否为真实对话消息（非 compact 摘要）。

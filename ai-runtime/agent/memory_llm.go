@@ -19,30 +19,26 @@ func (a *llmAdapter) Chat(ctx context.Context, req *memory.ChatRequest) (*memory
 	coreReq := &core.ChatRequest{
 		Model:    req.Model,
 		Messages: toCoreMessages(req.Messages),
-	}
-	if req.JSONMode {
-		// DeepSeek/OpenAI 兼容的 JSON 模式：配合 system 提示词里的 JSON 指示，
-		// 保证固化输出是合法 JSON，而不是靠解析器事后擦屁股。
-		coreReq.ResponseFormat = map[string]any{"type": "json_object"}
+		JSONMode: req.JSONMode,
 	}
 	resp, err := a.inner.Chat(ctx, coreReq)
 	if err != nil {
 		return nil, err
 	}
 	out := &memory.ChatResponse{Choices: make([]memory.ResponseChoice, 0, len(resp.Choices))}
-	for _, c := range resp.Choices {
+	for _, choice := range resp.Choices {
 		out.Choices = append(out.Choices, memory.ResponseChoice{
-			Message: memory.Message{Role: c.Message.Role, Content: c.Message.Content},
+			Message: memory.Message{Role: choice.Message.Role, Content: choice.Message.Content},
 		})
 	}
 	return out, nil
 }
 
 // toCoreMessages 把 memory.Message 转成 core.Message（只带 role/content）。
-func toCoreMessages(msgs []memory.Message) []core.Message {
-	out := make([]core.Message, 0, len(msgs))
-	for _, m := range msgs {
-		out = append(out, core.Message{Role: m.Role, Content: m.Content})
+func toCoreMessages(messages []memory.Message) []core.Message {
+	out := make([]core.Message, 0, len(messages))
+	for _, message := range messages {
+		out = append(out, core.Message{Role: message.Role, Content: message.Content})
 	}
 	return out
 }
@@ -55,13 +51,13 @@ func toCoreMessages(msgs []memory.Message) []core.Message {
 //     （user 意图 + assistant 行动/结论）信息量足够，还省 token；
 //  2. 残缺的 tool 结构（memory.Message 不携带 tool_call_id）会踩 OpenAI 的
 //     严格校验 —— 400 "missing field tool_call_id"。主动过滤掉比补全字段干净。
-func toMemoryMessages(msgs []core.Message) []memory.Message {
-	out := make([]memory.Message, 0, len(msgs))
-	for _, m := range msgs {
-		if m.Role == "tool" || len(m.ToolCalls) > 0 {
+func toMemoryMessages(messages []core.Message) []memory.Message {
+	out := make([]memory.Message, 0, len(messages))
+	for _, message := range messages {
+		if message.Role == "tool" || len(message.ToolCalls) > 0 {
 			continue
 		}
-		out = append(out, memory.Message{Role: m.Role, Content: m.Content})
+		out = append(out, memory.Message{Role: message.Role, Content: message.Content})
 	}
 	return out
 }

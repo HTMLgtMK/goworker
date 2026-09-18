@@ -56,16 +56,30 @@ func NewEngine(cfg *config.Config, runtimeCfg *runtimeconfig.Config, l *logger.L
 func (e *Engine) Config() *config.Config { return e.config }
 
 // SaveConfig 持久化配置到 YAML 文件并同步内存。
-// cfg 是插件注入的 ai-runtime 配置（plugin.Hub.Config 已 any 化），
-// 回写解析层后整份落盘，保证 runtime→daemon→磁盘三处一致。
+// cfg 是插件注入的 ai-runtime 配置（plugin.Hub.Config 已 any 化）。
 func (e *Engine) SaveConfig(cfg any) error {
+	return e.saveConfig(cfg, config.Save)
+}
+
+func (e *Engine) saveConfig(cfg any, save func(*config.Config, string) error) error {
 	rc, ok := cfg.(*runtimeconfig.Config)
 	if !ok {
 		return fmt.Errorf("SaveConfig: unexpected config type %T", cfg)
 	}
-	*e.runtimeCfg = *rc
-	e.config.ApplyRuntime(rc)
-	return config.Save(e.config, config.DefaultPath())
+	candidateRuntime := *rc
+	candidateRuntime.LLM = rc.LLM.Clone()
+	if err := candidateRuntime.LLM.Validate(); err != nil {
+		return fmt.Errorf("SaveConfig: invalid LLM configuration: %w", err)
+	}
+	candidateDaemon := *e.config
+	candidateDaemon.LLM = e.config.LLM.Clone()
+	candidateDaemon.ApplyRuntime(&candidateRuntime)
+	if err := save(&candidateDaemon, config.DefaultPath()); err != nil {
+		return err
+	}
+	*e.runtimeCfg = candidateRuntime
+	*e.config = candidateDaemon
+	return nil
 }
 
 // SetFallbackHandler 设置未匹配命令的兜底处理器。
