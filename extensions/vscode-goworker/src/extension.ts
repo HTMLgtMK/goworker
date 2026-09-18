@@ -57,6 +57,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('goworker.openChatSession', (raw: unknown) =>
       void openChatSession(raw),
     ),
+    vscode.commands.registerCommand('goworker.newChatSession', () => void newChatSession()),
     { dispose: () => client.disconnect() },
     participant,
     { dispose: () => agent.disconnect() },
@@ -68,11 +69,29 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // 打开聊天面板的统一入口（命令/树点击/启动自动打开共用）：会话记录与
   // session_info_update 的接线在这里闭包，openAgentChat 保持纯参数。
-  function openChat(options: { runtimeSessionId?: string } = {}): void {
-    openAgentChat(context, chatRegistry, {
+  // 返回面板供调用方继续操作（如「新建会话」要往这个面板里发 /new）。
+  function openChat(options: { runtimeSessionId?: string } = {}): vscode.WebviewPanel | undefined {
+    return openAgentChat(context, chatRegistry, {
       runtimeSessionId: options.runtimeSessionId,
       onSessionInfoUpdate: (update) => chats.noteSessionInfoUpdate(update),
     });
+  }
+
+  // Chats 树顶「新建会话」：确保面板存在，再在其中执行 daemon 的 /new。
+  // 语义是 daemon 侧结束当前会话（固化记忆 → 清空 STM → 换新 Session），
+  // 与前端 resetSession（仅重建传输连接）不同，详见 PanelAcpChatSession.startNewSession。
+  async function newChatSession(): Promise<void> {
+    // 不传 runtimeSessionId：新建会话不该先重放旧会话历史。
+    const panel = openChat();
+    if (!panel) return;
+    const session = chatRegistry.sessionFor(panel);
+    if (!session) return;
+    try {
+      await session.startNewSession();
+      void chats.refresh(); // 新会话的标题/时间要反映到清单
+    } catch (error) {
+      void vscode.window.showErrorMessage(`New session failed: ${asError(error).message}`);
+    }
   }
 
   // Chats 树点击：当前会话与归档会话都直接 load 重放（daemon 现支持归档只读重放；
@@ -210,15 +229,15 @@ function openAgentChat(
     runtimeSessionId?: string;
     onSessionInfoUpdate?: (update: AcpSessionInfoUpdate) => void;
   } = {},
-): void {
+): vscode.WebviewPanel | undefined {
   let socketPath: string;
   try {
     socketPath = agentSocketPath();
   } catch (error) {
     void vscode.window.showErrorMessage(asError(error).message);
-    return;
+    return undefined;
   }
-  openAgentChatPanel({
+  return openAgentChatPanel({
     context,
     registry,
     agentConfig: createGoworkerAgentSpawnConfig(socketPath),

@@ -56,6 +56,22 @@ export class PanelAcpChatSession {
     });
   }
 
+  // startNewSession：在现有面板里执行 daemon 的 /new。
+  //
+  // 与 reset() 的区别很关键：reset 只重建**传输层**连接（session/new），daemon 的
+  // store 与对话上下文原样保留；/new 才是 daemon 侧的「结束当前会话」——固化记忆、
+  // 清空 STM、换新 Session 实例。用户点「新建会话」要的是后者。
+  //
+  // 走 bridge.prompt 而非直接发通知：/new 是一条命令，得经 daemon 的引擎求值，
+  // 输出也照常回流到面板（与手敲 /new 完全同一条路径）。
+  async startNewSession(): Promise<boolean> {
+    const bridge = await this.ensureConnected();
+    if (!bridge) return false;
+    if (bridge.isPrompting) await bridge.cancel(); // 会话进行中先取消，避免与 /new 抢上下文
+    await bridge.prompt('/new');
+    return true;
+  }
+
   // resetSession：断开旧 bridge，重建新连接（同一面板复用）。语义是「开新会话」，
   // 因此丢弃可能残留的 runtimeSessionId，不再重放旧会话。
   async reset(): Promise<AcpSessionBridge | undefined> {

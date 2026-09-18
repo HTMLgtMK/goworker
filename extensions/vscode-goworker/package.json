@@ -20,7 +20,8 @@
     "onCommand:goworker.openTask",
     "onCommand:goworker.openAgentChat",
     "onCommand:goworker.refreshChats",
-    "onCommand:goworker.openChatSession"
+    "onCommand:goworker.openChatSession",
+    "onCommand:goworker.newChatSession"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -75,6 +76,11 @@
         "title": "GOWORKER: Open Agent Chat"
       },
       {
+        "command": "goworker.newChatSession",
+        "title": "GOWORKER: New Chat Session",
+        "icon": "$(add)"
+      },
+      {
         "command": "goworker.refreshChats",
         "title": "GOWORKER: Refresh Chats",
         "icon": "$(refresh)"
@@ -121,9 +127,14 @@
           "group": "navigation"
         },
         {
+          "command": "goworker.newChatSession",
+          "when": "view == goworker.chats",
+          "group": "navigation@1"
+        },
+        {
           "command": "goworker.refreshChats",
           "when": "view == goworker.chats",
-          "group": "navigation"
+          "group": "navigation@2"
         }
       ],
       "commandPalette": [
