@@ -1,0 +1,70 @@
+name: PR Review
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read        # 只读代码
+  pull-requests: write  # 写评论
+
+# 连续 push 时只评审最新一次，旧 review 没意义还烧 token
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # diff 要拿 base 分支做对比，浅克隆不够
+          fetch-depth: 0
+
+      # fork 来的 PR 拿不到 secrets，直接跳过而不是让 job 红。
+      # 否则每个外部贡献者的 PR 都会挂一个失败标记，很难看。
+      - name: 检查密钥是否可用
+        id: gate
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ -z "$LLM_API_KEY" ]; then
+            echo "::notice::LLM_API_KEY 不可用（fork PR 或未配置），跳过 review"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 生成 diff
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          # PR 事件下 checkout 检出的通常是 merge ref，本地不一定有
+          # origin/<base> 这个引用。显式 fetch 一次，别赌 checkout 的行为。
+          base="${{ github.base_ref }}"
+          git fetch --no-tags --depth=1 origin "$base"
+
+          # 三点号 = 以 merge-base 为准，拿到的才是这个 PR 真正引入的改动，
+          # 不会把期间 master 上别人的提交混进来。
+          git diff "origin/${base}...HEAD" > /tmp/pr.diff
+          git diff --stat "origin/${base}...HEAD" > /tmp/pr.diff.stat
+          echo "base=${base} diff 行数: $(wc -l < /tmp/pr.diff)"
+
+      - name: LLM review 并评论
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          # 没配就用 OpenAI 默认。建议自己填，CI 里跑 gpt-4o-mini 级别的够用。
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          # 行级评论必须锚定到具体 commit。给 merge commit sha 会 422，
+          # 必须是 PR 分支的头。
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/review.py /tmp/pr.diff
