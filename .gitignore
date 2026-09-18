@@ -37,16 +37,19 @@ config.yaml
 
 # Dependencies
 vendor/
+node_modules/
 
 # Build artifacts
 /tmp/
 build/
+dist/
 
 # Tooling runtime state
 .omc/
 omc/
 .specify/
 .codegraph
+.zcode/
 
 # Claude local config (keep CLAUDE.md in repo, skip the rest)
 .claude/settings.local.json
