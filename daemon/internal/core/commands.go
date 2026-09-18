@@ -3,14 +3,13 @@ package core
 import (
 	"fmt"
 	"os"
-	"runtime"
-	"runtime/debug"
 	"strings"
 
 	term "github.com/charmbracelet/x/term"
 	"github.com/muesli/termenv"
 
 	"github.com/tinguo/goworker/daemon/internal/plugin"
+	"github.com/tinguo/goworker/daemon/internal/version"
 )
 
 // RegisterBuiltinCommands 注册引擎内置命令（/help, /config 等）。
@@ -32,6 +31,16 @@ func (e *Engine) RegisterBuiltinCommands() {
 		Aliases:     []string{"/diag"},
 		Description: "输出终端/主题/LLM/运行时诊断信息（排版问题排查用）",
 		Handler:     e.handleDiagnose,
+	})
+
+	e.RegisterCommand(plugin.Command{
+		Name:        "/version",
+		Aliases:     []string{"/ver"},
+		Description: "显示版本号/commit/构建信息",
+		Handler: func(ctx *plugin.Context) error {
+			ctx.Writer(version.Get().String() + "\n")
+			return nil
+		},
 	})
 
 	e.RegisterCommand(plugin.Command{
@@ -140,13 +149,6 @@ func (e *Engine) handleDiagnose(ctx *plugin.Context) error {
 	w("\n")
 
 	w("== 运行时 ==\n")
-	w("  %s %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
-	if info, ok := debug.ReadBuildInfo(); ok {
-		for _, setting := range info.Settings {
-			if setting.Key == "vcs.revision" {
-				w("  commit=%s\n", setting.Value)
-			}
-		}
-	}
+	w("  %s\n", version.Get().String())
 	return nil
 }
