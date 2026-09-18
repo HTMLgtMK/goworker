@@ -56,6 +56,38 @@ test('toChatEntries falls back to the index-0 convention when isCurrent is missi
   ]);
 });
 
+// 回归：/new 之后 store 被归档、head 置空，daemon 不再产出当前会话条目，
+// 清单全是显式 isCurrent:false 的归档。逐条回退 `?? index === 0` 会把最新的
+// 那条归档标成当前会话，点开即报 read-only（用户实际踩到的 bug）。
+test('toChatEntries marks nothing current when the list is all archived', () => {
+  const entries = toChatEntries([
+    { sessionId: '1789695701804819000', isCurrent: false },
+    { sessionId: '1789000000000000000', isCurrent: false },
+  ]);
+
+  assert.deepEqual(
+    entries.map((entry) => entry.isCurrent),
+    [false, false],
+  );
+});
+
+// 只要清单里有一条带布尔 isCurrent，就整份按它取值 —— 归档的 false 不能被
+// 位置约定覆盖掉。
+test('toChatEntries trusts the flag for the whole list once any entry carries it', () => {
+  const entries = toChatEntries([
+    { sessionId: 'archive-newest', isCurrent: false },
+    { sessionId: 'live', isCurrent: true },
+  ]);
+
+  assert.deepEqual(
+    entries.map((entry) => [entry.sessionId, entry.isCurrent]),
+    [
+      ['archive-newest', false],
+      ['live', true],
+    ],
+  );
+});
+
 test('toChatEntries never promotes a later entry to current when index 0 is malformed', () => {
   // index 0 非法（缺 sessionId）时宁缺毋滥：回退判定按 wire 位置，不把归档条目补位成当前会话。
   assert.deepEqual(toChatEntries([{ title: 'no id' }, { sessionId: 'archive-1' }]), [

@@ -6,7 +6,10 @@ export type AcpSessionListEntry = {
   cwd?: string;
   title?: string;
   updatedAt?: string;
-  /** 当前活动会话标记；Go 侧 omitempty，false/缺省窄化为 undefined。 */
+  /**
+   * 当前活动会话标记。Go 侧不带 omitempty，因此归档条目显式带 false；
+   * 仅当对端是旧版 wire（整份清单都不带该字段）时才为 undefined。
+   */
   isCurrent?: boolean;
 };
 
@@ -57,8 +60,10 @@ export function narrowSessionListEntries(result: unknown): AcpSessionListEntry[]
       const value = source[key];
       if (typeof value === 'string' && value.length > 0) entry[key] = value;
     }
-    // isCurrent 与 Go 侧 omitempty 对齐：仅 true 保留，false/缺省均为 undefined。
-    if (source['isCurrent'] === true) entry.isCurrent = true;
+    // isCurrent 保留完整布尔值（true / false），不把 false 抹成 undefined：
+    // false 是「这条是归档」的有效信息，抹掉它就无法与「旧版 wire 不表达该字段」
+    // 区分，上层只能靠位置猜（见 toChatEntries）。
+    if (typeof source['isCurrent'] === 'boolean') entry.isCurrent = source['isCurrent'];
     out.push(entry);
   }
   return out;

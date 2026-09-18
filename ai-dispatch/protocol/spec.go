@@ -106,7 +106,11 @@ type SessionInfo struct {
 	Cwd       string `json:"cwd"`
 	Title     string `json:"title,omitempty"`
 	UpdatedAt string `json:"updatedAt,omitempty"` // RFC3339
-	IsCurrent bool   `json:"isCurrent,omitempty"`
+	// IsCurrent 标记当前活动会话。**不带 omitempty**：false 必须显式出现在 wire 上，
+	// 否则「这条是归档（false）」与「这份 wire 压根不表达该字段（旧版）」在单条上
+	// 无法区分，客户端只能靠位置猜，/new 之后（清单全是归档）就会把最新的一条归档
+	// 误判成当前会话。
+	IsCurrent bool `json:"isCurrent"`
 }
 
 type ListSessionsResponse struct {

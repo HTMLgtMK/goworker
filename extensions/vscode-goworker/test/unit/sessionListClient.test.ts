@@ -184,7 +184,9 @@ test('fetchAcpSessionList rejects when the daemon socket does not exist', async 
   await assert.rejects(fetchAcpSessionList(missing), /Failed to connect to ACP daemon socket/);
 });
 
-test('narrowSessionListEntries keeps isCurrent only when true (Go omitempty alignment)', () => {
+// isCurrent 必须保留完整布尔值：false 是「这条是归档」的有效信息，抹成 undefined
+// 就与「旧版 wire 不表达该字段」混为一谈，上层只能靠位置猜。
+test('narrowSessionListEntries preserves isCurrent booleans (both true and false)', () => {
   assert.deepEqual(
     narrowSessionListEntries({
       sessions: [
@@ -196,8 +198,8 @@ test('narrowSessionListEntries keeps isCurrent only when true (Go omitempty alig
     }),
     [
       { sessionId: 'live', isCurrent: true },
-      { sessionId: 'off' },
-      { sessionId: 'str' },
+      { sessionId: 'off', isCurrent: false },
+      { sessionId: 'str' }, // 非布尔一律丢弃，不猜
       { sessionId: 'absent' },
     ],
   );

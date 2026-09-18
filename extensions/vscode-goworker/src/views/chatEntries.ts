@@ -28,26 +28,37 @@ export type ChatEntryClick = {
 
 /**
  * session/list 响应条目 → 展示行：遍历完整清单（当前会话 + 归档会话）生成行。
- * 归档会话现在可查看：load 会重放历史，prompt 会被 daemon 拒绝（只读归档错误，
- * 由面板既有 error 通道显示）。isCurrent 优先用条目自身的 isCurrent === true
- * （daemon 对当前会话置 true、归档按 omitempty 省略），缺失时回退现约定
- * （index 0 为当前，兼容不带该字段的旧 wire 数据）；其余行一律 isCurrent: false。
- * lastSessionId 命中时加 isLast 标记。
+ * 归档会话可查看：load 会重放历史，prompt 会被 daemon 拒绝（只读归档错误，
+ * 由面板既有 error 通道显示）。lastSessionId 命中时加 isLast 标记。
+ *
+ * isCurrent 的判定分两轮，不能逐条回退：
+ *
+ * 归档条目的 isCurrent 因 `omitempty` 在 wire 上**整个字段缺失**，与「旧版 wire
+ * 不带这个字段」在单条上无法区分。所以先扫一遍整份清单 —— 只要**有任何一条**带
+ * 布尔 isCurrent，就说明这份 wire 会表达该字段，逐条严格按它取值（缺失即 false）。
+ *
+ * 逐条回退 `?? index === 0` 是错的：/new 之后 store 被归档、head 置空，daemon 不再
+ * 产出当前会话条目，清单全是归档 —— 那时 index 0 是最新的一条**归档**，被标成当前
+ * 会话后点开就报 read-only。
+ *
+ * 只有整份清单都缺该字段（真·旧版 wire）才回退到 index 0 约定。
  */
 export function toChatEntries(raw: unknown, lastSessionId?: string): ChatEntry[] {
   const items = Array.isArray(raw) ? raw : [];
   const last = lastSessionId?.trim() ?? '';
+  // 整份清单里有没有任何条目显式带 isCurrent —— 决定是否还走位置约定。
+  const wireCarriesFlag = items.some((item) => readBoolean(item, 'isCurrent') !== undefined);
   const out: ChatEntry[] = [];
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index];
     const sessionId = readString(item, 'sessionId');
-    if (!sessionId) continue; // 非法条目跳过；回退判定按 wire 位置，不把归档条目补位成当前会话
+    if (!sessionId) continue; // 非法条目跳过
     const flagged = readBoolean(item, 'isCurrent');
     out.push({
       sessionId,
       title: readString(item, 'title'),
       updatedAt: readString(item, 'updatedAt'),
-      isCurrent: flagged ?? index === 0,
+      isCurrent: wireCarriesFlag ? flagged === true : index === 0,
       isLast: sessionId === last,
     });
   }
