@@ -16,7 +16,7 @@ import (
 	runtimeopenai "github.com/tinguo/goworker/ai-runtime/provider/openai"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-sandbox"
-	"github.com/tinguo/goworker/daemon/internal/config"
+	"github.com/tinguo/goworker/daemon/internal/app/config"
 )
 
 // TestE2E_SessionPersistFullChain 端到端验证会话持久化完整链路：

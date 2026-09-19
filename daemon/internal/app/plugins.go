@@ -1,6 +1,5 @@
-// Package app 是 daemon 的插件装配层（composition root）：决定哪些内置插件
-// 被编进二进制、以什么依赖注册进 engine。cmd/goworker 只负责入口与生命周期，
-// 不感知具体插件。
+// 插件装配链（composition root）：决定哪些内置插件被编进二进制、以什么依赖
+// 注册进 engine。壳层（cmd/goworker、mobile）经 app.New 间接使用，不感知具体插件。
 //
 // 每个可选插件对应一对构建标签文件：plugins_agent.go（//go:build !goworker_no_<name>）
 // 与 plugins_agent_off.go（//go:build goworker_no_<name>）。off-tag 缺省不生效，
@@ -14,11 +13,11 @@ import (
 
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/logger"
-	"github.com/tinguo/goworker/daemon/internal/core"
+	"github.com/tinguo/goworker/daemon/internal/core/engine"
 )
 
 // RegisterPlugins 按序装配编译进二进制的插件。
-func RegisterPlugins(engine *core.Engine, runtimeCfg *runtimeconfig.Config, log *logger.Logger) error {
+func RegisterPlugins(engine *engine.Engine, runtimeCfg *runtimeconfig.Config, log *logger.Logger) error {
 	if err := registerAgent(engine, runtimeCfg, log); err != nil {
 		return fmt.Errorf("agent: %w", err)
 	}
