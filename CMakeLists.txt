@@ -10,8 +10,8 @@
 # 交叉编译：
 #   cmake -B build -DGOOS=linux -DGOARCH=amd64 && cmake --build build
 #
-# 版本号：git describe（tags 优先）注入 ldflags -X main.version，
-# 运行 `goworker version` 查询；无 tag 时回退 project version。
+# 版本号：git describe（tags 优先）注入 ldflags -X internal/version.version，
+# 运行 `goworker -version` 查询；无 tag 时回退 project version。
 cmake_minimum_required(VERSION 3.20)
 
 # 禁止源码内构建（Go 源码树混入 CMake 产物会污染 go build 的目录遍历）
@@ -50,6 +50,20 @@ if(GIT_EXECUTABLE AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git)
 endif()
 message(STATUS "goworker version: ${PROJ_VERSION}")
 
+# ---- 模块清单（从 go.work 动态读取，与 ci.yml 同源，避免硬编码清单漂移）----
+file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/go.work _gowork_lines
+    REGEX "^[ \t]*\\./[a-zA-Z-]+[ \t]*$")
+set(GO_MODULES "")
+foreach(_line IN LISTS _gowork_lines)
+    string(REGEX REPLACE "^[ \t]*\\./([a-zA-Z-]+)[ \t]*$" "\\1" _mod "${_line}")
+    list(APPEND GO_MODULES "${_mod}")
+endforeach()
+set(GO_TEST_PKGS "")
+foreach(_mod IN LISTS GO_MODULES)
+    list(APPEND GO_TEST_PKGS "./${_mod}/...")
+endforeach()
+message(STATUS "go.work 模块: ${GO_MODULES}")
+
 # ---- 输出 ----
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(GOWORKER_BIN_NAME goworker)
@@ -73,7 +87,7 @@ add_custom_command(
     OUTPUT ${GOWORKER_BIN}
     COMMAND ${CMAKE_COMMAND} -E env ${_go_env}
         ${GO_EXECUTABLE} build ${GO_BUILD_FLAGS}
-            -ldflags "-X main.version=${PROJ_VERSION}"
+            -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version=${PROJ_VERSION}"
             -o ${GOWORKER_BIN}
             ./daemon/cmd/goworker
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -85,8 +99,7 @@ add_custom_target(goworker ALL DEPENDS ${GOWORKER_BIN})
 
 # ---- 辅助目标 ----
 add_custom_target(test
-    COMMAND ${GO_EXECUTABLE} test
-        ./ai-core/... ./ai-dispatch/... ./ai-memory/... ./ai-sandbox/... ./ai-runtime/... ./daemon/...
+    COMMAND ${GO_EXECUTABLE} test ${GO_TEST_PKGS}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "go test（全 workspace）"
     VERBATIM
@@ -100,8 +113,7 @@ add_custom_target(test-race
 )
 
 add_custom_target(vet
-    COMMAND ${GO_EXECUTABLE} vet
-        ./ai-core/... ./ai-dispatch/... ./ai-memory/... ./ai-sandbox/... ./ai-runtime/... ./daemon/...
+    COMMAND ${GO_EXECUTABLE} vet ${GO_TEST_PKGS}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "go vet"
     VERBATIM
