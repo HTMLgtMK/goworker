@@ -11,7 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
@@ -19,9 +22,6 @@ import (
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/mcp"
-	runtimeprovider "github.com/tinguo/goworker/ai-runtime/provider"
-	runtimeanthropic "github.com/tinguo/goworker/ai-runtime/provider/anthropic"
-	runtimeopenai "github.com/tinguo/goworker/ai-runtime/provider/openai"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
@@ -38,23 +38,38 @@ type AgentPlugin struct {
 	cfg   *runtimeconfig.Config
 	paths runtimeconfig.Paths
 	hub   *model.Hub
+	// runGate 是 agent 执行串行门禁（容量 1 的信号量）：/agent 与自然语言 fallback
+	// 共用 handleAgent 入口，gate 保证同一时刻只有一个命令回合在跑（session.Run 全程互斥）。
+	// 只 gate handleAgent —— /new /compact /task /memory 等 handler 绝不能获取它：
+	// collectTools 会在 agent 运行期间嵌套 hub.Eval 执行这些命令，重复取锁即死锁。
+	runGate chan struct{}
 	// deps 是 Session 的资源依赖，startSession 每次会话边界全量重建（含指令快照），
 	// /new 经同一路径刷新后以新 deps 创建新会话。
 	deps runtimeagent.SessionDeps
 	// session 是当前会话。NewSession 创建（Init 一次 + /new 一次）；/new 用新实例替换，
 	// 旧会话状态（conversation/usage）随对象回收。
-	session    *runtimeagent.Session
-	store      *session.Store        // 会话持久化 store，nil = 禁用
-	skills     []skills.Skill        // Init 时加载的 skill 清单，注册为 skill_* 工具
-	mcpClients map[string]mcp.Client // server name → 连接，Stop 时统一关闭
-	mcpTools   []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
-	memory     *memory.Client        // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
+	// 两者用 atomic.Pointer：/new 在 REPL goroutine 上换指针，vscode ingress 的
+	// session/list|load 与各命令 handler 在别的 goroutine 上读（评审 I4），
+	// 裸指针读写是没有 happens-before 的数据竞争。
+	session    atomic.Pointer[runtimeagent.Session]
+	store      atomic.Pointer[session.Store] // nil = 持久化禁用
+	skills     []skills.Skill                // Init 时加载的 skill 清单，注册为 skill_* 工具
+	mcpClients map[string]mcp.Client         // server name → 连接，Stop 时统一关闭
+	mcpTools   []core.Tool                   // 从已连接 server 拉取的工具（静态，collectTools 复用）
+	memory     *memory.Client                // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
+
+	// 会话工作目录状态（mu 保护）。ACP 提交方经 session/new|load 声明的 cwd 经
+	// sandbox 边界校验后落到这里并应用到当前会话；非法声明只记 cwdErr（无效标记），
+	// session/prompt 时明确报错，绝不静默生效或回落旧值。
+	mu         sync.Mutex
+	sessionCwd string // 最近一次有效声明的会话 cwd（绝对路径；空 = 未声明）
+	cwdErr     error  // 最近一次声明的校验错误（nil = 无声明或已通过）
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
 // 插件不再从 model.Hub.Config 读配置（Hub.Config 已 any 化）——配置与路径全部构造函数注入。
 func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *AgentPlugin {
-	return &AgentPlugin{cfg: cfg, paths: paths}
+	return &AgentPlugin{cfg: cfg, paths: paths, runGate: make(chan struct{}, 1)}
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }
@@ -172,7 +187,7 @@ func (p *AgentPlugin) Stop() error {
 		// LLM 网关慢时 20s 容易超时丢历史，放宽到 120s 给足时间。
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		// Client.Checkpoint 内部已打 applied 日志，这里不重复
-		if _, err := p.session.Consolidate(ctx); err != nil {
+		if _, err := p.session.Load().Consolidate(ctx); err != nil {
 			slog.Warn("memory: stop checkpoint failed", "err", err)
 		}
 		cancel()
@@ -181,8 +196,8 @@ func (p *AgentPlugin) Stop() error {
 		}
 	}
 	// store 生命周期收尾：consolidate 后关闭
-	if p.store != nil {
-		if err := p.store.Close(); err != nil {
+	if st := p.store.Load(); st != nil {
+		if err := st.Close(); err != nil {
 			slog.Warn("session: store close failed", "err", err)
 		}
 	}
@@ -201,13 +216,13 @@ func (p *AgentPlugin) closeMCP() {
 
 func (p *AgentPlugin) startSession() {
 	// 打开会话持久化 store。失败降级不阻塞插件启动。
-	p.store = nil
+	p.store.Store(nil)
 	if p.cfg.Session.Enabled {
 		st, err := session.Open(p.cfg.Session.Dir)
 		if err != nil {
 			slog.Warn("session: store open failed, persistence disabled", "err", err)
 		} else {
-			p.store = st
+			p.store.Store(st)
 		}
 	}
 
@@ -229,39 +244,7 @@ func (p *AgentPlugin) startSession() {
 
 	// 会话层组装：资源就绪后构造 deps 与首会话。
 
-	modelProvider := func(cfg *runtimeconfig.Config) (core.Provider, error) {
-		name, provider, err := cfg.LLM.ResolveDefault()
-		if err != nil {
-			return nil, err
-		}
-		switch provider.Type {
-		case runtimeconfig.ProviderTypeOpenAI:
-			return runtimeopenai.NewProvider(
-				name,
-				provider.Endpoint,
-				provider.APIKey,
-				provider.Model,
-				client,
-				runtimeopenai.WithThinkingOptions(runtimeprovider.ThinkingOptions{
-					RequestMode: provider.Thinking.RequestMode,
-					Effort:      provider.Thinking.Effort,
-				}),
-			), nil
-
-		case runtimeconfig.ProviderTypeAnthropic:
-			return runtimeanthropic.NewProvider(
-				name,
-				provider.Endpoint,
-				provider.APIKey,
-				provider.Model,
-				client,
-				runtimeanthropic.AnthropicAuthType(provider.AuthType),
-				runtimeanthropic.WithAnthropicMaxTokens(provider.MaxTokens),
-			), nil
-		default:
-			return nil, fmt.Errorf("unsupported provider type %q", provider.Type)
-		}
-	}
+	modelProvider := ProviderFactory(client)
 
 	p.deps = runtimeagent.SessionDeps{
 		Config:       p.cfg,
@@ -269,14 +252,90 @@ func (p *AgentPlugin) startSession() {
 		Memory:       p.memory,
 		CollectTools: p.collectTools,
 		NewProvider:  modelProvider,
-		Store:        p.store,
+		Store:        p.store.Load(),
 	}
 	// 指令快照与记忆组件同开关：memory disabled 时留 nil，buildSystemPrompt 跳过指令段。
 	// 会话边界（Init / /new）经 startSession 重载 —— system prompt 在会话创建前就绪。
 	if p.cfg.Memory.Enabled {
 		p.deps.Instruction = p.loadInstructions()
 	}
-	p.session = runtimeagent.NewSession(p.deps)
+	p.session.Store(runtimeagent.NewSession(p.deps))
+
+	// 会话重建 = 新的会话边界。无效 cwd 标记随旧会话作废（否则会毒化新会话的
+	// 每个 prompt）；有效声明跨会话保留并应用到新会话 —— 工作区没变，/new 不该
+	// 让工具悄悄回退到别的目录。取舍：不追踪「声明了 cwd 的 transport 会话与
+	// store 会话的对应关系」，单活动会话模型下一律落当前会话。
+	p.mu.Lock()
+	p.cwdErr = nil
+	cwd := p.sessionCwd
+	p.mu.Unlock()
+	p.session.Load().SetCWD(cwd)
+}
+
+// SetSession 记录 ACP 提交方声明的会话工作目录并应用到当前会话（单活动会话模型：
+// transport sessionID 与 store 的 head id 不同源，cwd 一律落当前活动会话）。
+//
+// sandbox 边界在插件侧校验：cfg.Sandbox.AllowedWorkDir 非空时，声明的 cwd 必须
+// 落在它之下（Abs + EvalSymlinks 解析后判断前缀，符号链接与相对路径钉到真实
+// 位置）；非法声明存为无效标记，session/prompt 时返回明确错误，不让越界目录
+// 静默生效。AllowedWorkDir 为空 = 不限制，接受任意 cwd；cwd 为空 = 未声明，
+// 清空会话目录回退现行为。
+func (p *AgentPlugin) SetSession(sessionID, cwd string) {
+	cwd = strings.TrimSpace(cwd)
+	if cwd != "" {
+		if abs, err := filepath.Abs(cwd); err == nil {
+			cwd = abs // cmd.Dir 要求绝对路径；SessionInfo.Cwd 也回显规范化值
+		}
+	}
+	if err := p.validateSessionCWD(cwd); err != nil {
+		p.mu.Lock()
+		p.sessionCwd, p.cwdErr = "", err
+		p.mu.Unlock()
+		slog.Warn("agent: reject session cwd", "session", sessionID, "cwd", cwd, "err", err)
+		return
+	}
+	p.mu.Lock()
+	p.sessionCwd, p.cwdErr = cwd, nil
+	p.mu.Unlock()
+	if s := p.session.Load(); s != nil {
+		s.SetCWD(cwd)
+	}
+}
+
+// validateSessionCWD 校验声明的 cwd 是否落在 sandbox 边界内。
+// allowed 为空 = 不限制；cwd 为空 = 未声明，均直接放行。
+func (p *AgentPlugin) validateSessionCWD(cwd string) error {
+	allowed := ""
+	if p.cfg != nil {
+		allowed = p.cfg.Sandbox.AllowedWorkDir
+	}
+	if allowed == "" || cwd == "" {
+		return nil
+	}
+	resolvedCwd, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return fmt.Errorf("invalid session cwd %q: %w", cwd, err)
+	}
+	absAllowed, err := filepath.Abs(allowed)
+	if err != nil {
+		return fmt.Errorf("invalid session cwd %q: sandbox boundary %q: %w", cwd, allowed, err)
+	}
+	resolvedAllowed, err := filepath.EvalSymlinks(absAllowed)
+	if err != nil {
+		return fmt.Errorf("invalid session cwd %q: sandbox boundary %q: %w", cwd, allowed, err)
+	}
+	if resolvedCwd != resolvedAllowed && !strings.HasPrefix(resolvedCwd, resolvedAllowed+string(os.PathSeparator)) {
+		return fmt.Errorf("invalid session cwd %q: outside sandbox boundary %q", cwd, allowed)
+	}
+	return nil
+}
+
+// sessionCWDError 返回最近一次会话 cwd 声明的校验错误（无声明或已通过 = nil）。
+// session/prompt 入口（handleAgent）先查它：无效声明下不执行任何工具。
+func (p *AgentPlugin) sessionCWDError() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cwdErr
 }
 
 /**

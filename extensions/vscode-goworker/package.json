@@ -1,0 +1,165 @@
+{
+  "name": "vscode-goworker",
+  "displayName": "GOWORKER",
+  "description": "GOWORKER task console and ACP trace observer for VS Code.",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:goworker.tasks",
+    "onView:goworker.workers",
+    "onView:goworker.runtime",
+    "onView:goworker.chats",
+    "onChatParticipant:goworker.chat",
+    "onCommand:goworker.refreshTasks",
+    "onCommand:goworker.openTask",
+    "onCommand:goworker.openAgentChat",
+    "onCommand:goworker.refreshChats",
+    "onCommand:goworker.openChatSession",
+    "onCommand:goworker.newChatSession"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "goworker",
+          "title": "GOWORKER",
+          "icon": "media/goworker.svg"
+        }
+      ]
+    },
+    "views": {
+      "goworker": [
+        {
+          "id": "goworker.chats",
+          "name": "Chats"
+        },
+        {
+          "id": "goworker.tasks",
+          "name": "Tasks"
+        },
+        {
+          "id": "goworker.workers",
+          "name": "Workers"
+        },
+        {
+          "id": "goworker.runtime",
+          "name": "Runtime"
+        }
+      ]
+    },
+    "chatParticipants": [
+      {
+        "id": "goworker.chat",
+        "name": "goworker",
+        "description": "Chat with the GOWORKER daemon agent to run and inspect tasks.",
+        "isSticky": true
+      }
+    ],
+    "commands": [
+      {
+        "command": "goworker.refreshTasks",
+        "title": "GOWORKER: Refresh Tasks"
+      },
+      {
+        "command": "goworker.openTask",
+        "title": "GOWORKER: Open Task"
+      },
+      {
+        "command": "goworker.openAgentChat",
+        "title": "GOWORKER: Open Agent Chat"
+      },
+      {
+        "command": "goworker.newChatSession",
+        "title": "GOWORKER: New Chat Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "goworker.refreshChats",
+        "title": "GOWORKER: Refresh Chats",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "goworker.openChatSession",
+        "title": "GOWORKER: Open Chat Session"
+      },
+      {
+        "command": "goworker.reconnect",
+        "title": "GOWORKER: Reconnect"
+      }
+    ],
+    "configuration": {
+      "title": "GOWORKER",
+      "properties": {
+        "goworker.socketPath": {
+          "type": "string",
+          "default": "",
+          "description": "Override the local GOWORKER dispatcher Unix socket path. TCP URLs are not supported."
+        },
+        "goworker.agentSocketPath": {
+          "type": "string",
+          "default": "",
+          "description": "Override the GOWORKER agent chat Unix socket path. TCP is not supported. Leave empty to derive ~/.config/goworker/frontend/vscode.sock."
+        },
+        "goworker.autoOpenChat": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the GOWORKER Agent Chat panel automatically when a workspace opens."
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "goworker.refreshTasks",
+          "when": "view == goworker.tasks",
+          "group": "navigation"
+        },
+        {
+          "command": "goworker.reconnect",
+          "when": "view == goworker.runtime",
+          "group": "navigation"
+        },
+        {
+          "command": "goworker.newChatSession",
+          "when": "view == goworker.chats",
+          "group": "navigation@1"
+        },
+        {
+          "command": "goworker.refreshChats",
+          "when": "view == goworker.chats",
+          "group": "navigation@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "goworker.openChatSession",
+          "when": "false"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/unit/**/*.test.ts",
+    "package": "npm run typecheck && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/vscode": "^1.100.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "@htmlgtmk/acp-ui": "file:../../../vscode-acp-ui/dist-sdk"
+  }
+}

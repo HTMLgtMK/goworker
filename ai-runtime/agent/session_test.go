@@ -7,6 +7,7 @@ import (
 
 	"github.com/tinguo/goworker/ai-core/core"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
@@ -134,6 +135,26 @@ func TestSessionRun_AccumulatesUsageAcrossRuns(t *testing.T) {
 	// 本轮 captureProvider 记 1 次 → 累计 2 次
 	if n := len(s.usage.Calls()); n != 2 {
 		t.Errorf("calls = %d, want 2 (accumulated across runs)", n)
+	}
+}
+
+func TestSessionStreamTokens_ForwardsEmptyToolResult(t *testing.T) {
+	s, _ := testSession(&captureProvider{})
+	tokens := make(chan core.Token, 2)
+	tokens <- core.Token{Type: core.TokenTypeToolCall, ToolCall: core.ToolCall{ID: "call_1"}}
+	tokens <- core.Token{Type: core.TokenTypeToolResult, ToolCallID: "call_1"}
+	close(tokens)
+
+	var emitted []core.Token
+	s.streamTokens(RunCallbacks{EmitToken: func(token core.Token) {
+		emitted = append(emitted, token)
+	}}, context.Background(), tokens, make(chan hitl.Decision, 1))
+
+	if len(emitted) != 2 {
+		t.Fatalf("emitted tokens = %+v, want tool call and result", emitted)
+	}
+	if emitted[1].Type != core.TokenTypeToolResult || emitted[1].ToolCallID != "call_1" {
+		t.Errorf("tool result = %+v, want empty result for call_1", emitted[1])
 	}
 }
 

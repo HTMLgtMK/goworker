@@ -24,21 +24,29 @@ import (
 
 // Config 是 goworker 的整体配置。所有段顶层平铺，旧 config.yaml 不缩进 → 兼容。
 type Config struct {
-	Frontend FrontendConfig              `yaml:"frontend"`
-	LLM      runtimeconfig.LLMConfig     `yaml:"llm"`
-	Memory   runtimeconfig.MemoryConfig  `yaml:"memory"`
-	Sandbox  SandboxConfig               `yaml:"sandbox"`
-	Session  runtimeconfig.SessionConfig `yaml:"session"`
-	MCP      runtimeconfig.MCPConfig     `yaml:"mcp"`
-	Log      logger.Config               `yaml:"log"`
+	Frontend FrontendConfig               `yaml:"frontend"`
+	LLM      runtimeconfig.LLMConfig      `yaml:"llm"`
+	Memory   runtimeconfig.MemoryConfig   `yaml:"memory"`
+	Sandbox  SandboxConfig                `yaml:"sandbox"`
+	Session  runtimeconfig.SessionConfig  `yaml:"session"`
+	MCP      runtimeconfig.MCPConfig      `yaml:"mcp"`
+	Dispatch runtimeconfig.DispatchConfig `yaml:"dispatch"`
+	Log      logger.Config                `yaml:"log"`
 }
 
 type FrontendConfig struct {
-	Stdin StdinConfig `yaml:"stdin"`
+	Stdin  StdinConfig          `yaml:"stdin"`
+	Vscode VscodeFrontendConfig `yaml:"vscode"`
 }
 
 type StdinConfig struct {
 	Theme string `yaml:"theme"` // "default" 或主题 JSON 文件路径
+}
+
+// VscodeFrontendConfig 是 VS Code ACP socket 前端的解析层配置。
+type VscodeFrontendConfig struct {
+	Enabled bool   `yaml:"enabled"`          // false = 不启动 vscode ACP 前端（默认 true）
+	Socket  string `yaml:"socket,omitempty"` // 完整 Unix socket 路径；空 = main 按 DefaultDir 派生
 }
 
 // ---- sandbox 解析层（保留双格式兼容，运行时转 ai-sandbox）----
@@ -124,11 +132,18 @@ func fromSandbox(s sandbox.SandboxConfig) SandboxConfig {
 // ToRuntime 复制出 ai-runtime 的聚合配置，供插件消费。
 func (c *Config) ToRuntime() *runtimeconfig.Config {
 	return &runtimeconfig.Config{
-		LLM:     c.LLM.Clone(),
-		Memory:  c.Memory,
-		Sandbox: c.Sandbox.ToSandbox(),
-		Session: c.Session,
-		MCP:     c.MCP,
+		LLM:      c.LLM.Clone(),
+		Memory:   c.Memory,
+		Sandbox:  c.Sandbox.ToSandbox(),
+		Session:  c.Session,
+		MCP:      c.MCP,
+		Dispatch: c.Dispatch,
+		Frontend: runtimeconfig.FrontendConfig{
+			Vscode: runtimeconfig.VscodeFrontendConfig{
+				Enabled: c.Frontend.Vscode.Enabled,
+				Socket:  c.Frontend.Vscode.Socket,
+			},
+		},
 	}
 }
 
@@ -138,7 +153,12 @@ func (c *Config) ApplyRuntime(r *runtimeconfig.Config) {
 	c.Memory = r.Memory
 	c.Session = r.Session
 	c.MCP = r.MCP
+	c.Dispatch = r.Dispatch
 	c.Sandbox = fromSandbox(r.Sandbox)
+	c.Frontend.Vscode = VscodeFrontendConfig{
+		Enabled: r.Frontend.Vscode.Enabled,
+		Socket:  r.Frontend.Vscode.Socket,
+	}
 }
 
 // ---- 默认值 ----
@@ -152,6 +172,8 @@ func Default() *Config {
 	return &Config{
 		Frontend: FrontendConfig{
 			Stdin: StdinConfig{Theme: "default"},
+			// vscode ACP 前端默认开启；socket 路径留空，由 main 按 DefaultDir 派生
+			Vscode: VscodeFrontendConfig{Enabled: true},
 		},
 		LLM:    runtimeconfig.DefaultLLM(),
 		Memory: mem,
@@ -458,6 +480,10 @@ func Load(path string) *Config {
 	}
 	if err := cfg.LLM.Validate(); err != nil {
 		slog.Error("config: invalid LLM configuration", "err", err)
+		return nil
+	}
+	if err := cfg.Dispatch.Validate(); err != nil {
+		slog.Error("config: invalid dispatch configuration", "err", err)
 		return nil
 	}
 	return cfg

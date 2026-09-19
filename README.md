@@ -4,36 +4,44 @@ A modular REPL agent terminal in Go — plugin-based, middleware-driven, LLM-rea
 
 ## Architecture
 
-Five Go modules in one workspace (`go.work`), layered as an SDK. `ai-core` / `ai-sandbox` / `ai-memory` are standalone, independently-releasable; `ai-runtime` aggregates them into an out-of-the-box agent for external projects; `daemon/` is the agent backend consuming `ai-runtime`, with one shared assembly (`internal/app`) behind per-frontend shells — CLI (`cmd/goworker`) and Android (`mobile/`, gobind).
+Six Go modules in one workspace (`go.work`), layered as an SDK. `ai-core` / `ai-sandbox` / `ai-memory` / `ai-dispatch` are standalone, independently-releasable; `ai-runtime` aggregates core+memory+sandbox into an out-of-the-box agent for external projects; `daemon/` is the agent backend consuming `ai-runtime` — one shared assembly (`internal/app`) behind per-frontend shells (CLI `cmd/goworker`, Android `mobile/` via gobind) and the multi-agent dispatcher host (`internal/dispatcher`).
 
 ```
 ai-memory/                     ← standalone: MTM task archive + LTM facts (mem0-like), zero deps
 ai-sandbox/                    ← standalone: command safety layer (risk R0-R7 → policy → allow/hitl/deny), stdlib only
 ai-core/                       ← pure engine kernel: spec protocol + ReAct engine + core types + engine middlewares
 │  ├── spec/                   ← Hub, Command, Plugin, Context (pure protocol)
-│  ├── core/                   ← Tool, Message, Usage, Compressor, NewMsgID
+│  ├── core/                   ← Tool, Message(+Thinking/Custom), Usage, Compressor
 │  ├── config/                 ← LLMConfig/MemoryConfig + validators (engine needs)
-│  ├── agent/                  ← ReAct loop (zero sandbox/memory deps)
+│  ├── agent/                  ← ReAct loop (zero sandbox/memory deps; emits thinking tokens)
 │  └── middlewares/            ← usage/iteration/compression/memory (MemoryClient as local interface)
+ai-dispatch/                   ← standalone: ACP (Agent Client Protocol) dual-role + commit-dispatcher core, stdlib only
+│  ├── protocol/               ← JSON-RPC 2.0 conn + ACP REV_1 types/methods (initialize/session.*/permissions)
+│  ├── task/                   ← Task state machine (code/general) + JSONL snapshot store + event contract
+│  └── dispatch                ← Client (drive worker subprocess) / Server (accept task submissions)
 ai-runtime/                    ← aggregation: out-of-the-box agent for external projects
-│  ├── config/                 ← aggregated Config{LLM,Memory,Sandbox,Session,MCP} + Paths + event contract
-│  ├── agent/                  ← AgentPlugin (NewPlugin(cfg, paths)), session, tools, commands, DefaultTools
+│  ├── config/                 ← aggregated Config{LLM,Memory,Sandbox,Session,MCP,Dispatch} + Paths + event contract
+│  ├── provider/               ← LLM protocol adapters: BaseProvider + openai/ + anthropic/
+│  ├── agent/                  ← agent SDK: Session + SessionDeps + RunRequest/RunCallbacks + DefaultTools
 │  ├── middlewares/            ← HITL middleware (sandbox decision gating)
 │  ├── session/                ← conversation store (checkpoint/rewind)
 │  ├── mcp/ skills/ logger/    ← moved from daemon, reusable
-daemon/                        ← agent backend: engine + service + shell per frontend
-│  ├── cmd/goworker/           ← CLI 壳：stdin 前端 + 信号处理
+daemon/                        ← agent backend: engine + service + shell per frontend + dispatcher host
+│  ├── cmd/goworker/           ← CLI 壳：stdin 前端 + `acp` worker 模式 + 信号处理
 │  ├── mobile/                 ← Android 壳占位（gobind 入口，共享同一套装配）
 │  ├── internal/app/           ← 装配层：Application（配置→日志→Engine→RegisterPlugins→StartAll）+ config/
 │  ├── internal/core/          ← engine（Engine）+ model（plugin 协议）+ service（AgentPlugin）
-│  └── internal/cli/           ← stdin REPL + statusbar (subscribes ai-runtime events)
+│  ├── internal/dispatcher/    ← /dispatch /workers commands, ACP ingress socket, HITL review, audit
+│  └── internal/cli/           ← stdin REPL + vscode ACP frontend + statusbar (subscribes ai-runtime events)
 docs/architecture.md           ← detailed architecture doc
+docs/dispatcher.md             ← dispatcher design (ACP dual-role, worktree isolation, HITL merge)
 ```
 
 ```
 daemon ──→ ai-runtime ──→ ai-core ──→ (zero goworker deps)
-                 ├──→ ai-memory
-                 └──→ ai-sandbox
+      │         ├──→ ai-memory
+      │         └──→ ai-sandbox
+      └──→ ai-dispatch ──→ (stdlib only)
 ```
 
 ### Core Concepts
@@ -43,7 +51,9 @@ daemon ──→ ai-runtime ──→ ai-core ──→ (zero goworker deps)
 - **Hub** — adapter that exposes a limited API from Engine to plugins (function-pointer struct pattern).
 - **Middleware** — onion model middleware chain wrapping every command execution.
 - **Command** — slash commands like `/help`, `/agent`, `/model`.
-- **ReAct Agent** — Think→Act→Observe loop with OpenAI-compatible LLM + tool calling.
+- **ReAct Agent** — Think→Act→Observe loop with multi-provider LLM (OpenAI-compatible / Anthropic Messages) + tool calling; thinking tokens stream end-to-end.
+- **Dispatcher** — commit-dispatching center as a plugin: accepts tasks (REPL `/dispatch` or external ACP clients), drives worker agents (Claude Code / Codex / ZCode) over ACP in isolated git worktrees, gates every merge behind human review.
+- **ACP dual role** — goworker speaks the Agent Client Protocol on both sides: as Client it spawns worker agents; as Agent it accepts task submissions (`<config-dir>/dispatch/acp.sock`) and exposes itself as a worker via `goworker acp`.
 
 ### Agent Plugin
 
@@ -61,6 +71,8 @@ soften normal-mode confirmations, and strict/readonly modes hard-deny. Injection
 vectors (subshell, interpreter `-c`, eval) and newline-joined commands are
 flagged. Set `audit_log: true` to append every decision (with the human verdict)
 to `audit/audit.jsonl`.
+
+Multiple LLM providers are supported per config (`llm.providers.<name>.type`: `openai` or `anthropic`, with `auth_type`/`max_tokens`/thinking options for Anthropic); `/model` edits the default one.
 
 Configure LLM endpoint via `/model`:
 
@@ -157,13 +169,37 @@ write the file for you.
 
 (This sample is pinned by a test — `TestReadmeSampleConfigParses` — so it can't
 drift away from what the loader actually accepts.)
+Dispatcher (`docs/dispatcher.md`, `dispatch.enabled: true` in config.yaml):
+- `/dispatch <prompt>` — queue a task: git repo → code task (mandatory worktree isolation, commits collected via `BaseCommit..HEAD`); otherwise general task (no git needed)
+- `/dispatch @claude <prompt>` — target a specific worker; `ls/show/approve/complete/reject/cancel` manage the lifecycle
+- Workers are ACP subprocesses (`dispatch.workers`): Claude Code via `claude-agent-acp`, Codex via `codex-acp`, ZCode via `goworker acp`
+- Every merge waits for human review (`approve` = ff-only merge attempt; conflicts → manual merge + `complete`); decisions land in `audit/dispatch.jsonl`
+- External ACP clients submit tasks to `<config-dir>/dispatch/acp.sock`; progress streams back as `session/update`
+- Status bar shows live task state (`dispatch 2 run !1 review · summary`)
+
+Config: YAML at `~/.config/goworker/config.yaml` (`GOWORKER_CONFIG_DIR` relocates the whole runtime dir — one dir per instance when running multiple goworkers).
 
 ## Getting Started
 
 ```bash
-cd daemon
-go run cmd/goworker/main.go     # go.work resolves the ai-* modules; standalone builds use the replaces in daemon/go.mod
+cmake -B build && cmake --build build   # -> build/bin/goworker（版本号经 git describe 注入）
+./build/bin/goworker                    # REPL
+./build/bin/goworker acp                # ACP worker 模式（被 dispatcher/编辑器驱动）
+./build/bin/goworker -version           # 版本信息
+
+cmake --build build --target test       # 全量测试
+cmake --build build --target vet
+cmake --build build --target instance   # 生成本地隔离子实例目录（多运行时）
+
+# 交叉编译
+cmake -B build -DGOOS=linux -DGOARCH=amd64 && cmake --build build
+
+# 无 CMake 时：go build（workspace 内）
+cd daemon && go run cmd/goworker/main.go
 ```
+
+多运行时：`GOWORKER_CONFIG_DIR=<dir>` 隔离每个实例的 config/sessions/memory/dispatch 与 acp.sock，
+dispatcher 在 `<dir>/dispatch/acp.sock` 接受外部 ACP 任务提交（见 docs/dispatcher.md）。
 
 Build with the version stamped in:
 
@@ -197,8 +233,9 @@ lists the plugins to leave out; each name becomes a `goworker_no_<name>` build
 tag that removes it at compile time:
 
 ```bash
-cmake -B build                                  # default: every plugin compiled in
-cmake -B build -DGOWORKER_NO_PLUGINS=agent      # minimal shell: engine + builtin commands, no plugins
+cmake -B build                                        # default: every plugin compiled in
+cmake -B build -DGOWORKER_NO_PLUGINS=agent            # no agent plugin: engine + builtin commands only
+cmake -B build -DGOWORKER_NO_PLUGINS=dispatcher       # full REPL, no multi-agent dispatch
 ```
 
 The wiring lives in `daemon/internal/app` (one `plugins_<name>.go` /

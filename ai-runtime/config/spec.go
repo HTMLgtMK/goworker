@@ -5,6 +5,9 @@
 package config
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/tinguo/goworker/ai-core/core"
 	sandbox "github.com/tinguo/goworker/ai-sandbox"
 )
@@ -109,11 +112,140 @@ type MCPServer struct {
 
 // Config 是 ai-runtime 的运行配置聚合。
 type Config struct {
-	LLM     LLMConfig             `yaml:"llm"`
-	Memory  MemoryConfig          `yaml:"memory"`
-	Sandbox sandbox.SandboxConfig `yaml:"sandbox"`
-	Session SessionConfig         `yaml:"session"`
-	MCP     MCPConfig             `yaml:"mcp"`
+	LLM      LLMConfig             `yaml:"llm"`
+	Memory   MemoryConfig          `yaml:"memory"`
+	Sandbox  sandbox.SandboxConfig `yaml:"sandbox"`
+	Session  SessionConfig         `yaml:"session"`
+	MCP      MCPConfig             `yaml:"mcp"`
+	Dispatch DispatchConfig        `yaml:"dispatch"`
+	Frontend FrontendConfig        `yaml:"frontend"`
+}
+
+// FrontendConfig 是前端装配配置（当前仅 vscode ACP 入口）。
+// 与 DispatchConfig 完全分离：dispatch 的 <DispatchDir>/acp.sock 是无人值守 worker
+// 的任务提交入口；这里的 socket 是外部编辑器驱动 daemon 主会话的前端入口，
+// 路径与生命周期互不相干。
+type FrontendConfig struct {
+	Vscode VscodeFrontendConfig `yaml:"vscode"`
+}
+
+// VscodeFrontendConfig 是 VS Code ACP 前端入口配置。
+type VscodeFrontendConfig struct {
+	// Enabled=false 时宿主不装配 socket 前端（默认 true，由 daemon 侧 Defaults 兜底）。
+	Enabled bool `yaml:"enabled"`
+	// Socket 是完整的 Unix socket 文件路径，仅 net.Listen("unix", path) 使用，
+	// 不复用 DispatchDir/acp.sock；空 = 由宿主按其目录约定派生默认路径。
+	Socket string `yaml:"socket,omitempty"`
+}
+
+// DispatchConfig 是 commit dispatcher 的配置。
+// Enabled=false 时 dispatcher 插件不注册，其余字段不生效。
+type DispatchConfig struct {
+	Enabled       bool           `yaml:"enabled"`
+	Workers       []WorkerConfig `yaml:"workers"`
+	DefaultWorker string         `yaml:"default_worker,omitempty"` // 空 = 第一个 worker
+	MaxParallel   int            `yaml:"max_parallel,omitempty"`   // 0 = 1
+	Routes        []RouteConfig  `yaml:"routes,omitempty"`         // 关键词路由，优先于 default_worker
+}
+
+// WorkerConfig 描述一个 ACP worker 子进程（claude-agent-acp / codex-acp / goworker acp）。
+type WorkerConfig struct {
+	Name    string   `yaml:"name"`
+	Command string   `yaml:"command"`
+	Args    []string `yaml:"args,omitempty"`
+	// OnPermission 无人值守时 worker 权限请求的应答策略：
+	//   - "deny"（默认，拒绝并记审计）
+	//   - "allow"（自动选择首个 allow 类 option）
+	//   - "ask"（转给订阅了该任务的 ACP client 由用户裁决；无订阅者时保守拒绝）
+	OnPermission string `yaml:"on_permission,omitempty"`
+}
+
+// RouteConfig 是关键词路由：prompt 命中任一关键词（大小写不敏感的包含匹配）
+// 即派发给指定 worker；多条 route 按声明顺序，首条命中生效。
+type RouteConfig struct {
+	Keywords []string `yaml:"keywords"`
+	Worker   string   `yaml:"worker"`
+}
+
+// Validate 校验 dispatch 配置；未启用时仅校验已填写的部分。
+func (c DispatchConfig) Validate() error {
+	seen := make(map[string]bool, len(c.Workers))
+	for i, w := range c.Workers {
+		if w.Name == "" {
+			return fmt.Errorf("dispatch.workers[%d]: name is required", i)
+		}
+		if seen[w.Name] {
+			return fmt.Errorf("dispatch.workers[%d]: duplicate name %q", i, w.Name)
+		}
+		if w.Command == "" {
+			return fmt.Errorf("dispatch.workers[%d] (%s): command is required", i, w.Name)
+		}
+		seen[w.Name] = true
+	}
+	if c.DefaultWorker != "" && !seen[c.DefaultWorker] {
+		return fmt.Errorf("dispatch.default_worker %q is not in workers", c.DefaultWorker)
+	}
+	if c.MaxParallel < 0 {
+		return fmt.Errorf("dispatch.max_parallel must be >= 0")
+	}
+	for _, w := range c.Workers {
+		switch w.OnPermission {
+		case "", "deny", "allow", "ask":
+		default:
+			return fmt.Errorf("dispatch.workers[%s]: invalid on_permission %q (deny|allow|ask)", w.Name, w.OnPermission)
+		}
+	}
+	for i, r := range c.Routes {
+		if len(r.Keywords) == 0 {
+			return fmt.Errorf("dispatch.routes[%d]: keywords is required", i)
+		}
+		if !seen[r.Worker] {
+			return fmt.Errorf("dispatch.routes[%d]: worker %q is not in workers", i, r.Worker)
+		}
+	}
+	if c.Enabled {
+		if len(c.Workers) == 0 {
+			return fmt.Errorf("dispatch.enabled requires at least one worker")
+		}
+		if c.DefaultWorker == "" {
+			return fmt.Errorf("dispatch.default_worker is required when enabled")
+		}
+	}
+	return nil
+}
+
+// ResolveDefaultWorker 返回默认 worker 名：显式配置 > 第一个 worker。
+func (c DispatchConfig) ResolveDefaultWorker() (string, error) {
+	if c.DefaultWorker != "" {
+		return c.DefaultWorker, nil
+	}
+	if len(c.Workers) > 0 {
+		return c.Workers[0].Name, nil
+	}
+	return "", fmt.Errorf("dispatch: no workers configured")
+}
+
+// MatchWorker 关键词路由：返回首个命中的 worker 名；未命中返回 false。
+func (c DispatchConfig) MatchWorker(prompt string) (string, bool) {
+	lower := strings.ToLower(prompt)
+	for _, r := range c.Routes {
+		for _, kw := range r.Keywords {
+			if kw != "" && strings.Contains(lower, strings.ToLower(kw)) {
+				return r.Worker, true
+			}
+		}
+	}
+	return "", false
+}
+
+// Worker 返回指定名称的 worker 配置。
+func (c DispatchConfig) Worker(name string) (WorkerConfig, bool) {
+	for _, w := range c.Workers {
+		if w.Name == name {
+			return w, true
+		}
+	}
+	return WorkerConfig{}, false
 }
 
 // Paths 是宿主注入的目录路径，避免 ai-runtime 反向依赖 daemon 的 DefaultDir。
@@ -122,6 +254,7 @@ type Paths struct {
 	SkillsUser    string // 用户级 skills 目录
 	SkillsProject string // 项目级 skills 目录
 	AuditDir      string // sandbox 审计落盘目录
+	DispatchDir   string // dispatcher 任务持久化目录
 }
 
 // 状态栏事件契约。statusbar 是前端 UI，不进 SDK；前端 addon 订阅这些事件名与载荷。

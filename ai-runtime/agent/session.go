@@ -27,9 +27,24 @@ import (
 // NewSession 创建一个会话。usage 初始清零，conversation 从空开始。
 // 有 store 时从持久化恢复会话（重启恢复），无 store（nil）时纯内存。
 func NewSession(deps SessionDeps) *Session {
-	s := &Session{usage: core.NewUsageTracker(), deps: deps}
+	s := &Session{usage: core.NewUsageTracker(), deps: deps, workDir: deps.CWD}
 	_ = s.refreshConversation() // 构造时无并发，锁无害；与运行时共用统一刷新路径
 	return s
+}
+
+// SetCWD 更新会话工作目录（client 经 wire 重新声明、宿主校验后写入，如
+// session/load 重新声明 cwd）。锁内写入，与 Run 的读取互斥。
+func (s *Session) SetCWD(cwd string) {
+	s.mu.Lock()
+	s.workDir = cwd
+	s.mu.Unlock()
+}
+
+// cwd 返回会话工作目录快照（空 = 未声明，工具回退 cfg.AllowedWorkDir）。
+func (s *Session) cwd() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.workDir
 }
 
 // Run 执行一轮 /agent 对话：组装 agent → 跑 ReAct 循环 → 流式输出 → 写回 conversation。
@@ -44,6 +59,13 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 
 	// usage 是会话累计账本：跨多次 /agent 累计，直到 /new 用新对象替换当前会话才清零。
 	sandboxCfg := *sandbox.NewFromConfig(&s.deps.Config.Sandbox)
+	// 会话工作目录渗透：client 声明（且经宿主 sandbox 边界校验）的 cwd 优先作为
+	// 工具执行目录 —— bash 的 cmd.Dir 与 read/write 的相对路径基准都取自
+	// AllowedWorkDir，为空则回退现行为（cfg.AllowedWorkDir，NewFromConfig 兜底进程
+	// cwd）。只改本会话的沙箱配置副本，不动全局配置。
+	if cwd := s.cwd(); cwd != "" {
+		sandboxCfg.AllowedWorkDir = cwd
+	}
 	tools := s.deps.CollectTools(&sandboxCfg)
 	cfg := s.deps.Config
 
@@ -138,6 +160,10 @@ func (s *Session) streamTokens(cb RunCallbacks, agentCtx context.Context, tokenC
 		// 先输出内容再检查 Done — Done token 也可能带内容（如错误信息）。
 		// 空 content 的 Done 也要转发：前端靠它定稿未完成的流式渲染。
 		showToken := tok.Type != core.TokenTypeThinking || s.deps.Config.LLM.Thinking.Show
+		isToolLifecycle := tok.Type == core.TokenTypeToolCall || tok.Type == core.TokenTypeToolResult
+		if showToken && cb.EmitToken != nil && (tok.Content != "" || tok.Done || isToolLifecycle) {
+			cb.EmitToken(tok)
+		}
 		if showToken && cb.WriteToken != nil && (tok.Content != "" || tok.Done) {
 			kind, c := renderKind(tok)
 			cb.WriteToken(kind, c, tok.Done)

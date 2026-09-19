@@ -31,7 +31,7 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 			Parameters:  parseSchema(tool.Schema),
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
 				var buf strings.Builder
-				err := p.hub.Eval(model.NewContext(context.Background(), func(s string) { buf.WriteString(s) }, nil, nil), "/"+tool.Name)
+				err := p.hub.Eval(model.NewContext(ctx, func(s string) { buf.WriteString(s) }, nil, nil), "/"+tool.Name)
 				if err != nil {
 					return buf.String(), err
 				}

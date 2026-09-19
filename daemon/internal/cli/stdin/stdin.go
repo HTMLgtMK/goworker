@@ -13,6 +13,7 @@ import (
 
 	term "github.com/charmbracelet/x/term"
 
+	"github.com/tinguo/goworker/ai-dispatch/task"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/daemon/internal/app/config"
@@ -64,7 +65,17 @@ func NewStdinFrontend(engine *engine.Engine, config *config.StdinConfig) *StdinF
 	}
 
 	sb := statusbar.New()
-	sb.Use(NewProgressAddon(), NewIterationAddon(), NewUsageAddon())
+	sb.Use(NewProgressAddon(), NewIterationAddon(), NewUsageAddon(), NewTaskAddon())
+
+	// dispatcher 事件桥接：dispatcher 任务跑在后台 goroutine（无命令 Context），
+	// 不能走 /agent 的 ctx.Publish 注入链，改经 Engine 事件总线常驻转发。
+	// Bar 未运行时事件积压在 addon channel（满则丢），不阻塞 dispatcher。
+	engine.AddEventListener(func(event model.Event) {
+		switch model.EventType(event.Type) {
+		case model.EventType(task.EventTaskStatus), model.EventType(task.EventTaskProgress):
+			sb.Publish(string(event.Type), event.Payload)
+		}
+	})
 
 	f := &StdinFrontend{
 		engine:   engine,

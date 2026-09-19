@@ -1,0 +1,50 @@
+body {
+  color: var(--vscode-foreground);
+  background: var(--vscode-editor-background);
+  font-family: var(--vscode-font-family);
+  margin: 0;
+  padding: 16px;
+}
+
+.task-header, .filters, .composer, .trace-item {
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+}
+
+.task-header, .filters, .composer { padding: 10px 12px; }
+.task-header { display: flex; gap: 12px; align-items: baseline; position: sticky; top: 0; background: var(--vscode-editor-background); }
+.task-header span, .filters, .trace-note, .completed { color: var(--vscode-descriptionForeground); }
+.filters { margin: 10px 0; font-size: 12px; }
+.trace-list { display: grid; gap: 10px; }
+.trace-item { padding: 10px 12px; background: var(--vscode-editor-inactiveSelectionBackground); }
+.trace-item header, summary { color: var(--vscode-descriptionForeground); font-size: 12px; margin-bottom: 6px; }
+.trace-text, .trace-raw { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font-family: var(--vscode-editor-font-family); }
+.trace-thought { background: var(--vscode-textBlockQuote-background); }
+.trace-tool { border-left: 3px solid var(--vscode-charts-blue); }
+.trace-unknown { border-left: 3px solid var(--vscode-editorWarning-foreground); }
+.composer { position: sticky; bottom: 0; margin-top: 10px; background: var(--vscode-editor-background); }
+.composer input { box-sizing: border-box; width: 100%; padding: 8px; color: var(--vscode-disabledForeground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); }
+.new-events { position: fixed; right: 24px; bottom: 72px; padding: 6px 10px; border: 0; border-radius: 4px; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
+.error { color: var(--vscode-errorForeground); }
+
+.permission-dialog {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--vscode-editorWarning-foreground);
+  border-radius: 6px;
+  background: var(--vscode-editor-background);
+}
+.permission-tool {
+  margin: 0;
+  padding: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--vscode-editor-font-family);
+  background: var(--vscode-textCodeBlock-background);
+}
+.permission-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.permission-actions button { padding: 6px 12px; border: 0; border-radius: 4px; color: var(--vscode-button-foreground); background: var(--vscode-button-background); cursor: pointer; }
+.permission-actions button:hover { background: var(--vscode-button-hoverBackground); }
+.permission-actions button.permission-dismiss { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }

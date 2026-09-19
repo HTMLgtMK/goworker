@@ -30,11 +30,12 @@ const (
 
 type RunCallbacks struct {
 	Write func(string)
-	// WriteToken 按类型投递渲染 token。done 表示整个 agent 运行的输出已结束
-	// （空 content 的收尾标记），前端借此定稿未完成的流式渲染。
+	// WriteToken 是 terminal renderer 的兼容回调；新 frontend 应消费 EmitToken 的结构化语义。
 	WriteToken func(kind RenderKind, content string, done bool)
-	Decide     func(*hitl.InterruptRequest) hitl.Decision
-	Publish    func(event string, data any)
+	// EmitToken forwards a user-visible core token without discarding structured tool correlation.
+	EmitToken func(core.Token)
+	Decide    func(*hitl.InterruptRequest) hitl.Decision
+	Publish   func(event string, data any)
 }
 
 // Session 是一段会话：收敛会话状态（conversation/usage）与核心操作（Run/Compact/…）。
@@ -44,6 +45,7 @@ type Session struct {
 	conversation []core.Message
 	usage        *core.UsageTracker
 	audit        *sandbox.AuditLogger // 命令决策审计：配置开启 + 首次 Run 惰性打开，会话生命周期复用
+	workDir      string               // 会话工作目录（SessionDeps.CWD 的运行时可变副本，锁内读写）
 
 	deps SessionDeps
 }
@@ -53,6 +55,7 @@ type Session struct {
 type SessionDeps struct {
 	Config       *runtimeconfig.Config                                  // 运行配置（含 Sandbox 段）
 	AuditDir     string                                                 // sandbox 审计落盘目录
+	CWD          string                                                 // 会话工作目录（client 经 wire 声明、宿主校验后注入）；空 = 未声明，工具回退 cfg.AllowedWorkDir
 	Memory       *memory.Client                                         // nil = 禁用
 	CollectTools func(cfg *sandbox.Config) []core.Tool                  // 方法值捕获 p，按需收集工具
 	NewProvider  func(cfg *runtimeconfig.Config) (core.Provider, error) // 按当前 default_provider 构造协议适配器

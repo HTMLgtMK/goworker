@@ -121,64 +121,43 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 			}
 
 			for _, tc := range msg.ToolCalls {
-				if tc.Type != "function" {
-					// 非 function 类型也要回填 tool 响应，保持 assistant tool_call 配对完整 ——
-					// 缺配对下轮被 OpenAI 兼容后端以 400/空 choices 拒，正是"莫名停止"诱因
-					messages = append(messages, core.Message{
-						Role: "tool", Content: fmt.Sprintf("unsupported tool call type: %s", tc.Type), ToolCallID: tc.ID,
-					})
-					continue
-				}
-
-				tool, ok := a.toolMap[tc.Function.Name]
-				if !ok {
-					messages = append(messages, core.Message{
-						Role: "tool", Content: fmt.Sprintf("unknown tool: %s", tc.Function.Name), ToolCallID: tc.ID,
-					})
-					continue
-				}
-
-				var args map[string]any
-				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-					messages = append(messages, core.Message{
-						Role: "tool", Content: fmt.Sprintf("invalid args: %v", err), ToolCallID: tc.ID,
-					})
-					continue
-				}
-
-				// BeforeTool — middleware 可修改 args 或设置 Abort
-				btEv := &core.BeforeToolEvent{
-					Ctx:       ctx,
-					Iteration: iter,
-					History:   messages,
-					Tool:      &tc,
-					Emit:      tokenEmitter{ch: ch},
-					Args:      args,
-				}
-				a.fireMiddlewareEvent(btEv)
-				if btEv.Abort != nil {
-					messages = append(messages, btEv.Abort.Messages...)
-					continue
-				}
-
-				sendToken(ctx, ch, core.Token{Type: core.TokenTypeToolCall, Content: fmt.Sprintf("%s(%s)", tool.Name, tc.Function.Arguments)})
-
-				toolCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-				result, execErr := tool.Execute(toolCtx, args)
-				cancel()
-				if execErr != nil {
-					result = fmt.Sprintf("error: %v", execErr)
-				}
-
-				a.fireMiddlewareEvent(&core.AfterToolEvent{
-					Ctx: ctx, Iteration: iter, History: messages, Tool: &tc, Args: args, Result: result, Err: execErr,
+				emitToken(ctx, ch, core.Token{
+					Type:     core.TokenTypeToolCall,
+					Content:  fmt.Sprintf("%s(%s)", tc.Function.Name, tc.Function.Arguments),
+					ToolCall: tc,
 				})
 
-				sendToken(ctx, ch, core.Token{Type: core.TokenTypeToolResult, Content: result})
+				result := ""
+				tool, known := a.toolMap[tc.Function.Name]
+				switch {
+				case tc.Type != "function":
+					result = fmt.Sprintf("unsupported tool call type: %s", tc.Type)
+				case !known:
+					result = fmt.Sprintf("unknown tool: %s", tc.Function.Name)
+				default:
+					var args map[string]any
+					if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+						result = fmt.Sprintf("invalid args: %v", err)
+					} else {
+						btEv := &core.BeforeToolEvent{Ctx: ctx, Iteration: iter, History: messages, Tool: &tc, Emit: tokenEmitter{ch: ch}, Args: args}
+						a.fireMiddlewareEvent(btEv)
+						if btEv.Abort != nil {
+							result = abortResult(btEv.Abort, tc.ID)
+						} else {
+							toolCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+							var execErr error
+							result, execErr = tool.Execute(toolCtx, args)
+							cancel()
+							if execErr != nil {
+								result = fmt.Sprintf("error: %v", execErr)
+							}
+							a.fireMiddlewareEvent(&core.AfterToolEvent{Ctx: ctx, Iteration: iter, History: messages, Tool: &tc, Args: args, Result: result, Err: execErr})
+						}
+					}
+				}
 
-				messages = append(messages, core.Message{
-					Role: "tool", Content: result, ToolCallID: tc.ID,
-				})
+				emitToken(ctx, ch, core.Token{Type: core.TokenTypeToolResult, Content: result, ToolCallID: tc.ID})
+				messages = append(messages, core.Message{Role: "tool", Content: result, ToolCallID: tc.ID})
 			}
 		}
 
@@ -285,6 +264,31 @@ func emitMessageTokens(ctx context.Context, ch chan<- core.Token, message core.M
 	}
 	if message.Content != "" {
 		sendToken(ctx, ch, core.Token{Type: core.TokenTypeText, Content: message.Content})
+	}
+}
+
+func abortResult(abort *core.ToolAbort, toolCallID string) string {
+	for _, message := range abort.Messages {
+		if message.Role == "tool" && message.ToolCallID == toolCallID {
+			return message.Content
+		}
+	}
+	return "tool execution aborted"
+}
+
+// emitToken 发送工具生命周期 token（tool_call/tool_result），带取消保护。
+// 语义边界：ctx 取消 ≠ 消费方弃读 —— 正常取消路径下消费方仍在 range tokenCh，
+// 配对的 call/result 应继续送达（宽限窗口内阻塞发送必然成功）；消费方提前
+// 弃读时宽限超时放弃，Run 不会被永久卡死。历史侧的 tool 消息配对由主循环
+// 回填保证，不依赖 token 是否送达。
+func emitToken(ctx context.Context, ch chan<- core.Token, tok core.Token) {
+	select {
+	case ch <- tok:
+	case <-ctx.Done():
+		select {
+		case ch <- tok:
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 

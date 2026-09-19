@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -167,6 +168,13 @@ func (p *AgentPlugin) memoryHelp(ctx *model.Context) {
 // ---- /task 命令 ----
 
 func (p *AgentPlugin) handleTask(ctx *model.Context) error {
+	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+		runContext := withPluginContext(ctx, runCtx)
+		return p.handleTaskLocked(runContext)
+	})
+}
+
+func (p *AgentPlugin) handleTaskLocked(ctx *model.Context) error {
 	if p.memory == nil {
 		ctx.Writer("memory 未启用（检查 config.yaml 的 memory.enabled 与存储目录权限）\n")
 		return nil
@@ -231,7 +239,7 @@ func (p *AgentPlugin) handleTask(ctx *model.Context) error {
 		ctx.Writer(fmt.Sprintf("✔ 已关闭 task %s\n", id))
 
 	case "checkpoint":
-		sum, err := p.session.Consolidate(ctx.Ctx)
+		sum, err := p.session.Load().Consolidate(ctx.Ctx)
 		if err != nil {
 			ctx.Writer(fmt.Sprintf("✘ Consolidation failed: %v\n", err))
 			return nil

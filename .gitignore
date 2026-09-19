@@ -7,6 +7,7 @@
 daemon/goworker
 daemon/goworker.exe
 ai-runtime/fakeserver
+.goworker/
 
 # Test binary
 *.test
@@ -43,6 +44,7 @@ node_modules/
 /tmp/
 build/
 dist/
+/build/
 
 # Tooling runtime state
 .omc/
@@ -65,3 +67,6 @@ __pycache__/
 *~
 .claude/worktrees/
 daemon/.claude/
+
+# 本地参考缓存（内嵌仓库，不入版本库）
+.openclaw/

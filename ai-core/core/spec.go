@@ -150,6 +150,11 @@ type Token struct {
 	Done    bool
 	Event   *RuntimeEvent
 
+	// ToolCall preserves the structured call when Type is TokenTypeToolCall.
+	ToolCall ToolCall
+	// ToolCallID links a TokenTypeToolResult to its originating tool call.
+	ToolCallID string
+
 	// Response 由流式 provider 在流结束时填充：增量 content/thinking/tool_calls
 	// 重组出的完整响应，供 agent 回填历史与触发 AfterModel 中间件。其余 token 为 nil。
 	Response *ChatResponse
@@ -233,6 +238,13 @@ type TokenEmitter interface {
 	Emit(ctx context.Context, tok Token)
 }
 
+// ToolAbort 中止本次 tool call，由 agent 把结果写回会话历史。
+//
+// 契约：agent 只消费与被中止 ToolCallID 配对的那条 tool 消息（取其 Content
+// 作为 tool result），Messages 里的其余条目一律忽略。中间件如需向用户解释
+// 中止原因，应把说明并进该 tool 消息的 Content（HITL 的 DecisionRespond 即
+// 此做法）；不要依赖其它条目被回填 —— assistant 消息插在 tool_call 与 tool
+// 结果之间会被 OpenAI 兼容后端以顺序非法拒绝，这里刻意只认单条配对消息。
 type ToolAbort struct {
 	Messages []Message
 }

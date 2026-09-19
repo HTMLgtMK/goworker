@@ -33,7 +33,7 @@ set(GOOS "" CACHE STRING "交叉编译目标 GOOS（空 = 本机）")
 set(GOARCH "" CACHE STRING "交叉编译目标 GOARCH（空 = 本机）")
 set(GO_BUILD_FLAGS "-trimpath" CACHE STRING "附加 go build 参数")
 set(GOWORKER_NO_PLUGINS "" CACHE STRING
-    "不编入 daemon 的插件，逗号/分号分隔（可选：agent）。默认空 = 全部编入；每个名字经 goworker_no_<name> 构建标签编译期剔除")
+    "不编入 daemon 的插件，逗号/分号分隔（可选：agent、dispatcher）。默认空 = 全部编入；每个名字经 goworker_no_<name> 构建标签编译期剔除")
 
 # ---- 版本号 ----
 set(PROJ_VERSION ${PROJECT_VERSION})
@@ -71,7 +71,8 @@ message(STATUS "go.work 模块: ${GO_MODULES}")
 # 参数只表达例外——名单里的每个插件翻译成 goworker_no_<name> off-tag 编译期剔除。
 # 这样新插件落地即生效，不需要谁回头改配置。
 # Go 侧装配层在 daemon/internal/app，每个插件对应一对 plugins_<name>.go / plugins_<name>_off.go。
-set(_known_plugins "agent")
+# 与 Go 侧耦合：新增插件时这里必须同步追加，否则新插件的 off-tag 会被当未知名拒掉。
+set(_known_plugins "agent" "dispatcher")
 string(REPLACE "," ";" _exclude_list "${GOWORKER_NO_PLUGINS}")
 set(GO_OFF_TAGS "")
 foreach(_p IN LISTS _exclude_list)

@@ -28,7 +28,12 @@ func (s *Session) checkpoint(ctx context.Context, conv []core.Message, cfg *runt
 	if s.deps.Memory == nil || len(conv) == 0 {
 		return nil, nil
 	}
-	cwd, _ := os.Getwd()
+	// 记忆档案的 CWD 优先取会话工作目录（任务发生在 client 声明的目录里）；
+	// 未声明时回退进程 cwd（与旧行为一致）。
+	cwd := s.cwd()
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
 	provider, err := s.deps.NewProvider(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create checkpoint provider: %w", err)

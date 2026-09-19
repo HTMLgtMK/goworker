@@ -77,6 +77,11 @@ func (e *Engine) saveConfig(cfg any, save func(*config.Config, string) error) er
 	if err := save(&candidateDaemon, config.DefaultPath()); err != nil {
 		return err
 	}
+	// TODO(竞态): 这里对共享的 *runtimeconfig.Config 做整体结构体拷贝，
+	// LLM.Providers 的 map 头不是原子写的 —— /model use 与 dispatcher 的
+	// worker 解析 / vscode 的 SessionModes 并发时可能读到撕裂的 map 头
+	// （评审 I5）。根治需要把运行时配置改成不可变快照 + atomic.Pointer 发布，
+	// 并让插件经 holder 读取；在那之前避免在任务运行中并发执行 /model use。
 	*e.runtimeCfg = candidateRuntime
 	*e.config = candidateDaemon
 	return nil
@@ -298,6 +303,11 @@ func (e *Engine) StopAll() {
 		e.Notify(model.Event{Type: model.EventPluginStopped, Payload: name})
 		e.log.Info("plugin stopped", "name", name)
 	}
+}
+
+// AddEventListener 注册外部事件监听者（前端桥接 statusbar 等场景）。
+func (e *Engine) AddEventListener(fn func(model.Event)) {
+	e.listeners = append(e.listeners, fn)
 }
 
 // Notify 向所有 EventAwarePlugin 和外部监听者广播事件。
