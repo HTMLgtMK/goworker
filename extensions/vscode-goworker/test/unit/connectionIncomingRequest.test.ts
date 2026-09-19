@@ -114,3 +114,31 @@ test('turns a handler failure into an RPC error', async () => {
     await server.close();
   }
 });
+
+// 关键回归（数字 id）：Go 侧 json.Marshal 的 int64 id 上线是数字，不是字符串。
+// isIncomingRequest 曾要求 typeof id === 'string'，导致 daemon 的 permission
+// 请求被当通知丢弃、Go 侧阻塞到 HITL 超时后拒绝 —— 与字符串 id 用例互为补充。
+test('answers an incoming request carrying a numeric id', async () => {
+  const server = await withServer((write) => {
+    write({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'session/request_permission',
+      params: { sessionId: 'sess-1' },
+    });
+  });
+  try {
+    const connection = new ACPConnection(server.socketPath);
+    connection.onRequest('session/request_permission', async () => ({
+      outcome: { outcome: 'selected', optionId: 'allow_once' },
+    }));
+    await connection.connect();
+
+    const response = (await server.received) as Record<string, unknown>;
+    assert.equal(response.id, 1);
+    assert.deepEqual(response.result, { outcome: { outcome: 'selected', optionId: 'allow_once' } });
+    connection.close();
+  } finally {
+    await server.close();
+  }
+});

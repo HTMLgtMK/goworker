@@ -45,7 +45,7 @@ func sessionFixture(t *testing.T, archives int) (*AgentPlugin, *session.Store, s
 	}
 
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
-	return &AgentPlugin{cfg: cfg, store: st}, st, dir
+	return withStore(cfg, st), st, dir
 }
 
 // archiveIDs 返回归档目录下的 sessionId（文件名去 .jsonl），按文件名排序。
@@ -132,7 +132,7 @@ func TestAgentPlugin_ListSessionsWithoutCurrentOrPersistence(t *testing.T) {
 		t.Fatalf("session open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	p := &AgentPlugin{cfg: &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}, store: st}
+	p := withStore(&runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}, st)
 	if got := p.ListSessions(); got == nil || len(got) != 0 {
 		t.Errorf("ListSessions = %#v, want non-nil empty", got)
 	}
@@ -152,16 +152,16 @@ func TestAgentPlugin_ListSessionsWithoutCurrentOrPersistence(t *testing.T) {
 
 func TestAgentPlugin_ReloadCurrentSessionRefreshesView(t *testing.T) {
 	p, st, _ := sessionFixture(t, 0)
-	p.session = runtimeagent.NewSession(runtimeagent.SessionDeps{Config: p.cfg, Store: st})
+	p.session.Store(runtimeagent.NewSession(runtimeagent.SessionDeps{Config: p.cfg, Store: st}))
 
-	before := len(p.session.Conversation())
+	before := len(p.session.Load().Conversation())
 	if _, err := st.Commit([]core.Message{{Role: "user", Content: "追加一条", MsgID: session.NewMsgID()}}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	if err := p.ReloadCurrentSession(); err != nil {
 		t.Fatalf("ReloadCurrentSession: %v", err)
 	}
-	if after := len(p.session.Conversation()); after != before+1 {
+	if after := len(p.session.Load().Conversation()); after != before+1 {
 		t.Errorf("conversation length = %d after reload, want %d", after, before+1)
 	}
 
@@ -242,7 +242,7 @@ func historyFixture(t *testing.T) (*AgentPlugin, *session.Store) {
 	)
 
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
-	return &AgentPlugin{cfg: cfg, store: st}, st
+	return withStore(cfg, st), st
 }
 
 // rawBodyFields 解码 Raw 透传体为字段表，便于逐字段断言 wire 形状。
@@ -490,7 +490,7 @@ func TestAgentPlugin_CurrentSessionHistoryEmpty(t *testing.T) {
 		t.Fatalf("session open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	p := &AgentPlugin{cfg: &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}, store: st}
+	p := withStore(&runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}, st)
 	if got := p.CurrentSessionHistory(); got == nil || len(got) != 0 {
 		t.Errorf("CurrentSessionHistory = %#v, want non-nil empty", got)
 	}
@@ -542,7 +542,7 @@ func archiveFixture(t *testing.T) (*AgentPlugin, *session.Store, string, []core.
 	}
 
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
-	return &AgentPlugin{cfg: cfg, store: st}, st, archiveIDs(t, dir)[0], want
+	return withStore(cfg, st), st, archiveIDs(t, dir)[0], want
 }
 
 // TestAgentPlugin_ArchivedSessionHistoryReplaysArchive 对真实归档文件做重放映射：
@@ -705,8 +705,8 @@ func TestAgentPlugin_SetSessionValidatesSandboxBoundary(t *testing.T) {
 		Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir},
 		Sandbox: sandbox.SandboxConfig{AllowedWorkDir: boundary},
 	}
-	p := &AgentPlugin{cfg: cfg, store: st}
-	p.session = runtimeagent.NewSession(runtimeagent.SessionDeps{Config: cfg, Store: st})
+	p := withStore(cfg, st)
+	p.session.Store(runtimeagent.NewSession(runtimeagent.SessionDeps{Config: cfg, Store: st}))
 
 	// 界内：接受，cwd 落到插件与会话
 	p.SetSession("sess_a", inside)
@@ -809,4 +809,11 @@ func TestAgentPlugin_SessionModesFromConfig(t *testing.T) {
 	if empty := (&AgentPlugin{cfg: &runtimeconfig.Config{}}).SessionModes(); empty != nil {
 		t.Errorf("SessionModes without providers = %+v, want nil", empty)
 	}
+}
+
+// withStore 测试构造辅助：atomic.Pointer 字段无法在 struct 字面量里直接赋值。
+func withStore(cfg *runtimeconfig.Config, st *session.Store) *AgentPlugin {
+	p := &AgentPlugin{cfg: cfg}
+	p.store.Store(st)
+	return p
 }

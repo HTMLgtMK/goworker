@@ -64,6 +64,7 @@ socket 权限 `0600`，仅本机同用户可达；启动时清理陈旧 socket �
   `SessionSource` 接口（由 `core/service` 的 agent 插件实现）
 - `ingress`（frontend.go 内）—— ACP TaskHandler：`SetSession`（cwd 落地）、
   `ListSessions`、`LoadSession`、`Run`
-- `command_output.go` —— 命令输出包 fenced code block 增量下发
+- 命令输出 fenced code block 的增量下发在 `frontend.go`（`commandOutput`），
+  `command_output_test.go` 钉住其行为
 - 会话 load 方案讨论见 `docs/session-load-discussion.md`，整体架构见
   `docs/architecture.md`

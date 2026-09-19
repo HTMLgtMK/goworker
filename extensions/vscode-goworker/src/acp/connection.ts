@@ -22,22 +22,24 @@ interface JSONRPCNotification {
 }
 
 // 服务端发来的请求：同时带 id 与 method（区别于通知，也区别于响应）。
+// id 不限定 string：Go 侧 json.Marshal 的 int64 id 上线是数字 —— 评审实测
+// 数字 id 被当通知丢弃，daemon 的 permission 请求因此永远等不到应答。
 interface JSONRPCIncomingRequest {
   jsonrpc: '2.0';
-  id: string;
+  id: string | number;
   method: string;
   params?: unknown;
 }
 
 interface JSONRPCResult {
   jsonrpc: '2.0';
-  id: string;
+  id: string | number;
   result: unknown;
 }
 
 interface JSONRPCFailure {
   jsonrpc: '2.0';
-  id: string;
+  id: string | number;
   error: { code: number; message: string };
 }
 
@@ -220,10 +222,11 @@ export class ACPConnection {
   }
 }
 
-// 服务端请求 = 同时带 id 与 method。单看 id 会把请求误判成响应（旧 bug）。
+// 服务端请求 = 同时带 id 与 method。单看 id 会把请求误判成响应（旧 bug）；
+// id 类型必须兼容 string 与 number —— Go 的 int64 id 上线是数字（评审 C1）。
 function isIncomingRequest(message: JSONRPCMessage): message is JSONRPCIncomingRequest {
   return 'id' in message
-    && typeof message.id === 'string'
+    && (typeof message.id === 'string' || typeof message.id === 'number')
     && 'method' in message
     && typeof message.method === 'string';
 }
