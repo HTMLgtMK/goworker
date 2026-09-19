@@ -4,7 +4,7 @@ A modular REPL agent terminal in Go — plugin-based, middleware-driven, LLM-rea
 
 ## Architecture
 
-Five Go modules in one workspace (`go.work`), layered as an SDK. `ai-core` / `ai-sandbox` / `ai-memory` are standalone, independently-releasable; `ai-runtime` aggregates them into an out-of-the-box agent for external projects; `daemon/` is the REPL shell consuming `ai-runtime`.
+Five Go modules in one workspace (`go.work`), layered as an SDK. `ai-core` / `ai-sandbox` / `ai-memory` are standalone, independently-releasable; `ai-runtime` aggregates them into an out-of-the-box agent for external projects; `daemon/` is the agent backend consuming `ai-runtime`, with one shared assembly (`internal/app`) behind per-frontend shells — CLI (`cmd/goworker`) and Android (`mobile/`, gobind).
 
 ```
 ai-memory/                     ← standalone: MTM task archive + LTM facts (mem0-like), zero deps
