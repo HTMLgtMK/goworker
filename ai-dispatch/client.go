@@ -101,7 +101,13 @@ func NewClient(name string, rwc io.ReadWriteCloser, closeFn func() error) *Clien
 	c := &Client{name: name, conn: protocol.NewConn(rwc), closeFn: closeFn}
 	c.conn.HandleNotification(protocol.MethodSessionUpdate, c.handleUpdate)
 	c.conn.Handle(protocol.MethodSessionRequestPermission, c.handlePermission)
-	go func() { _ = c.conn.Serve() }()
+	go func() {
+		// Serve 退出 = worker 侧连接结束（崩溃/协议错/EOF）。吞掉错误的话，
+		// 崩溃只能靠后续 Call 超时反推，与 handleUpdate 留诊断日志的口径一致。
+		if err := c.conn.Serve(); err != nil {
+			slog.Warn("dispatch: worker connection serve ended", "client", c.name, "err", err)
+		}
+	}()
 	return c
 }
 
@@ -224,7 +230,12 @@ func (c *Client) handlePermission(ctx context.Context, params json.RawMessage) (
 	}
 	optionID, err := onPermission(ctx, req)
 	if err != nil {
-		return nil, err
+		// 回调失败与"无人应答"同向收敛为拒绝（cancelled），而不是把 RPC 错误
+		// 抛回 worker —— worker 对协议错误的反应不可控（可能直接中止整回合），
+		// 拒绝是可预期、可审计的路径；回调失败原因留在本侧日志。
+		slog.Warn("dispatch: permission callback failed, deny",
+			"client", c.name, "tool", req.ToolCall.Title, "err", err)
+		return protocol.CancelledPermissionOutcome(), nil
 	}
 	return protocol.SelectedPermissionOutcome(optionID), nil
 }

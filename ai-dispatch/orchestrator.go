@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -94,7 +95,13 @@ func (o *Orchestrator) Run(ctx context.Context, t *task.Task, spec WorkerSpec, o
 	if err != nil {
 		return Outcome{}, o.fail(ctx, t, err)
 	}
-	defer client.Close()
+	defer func() {
+		// processConn.Close 在 worker 卡死时会 5s 强杀并返回诊断错误 ——
+		// 吞掉它，强杀这件事就永远无迹可循
+		if err := client.Close(); err != nil {
+			slog.Warn("dispatch: close worker", "worker", spec.Name, "err", err)
+		}
+	}()
 
 	init, err := client.Initialize(ctx)
 	if err != nil {
