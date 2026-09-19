@@ -7,9 +7,9 @@ import (
 
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/logger"
-	"github.com/tinguo/goworker/daemon/internal/core/service"
 	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/engine"
+	"github.com/tinguo/goworker/daemon/internal/core/service"
 )
 
 // registerAgent 装配 ai-runtime 的 agent 插件：配置与路径构造函数注入

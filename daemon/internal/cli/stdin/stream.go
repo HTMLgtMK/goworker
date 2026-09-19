@@ -33,12 +33,12 @@ type streamRenderer struct {
 	errOut io.Writer // 换行/控制序列（stderr）
 
 	kind    model.RenderKind // 正在流式渲染的 token 类型
-	pending string            // 未凑齐整行的尾部增量（不上屏）
-	text    strings.Builder   // 当前消息累积的原始文本（含已上屏行与 pending）
-	rows    int               // 当前消息已上屏的终端物理行数（含折行）
-	fresh   bool              // 当前消息尚未上屏任何内容
-	needSep bool              // 下一次上屏前是否需要分隔换行（提交行/上一块 → 内容区）
-	started bool              // 是否处于流式渲染中（两次 finish 之间）
+	pending string           // 未凑齐整行的尾部增量（不上屏）
+	text    strings.Builder  // 当前消息累积的原始文本（含已上屏行与 pending）
+	rows    int              // 当前消息已上屏的终端物理行数（含折行）
+	fresh   bool             // 当前消息尚未上屏任何内容
+	needSep bool             // 下一次上屏前是否需要分隔换行（提交行/上一块 → 内容区）
+	started bool             // 是否处于流式渲染中（两次 finish 之间）
 }
 
 func newStreamRenderer(f *StdinFrontend) *streamRenderer {

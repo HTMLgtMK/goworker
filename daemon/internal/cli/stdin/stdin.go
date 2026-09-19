@@ -16,8 +16,8 @@ import (
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/daemon/internal/app/config"
-	"github.com/tinguo/goworker/daemon/internal/core/engine"
 	"github.com/tinguo/goworker/daemon/internal/cli/statusbar"
+	"github.com/tinguo/goworker/daemon/internal/core/engine"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
