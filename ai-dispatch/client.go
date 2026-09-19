@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
 )
@@ -57,8 +58,20 @@ func (p *processConn) Write(b []byte) (int, error) { return p.w.Write(b) }
 
 func (p *processConn) Close() error {
 	_ = p.w.Close()
-	// stdin 关闭后 worker 正常退出；Wait 回收资源，避免僵尸进程
-	return p.cmd.Wait()
+	// stdin 关闭后 worker 通常随 EOF 退出；Wait 回收资源，避免僵尸进程。
+	// 但 worker 卡死（忽略 EOF / 内部挂起）时 cmd.Wait 会永久阻塞 —— Close
+	// 挂在 Orchestrator 的 defer 回收链上，会把已完成的任务一起拖死。
+	// 宽限后强杀并收尸，返回可诊断错误。
+	done := make(chan error, 1)
+	go func() { done <- p.cmd.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		_ = p.cmd.Process.Kill()
+		<-done // 强杀后收尸
+		return fmt.Errorf("dispatch: worker did not exit within 5s after stdin close, killed")
+	}
 }
 
 // ClientCallbacks 驱动任务回合时的回调。
@@ -200,7 +213,11 @@ func (c *Client) handlePermission(ctx context.Context, params json.RawMessage) (
 	onPermission := c.onPermission
 	c.cbMu.Unlock()
 	if onPermission == nil {
-		return nil, fmt.Errorf("dispatch: no permission handler, deny tool call %q", req.ToolCall.Title)
+		// 无人值守默认拒绝。用 cancelled outcome 显式应答而不是 RPC 错误：
+		// 协议错误对 worker 意味着"对端实现坏了"，各 worker 处理不一致；
+		// cancelled 是规范里的"用户未授权"，worker 侧按拒绝收敛
+		//（见 Server.RequestPermission 对非 selected outcome 的处理）。
+		return protocol.CancelledPermissionOutcome(), nil
 	}
 	optionID, err := onPermission(ctx, req)
 	if err != nil {
