@@ -3,10 +3,6 @@
 package app
 
 import (
-	"path/filepath"
-
-	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
-	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/dispatcher"
 )
 
@@ -17,12 +13,5 @@ func registerDispatcher(a *Application) error {
 	if !a.Runtime.Dispatch.Enabled {
 		return nil
 	}
-	paths := runtimeconfig.Paths{
-		ConfigDir:     config.DefaultDir(),
-		SkillsUser:    filepath.Join(config.DefaultDir(), "skills"),
-		SkillsProject: filepath.Join(".goworker", "skills"),
-		AuditDir:      filepath.Join(config.DefaultDir(), "audit"),
-		DispatchDir:   filepath.Join(config.DefaultDir(), "dispatch"),
-	}
-	return a.Engine.Register(dispatcher.NewPlugin(a.Runtime, paths))
+	return a.Engine.Register(dispatcher.NewPlugin(a.Runtime, defaultPaths()))
 }

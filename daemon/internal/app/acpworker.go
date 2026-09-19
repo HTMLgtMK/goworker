@@ -4,9 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 
-	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/service"
 )
 
@@ -14,7 +12,9 @@ import (
 // provider 装配与 agent 插件共用同一套（ProviderFactory），stdin EOF 即退出。
 //
 // 刻意不走 New()：worker 是 dispatcher spawn 的无人值守单任务进程，不装
-// Engine/插件/内置命令，也没有前端 —— 只共享配置/日志装配与 ProviderFactory。
+// Engine/插件/内置命令，也没有前端。与 New() 的共享点：配置/日志装载
+// （loadConfigAndLogger）、目录布局（defaultPaths）、ProviderFactory ——
+// 分叉的只有 Engine/插件装配与生命周期，那正是两种形态的本质差异。
 func RunACPWorker() error {
 	cfg, log, err := loadConfigAndLogger()
 	if err != nil {
@@ -37,7 +37,7 @@ func RunACPWorker() error {
 
 	server := service.ServeACPWorker(service.Stdio(), service.ACPWorkerDeps{
 		Config:   runtimeCfg,
-		AuditDir: filepath.Join(config.DefaultDir(), "audit"),
+		AuditDir: defaultPaths().AuditDir,
 	})
 	// 阻塞到对端关闭输入（dispatcher spawn 的子进程随任务结束被回收）
 	<-server.Done()
