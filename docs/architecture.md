@@ -27,7 +27,7 @@ daemon/                         [module github.com/tinguo/goworker/daemon] agent
   internal/app/config/          # 顶层平铺 config.yaml 解析 + ToRuntime/ApplyRuntime + SaveConfig
   internal/core/engine/         # Engine：插件生命周期、命令路由、中间件链、事件广播
   internal/core/model/          # 插件/命令/前端上下文协议：Hub, Command, Plugin, Context, RenderKind
-  internal/core/service/        # /agent 插件适配器：把 ai-runtime Session SDK 装配成 plugin.Plugin
+  internal/core/service/        # /agent 插件适配器：把 ai-runtime Session SDK 装配成 model.Plugin
                                 # （资源装载 skill/MCP/memory/store + 命令注册 + 生命周期）
   internal/cli/                 # stdin REPL + statusbar（addon 订阅 ai-runtime 事件）
 ```
@@ -43,7 +43,7 @@ daemon ──→ ai-runtime ──→ ai-core ──→ (zero goworker deps)
 - ai-core/agent 与 ai-memory、ai-sandbox、ai-runtime 零耦合：DefaultTools 在 ai-runtime/agent，MemoryClient 为 runtime 本地接口 + ai-runtime adapter。
 - 配置不跨层上溯：LLM/Memory/Sandbox/Session/MCP 在 ai-runtime/config；daemon 负责 YAML 兼容（risky_patterns 双格式）与本机路径派生。
 - 事件契约倒置：ai-runtime/config 定义 EventUsage/EventIteration + UsageEvent，daemon/statusbar 订阅渲染，statusbar 不进 SDK。
-- SDK/插件边界：ai-runtime/agent 是纯 Session SDK（零宿主 plugin 协议依赖），plugin.Plugin 适配器在 daemon/internal/core/service —— 宿主换协议（HTTP/MCP/mobile 等）只需重写 adapter，SDK 不动。
+- SDK/插件边界：ai-runtime/agent 是纯 Session SDK（零宿主 plugin 协议依赖），model.Plugin 适配器在 daemon/internal/core/service —— 宿主换协议（HTTP/MCP/mobile 等）只需重写 adapter，SDK 不动。
 
 ---
 

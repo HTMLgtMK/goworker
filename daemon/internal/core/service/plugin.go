@@ -1,4 +1,4 @@
-// Package agent 是 goworker 宿主侧的 /agent 插件适配器：把 ai-runtime 的 Session SDK
+// Package service 是 goworker 宿主侧的 /agent 插件适配器：把 ai-runtime 的 Session SDK
 // 装配成 model.Plugin 接入 daemon Engine。Session 本体在 ai-runtime/agent（SDK），
 // 这里只做资源装载（skill/MCP/memory/store/指令快照）、命令注册与生命周期管理。
 package service

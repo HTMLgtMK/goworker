@@ -1,4 +1,4 @@
-// Package plugin 定义 daemon 内部插件、命令与前端上下文协议。
+// Package model 定义 daemon 内部插件、命令与前端上下文协议。
 package model
 
 import (

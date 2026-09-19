@@ -35,7 +35,7 @@ func New() (*Application, error) {
 		// Load 遇到无效配置会返回 nil（具体原因它已经记日志了）。
 		// 不挡一下的话下一行 cfg.Log 就是空指针解引用——配置写错一个字段
 		// 换来一个段错误，排查成本高得离谱。
-		return nil, fmt.Errorf("配置无效: %s\n详见上方日志；修好后重试，或删掉该文件用默认配置", cfgPath)
+		return nil, fmt.Errorf("配置无效: %s\n详见上方日志；修好后重试，或删掉该文件用默认配置。", cfgPath)
 	}
 
 	// 初始化日志器（等级过滤 + 可选文件轮转/清理）
@@ -70,6 +70,10 @@ func New() (*Application, error) {
 
 	// 注册插件（ai-runtime 的 agent 插件：配置与路径构造函数注入）
 	if err := e.Register(service.NewPlugin(runtimeCfg, paths)); err != nil {
+		// 失败路径与原 main 的 defer 语义对齐：先 StopAll（已启动的插件回收）再关日志，
+		// 最后经 error 交壳层决定退出方式（CLI exit 1 / mobile 转 Java 异常）。
+		log.Error("register AgentPlugin failed", "error", err)
+		e.StopAll()
 		log.Close()
 		return nil, fmt.Errorf("register AgentPlugin failed: %w", err)
 	}
@@ -79,6 +83,8 @@ func New() (*Application, error) {
 
 	// 启动插件
 	if err := e.StartAll(); err != nil {
+		log.Error("start plugins failed", "error", err)
+		e.StopAll()
 		log.Close()
 		return nil, fmt.Errorf("start plugins failed: %w", err)
 	}

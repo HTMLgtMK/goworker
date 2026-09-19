@@ -10,7 +10,7 @@
 //	bar.Stop()
 //
 // 各 frontend 可以自行实现 Addon，也可以复用 statusbar 包下的内置 addon。
-// 当前内置 addon 在 internal/frontend/stdin/ 下：ProgressAddon、IterationAddon。
+// 当前内置 addon 在 internal/cli/stdin/ 下：ProgressAddon、IterationAddon。
 package statusbar
 
 import (
