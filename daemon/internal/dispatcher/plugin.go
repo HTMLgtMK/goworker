@@ -136,14 +136,6 @@ func (p *DispatcherPlugin) snapshotLiveRoutes(taskID string) []acpRoute {
 	return append([]acpRoute(nil), p.liveRoutes[taskID]...)
 }
 
-// hasAnyObserver 报告该任务此刻是否有任何 ACP 订阅者（同步路由或观察者路由）。
-// 用于区分"根本没人看"与"有人看但对端不会答"。
-func (p *DispatcherPlugin) hasAnyObserver(taskID string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return len(p.acpRoutes[taskID]) > 0 || len(p.liveRoutes[taskID]) > 0
-}
-
 // NewPlugin 构造 dispatcher 插件。cfg.Dispatch.Enabled=false 时 main 不会注册本插件。
 func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *DispatcherPlugin {
 	return &DispatcherPlugin{
@@ -227,8 +219,11 @@ func (p *DispatcherPlugin) Init(h *model.Hub) error {
 // 续接 worker 上下文（能力协商失败则降级重跑）。
 func (p *DispatcherPlugin) resumeInterrupted() {
 	for _, t := range p.store.List() {
-		if t.Status.Terminal() || t.Status == task.StatusAwaitingReview {
-			continue // awaiting_review 等人审批，不需要重派
+		// 跳过不重派的状态：终态已了结；awaiting_review 等人审批；merging
+		// 崩溃后重派会撞非法迁移（merging→dispatching）落 failed 并清掉
+		// worktree —— 留给人工 --complete 收尾（评审 M4）。
+		if t.Status.Terminal() || t.Status == task.StatusAwaitingReview || t.Status == task.StatusMerging {
+			continue
 		}
 		slog.Info("dispatcher: resuming interrupted task", "task", t.ID, "status", t.Status)
 		p.launch(&t)
@@ -1103,11 +1098,10 @@ func (p *DispatcherPlugin) askPermissionPolicy(taskID string) func(context.Conte
 }
 
 // noObserverReason 给出"没人能批准"的具体原因，用于日志与错误信息。
-// 区分"压根没订阅者"与"任务根本不在运行"，后者通常是重启恢复的窗口期。
+// 唯一调用点在路由表为空时（review M9：原实现的分支与调用条件矛盾，
+// hasAnyObserver 查的就是同一批表，第一分支是死代码）—— 到这里必然是
+// 压根没人订阅，措辞直接引导用户去详情页 attach。
 func (p *DispatcherPlugin) noObserverReason(taskID string) string {
-	if p.hasAnyObserver(taskID) {
-		return fmt.Sprintf("no ACP client is observing task %s", taskID)
-	}
 	return fmt.Sprintf("no ACP client is observing task %s (attach to it from the task detail view to approve)", taskID)
 }
 
@@ -1127,6 +1121,13 @@ func (p *DispatcherPlugin) launch(t *task.Task) {
 			delete(p.running, t.ID)
 			p.mu.Unlock()
 		}()
+
+		// M1：排队窗口期任务可能已被取消（store 已落 cancelled，手里的 t 还是
+		// 旧快照）—— 以 store 为准，别把已取消的任务再派出去。
+		if fresh, ok := p.store.Get(t.ID); ok && fresh.Status != t.Status {
+			slog.Info("dispatch launch skipped: task changed before start", "task", t.ID, "status", fresh.Status)
+			return
+		}
 
 		spec := p.workerSpec(t.Worker)
 		outcome, err := p.orch.Run(runCtx, t, spec, p.runOptions(t.Worker, t.ID, runCtx)...)

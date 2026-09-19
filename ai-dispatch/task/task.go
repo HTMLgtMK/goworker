@@ -83,7 +83,7 @@ type Task struct {
 	Error         string    `json:"error,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
-	ExpiresAt     time.Time `json:"expires_at,omitempty"` // 唯一超时来源
+	ExpiresAt     time.Time `json:"expires_at,omitempty"` // 预留：审批/提问超时策略落地前无人赋值（暂无超时，决策 2026-09-19）
 }
 
 // NewID 生成 task_<16hex>。
