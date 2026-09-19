@@ -41,9 +41,15 @@ func (errNotStreamed) Error() string { return "not implemented" }
 func TestACPWorker_ServesSessionOverACP(t *testing.T) {
 	clientEnd, agentEnd := net.Pipe()
 
+	// 端点钉死到必死端口：本测试依赖"provider 不可达 → agent error 回流"，
+	// 不能依赖宿主 8000 端口恰好没人监听（mock/其他服务可能占位）。
+	llm := runtimeconfig.DefaultLLM()
+	p := llm.Providers["openai"]
+	p.Endpoint = "http://127.0.0.1:1/v1"
+	llm.Providers["openai"] = p
 	runtimeCfg := &runtimeconfig.Config{
 		Dispatch: runtimeconfig.DispatchConfig{},
-		LLM:      runtimeconfig.DefaultLLM(),
+		LLM:      llm,
 	}
 	server := ServeACPWorker(agentEnd, ACPWorkerDeps{Config: runtimeCfg})
 	t.Cleanup(func() { _ = server.Close() })
@@ -113,7 +119,11 @@ func TestACPWorker_ServesSessionOverACP(t *testing.T) {
 // TestACPWorker_UnknownSession 测试未开 session 直接 prompt 的错误回传。
 func TestACPWorker_UnknownSession(t *testing.T) {
 	clientEnd, agentEnd := net.Pipe()
-	server := ServeACPWorker(agentEnd, ACPWorkerDeps{Config: &runtimeconfig.Config{LLM: runtimeconfig.DefaultLLM()}})
+	llm2 := runtimeconfig.DefaultLLM()
+	p2 := llm2.Providers["openai"]
+	p2.Endpoint = "http://127.0.0.1:1/v1"
+	llm2.Providers["openai"] = p2
+	server := ServeACPWorker(agentEnd, ACPWorkerDeps{Config: &runtimeconfig.Config{LLM: llm2}})
 	t.Cleanup(func() { _ = server.Close() })
 
 	conn := protocol.NewConn(clientEnd)

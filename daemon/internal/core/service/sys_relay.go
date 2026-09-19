@@ -71,10 +71,12 @@ func ProbeDeviceTools(ctx context.Context, caller DeviceCaller) []DeviceToolDesc
 		resp.Tools = resp.Tools[:maxDeviceTools]
 	}
 	clean := make([]DeviceToolDescriptor, 0, len(resp.Tools))
+	seen := map[string]bool{}
 	for _, d := range resp.Tools {
-		if d.Name == "" || !deviceToolNameRe.MatchString(d.Name) {
-			continue
+		if d.Name == "" || !deviceToolNameRe.MatchString(d.Name) || seen[d.Name] {
+			continue // 重复名剔除：toolMap 静默保留最后一个，不如源头去掉
 		}
+		seen[d.Name] = true
 		switch d.RiskLevel {
 		case "never", "mode", "always":
 		default:
@@ -93,7 +95,8 @@ func RelayDeviceTools(caller DeviceCaller, descriptors []DeviceToolDescriptor) [
 	for _, d := range descriptors {
 		d := d
 		var schema map[string]any
-		if err := json.Unmarshal([]byte(d.Schema), &schema); err != nil {
+		if err := json.Unmarshal([]byte(d.Schema), &schema); err != nil || schema == nil {
+			// "null" 能被 Unmarshal 成 nil map —— 落到线上就是 parameters:null，兜底成空对象
 			schema = map[string]any{"type": "object"} // 无合法 schema 也能注册，靠 description 引导
 		}
 		tools = append(tools, core.Tool{

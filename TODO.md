@@ -70,6 +70,11 @@
 - [ ] **usage 状态条** — 订阅 `usage` 事件渲染 tokens/上下文窗口百分比（事件已在流里，UI 未接）
 - [ ] **输入体验** — 多行输入优化、发送中禁用态、错误气泡与 agent 消息的视觉分层
 
+### 质量（review 遗留）
+
+- [ ] **sys_/mcp_ 工具审计缺失** — bash 全路径审计（含用户裁决，训练数据），checkSys/checkMCP 均无审计 —— 补 recordAudit 接入
+- [x] **TestACPWorker_ServesSessionOverACP 封闭化** — LLM 端点钉死 127.0.0.1:1，不再依赖宿主 8000 端口空闲（mock 占位曾致误报）
+
 ### 工程收尾
 
 - [ ] **Android 工程推远端** — goworkerandroid 已 git init（main@4dab96b），建 GitHub 仓库并 push
