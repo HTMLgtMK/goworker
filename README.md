@@ -190,21 +190,20 @@ cmake -B build -DGOOS=linux -DGOARCH=amd64 && cmake --build build   # cross-comp
 cmake --build build --target instance      # bootstrap an isolated instance dir
 ```
 
-**Plugin selection at build time**: `GOWORKER_PLUGINS` lists the plugins compiled
-into the daemon (default `agent`). Plugins left out of the list are removed at
-compile time via `goworker_no_<name>` build tags:
+**Plugin selection at build time**: plugins are compiled in by default — the
+same as a bare `go build`, which is what CI and release use. `GOWORKER_NO_PLUGINS`
+lists the plugins to leave out; each name becomes a `goworker_no_<name>` build
+tag that removes it at compile time:
 
 ```bash
-cmake -B build -DGOWORKER_PLUGINS=""       # minimal shell: engine + builtin commands, no plugins
-cmake -B build -DGOWORKER_PLUGINS=agent    # default, full build
+cmake -B build                                  # default: every plugin compiled in
+cmake -B build -DGOWORKER_NO_PLUGINS=agent      # minimal shell: engine + builtin commands, no plugins
 ```
 
 The wiring lives in `daemon/internal/app` (one `plugins_<name>.go` /
-`plugins_<name>_off.go` pair per plugin, assembled in `plugins.go`). A bare
-`go build` without tags — what CI and release use — always compiles every
-plugin in. CMake cache is sticky: after changing `GOWORKER_PLUGINS`, a plain
-`cmake -B build` won't revert to the default; pass `-D` explicitly or delete
-`build/`.
+`plugins_<name>_off.go` pair per plugin, assembled in `plugins.go`). CMake
+cache is sticky: after changing `GOWORKER_NO_PLUGINS`, a plain `cmake -B build`
+won't revert to the default; pass `-D` explicitly or delete `build/`.
 
 ## CI & Release
 

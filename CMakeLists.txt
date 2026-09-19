@@ -32,8 +32,8 @@ find_program(GIT_EXECUTABLE git)
 set(GOOS "" CACHE STRING "交叉编译目标 GOOS（空 = 本机）")
 set(GOARCH "" CACHE STRING "交叉编译目标 GOARCH（空 = 本机）")
 set(GO_BUILD_FLAGS "-trimpath" CACHE STRING "附加 go build 参数")
-set(GOWORKER_PLUGINS "agent" CACHE STRING
-    "编译进 daemon 的插件，逗号/分号分隔（可选：agent）。未选中的插件经 goworker_no_<name> 构建标签编译期剔除")
+set(GOWORKER_NO_PLUGINS "" CACHE STRING
+    "不编入 daemon 的插件，逗号/分号分隔（可选：agent）。默认空 = 全部编入；每个名字经 goworker_no_<name> 构建标签编译期剔除")
 
 # ---- 版本号 ----
 set(PROJ_VERSION ${PROJECT_VERSION})
@@ -66,26 +66,22 @@ foreach(_mod IN LISTS GO_MODULES)
 endforeach()
 message(STATUS "go.work 模块: ${GO_MODULES}")
 
-# ---- 插件装配（GOWORKER_PLUGINS → go build tags）----
-# 语义是「全量默认 + 按清单剔除」：不带 tag 的裸 go build（CI/release/README 流程）
-# 始终编入全部插件；CMake 只对未选中的插件追加 goworker_no_<name> off-tag。
+# ---- 插件装配（GOWORKER_NO_PLUGINS → go build tags）----
+# 插件写了就是拿来用的：默认全量编入（裸 go build 的 CI/release 同样如此），
+# 参数只表达例外——名单里的每个插件翻译成 goworker_no_<name> off-tag 编译期剔除。
+# 这样新插件落地即生效，不需要谁回头改配置。
 # Go 侧装配层在 daemon/internal/app，每个插件对应一对 plugins_<name>.go / plugins_<name>_off.go。
 set(_known_plugins "agent")
-string(REPLACE "," ";" _plugin_list "${GOWORKER_PLUGINS}")
-set(_selected_plugins "")
-foreach(_p IN LISTS _plugin_list)
+string(REPLACE "," ";" _exclude_list "${GOWORKER_NO_PLUGINS}")
+set(GO_OFF_TAGS "")
+foreach(_p IN LISTS _exclude_list)
     string(STRIP "${_p}" _p)
     if(_p STREQUAL "")
         continue()
     endif()
     if(NOT _p IN_LIST _known_plugins)
-        message(FATAL_ERROR "GOWORKER_PLUGINS 含未知插件 '${_p}'，可选值：${_known_plugins}")
+        message(FATAL_ERROR "GOWORKER_NO_PLUGINS 含未知插件 '${_p}'，可选值：${_known_plugins}")
     endif()
-    list(APPEND _selected_plugins "${_p}")
-    list(REMOVE_ITEM _known_plugins "${_p}")
-endforeach()
-set(GO_OFF_TAGS "")
-foreach(_p IN LISTS _known_plugins)
     list(APPEND GO_OFF_TAGS "goworker_no_${_p}")
 endforeach()
 set(_go_tag_args "")
@@ -93,10 +89,14 @@ if(GO_OFF_TAGS)
     list(JOIN GO_OFF_TAGS "," _off_tag_str)
     set(_go_tag_args "-tags" "${_off_tag_str}")
 endif()
-if(_selected_plugins)
-    message(STATUS "plugins: 编入 ${_selected_plugins}（剔除：${GO_OFF_TAGS}）")
+list(LENGTH GO_OFF_TAGS _off_count)
+list(LENGTH _known_plugins _known_count)
+if(_off_count EQUAL 0)
+    message(STATUS "plugins: 全量编入")
+elseif(_off_count EQUAL _known_count)
+    message(STATUS "plugins: 最小壳，全部插件已剔除")
 else()
-    message(STATUS "plugins: 最小壳，不编入任何插件")
+    message(STATUS "plugins: 剔除 ${GO_OFF_TAGS}，其余全量编入")
 endif()
 
 # ---- 输出 ----

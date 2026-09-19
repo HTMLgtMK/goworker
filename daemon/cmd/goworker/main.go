@@ -68,7 +68,7 @@ func main() {
 	// 注册拦截器
 	engine.Use(core.LoggingInterceptor(log))
 
-	// 注册插件：按构建标签装配（CMake GOWORKER_PLUGINS → goworker_no_<name> off-tag），
+	// 注册插件：按构建标签装配（CMake GOWORKER_NO_PLUGINS → goworker_no_<name> off-tag），
 	// 装配层见 daemon/internal/app
 	if err := app.RegisterPlugins(engine, runtimeCfg, log); err != nil {
 		log.Error("register plugins failed", "error", err)
