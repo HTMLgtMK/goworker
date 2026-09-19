@@ -32,6 +32,8 @@ find_program(GIT_EXECUTABLE git)
 set(GOOS "" CACHE STRING "交叉编译目标 GOOS（空 = 本机）")
 set(GOARCH "" CACHE STRING "交叉编译目标 GOARCH（空 = 本机）")
 set(GO_BUILD_FLAGS "-trimpath" CACHE STRING "附加 go build 参数")
+set(GOWORKER_PLUGINS "agent" CACHE STRING
+    "编译进 daemon 的插件，逗号/分号分隔（可选：agent）。未选中的插件经 goworker_no_<name> 构建标签编译期剔除")
 
 # ---- 版本号 ----
 set(PROJ_VERSION ${PROJECT_VERSION})
@@ -64,6 +66,39 @@ foreach(_mod IN LISTS GO_MODULES)
 endforeach()
 message(STATUS "go.work 模块: ${GO_MODULES}")
 
+# ---- 插件装配（GOWORKER_PLUGINS → go build tags）----
+# 语义是「全量默认 + 按清单剔除」：不带 tag 的裸 go build（CI/release/README 流程）
+# 始终编入全部插件；CMake 只对未选中的插件追加 goworker_no_<name> off-tag。
+# Go 侧每个插件对应一对 plugin_<name>.go / plugin_<name>_off.go（见 daemon/cmd/goworker）。
+set(_known_plugins "agent")
+string(REPLACE "," ";" _plugin_list "${GOWORKER_PLUGINS}")
+set(_selected_plugins "")
+foreach(_p IN LISTS _plugin_list)
+    string(STRIP "${_p}" _p)
+    if(_p STREQUAL "")
+        continue()
+    endif()
+    if(NOT _p IN_LIST _known_plugins)
+        message(FATAL_ERROR "GOWORKER_PLUGINS 含未知插件 '${_p}'，可选值：${_known_plugins}")
+    endif()
+    list(APPEND _selected_plugins "${_p}")
+    list(REMOVE_ITEM _known_plugins "${_p}")
+endforeach()
+set(GO_OFF_TAGS "")
+foreach(_p IN LISTS _known_plugins)
+    list(APPEND GO_OFF_TAGS "goworker_no_${_p}")
+endforeach()
+set(_go_tag_args "")
+if(GO_OFF_TAGS)
+    list(JOIN GO_OFF_TAGS "," _off_tag_str)
+    set(_go_tag_args "-tags" "${_off_tag_str}")
+endif()
+if(_selected_plugins)
+    message(STATUS "plugins: 编入 ${_selected_plugins}（剔除：${GO_OFF_TAGS}）")
+else()
+    message(STATUS "plugins: 最小壳，不编入任何插件")
+endif()
+
 # ---- 输出 ----
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(GOWORKER_BIN_NAME goworker)
@@ -86,7 +121,7 @@ set(_go_env "GOOS=${GOOS}" "GOARCH=${GOARCH}")
 add_custom_command(
     OUTPUT ${GOWORKER_BIN}
     COMMAND ${CMAKE_COMMAND} -E env ${_go_env}
-        ${GO_EXECUTABLE} build ${GO_BUILD_FLAGS}
+        ${GO_EXECUTABLE} build ${GO_BUILD_FLAGS} ${_go_tag_args}
             -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version=${PROJ_VERSION}"
             -o ${GOWORKER_BIN}
             ./daemon/cmd/goworker

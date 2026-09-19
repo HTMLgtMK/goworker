@@ -6,12 +6,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
-	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/logger"
-	"github.com/tinguo/goworker/daemon/internal/agent"
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/core"
 	"github.com/tinguo/goworker/daemon/internal/frontend/stdin"
@@ -61,14 +58,8 @@ func main() {
 		log.Info("log to stderr only")
 	}
 
-	// ai-runtime 聚合配置 + 目录路径注入（daemon 是路径中枢，ai-runtime 不反向依赖 DefaultDir）
+	// ai-runtime 聚合配置（各插件的目录路径注入见 plugin_<name>.go 装配文件）
 	runtimeCfg := cfg.ToRuntime()
-	paths := runtimeconfig.Paths{
-		ConfigDir:     config.DefaultDir(),
-		SkillsUser:    filepath.Join(config.DefaultDir(), "skills"),
-		SkillsProject: filepath.Join(".goworker", "skills"),
-		AuditDir:      filepath.Join(config.DefaultDir(), "audit"),
-	}
 
 	engine := core.NewEngine(cfg, runtimeCfg, log)
 	defer engine.StopAll()
@@ -76,9 +67,10 @@ func main() {
 	// 注册拦截器
 	engine.Use(core.LoggingInterceptor(log))
 
-	// 注册插件（ai-runtime 的 agent 插件：配置与路径构造函数注入）
-	if err := engine.Register(agent.NewPlugin(runtimeCfg, paths)); err != nil {
-		log.Error("register AgentPlugin failed", "error", err)
+	// 注册插件：按构建标签装配（CMake GOWORKER_PLUGINS → goworker_no_<name> off-tag），
+	// 装配链见 plugins.go
+	if err := registerPlugins(engine, runtimeCfg, log); err != nil {
+		log.Error("register plugins failed", "error", err)
 		return
 	}
 

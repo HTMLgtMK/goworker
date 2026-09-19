@@ -177,6 +177,34 @@ go build -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version
 (`-buildvcs`, on by default) — no ldflags needed, and they work for local
 `go run` builds too. Only the semver string has to be injected.
 
+### CMake orchestration (optional)
+
+CMake drives the same `go build` for local development — version stamping,
+common targets, cross-compilation, multi-instance bootstrap:
+
+```bash
+cmake -B build && cmake --build build      # -> build/bin/goworker (version via git describe)
+cmake --build build --target test          # go test across the workspace (module list read from go.work)
+cmake --build build --target vet
+cmake -B build -DGOOS=linux -DGOARCH=amd64 && cmake --build build   # cross-compile
+cmake --build build --target instance      # bootstrap an isolated instance dir
+```
+
+**Plugin selection at build time**: `GOWORKER_PLUGINS` lists the plugins compiled
+into the daemon (default `agent`). Plugins left out of the list are removed at
+compile time via `goworker_no_<name>` build tags:
+
+```bash
+cmake -B build -DGOWORKER_PLUGINS=""       # minimal shell: engine + builtin commands, no plugins
+cmake -B build -DGOWORKER_PLUGINS=agent    # default, full build
+```
+
+The wiring lives in `daemon/cmd/goworker/plugins.go` (one `plugin_<name>.go` /
+`plugin_<name>_off.go` pair per plugin). A bare `go build` without tags — what
+CI and release use — always compiles every plugin in. CMake cache is sticky:
+after changing `GOWORKER_PLUGINS`, a plain `cmake -B build` won't revert to the
+default; pass `-D` explicitly or delete `build/`.
+
 ## CI & Release
 
 | Workflow | Trigger | Does |
