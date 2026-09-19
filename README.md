@@ -24,7 +24,7 @@ ai-runtime/                    ← aggregation: out-of-the-box agent for externa
 daemon/                        ← agent backend: engine + service + shell per frontend
 │  ├── cmd/goworker/           ← CLI 壳：stdin 前端 + 信号处理
 │  ├── mobile/                 ← Android 壳占位（gobind 入口，共享同一套装配）
-│  ├── internal/app/           ← 装配层：Application（配置→日志→Engine→插件→StartAll）+ config/
+│  ├── internal/app/           ← 装配层：Application（配置→日志→Engine→RegisterPlugins→StartAll）+ config/
 │  ├── internal/core/          ← engine（Engine）+ model（plugin 协议）+ service（AgentPlugin）
 │  └── internal/cli/           ← stdin REPL + statusbar (subscribes ai-runtime events)
 docs/architecture.md           ← detailed architecture doc
@@ -177,6 +177,34 @@ go build -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version
 `commit` / commit date / dirty-worktree flag come from Go's own build metadata
 (`-buildvcs`, on by default) — no ldflags needed, and they work for local
 `go run` builds too. Only the semver string has to be injected.
+
+### CMake orchestration (optional)
+
+CMake drives the same `go build` for local development — version stamping,
+common targets, cross-compilation, multi-instance bootstrap:
+
+```bash
+cmake -B build && cmake --build build      # -> build/bin/goworker (version via git describe)
+cmake --build build --target test          # go test across the workspace (module list read from go.work)
+cmake --build build --target vet
+cmake -B build -DGOOS=linux -DGOARCH=amd64 && cmake --build build   # cross-compile
+cmake --build build --target instance      # bootstrap an isolated instance dir
+```
+
+**Plugin selection at build time**: plugins are compiled in by default — the
+same as a bare `go build`, which is what CI and release use. `GOWORKER_NO_PLUGINS`
+lists the plugins to leave out; each name becomes a `goworker_no_<name>` build
+tag that removes it at compile time:
+
+```bash
+cmake -B build                                  # default: every plugin compiled in
+cmake -B build -DGOWORKER_NO_PLUGINS=agent      # minimal shell: engine + builtin commands, no plugins
+```
+
+The wiring lives in `daemon/internal/app` (one `plugins_<name>.go` /
+`plugins_<name>_off.go` pair per plugin, assembled in `plugins.go`). CMake
+cache is sticky: after changing `GOWORKER_NO_PLUGINS`, a plain `cmake -B build`
+won't revert to the default; pass `-D` explicitly or delete `build/`.
 
 ## CI & Release
 

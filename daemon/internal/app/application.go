@@ -6,14 +6,12 @@ package app
 import (
 	"fmt"
 	"log/slog"
-	"path/filepath"
 
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/logger"
 	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/engine"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
-	"github.com/tinguo/goworker/daemon/internal/core/service"
 )
 
 // Application 是装配完成的 agent 后端：Engine + 插件 + 配置 + 日志。
@@ -54,28 +52,22 @@ func New() (*Application, error) {
 		log.Info("log to stderr only")
 	}
 
-	// ai-runtime 聚合配置 + 目录路径注入（daemon 是路径中枢，ai-runtime 不反向依赖 DefaultDir）
+	// ai-runtime 聚合配置（各插件的目录路径注入见 RegisterPlugins 装配链）
 	runtimeCfg := cfg.ToRuntime()
-	paths := runtimeconfig.Paths{
-		ConfigDir:     config.DefaultDir(),
-		SkillsUser:    filepath.Join(config.DefaultDir(), "skills"),
-		SkillsProject: filepath.Join(".goworker", "skills"),
-		AuditDir:      filepath.Join(config.DefaultDir(), "audit"),
-	}
 
 	e := engine.NewEngine(cfg, runtimeCfg, log)
 
 	// 注册拦截器
 	e.Use(engine.LoggingInterceptor(log))
 
-	// 注册插件（ai-runtime 的 agent 插件：配置与路径构造函数注入）
-	if err := e.Register(service.NewPlugin(runtimeCfg, paths)); err != nil {
+	// 注册插件：按构建标签装配（CMake GOWORKER_NO_PLUGINS → goworker_no_<name> off-tag）
+	if err := RegisterPlugins(e, runtimeCfg, log); err != nil {
 		// 失败路径与原 main 的 defer 语义对齐：先 StopAll（已启动的插件回收）再关日志，
 		// 最后经 error 交壳层决定退出方式（CLI exit 1 / mobile 转 Java 异常）。
-		log.Error("register AgentPlugin failed", "error", err)
+		log.Error("register plugins failed", "error", err)
 		e.StopAll()
 		log.Close()
-		return nil, fmt.Errorf("register AgentPlugin failed: %w", err)
+		return nil, fmt.Errorf("register plugins failed: %w", err)
 	}
 
 	// 内置命令
