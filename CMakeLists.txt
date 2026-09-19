@@ -141,9 +141,9 @@ add_custom_target(test
 )
 
 add_custom_target(test-race
-    COMMAND ${GO_EXECUTABLE} test -race ./...
+    COMMAND ${GO_EXECUTABLE} test -race ${GO_TEST_PKGS}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMENT "go test -race"
+    COMMENT "go test -race（全 workspace）"
     VERBATIM
 )
 

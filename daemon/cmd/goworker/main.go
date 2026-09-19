@@ -59,7 +59,7 @@ func main() {
 		log.Info("log to stderr only")
 	}
 
-	// ai-runtime 聚合配置（各插件的目录路径注入见 plugin_<name>.go 装配文件）
+	// ai-runtime 聚合配置（各插件的目录路径注入见 daemon/internal/app 装配层）
 	runtimeCfg := cfg.ToRuntime()
 
 	engine := core.NewEngine(cfg, runtimeCfg, log)
