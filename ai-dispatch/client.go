@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"sync"
@@ -194,6 +195,8 @@ func (c *Client) Name() string { return c.name }
 func (c *Client) handleUpdate(params json.RawMessage) {
 	var update protocol.SessionUpdate
 	if err := json.Unmarshal(params, &update); err != nil {
+		// 静默丢弃会让「worker 协议不匹配」变成无声的进度黑洞，留一条诊断日志
+		slog.Warn("dispatch: decode session/update", "client", c.name, "err", err)
 		return
 	}
 	c.cbMu.Lock()
