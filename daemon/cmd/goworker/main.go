@@ -18,16 +18,10 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/frontend/stdin"
 	"github.com/tinguo/goworker/daemon/internal/frontend/vscode"
 	"github.com/tinguo/goworker/daemon/internal/plugin"
+	"github.com/tinguo/goworker/daemon/internal/version"
 )
 
 // ---- 入口 ----
-
-// version 由构建注入（cmake/go build 的 ldflags -X main.version=...），源码直跑为 dev。
-var version = "dev"
-
-func printVersion() {
-	fmt.Printf("goworker %s\n", version)
-}
 
 // runACPWorker 以 stdio ACP Agent 模式服务 ZCode 会话：配置解析、HTTP 客户端、
 // provider 装配与 agent 插件共用同一套（ProviderFactory），stdin EOF 即退出。
@@ -77,15 +71,6 @@ func main() {
 	if *showVersion {
 		fmt.Println(version.Get().String())
 		return
-	}
-
-	// 版本查询：goworker [-v|--version|version]
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "-v", "--version", "version":
-			printVersion()
-			return
-		}
 	}
 
 	// goworker acp：ZCode 以 ACP worker 身份跑在 stdio 上（被 dispatcher/编辑器驱动）

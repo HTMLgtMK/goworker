@@ -185,7 +185,7 @@ Config: YAML at `~/.config/goworker/config.yaml` (`GOWORKER_CONFIG_DIR` relocate
 cmake -B build && cmake --build build   # -> build/bin/goworker（版本号经 git describe 注入）
 ./build/bin/goworker                    # REPL
 ./build/bin/goworker acp                # ACP worker 模式（被 dispatcher/编辑器驱动）
-./build/bin/goworker version
+./build/bin/goworker -version           # 版本信息
 
 cmake --build build --target test       # 全量测试
 cmake --build build --target vet

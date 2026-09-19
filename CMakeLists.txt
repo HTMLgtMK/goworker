@@ -10,8 +10,8 @@
 # 交叉编译：
 #   cmake -B build -DGOOS=linux -DGOARCH=amd64 && cmake --build build
 #
-# 版本号：git describe（tags 优先）注入 ldflags -X main.version，
-# 运行 `goworker version` 查询；无 tag 时回退 project version。
+# 版本号：git describe（tags 优先）注入 ldflags -X internal/version.version，
+# 运行 `goworker -version` 查询；无 tag 时回退 project version。
 cmake_minimum_required(VERSION 3.20)
 
 # 禁止源码内构建（Go 源码树混入 CMake 产物会污染 go build 的目录遍历）
@@ -73,7 +73,7 @@ add_custom_command(
     OUTPUT ${GOWORKER_BIN}
     COMMAND ${CMAKE_COMMAND} -E env ${_go_env}
         ${GO_EXECUTABLE} build ${GO_BUILD_FLAGS}
-            -ldflags "-X main.version=${PROJ_VERSION}"
+            -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version=${PROJ_VERSION}"
             -o ${GOWORKER_BIN}
             ./daemon/cmd/goworker
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
