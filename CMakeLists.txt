@@ -69,7 +69,7 @@ message(STATUS "go.work 模块: ${GO_MODULES}")
 # ---- 插件装配（GOWORKER_PLUGINS → go build tags）----
 # 语义是「全量默认 + 按清单剔除」：不带 tag 的裸 go build（CI/release/README 流程）
 # 始终编入全部插件；CMake 只对未选中的插件追加 goworker_no_<name> off-tag。
-# Go 侧每个插件对应一对 plugin_<name>.go / plugin_<name>_off.go（见 daemon/cmd/goworker）。
+# Go 侧装配层在 daemon/internal/app，每个插件对应一对 plugins_<name>.go / plugins_<name>_off.go。
 set(_known_plugins "agent")
 string(REPLACE "," ";" _plugin_list "${GOWORKER_PLUGINS}")
 set(_selected_plugins "")

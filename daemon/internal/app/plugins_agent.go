@@ -1,6 +1,6 @@
 //go:build !goworker_no_agent
 
-package main
+package app
 
 import (
 	"path/filepath"

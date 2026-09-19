@@ -199,11 +199,12 @@ cmake -B build -DGOWORKER_PLUGINS=""       # minimal shell: engine + builtin com
 cmake -B build -DGOWORKER_PLUGINS=agent    # default, full build
 ```
 
-The wiring lives in `daemon/cmd/goworker/plugins.go` (one `plugin_<name>.go` /
-`plugin_<name>_off.go` pair per plugin). A bare `go build` without tags — what
-CI and release use — always compiles every plugin in. CMake cache is sticky:
-after changing `GOWORKER_PLUGINS`, a plain `cmake -B build` won't revert to the
-default; pass `-D` explicitly or delete `build/`.
+The wiring lives in `daemon/internal/app` (one `plugins_<name>.go` /
+`plugins_<name>_off.go` pair per plugin, assembled in `plugins.go`). A bare
+`go build` without tags — what CI and release use — always compiles every
+plugin in. CMake cache is sticky: after changing `GOWORKER_PLUGINS`, a plain
+`cmake -B build` won't revert to the default; pass `-D` explicitly or delete
+`build/`.
 
 ## CI & Release
 

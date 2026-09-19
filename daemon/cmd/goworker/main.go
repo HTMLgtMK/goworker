@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/tinguo/goworker/ai-runtime/logger"
+	"github.com/tinguo/goworker/daemon/internal/app"
 	"github.com/tinguo/goworker/daemon/internal/config"
 	"github.com/tinguo/goworker/daemon/internal/core"
 	"github.com/tinguo/goworker/daemon/internal/frontend/stdin"
@@ -68,8 +69,8 @@ func main() {
 	engine.Use(core.LoggingInterceptor(log))
 
 	// 注册插件：按构建标签装配（CMake GOWORKER_PLUGINS → goworker_no_<name> off-tag），
-	// 装配链见 plugins.go
-	if err := registerPlugins(engine, runtimeCfg, log); err != nil {
+	// 装配层见 daemon/internal/app
+	if err := app.RegisterPlugins(engine, runtimeCfg, log); err != nil {
 		log.Error("register plugins failed", "error", err)
 		return
 	}
