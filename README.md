@@ -4,7 +4,7 @@ A modular REPL agent terminal in Go — plugin-based, middleware-driven, LLM-rea
 
 ## Architecture
 
-Six Go modules in one workspace (`go.work`), layered as an SDK. `ai-core` / `ai-sandbox` / `ai-memory` / `ai-dispatch` are standalone, independently-releasable; `ai-runtime` aggregates core+memory+sandbox into an out-of-the-box agent for external projects; `daemon/` is the REPL shell / dispatcher host consuming both.
+Six Go modules in one workspace (`go.work`), layered as an SDK. `ai-core` / `ai-sandbox` / `ai-memory` / `ai-dispatch` are standalone, independently-releasable; `ai-runtime` aggregates core+memory+sandbox into an out-of-the-box agent for external projects; `daemon/` is the agent backend consuming `ai-runtime` — one shared assembly (`internal/app`) behind per-frontend shells (CLI `cmd/goworker`, Android `mobile/` via gobind) and the multi-agent dispatcher host (`internal/dispatcher`).
 
 ```
 ai-memory/                     ← standalone: MTM task archive + LTM facts (mem0-like), zero deps
@@ -26,13 +26,13 @@ ai-runtime/                    ← aggregation: out-of-the-box agent for externa
 │  ├── middlewares/            ← HITL middleware (sandbox decision gating)
 │  ├── session/                ← conversation store (checkpoint/rewind)
 │  ├── mcp/ skills/ logger/    ← moved from daemon, reusable
-daemon/                        ← REPL shell + dispatcher host: core.Engine + frontend + config parsing + path hub
-│  ├── cmd/goworker/           ← entry point (REPL / `goworker acp` worker mode)
-│  ├── internal/config/        ← top-level flattened config.yaml + ToRuntime()/ApplyRuntime()
-│  ├── internal/core/          ← Engine: plugin lifecycle, command routing, middleware chain, event broadcast
-│  ├── internal/agent/         ← /agent plugin adapter + `acp` worker mode + shared ProviderFactory
+daemon/                        ← agent backend: engine + service + shell per frontend + dispatcher host
+│  ├── cmd/goworker/           ← CLI 壳：stdin 前端 + `acp` worker 模式 + 信号处理
+│  ├── mobile/                 ← Android 壳占位（gobind 入口，共享同一套装配）
+│  ├── internal/app/           ← 装配层：Application（配置→日志→Engine→RegisterPlugins→StartAll）+ config/
+│  ├── internal/core/          ← engine（Engine）+ model（plugin 协议）+ service（AgentPlugin）
 │  ├── internal/dispatcher/    ← /dispatch /workers commands, ACP ingress socket, HITL review, audit
-│  └── internal/frontend/      ← stdin REPL + statusbar (addons subscribe Engine event bridge)
+│  └── internal/cli/           ← stdin REPL + vscode ACP frontend + statusbar (subscribes ai-runtime events)
 docs/architecture.md           ← detailed architecture doc
 docs/dispatcher.md             ← dispatcher design (ACP dual-role, worktree isolation, HITL merge)
 ```
@@ -213,6 +213,34 @@ go build -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version
 `commit` / commit date / dirty-worktree flag come from Go's own build metadata
 (`-buildvcs`, on by default) — no ldflags needed, and they work for local
 `go run` builds too. Only the semver string has to be injected.
+
+### CMake orchestration (optional)
+
+CMake drives the same `go build` for local development — version stamping,
+common targets, cross-compilation, multi-instance bootstrap:
+
+```bash
+cmake -B build && cmake --build build      # -> build/bin/goworker (version via git describe)
+cmake --build build --target test          # go test across the workspace (module list read from go.work)
+cmake --build build --target vet
+cmake -B build -DGOOS=linux -DGOARCH=amd64 && cmake --build build   # cross-compile
+cmake --build build --target instance      # bootstrap an isolated instance dir
+```
+
+**Plugin selection at build time**: plugins are compiled in by default — the
+same as a bare `go build`, which is what CI and release use. `GOWORKER_NO_PLUGINS`
+lists the plugins to leave out; each name becomes a `goworker_no_<name>` build
+tag that removes it at compile time:
+
+```bash
+cmake -B build                                  # default: every plugin compiled in
+cmake -B build -DGOWORKER_NO_PLUGINS=agent      # minimal shell: engine + builtin commands, no plugins
+```
+
+The wiring lives in `daemon/internal/app` (one `plugins_<name>.go` /
+`plugins_<name>_off.go` pair per plugin, assembled in `plugins.go`). CMake
+cache is sticky: after changing `GOWORKER_NO_PLUGINS`, a plain `cmake -B build`
+won't revert to the default; pass `-D` explicitly or delete `build/`.
 
 ## CI & Release
 

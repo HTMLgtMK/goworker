@@ -1,5 +1,5 @@
 // Package dispatcher 是 commit dispatcher 的 daemon 插件适配器：
-// 把 ai-dispatch 的编排器（Task 状态机 × ACP worker）装进 plugin.Plugin，
+// 把 ai-dispatch 的编排器（Task 状态机 × ACP worker）装进 model.Plugin，
 // 提供 /dispatch /workers 命令族与审批入口。设计见 docs/dispatcher.md。
 package dispatcher
 
@@ -23,14 +23,14 @@ import (
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	"github.com/tinguo/goworker/ai-dispatch/task"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
-	"github.com/tinguo/goworker/daemon/internal/plugin"
+	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
 // DispatcherPlugin 是 dispatcher 插件入口：持有任务 store、编排器与运行中任务表。
 type DispatcherPlugin struct {
 	cfg   *runtimeconfig.Config
 	paths runtimeconfig.Paths
-	hub   *plugin.Hub
+	hub   *model.Hub
 
 	store    *task.Store
 	eventLog *task.EventLog
@@ -148,7 +148,7 @@ func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *Dispatcher
 
 func (p *DispatcherPlugin) Name() string { return "dispatcher" }
 
-func (p *DispatcherPlugin) Init(h *plugin.Hub) error {
+func (p *DispatcherPlugin) Init(h *model.Hub) error {
 	p.hub = h
 
 	store, err := task.Open(filepath.Join(p.paths.DispatchDir, "tasks.jsonl"))
@@ -185,8 +185,8 @@ func (p *DispatcherPlugin) Init(h *plugin.Hub) error {
 		}
 		// statusbar 进度广播（addon 端 channel drop 兜底）
 		if u.Content != nil {
-			p.hub.Notify(plugin.Event{
-				Type: plugin.EventType(task.EventTaskProgress),
+			p.hub.Notify(model.Event{
+				Type: model.EventType(task.EventTaskProgress),
 				Payload: task.ProgressEvent{
 					TaskID:  taskID,
 					Kind:    u.SessionUpdate,
@@ -197,14 +197,14 @@ func (p *DispatcherPlugin) Init(h *plugin.Hub) error {
 	})
 	p.resumeInterrupted()
 
-	if err := h.RegisterCommand(plugin.Command{
+	if err := h.RegisterCommand(model.Command{
 		Name:        "/dispatch",
 		Description: "commit dispatcher：加任务/查任务/审批，用法见 /dispatch help",
 		Handler:     p.handleDispatch,
 	}); err != nil {
 		return err
 	}
-	return h.RegisterCommand(plugin.Command{
+	return h.RegisterCommand(model.Command{
 		Name:        "/workers",
 		Description: "查看已配置的 ACP worker 清单",
 		Handler:     p.handleWorkers,
@@ -718,7 +718,7 @@ func (h *acpIngress) dispatchSync(ctx context.Context, sessionID, cwd, prompt st
 
 // ---- /dispatch ----
 
-func (p *DispatcherPlugin) handleDispatch(ctx *plugin.Context) error {
+func (p *DispatcherPlugin) handleDispatch(ctx *model.Context) error {
 	args := ctx.Args
 	if len(args) == 0 || args[0] == "help" {
 		p.writeUsage(ctx)
@@ -817,7 +817,7 @@ func (p *DispatcherPlugin) resolveWorker(explicit, prompt string, write func(str
 	return name, true
 }
 
-func (p *DispatcherPlugin) writeUsage(ctx *plugin.Context) {
+func (p *DispatcherPlugin) writeUsage(ctx *model.Context) {
 	ctx.Writer(`用法:
   /dispatch <prompt>              ← 当前目录是 git 仓库 → code 任务（worktree 隔离）；否则 general 任务
   /dispatch --general <prompt>    ← 强制 general 任务
@@ -833,7 +833,7 @@ func (p *DispatcherPlugin) writeUsage(ctx *plugin.Context) {
 `)
 }
 
-func (p *DispatcherPlugin) addTask(ctx *plugin.Context, explicitWorker string, general bool, prompt string) error {
+func (p *DispatcherPlugin) addTask(ctx *model.Context, explicitWorker string, general bool, prompt string) error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -890,8 +890,8 @@ func (p *DispatcherPlugin) notifyStatus(t *task.Task, from, to task.Status) {
 	}); err != nil {
 		slog.Error("dispatch: append task status", "task", t.ID, "error", err)
 	}
-	p.hub.Notify(plugin.Event{
-		Type: plugin.EventType(task.EventTaskStatus),
+	p.hub.Notify(model.Event{
+		Type: model.EventType(task.EventTaskStatus),
 		Payload: task.StatusEvent{
 			TaskID: t.ID, From: from, To: to, Kind: t.Kind, Worker: t.Worker,
 		},
@@ -1045,7 +1045,7 @@ func (p *DispatcherPlugin) workerSpec(name string) dispatch.WorkerSpec {
 	return dispatch.WorkerSpec{Name: name}
 }
 
-func (p *DispatcherPlugin) handleList(ctx *plugin.Context, args []string) error {
+func (p *DispatcherPlugin) handleList(ctx *model.Context, args []string) error {
 	filter := ""
 	if len(args) > 0 {
 		filter = args[0]
@@ -1068,7 +1068,7 @@ func (p *DispatcherPlugin) doList(filter string, write func(string)) {
 	}
 }
 
-func (p *DispatcherPlugin) handleShow(ctx *plugin.Context, id string) error {
+func (p *DispatcherPlugin) handleShow(ctx *model.Context, id string) error {
 	p.doShow(id, ctx.Writer)
 	return nil
 }
@@ -1083,7 +1083,7 @@ func (p *DispatcherPlugin) doShow(id string, write func(string)) {
 	write(string(data) + "\n")
 }
 
-func (p *DispatcherPlugin) handleTail(ctx *plugin.Context, id string) error {
+func (p *DispatcherPlugin) handleTail(ctx *model.Context, id string) error {
 	if _, ok := p.store.Get(id); !ok {
 		ctx.Writer(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
 		return nil
@@ -1182,7 +1182,7 @@ func writeTaskEvent(write func(string), event task.TaskEvent) {
 
 // handleApprove 审批通过：code 任务尝试 ff 合并（失败则提示走人工 complete），
 // general 任务直接标记完成。
-func (p *DispatcherPlugin) handleApprove(ctx *plugin.Context, id string) error {
+func (p *DispatcherPlugin) handleApprove(ctx *model.Context, id string) error {
 	p.doApprove(ctx.Ctx, id, ctx.Writer)
 	return nil
 }
@@ -1225,7 +1225,7 @@ func (p *DispatcherPlugin) doApprove(execCtx context.Context, id string, write f
 }
 
 // handleComplete 人工合并后的收尾：清 worktree + 分支，标记 done。
-func (p *DispatcherPlugin) handleComplete(ctx *plugin.Context, id string) error {
+func (p *DispatcherPlugin) handleComplete(ctx *model.Context, id string) error {
 	p.doComplete(ctx.Ctx, id, ctx.Writer)
 	return nil
 }
@@ -1265,7 +1265,7 @@ func (p *DispatcherPlugin) finishCodeTask(execCtx context.Context, t *task.Task,
 }
 
 // handleReject 拒绝任务：code 任务弃置 worktree 与分支。
-func (p *DispatcherPlugin) handleReject(ctx *plugin.Context, id string) error {
+func (p *DispatcherPlugin) handleReject(ctx *model.Context, id string) error {
 	p.doReject(ctx.Ctx, id, ctx.Writer)
 	return nil
 }
@@ -1297,7 +1297,7 @@ func (p *DispatcherPlugin) doReject(execCtx context.Context, id string, write fu
 
 // handleCancel 取消任务：运行中的取消 ctx（orchestrator 落 cancelled），
 // 排队/待审的直接流转。
-func (p *DispatcherPlugin) handleCancel(ctx *plugin.Context, id string) error {
+func (p *DispatcherPlugin) handleCancel(ctx *model.Context, id string) error {
 	p.doCancel(ctx.Ctx, id, ctx.Writer)
 	return nil
 }
@@ -1339,7 +1339,7 @@ func (p *DispatcherPlugin) doCancel(execCtx context.Context, id string, write fu
 
 // ---- /workers ----
 
-func (p *DispatcherPlugin) handleWorkers(ctx *plugin.Context) error {
+func (p *DispatcherPlugin) handleWorkers(ctx *model.Context) error {
 	cfg := p.cfg.Dispatch
 	ctx.Writer(fmt.Sprintf("dispatcher: enabled=%v max_parallel=%d\n", cfg.Enabled, orOne(cfg.MaxParallel)))
 	defaultWorker, _ := cfg.ResolveDefaultWorker()

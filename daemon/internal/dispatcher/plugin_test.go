@@ -18,24 +18,24 @@ import (
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	"github.com/tinguo/goworker/ai-dispatch/task"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
-	"github.com/tinguo/goworker/daemon/internal/plugin"
+	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// recordingHub 用真实 plugin.Hub 结构（函数字段）记录注册的命令与事件。
+// recordingHub 用真实 model.Hub 结构（函数字段）记录注册的命令与事件。
 type recordingHub struct {
 	mu       sync.Mutex
-	commands map[string]plugin.Command
-	events   []plugin.Event
+	commands map[string]model.Command
+	events   []model.Event
 }
 
-func newRecordingHub() (*plugin.Hub, *recordingHub) {
-	rh := &recordingHub{commands: map[string]plugin.Command{}}
-	return &plugin.Hub{
-		RegisterCommand: func(cmd plugin.Command) error {
+func newRecordingHub() (*model.Hub, *recordingHub) {
+	rh := &recordingHub{commands: map[string]model.Command{}}
+	return &model.Hub{
+		RegisterCommand: func(cmd model.Command) error {
 			rh.commands[cmd.Name] = cmd
 			return nil
 		},
-		Notify: func(event plugin.Event) {
+		Notify: func(event model.Event) {
 			rh.mu.Lock()
 			defer rh.mu.Unlock()
 			rh.events = append(rh.events, event)
@@ -149,7 +149,7 @@ func runCmd(t *testing.T, p *DispatcherPlugin, hub *recordingHub, name string, a
 	if !ok {
 		t.Fatalf("command %s not registered", name)
 	}
-	ctx := plugin.NewContext(context.Background(), func(s string) { out.WriteString(s) }, nil, args)
+	ctx := model.NewContext(context.Background(), func(s string) { out.WriteString(s) }, nil, args)
 	if err := cmd.Handler(ctx); err != nil {
 		t.Fatalf("%s %v: %v", name, args, err)
 	}
@@ -461,7 +461,7 @@ func TestPlugin_TailStreamsRunningTaskUpdates(t *testing.T) {
 	attached := make(chan struct{}, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- p.handleTail(plugin.NewContext(ctx, func(text string) {
+		done <- p.handleTail(model.NewContext(ctx, func(text string) {
 			mu.Lock()
 			output.WriteString(text)
 			mu.Unlock()

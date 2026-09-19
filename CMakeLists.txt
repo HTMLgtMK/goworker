@@ -32,6 +32,8 @@ find_program(GIT_EXECUTABLE git)
 set(GOOS "" CACHE STRING "交叉编译目标 GOOS（空 = 本机）")
 set(GOARCH "" CACHE STRING "交叉编译目标 GOARCH（空 = 本机）")
 set(GO_BUILD_FLAGS "-trimpath" CACHE STRING "附加 go build 参数")
+set(GOWORKER_NO_PLUGINS "" CACHE STRING
+    "不编入 daemon 的插件，逗号/分号分隔（可选：agent）。默认空 = 全部编入；每个名字经 goworker_no_<name> 构建标签编译期剔除")
 
 # ---- 版本号 ----
 set(PROJ_VERSION ${PROJECT_VERSION})
@@ -49,6 +51,54 @@ if(GIT_EXECUTABLE AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git)
     endif()
 endif()
 message(STATUS "goworker version: ${PROJ_VERSION}")
+
+# ---- 模块清单（从 go.work 动态读取，与 ci.yml 同源，避免硬编码清单漂移）----
+file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/go.work _gowork_lines
+    REGEX "^[ \t]*\\./[a-zA-Z-]+[ \t]*$")
+set(GO_MODULES "")
+foreach(_line IN LISTS _gowork_lines)
+    string(REGEX REPLACE "^[ \t]*\\./([a-zA-Z-]+)[ \t]*$" "\\1" _mod "${_line}")
+    list(APPEND GO_MODULES "${_mod}")
+endforeach()
+set(GO_TEST_PKGS "")
+foreach(_mod IN LISTS GO_MODULES)
+    list(APPEND GO_TEST_PKGS "./${_mod}/...")
+endforeach()
+message(STATUS "go.work 模块: ${GO_MODULES}")
+
+# ---- 插件装配（GOWORKER_NO_PLUGINS → go build tags）----
+# 插件写了就是拿来用的：默认全量编入（裸 go build 的 CI/release 同样如此），
+# 参数只表达例外——名单里的每个插件翻译成 goworker_no_<name> off-tag 编译期剔除。
+# 这样新插件落地即生效，不需要谁回头改配置。
+# Go 侧装配层在 daemon/internal/app，每个插件对应一对 plugins_<name>.go / plugins_<name>_off.go。
+# 与 Go 侧耦合：新增插件时这里必须同步追加，否则新插件的 off-tag 会被当未知名拒掉。
+set(_known_plugins "agent" "dispatcher")
+string(REPLACE "," ";" _exclude_list "${GOWORKER_NO_PLUGINS}")
+set(GO_OFF_TAGS "")
+foreach(_p IN LISTS _exclude_list)
+    string(STRIP "${_p}" _p)
+    if(_p STREQUAL "")
+        continue()
+    endif()
+    if(NOT _p IN_LIST _known_plugins)
+        message(FATAL_ERROR "GOWORKER_NO_PLUGINS 含未知插件 '${_p}'，可选值：${_known_plugins}")
+    endif()
+    list(APPEND GO_OFF_TAGS "goworker_no_${_p}")
+endforeach()
+set(_go_tag_args "")
+if(GO_OFF_TAGS)
+    list(JOIN GO_OFF_TAGS "," _off_tag_str)
+    set(_go_tag_args "-tags" "${_off_tag_str}")
+endif()
+list(LENGTH GO_OFF_TAGS _off_count)
+list(LENGTH _known_plugins _known_count)
+if(_off_count EQUAL 0)
+    message(STATUS "plugins: 全量编入")
+elseif(_off_count EQUAL _known_count)
+    message(STATUS "plugins: 最小壳，全部插件已剔除")
+else()
+    message(STATUS "plugins: 剔除 ${GO_OFF_TAGS}，其余全量编入")
+endif()
 
 # ---- 输出 ----
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -72,7 +122,7 @@ set(_go_env "GOOS=${GOOS}" "GOARCH=${GOARCH}")
 add_custom_command(
     OUTPUT ${GOWORKER_BIN}
     COMMAND ${CMAKE_COMMAND} -E env ${_go_env}
-        ${GO_EXECUTABLE} build ${GO_BUILD_FLAGS}
+        ${GO_EXECUTABLE} build ${GO_BUILD_FLAGS} ${_go_tag_args}
             -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version=${PROJ_VERSION}"
             -o ${GOWORKER_BIN}
             ./daemon/cmd/goworker
@@ -85,23 +135,21 @@ add_custom_target(goworker ALL DEPENDS ${GOWORKER_BIN})
 
 # ---- 辅助目标 ----
 add_custom_target(test
-    COMMAND ${GO_EXECUTABLE} test
-        ./ai-core/... ./ai-dispatch/... ./ai-memory/... ./ai-sandbox/... ./ai-runtime/... ./daemon/...
+    COMMAND ${GO_EXECUTABLE} test ${GO_TEST_PKGS}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "go test（全 workspace）"
     VERBATIM
 )
 
 add_custom_target(test-race
-    COMMAND ${GO_EXECUTABLE} test -race ./...
+    COMMAND ${GO_EXECUTABLE} test -race ${GO_TEST_PKGS}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMENT "go test -race"
+    COMMENT "go test -race（全 workspace）"
     VERBATIM
 )
 
 add_custom_target(vet
-    COMMAND ${GO_EXECUTABLE} vet
-        ./ai-core/... ./ai-dispatch/... ./ai-memory/... ./ai-sandbox/... ./ai-runtime/... ./daemon/...
+    COMMAND ${GO_EXECUTABLE} vet ${GO_TEST_PKGS}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "go vet"
     VERBATIM

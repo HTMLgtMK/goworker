@@ -11,7 +11,7 @@ import (
 
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	"github.com/tinguo/goworker/ai-dispatch/task"
-	"github.com/tinguo/goworker/daemon/internal/plugin"
+	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
 type reviewUsage struct {
@@ -73,7 +73,7 @@ type taskReview struct {
 	Tools    []reviewTool
 }
 
-func (p *DispatcherPlugin) handleReview(ctx *plugin.Context, id string) error {
+func (p *DispatcherPlugin) handleReview(ctx *model.Context, id string) error {
 	p.doReview(id, ctx.Writer)
 	return nil
 }
