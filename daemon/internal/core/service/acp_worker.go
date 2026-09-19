@@ -90,7 +90,7 @@ func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispa
 }
 
 // TokenToUpdate 把结构化 runtime token 映射为 ACP session/update 的唯一映射：
-// stdio worker（acpWorker）与 vscode socket 前端（frontend/vscode）两处共用，
+// stdio worker（acpWorker）与 vscode socket 前端（cli/vscode）两处共用，
 // 保证两条 ACP 入口的工具生命周期/思考/正文渲染一致。
 func TokenToUpdate(token core.Token) protocol.SessionUpdateBody {
 	switch token.Type {

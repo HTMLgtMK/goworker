@@ -65,7 +65,7 @@ func NewStdinFrontend(engine *engine.Engine, config *config.StdinConfig) *StdinF
 	}
 
 	sb := statusbar.New()
-	sb.Use(NewProgressAddon(), NewIterationAddon(), NewUsageAddon())
+	sb.Use(NewProgressAddon(), NewIterationAddon(), NewUsageAddon(), NewTaskAddon())
 
 	// dispatcher 事件桥接：dispatcher 任务跑在后台 goroutine（无命令 Context），
 	// 不能走 /agent 的 ctx.Publish 注入链，改经 Engine 事件总线常驻转发。

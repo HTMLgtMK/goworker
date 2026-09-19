@@ -57,7 +57,8 @@ func main() {
 // 退出顺序由 defer LIFO 保证：先停 vscode 前端，再由调用方的 appl.Stop 停 engine+日志。
 func runFrontends(appl *app.Application) error {
 	// vscode ACP 前端：vscode.enabled=true 时经本地 Unix socket 服务外部编辑器（ACP 协议）。
-	// 启动失败与 dispatcher 插件的 listener 启动失败一致：返回错误终止启动，不静默降级。
+	// 启动失败返回错误终止启动，不静默降级（与 dispatcher listener 失败同级处理，
+	// 但走壳层的 exit 0 退出码——退出策略归壳层，见 app 包文档）。
 	if appl.Runtime.Frontend.Vscode.Enabled {
 		stopVSCode, err := startVSCodeFrontend(appl)
 		if err != nil {

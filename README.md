@@ -233,8 +233,9 @@ lists the plugins to leave out; each name becomes a `goworker_no_<name>` build
 tag that removes it at compile time:
 
 ```bash
-cmake -B build                                  # default: every plugin compiled in
-cmake -B build -DGOWORKER_NO_PLUGINS=agent      # minimal shell: engine + builtin commands, no plugins
+cmake -B build                                        # default: every plugin compiled in
+cmake -B build -DGOWORKER_NO_PLUGINS=agent            # no agent plugin: engine + builtin commands only
+cmake -B build -DGOWORKER_NO_PLUGINS=dispatcher       # full REPL, no multi-agent dispatch
 ```
 
 The wiring lives in `daemon/internal/app` (one `plugins_<name>.go` /
