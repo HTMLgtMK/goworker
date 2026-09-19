@@ -38,12 +38,25 @@ type errNotStreamed struct{}
 
 func (errNotStreamed) Error() string { return "not implemented" }
 
+// deadLLMConfig 返回端点必然拒绝连接的 LLM 配置。测试要的是「provider 出错」
+// 这个结果，不能依赖「默认端点恰好不可达」——localhost:8000 被本机其它进程
+// 占用时 DefaultLLM() 的假设就破产了（accept 慢响应/5xx 重试都会拖过测试窗口）。
+// 127.0.0.1:1 在所有平台即时 ECONNREFUSED。
+func deadLLMConfig() runtimeconfig.LLMConfig {
+	cfg := runtimeconfig.DefaultLLM()
+	for name, p := range cfg.Providers {
+		p.Endpoint = "http://127.0.0.1:1"
+		cfg.Providers[name] = p
+	}
+	return cfg
+}
+
 func TestACPWorker_ServesSessionOverACP(t *testing.T) {
 	clientEnd, agentEnd := net.Pipe()
 
 	runtimeCfg := &runtimeconfig.Config{
 		Dispatch: runtimeconfig.DispatchConfig{},
-		LLM:      runtimeconfig.DefaultLLM(),
+		LLM:      deadLLMConfig(),
 	}
 	server := ServeACPWorker(agentEnd, ACPWorkerDeps{Config: runtimeCfg})
 	t.Cleanup(func() { _ = server.Close() })
@@ -113,7 +126,7 @@ func TestACPWorker_ServesSessionOverACP(t *testing.T) {
 // TestACPWorker_UnknownSession 测试未开 session 直接 prompt 的错误回传。
 func TestACPWorker_UnknownSession(t *testing.T) {
 	clientEnd, agentEnd := net.Pipe()
-	server := ServeACPWorker(agentEnd, ACPWorkerDeps{Config: &runtimeconfig.Config{LLM: runtimeconfig.DefaultLLM()}})
+	server := ServeACPWorker(agentEnd, ACPWorkerDeps{Config: &runtimeconfig.Config{LLM: deadLLMConfig()}})
 	t.Cleanup(func() { _ = server.Close() })
 
 	conn := protocol.NewConn(clientEnd)

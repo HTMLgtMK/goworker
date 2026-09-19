@@ -55,8 +55,12 @@ type Handler func(ctx context.Context, params json.RawMessage) (any, error)
 type Notifier func(params json.RawMessage)
 
 // Conn 是双向 JSON-RPC 连接，Client/Agent 两端共用。
-// Serve 在后台逐行读取并分发；请求各自在独立 goroutine 中处理，
-// 因此长任务 handler 不会阻塞 notification（如 session/cancel）。
+// Serve 在后台逐行读取并分发。分发语义是有意不对称的：
+//   - 请求各自在独立 goroutine 中处理 —— 长任务 handler（session/prompt）
+//     不得阻塞读循环，否则并发的 session/cancel 通知永远到不了；
+//   - 通知也是异步分发（handler 阻塞不得卡死读循环），但串成 FIFO 链：
+//     线上顺序即送达顺序，session/update 的流式渲染依赖这一点
+//     （chunk 必须先于它触发的 tool_call 被消费端观察到）。
 type Conn struct {
 	rwc io.ReadWriteCloser
 
@@ -67,6 +71,12 @@ type Conn struct {
 	pending map[string]chan *Response
 	methods map[string]Handler
 	notif   map[string]Notifier
+
+	// notification FIFO 链：notifLast 是上一条通知的完成信号。
+	// 每条通知的 goroutine 先等它再跑 handler，串行化送达顺序；
+	// 读循环本身只做入链，永不被慢 handler 阻塞（见 Conn 文档）。
+	notifMu   sync.Mutex
+	notifLast chan struct{}
 
 	closed   chan struct{}
 	once     sync.Once
@@ -95,6 +105,24 @@ func (c *Conn) HandleNotification(method string, h Notifier) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.notif[method] = h
+}
+
+// dispatchNotif 把一条 notification 挂上 FIFO 链：goroutine 先等前一条完成，
+// 再跑自己的 handler —— 送达顺序与线上顺序一致（见 Conn 文档的分发语义）。
+func (c *Conn) dispatchNotif(h Notifier, params json.RawMessage) {
+	c.notifMu.Lock()
+	wait := c.notifLast
+	done := make(chan struct{})
+	c.notifLast = done
+	c.notifMu.Unlock()
+
+	go func() {
+		if wait != nil {
+			<-wait
+		}
+		defer close(done)
+		h(params)
+	}()
 }
 
 // Serve 阻塞读循环，直到连接关闭或对端 EOF。
@@ -133,7 +161,7 @@ func (c *Conn) dispatch(line []byte) {
 		h := c.notif[req.Method]
 		c.mu.Unlock()
 		if h != nil {
-			go h(req.Params)
+			c.dispatchNotif(h, req.Params)
 		}
 		return
 	}
