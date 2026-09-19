@@ -216,3 +216,90 @@ func TestHITL_NonBashNonMCPNotTouched(t *testing.T) {
 		t.Fatal("unrelated tool should pass through untouched")
 	}
 }
+
+// ---- sys_*：risk_level × 沙箱模式 裁决矩阵 ----
+
+func newSysToolEvent(name string, args map[string]any, riskLevel string) (*core.BeforeToolEvent, *captureEmitter) {
+	ev, em := newToolEvent(name, args)
+	ev.ToolDef = &core.Tool{Name: name, Metadata: map[string]string{"risk_level": riskLevel}}
+	return ev, em
+}
+
+func TestHITL_SysRiskLevelMatrix(t *testing.T) {
+	cases := []struct {
+		mode  string
+		level string
+		want  string // allow | hitl | deny
+	}{
+		{"normal", "never", "allow"},
+		{"normal", "mode", "hitl"},
+		{"normal", "always", "hitl"},
+		{"normal", "", "hitl"},      // 缺省 = mode
+		{"normal", "bogus", "hitl"}, // 非法值 = mode
+		{"strict", "never", "allow"},
+		{"strict", "mode", "deny"},
+		{"strict", "always", "deny"},
+		{"readonly", "mode", "deny"},
+		{"off", "never", "allow"},
+		{"off", "mode", "allow"},
+		{"off", "always", "hitl"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.mode+"/"+tc.level, func(t *testing.T) {
+			cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: tc.mode})
+			decisions := make(chan hitl.Decision, 1)
+			mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
+			var ev *core.BeforeToolEvent
+			var em *captureEmitter
+			if tc.level == "" || tc.level == "bogus" {
+				ev, em = newToolEvent("sys_send_notification", map[string]any{"title": "t"}) // ToolDef 无 risk_level → 按 mode
+			} else {
+				ev, em = newSysToolEvent("sys_send_notification", map[string]any{"title": "t"}, tc.level)
+			}
+
+			switch tc.want {
+			case "allow":
+				resp := mw.OnBeforeTool(ev)
+				if ev.Abort != nil {
+					t.Fatalf("want allow, got aborted: %+v", ev.Abort)
+				}
+				if resp == nil {
+					t.Fatal("nil response")
+				}
+			case "deny":
+				mw.OnBeforeTool(ev)
+				if ev.Abort == nil {
+					t.Fatal("want deny (Abort), got pass-through")
+				}
+			case "hitl":
+				go func() { decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionApprove} }()
+				mw.OnBeforeTool(ev)
+				if ev.Abort != nil {
+					t.Fatalf("want confirm then approve, got aborted: %+v", ev.Abort)
+				}
+				if _, ok := interruptFor(t, em.tokens, "sys_send_notification"); !ok {
+					t.Fatal("want interrupt token, got none")
+				}
+			}
+		})
+	}
+}
+
+// TestHITL_SysHitlCarriesDeclaredLevel：HITL 请求应携带声明档位（展示给用户）。
+func TestHITL_SysHitlCarriesDeclaredLevel(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
+	decisions := make(chan hitl.Decision, 1)
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
+	ev, em := newSysToolEvent("sys_send_sms", map[string]any{"to": "x"}, "always")
+
+	go func() { decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionReject} }()
+	mw.OnBeforeTool(ev)
+
+	req, ok := interruptFor(t, em.tokens, "sys_send_sms")
+	if !ok {
+		t.Fatal("no interrupt emitted for sys tool")
+	}
+	if req.RiskLevel != "always" {
+		t.Errorf("RiskLevel = %q, want always", req.RiskLevel)
+	}
+}

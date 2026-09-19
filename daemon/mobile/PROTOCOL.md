@@ -65,13 +65,36 @@ NewHost(configDir, callbacks)   装载配置/日志（GOWORKER_CONFIG_DIR 注入
 配置文件落在 `configDir`（`config.yaml`），LLM endpoint 等可经 ACP 无关路径
 预置（app 首启引导生成），或后续经 agent 的命令通道设置。
 
-## 系统能力工具（设计方向，待实现）
+## 系统能力工具：x-device 扩展（已实现）
 
-通知/联系人等 Android 能力只有 app 进程可调用，走 ACP 的 client-ward 方法
-（Zed `fs/*` 模式）：worker 侧把这类工具的执行请求经协议发给 client，
-app 执行后回传结果。具名工具按 `sys_<capability>` 命名，声明风险等级
-（never / always / mode），在 HITL 权限链路统一门控；`Execute` 内不做用户
-确认（worker 侧工具执行有 60s 硬超时）。
+设备能力只有 client（app 进程）可调用，走 **client-ward 扩展方法**（Zed `fs/*` 模式）。
+方法名带 `x-` 前缀 = goworker 应用层扩展，**不进 `ai-dispatch/protocol` 标准面**；
+VS Code/ZCode 等标准客户端不认识 → 自动 method-not-found → 无设备工具，零兼容负担。
+
+```
+session/new 后：agent ── x-device/tools（探测请求）──→ client
+                 ← {tools: [{name, description, schema, risk_level}]}
+                 （method-not-found / 超时 / 非法条目 → 视为无能力，不注册工具）
+
+LLM 调 sys_<name> → HITL 门控（risk_level × 沙箱模式，见下）→ 通过后：
+                 agent ── x-device/call {name, arguments} ──→ client 执行
+                 ← {result: "<文本结果回给 LLM>"}
+```
+
+- **工具名强制 `sys_` 前缀**（worker 添加）：与 bash/mcp 命名空间隔离，且自动进 HITL 门控
+- **risk_level 声明**（`never | mode | always`，缺省 mode）：
+
+  | | normal | strict / readonly | off |
+  |---|---|---|---|
+  | never | 放行 | 放行 | 放行 |
+  | mode（默认） | **询问** | 拒绝 | 放行 |
+  | always | **询问** | 拒绝 | **询问** |
+
+- **实现位置**：worker 中继 `daemon/internal/core/service/sys_relay.go`；裁决 `ai-runtime/middlewares/hitl.go checkSys`（读 `BeforeToolEvent.ToolDef.Metadata["risk_level"]`）；执行器在 Kotlin `DeviceTools` 注册表
+- **每加一个能力的成本 = Kotlin 一处**（注册描述符 + handler），Go/协议零改动、无需重绑 AAR 之外的任何东西
+
+**客户端义务**：对不认识的带 id 请求必须自动回 -32601（JSON-RPC 标准行为）——
+worker 的探测靠这个快速失败；沉默客户端会把 session/new 拖到探测超时（2s）。
 
 ## 演进规则
 

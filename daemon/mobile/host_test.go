@@ -2,6 +2,7 @@ package mobile
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -10,15 +11,26 @@ import (
 
 // collectCB 收集 OnData 字节流并记录 OnClose，供往返断言。
 type collectCB struct {
-	mu     sync.Mutex
-	buffer strings.Builder
-	closed chan string
+	mu      sync.Mutex
+	buffer  strings.Builder
+	closed  chan string
+	partial string            // 跨 chunk 的半行残留
+	onLine  func(line string) // 完整行回调（可选）：模拟客户端对 server 请求的自动应答
 }
 
 func (c *collectCB) OnData(chunk []byte) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.buffer.Write(chunk)
+	text := c.partial + string(chunk)
+	lines := strings.Split(text, "\n")
+	c.partial = lines[len(lines)-1]
+	complete := lines[:len(lines)-1]
+	c.mu.Unlock()
+	for _, line := range complete {
+		if line = strings.TrimSpace(line); line != "" && c.onLine != nil {
+			c.onLine(line)
+		}
+	}
 }
 
 func (c *collectCB) OnClose(message string) {
@@ -67,6 +79,24 @@ func TestHostBridgeRoundTrip(t *testing.T) {
 	defer h.Close()
 	if err := h.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
+	}
+
+	// 模拟客户端契约：对未知方法请求自动回 -32601（Kotlin AcpClient 同款义务）——
+	// 否则 worker 的 x-device/tools 探测会吃满超时，session/new 被拖住。
+	cb.onLine = func(line string) {
+		obj := map[string]any{}
+		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+			return
+		}
+		method, _ := obj["method"].(string)
+		id, hasID := obj["id"].(float64)
+		if method == "" || !hasID {
+			return
+		}
+		if strings.HasPrefix(method, "session/") {
+			return // 正常 RPC 由 waitResponse 断言
+		}
+		_ = h.Write([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"error":{"code":-32601,"message":"method not found"}}`, int64(id))))
 	}
 
 	// initialize 往返

@@ -17,7 +17,10 @@ type Tool struct {
 	Name        string
 	Description string
 	Parameters  map[string]any // JSON Schema
-	Execute     func(ctx context.Context, args map[string]any) (string, error)
+	// Metadata 是工具自带的策略元数据（如 risk_level），随工具定义走单一事实源。
+	// 中间件按需读取，provider 序列化时不输出。
+	Metadata map[string]string
+	Execute  func(ctx context.Context, args map[string]any) (string, error)
 }
 
 // ---- 消息 ----
@@ -249,6 +252,7 @@ type BeforeToolEvent struct {
 	Iteration int
 	History   []Message
 	Tool      *ToolCall
+	ToolDef   *Tool // 命中的工具定义（含 Metadata）；未知工具时为 nil
 	Emit      TokenEmitter
 	Args      map[string]any
 	Abort     *ToolAbort

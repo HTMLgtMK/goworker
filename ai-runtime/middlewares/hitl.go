@@ -54,8 +54,71 @@ func (mw *HITLMiddleware) OnBeforeTool(ev *core.BeforeToolEvent) *core.Middlewar
 		return mw.checkBash(ev)
 	case strings.HasPrefix(name, "mcp_"):
 		return mw.checkMCP(ev)
+	case strings.HasPrefix(name, "sys_"):
+		return mw.checkSys(ev)
 	}
 	return &core.MiddlewareResponse{}
+}
+
+// ---- sys_*：client-ward 设备能力，按声明的 risk_level × 沙箱模式裁决 ----
+
+const (
+	RiskLevelNever  = "never"  // 声明方担保无害：任何模式直接放行
+	RiskLevelMode   = "mode"   // 跟随沙箱模式（缺省）：normal 询问 / strict、readonly 拒绝 / off 放行
+	RiskLevelAlways = "always" // 高危兜底：连 off 都要询问
+)
+
+// checkSys 裁决客户端声明工具（x-device 中继）的风险档位。
+// risk_level 声明在工具 Metadata（client 描述符透传），裁决矩阵与 mcp 同构：
+// strict/readonly 下除 never 外一律拒绝（无人值守不做设备副作用）。
+func (mw *HITLMiddleware) checkSys(ev *core.BeforeToolEvent) *core.MiddlewareResponse {
+	level := RiskLevelMode
+	if ev.ToolDef != nil {
+		if l := ev.ToolDef.Metadata["risk_level"]; l == RiskLevelNever || l == RiskLevelMode || l == RiskLevelAlways {
+			level = l
+		}
+	}
+
+	decision := func() string {
+		switch mw.sandboxCfg.Mode {
+		case sandbox.ModeStrict, sandbox.ModeReadOnly:
+			if level == RiskLevelNever {
+				return "allow"
+			}
+			return "deny"
+		case sandbox.ModeOff:
+			if level == RiskLevelAlways {
+				return "hitl"
+			}
+			return "allow"
+		default: // normal
+			if level == RiskLevelNever {
+				return "allow"
+			}
+			return "hitl"
+		}
+	}()
+
+	argsJSON, _ := json.Marshal(ev.Args)
+	now := time.Now()
+	req := &hitl.InterruptRequest{
+		ID:         fmt.Sprintf("req-%d", reqID.Add(1)),
+		ToolName:   ev.Tool.Function.Name,
+		Command:    string(argsJSON),
+		RiskReason: fmt.Sprintf("declared risk_level=%s (device capability)", level),
+		RiskLevel:  level,
+		CreatedAt:  now,
+		ExpiresAt:  now.Add(hitl.DefaultTimeout),
+	}
+	switch decision {
+	case "allow":
+		return &core.MiddlewareResponse{}
+	case "deny":
+		reason := fmt.Sprintf("⛔ tool %s denied in %s mode (risk_level=%s)", ev.Tool.Function.Name, mw.sandboxCfg.Mode, level)
+		return mw.block(ev, reason)
+	default: // hitl
+		return mw.confirm(ev, req, nil)
+	}
 }
 
 // ---- bash：sandbox 正则规则 ----

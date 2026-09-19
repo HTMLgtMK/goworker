@@ -525,3 +525,49 @@ func TestAgentRun_StreamsDeltasWithoutDuplication(t *testing.T) {
 		t.Errorf("provider calls = %d, want 1", provider.calls)
 	}
 }
+
+type beforeToolMetaSpy struct {
+	got *string
+}
+
+func (m beforeToolMetaSpy) Name() string { return "before-tool-meta-spy" }
+
+func (m *beforeToolMetaSpy) OnBeforeTool(ev *core.BeforeToolEvent) *core.MiddlewareResponse {
+	if ev.ToolDef != nil {
+		s := ev.ToolDef.Metadata["risk_level"]
+		m.got = &s
+	}
+	return nil
+}
+
+// TestAgent_BeforeToolEventCarriesToolDefMetadata：BeforeTool 必须携带命中的
+// 工具定义（含 Metadata）—— client-ward 工具的 risk_level 裁决依赖它。
+func TestAgent_BeforeToolEventCarriesToolDefMetadata(t *testing.T) {
+	mw := beforeToolMetaSpy{}
+	tools := []core.Tool{{
+		Name:        "bash",
+		Description: "execute a shell command",
+		Parameters:  map[string]any{"type": "object"},
+		Metadata:    map[string]string{"risk_level": "never"},
+		Execute: func(ctx context.Context, args map[string]any) (string, error) {
+			return "ok", nil
+		},
+	}}
+	a := NewAgent(&toolLoopProvider{count: 1}, "", tools, []core.Middleware{&mw})
+	tokenCh, msgCh, err := a.Run(context.Background(), nil, "do it")
+	if err != nil {
+		t.Fatalf("Run err = %v", err)
+	}
+	for tok := range tokenCh {
+		if tok.Done {
+			break
+		}
+	}
+	<-msgCh
+	if mw.got == nil {
+		t.Fatal("ToolDef not delivered to BeforeToolEvent")
+	}
+	if *mw.got != "never" {
+		t.Errorf("risk_level = %q, want never", *mw.got)
+	}
+}

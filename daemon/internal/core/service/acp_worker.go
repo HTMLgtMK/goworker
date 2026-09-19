@@ -18,6 +18,7 @@ import (
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/ai-sandbox"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -31,8 +32,10 @@ type ACPWorkerDeps struct {
 type acpWorker struct {
 	deps ACPWorkerDeps
 
-	mu       sync.Mutex
-	sessions map[string]*runtimeagent.Session
+	mu          sync.Mutex
+	sessions    map[string]*runtimeagent.Session
+	caller      DeviceCaller           // client-ward 调用通道（dispatch.Server），nil = 未知
+	deviceTools []DeviceToolDescriptor // 探测到的客户端设备工具（连接级，一次探测全会话复用）
 }
 
 // ServeACPWorker 在给定连接上服务 ACP worker 协议，返回 Server 便于测试与关闭。
@@ -40,7 +43,26 @@ func ServeACPWorker(rwc io.ReadWriteCloser, deps ACPWorkerDeps) *dispatch.Server
 	return dispatch.ServeConn(rwc, &acpWorker{deps: deps, sessions: map[string]*runtimeagent.Session{}})
 }
 
-// SetSession 建会话并落地提交方声明的 cwd。cwd 经 SessionDeps.CWD 渗透到
+// SetSessionServer 实现 SessionServerAware：捕获 client-ward 调用通道并探测
+// 设备工具清单（一次探测，连接内所有会话复用；失败按无能力处理，不阻塞会话建立）。
+func (w *acpWorker) SetSessionServer(sessionID, cwd string, server *dispatch.Server) {
+	w.mu.Lock()
+	w.caller = server
+	w.mu.Unlock()
+	if descs := probeDeviceTools(server); len(descs) > 0 {
+		w.mu.Lock()
+		w.deviceTools = descs
+		w.mu.Unlock()
+	}
+	w.setSession(sessionID, cwd)
+}
+
+// SetSession 建 Session（无 Server 引用的调用路径：设备工具不可用，仅 DefaultTools）。
+func (w *acpWorker) SetSession(sessionID, cwd string) {
+	w.setSession(sessionID, cwd)
+}
+
+// setSession 建会话并落地提交方声明的 cwd。cwd 经 SessionDeps.CWD 渗透到
 // Session 的 sandbox 配置副本（bash 的 cmd.Dir 与 read/write 的相对路径基准都
 // 取自 AllowedWorkDir）—— orchestrator 在 session/new 传的是 t.Worktree/t.Repo，
 // 于是工具就跑在该任务的 worktree 里，而不是 daemon 进程的 cwd。
@@ -49,15 +71,25 @@ func ServeACPWorker(rwc io.ReadWriteCloser, deps ACPWorkerDeps) *dispatch.Server
 // orchestrator 自己算出的任务 worktree，与 worker 同属一个信任域，不是远程
 // 不可信输入；套上 cfg.Sandbox.AllowedWorkDir 前缀校验反而会把合法 worktree
 // （位于 <repo>/.goworker/dispatch/ 下）误拒。
-func (w *acpWorker) SetSession(sessionID, cwd string) {
+func (w *acpWorker) setSession(sessionID, cwd string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	collectTools := runtimeagent.DefaultTools
+	if w.caller != nil && len(w.deviceTools) > 0 {
+		relayed := RelayDeviceTools(w.caller, w.deviceTools)
+		collectTools = func(cfg *sandbox.Config) []core.Tool {
+			tools := runtimeagent.DefaultTools(cfg)
+			return append(tools, relayed...)
+		}
+	}
+
 	w.sessions[sessionID] = runtimeagent.NewSession(runtimeagent.SessionDeps{
 		Config:       w.deps.Config,
 		AuditDir:     w.deps.AuditDir,
 		CWD:          cwd,
 		Memory:       nil,
-		CollectTools: runtimeagent.DefaultTools,
+		CollectTools: collectTools,
 		NewProvider:  ProviderFactory(acpHTTPClient()),
 		Store:        nil, // worker 会话由调用方管理生命周期，本地不持久化
 	})

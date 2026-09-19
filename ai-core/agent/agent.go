@@ -139,7 +139,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 					if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
 						result = fmt.Sprintf("invalid args: %v", err)
 					} else {
-						btEv := &core.BeforeToolEvent{Ctx: ctx, Iteration: iter, History: messages, Tool: &tc, Emit: tokenEmitter{ch: ch}, Args: args}
+						btEv := &core.BeforeToolEvent{Ctx: ctx, Iteration: iter, History: messages, Tool: &tc, ToolDef: &tool, Emit: tokenEmitter{ch: ch}, Args: args}
 						a.fireMiddlewareEvent(btEv)
 						if btEv.Abort != nil {
 							result = abortResult(btEv.Abort, tc.ID)
