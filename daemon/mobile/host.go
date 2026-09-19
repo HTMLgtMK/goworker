@@ -168,6 +168,11 @@ func (h *Host) Write(chunk []byte) (err error) {
 
 // Close 停止 worker 并释放资源。幂等；Close 后 OnClose 恰好回调一次。
 func (h *Host) Close() {
+	defer func() {
+		if r := recover(); r != nil && h.log != nil {
+			h.log.Error("mobile close panic", "panic", r)
+		}
+	}()
 	h.closeOnce.Do(func() {
 		h.mu.Lock()
 		started := h.started
@@ -201,7 +206,15 @@ func (h *Host) pump() {
 			h.safe(func() { h.cb.OnData(chunk) })
 		}
 		if err != nil {
-			h.reportClose("worker output closed: " + err.Error())
+			// 正常 Close 走到这里的报错（closed pipe）对用户无信息量，换成稳定文案。
+			h.mu.Lock()
+			wasClosed := h.closed
+			h.mu.Unlock()
+			if wasClosed {
+				h.reportClose("worker stopped")
+			} else {
+				h.reportClose("worker output closed: " + err.Error())
+			}
 			return
 		}
 	}
