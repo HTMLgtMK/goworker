@@ -55,11 +55,11 @@
 
 ### 系统工具协议（client-ward capabilities）
 
-- [ ] **协议定义** — `ai-dispatch/protocol` 新增 client-ward 方法（worker → client 请求执行设备能力，对齐 Zed `fs/*` 模式）；方法常量 + 请求/响应类型 + PROTOCOL.md 更新
-- [ ] **worker 侧工具注册** — `sys_notification` 等具名工具：Execute 经 ACP client-ward 请求阻塞等结果（60s 工具硬超时内，确认走 HITL 不走 Execute）
-- [ ] **风险分级门控** — 工具声明 never/always/mode，接入 HITL 权限链路（PROTOCOL.md 已预留分级框架）
-- [ ] **Kotlin 侧执行器** — client-ward 方法分发：通知（POST_NOTIFICATIONS API 33+ 运行时权限）、联系人（READ_CONTACTS）、剪贴板等
-- [ ] **真机 e2e** — LLM 触发 send_notification → 手机系统通知弹出
+- [x] **协议定义** — 落地为 `x-device/*` 应用层扩展方法（`x-device/tools` 探测 + `x-device/call` 转发），**不进 ai-dispatch/protocol 标准面**（用户决策：具体能力不写入共享协议）；方法常量在 `service/sys_relay.go`，机制复用 `Server.Call`
+- [x] **worker 侧工具注册** — `service/sys_relay.go`：ProbeDeviceTools（2s 超时 / method-not-found=无能力 / 条目清洗 + 32 上限）+ RelayDeviceTools（sys_ 前缀 + risk_level 元数据 + 转发 Execute）；acpWorker 经 SessionServerAware 捕获通道、CollectTools 组合
+- [x] **风险分级门控** — `ai-core`：Tool.Metadata + BeforeToolEvent.ToolDef（通用字段，声明随工具走）；`hitl.go checkSys`：risk_level(never/mode/always) × 沙箱模式 裁决矩阵；SessionDeps 零改动
+- [x] **Kotlin 侧执行器** — `DeviceTools` 注册表（描述符 + handler 同处声明）+ `AcpClient` client-ward 分发（未知方法自动 -32601）；send_notification 含 POST_NOTIFICATIONS 运行时权限
+- [x] **真机 e2e** — deepseek 触发 sys_send_notification → HITL 对话框（declared risk_level=mode 展示）→ Allow once → 系统通知真实弹出（dumpsys + 用户确认）
 
 ### UI 打磨
 
