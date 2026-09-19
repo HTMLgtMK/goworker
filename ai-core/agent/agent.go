@@ -121,7 +121,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 			}
 
 			for _, tc := range msg.ToolCalls {
-				emitToken(ch, core.Token{
+				emitToken(ctx, ch, core.Token{
 					Type:     core.TokenTypeToolCall,
 					Content:  fmt.Sprintf("%s(%s)", tc.Function.Name, tc.Function.Arguments),
 					ToolCall: tc,
@@ -156,7 +156,7 @@ func (a *Agent) Run(ctx context.Context, history []core.Message, input string) (
 					}
 				}
 
-				emitToken(ch, core.Token{Type: core.TokenTypeToolResult, Content: result, ToolCallID: tc.ID})
+				emitToken(ctx, ch, core.Token{Type: core.TokenTypeToolResult, Content: result, ToolCallID: tc.ID})
 				messages = append(messages, core.Message{Role: "tool", Content: result, ToolCallID: tc.ID})
 			}
 		}
@@ -276,8 +276,20 @@ func abortResult(abort *core.ToolAbort, toolCallID string) string {
 	return "tool execution aborted"
 }
 
-func emitToken(ch chan<- core.Token, tok core.Token) {
-	ch <- tok
+// emitToken 发送工具生命周期 token（tool_call/tool_result），带取消保护。
+// 语义边界：ctx 取消 ≠ 消费方弃读 —— 正常取消路径下消费方仍在 range tokenCh，
+// 配对的 call/result 应继续送达（宽限窗口内阻塞发送必然成功）；消费方提前
+// 弃读时宽限超时放弃，Run 不会被永久卡死。历史侧的 tool 消息配对由主循环
+// 回填保证，不依赖 token 是否送达。
+func emitToken(ctx context.Context, ch chan<- core.Token, tok core.Token) {
+	select {
+	case ch <- tok:
+	case <-ctx.Done():
+		select {
+		case ch <- tok:
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 func sendToken(ctx context.Context, ch chan<- core.Token, tok core.Token) {

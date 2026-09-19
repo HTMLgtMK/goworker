@@ -103,7 +103,7 @@ func (p fixedProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan co
 func seedRuns(p *AgentPlugin, inputs ...string) {
 	var out strings.Builder
 	for _, in := range inputs {
-		_ = p.session.Run(context.Background(), runtimeagent.RunRequest{Input: in}, runtimeagent.RunCallbacks{
+		_ = p.session.Load().Run(context.Background(), runtimeagent.RunRequest{Input: in}, runtimeagent.RunCallbacks{
 			Write: func(s string) { out.WriteString(s) },
 		})
 	}
@@ -120,7 +120,7 @@ func (p *AgentPlugin) setMemory(c *memory.Client) {
 // refreshSession 用当前 deps 重建会话，对齐 startSession 的会话边界构造
 // （测试不读真实文件 —— deps 由测试直接注入）。
 func (p *AgentPlugin) refreshSession() {
-	p.session = runtimeagent.NewSession(p.deps)
+	p.session.Store(runtimeagent.NewSession(p.deps))
 }
 
 // newContext 构造带输出捕获的 model.Context。
@@ -282,7 +282,7 @@ func TestHandleCompact_CompressesConversation(t *testing.T) {
 
 	// 播种 3 轮 user/assistant 对（走公开 Run API）
 	seedRuns(p, "q", "q", "q")
-	if n := len(p.session.Conversation()); n != 6 {
+	if n := len(p.session.Load().Conversation()); n != 6 {
 		t.Fatalf("seeded conversation = %d msgs, want 6", n)
 	}
 
@@ -291,7 +291,7 @@ func TestHandleCompact_CompressesConversation(t *testing.T) {
 		t.Fatalf("handleCompact: %v", err)
 	}
 
-	conv := p.session.Conversation()
+	conv := p.session.Load().Conversation()
 	if len(conv) >= 6 {
 		t.Fatalf("conversation not shrunk: %d → %d", 6, len(conv))
 	}
@@ -746,8 +746,8 @@ func TestHandleNew_EmptyConversationSkipsCheckpoint(t *testing.T) {
 	if err := p.handleNew(ctx); err != nil {
 		t.Fatalf("handleNew: %v", err)
 	}
-	if len(p.session.Conversation()) != 0 {
-		t.Errorf("conversation not cleared: %d", len(p.session.Conversation()))
+	if len(p.session.Load().Conversation()) != 0 {
+		t.Errorf("conversation not cleared: %d", len(p.session.Load().Conversation()))
 	}
 	if !strings.Contains(buf.String(), "New session started") {
 		t.Errorf("output = %q", buf.String())
@@ -793,8 +793,8 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	}
 
 	// STM 立即清空（同步路径，不等后台）
-	if len(p.session.Conversation()) != 0 {
-		t.Errorf("conversation not cleared: %d", len(p.session.Conversation()))
+	if len(p.session.Load().Conversation()) != 0 {
+		t.Errorf("conversation not cleared: %d", len(p.session.Load().Conversation()))
 	}
 	if !strings.Contains(out.String(), "New session started") {
 		t.Errorf("output = %q", out.String())

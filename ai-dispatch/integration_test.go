@@ -88,12 +88,18 @@ func (a *fakeAgent) handlePrompt(ctx context.Context, params json.RawMessage) (a
 		},
 	})
 
-	// 权限请求走反方向 request
+	// 权限请求走反方向 request。非 selected outcome（含 client 无 handler 时的
+	// cancelled 应答）一律视为拒绝 —— 与真 worker 的 Server.RequestPermission
+	// 语义一致：失败方向必须是拒绝，不是放行。
+	var permResp protocol.PermissionResponse
 	if err := a.conn.Call(ctx, protocol.MethodSessionRequestPermission, protocol.PermissionRequest{
 		SessionID: req.SessionID,
 		ToolCall:  protocol.ToolCallInfo{ToolCallID: "tc_1", Title: "bash"},
 		Options:   []protocol.PermissionOption{{OptionID: "allow", Kind: "allow_once"}},
-	}, nil); err != nil {
+	}, &permResp); err != nil {
+		return protocol.PromptResponse{StopReason: protocol.StopRefusal}, nil
+	}
+	if permResp.Outcome.Outcome != "selected" {
 		return protocol.PromptResponse{StopReason: protocol.StopRefusal}, nil
 	}
 

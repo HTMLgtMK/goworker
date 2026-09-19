@@ -33,7 +33,7 @@ set(GOOS "" CACHE STRING "交叉编译目标 GOOS（空 = 本机）")
 set(GOARCH "" CACHE STRING "交叉编译目标 GOARCH（空 = 本机）")
 set(GO_BUILD_FLAGS "-trimpath" CACHE STRING "附加 go build 参数")
 set(GOWORKER_NO_PLUGINS "" CACHE STRING
-    "不编入 daemon 的插件，逗号/分号分隔（可选：agent）。默认空 = 全部编入；每个名字经 goworker_no_<name> 构建标签编译期剔除")
+    "不编入 daemon 的插件，逗号/分号分隔（可选：agent、dispatcher）。默认空 = 全部编入；每个名字经 goworker_no_<name> 构建标签编译期剔除")
 
 # ---- 版本号 ----
 set(PROJ_VERSION ${PROJECT_VERSION})

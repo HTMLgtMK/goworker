@@ -41,12 +41,12 @@ const (
 //   - updatedAt：文件 mtime（RFC3339）。
 func (p *AgentPlugin) ListSessions() []protocol.SessionInfo {
 	out := make([]protocol.SessionInfo, 0, 4)
-	if p.store == nil || p.cfg.Session.Dir == "" {
+	if p.store.Load() == nil || p.cfg.Session.Dir == "" {
 		return out
 	}
 	dir := p.cfg.Session.Dir
 
-	if head := p.store.Head(); head != "" {
+	if head := p.store.Load().Head(); head != "" {
 		if m := describeSessionFile(filepath.Join(dir, "current.jsonl"), head); m != nil {
 			m.info.IsCurrent = true
 			m.info.Cwd = p.currentSessionCwd()
@@ -98,20 +98,20 @@ func (p *AgentPlugin) currentSessionCwd() string {
 // CurrentSessionID 返回当前活动会话的 head id（空 = 无活动会话/持久化未启用）。
 // vscode 前端用它判定 session/load 的目标是否为当前会话。
 func (p *AgentPlugin) CurrentSessionID() string {
-	if p.store == nil {
+	if p.store.Load() == nil {
 		return ""
 	}
-	return p.store.Head()
+	return p.store.Load().Head()
 }
 
 // ReloadCurrentSession 确保内存会话视图与 store 最新状态一致。session/load
 // 命中当前会话时调用——单活动会话模型下当前会话始终处于已加载状态，这里只做
 // 视图刷新（ReloadFromStore），不重建会话。
 func (p *AgentPlugin) ReloadCurrentSession() error {
-	if p.session == nil {
+	if p.session.Load() == nil {
 		return fmt.Errorf("agent: no active session")
 	}
-	return p.session.ReloadFromStore()
+	return p.session.Load().ReloadFromStore()
 }
 
 // CurrentSessionHistory 导出当前会话的完整对话历史，映射为 ACP session/update
@@ -126,14 +126,14 @@ func (p *AgentPlugin) ReloadCurrentSession() error {
 //
 // 全量重放，不设轮次/条数上限。无持久化（store 为 nil）或空会话返回非 nil 空切片。
 func (p *AgentPlugin) CurrentSessionHistory() []protocol.SessionUpdateBody {
-	if p.store == nil {
+	if p.store.Load() == nil {
 		return []protocol.SessionUpdateBody{}
 	}
-	view := p.store.ActiveView()
+	view := p.store.Load().ActiveView()
 	if len(view) == 0 {
 		return []protocol.SessionUpdateBody{}
 	}
-	return replayUpdates(view, checkpointAnchors(p.store))
+	return replayUpdates(view, checkpointAnchors(p.store.Load()))
 }
 
 // ArchivedSessionHistory 只读解析归档会话并映射为 ACP 重放通知序列（方案 B

@@ -208,10 +208,10 @@ func TestRunOptions_AskWithoutTaskIDFallsBackToDeny(t *testing.T) {
 	p, _ := newTestPlugin(t)
 	p.cfg.Dispatch.Workers = []runtimeconfig.WorkerConfig{{Name: "fake", Command: "fake", OnPermission: "ask"}}
 
-	if opts := p.runOptions("fake", ""); len(opts) != 0 {
+	if opts := p.runOptions("fake", "", context.Background()); len(opts) != 0 {
 		t.Errorf("opts = %d, want 0（无 taskID 时不装策略 = 拒绝）", len(opts))
 	}
-	if opts := p.runOptions("fake", "task_1"); len(opts) != 1 {
+	if opts := p.runOptions("fake", "task_1", context.Background()); len(opts) != 1 {
 		t.Errorf("opts = %d, want 1（有 taskID 时装 ask 策略）", len(opts))
 	}
 }

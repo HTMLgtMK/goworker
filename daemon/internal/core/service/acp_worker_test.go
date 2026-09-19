@@ -38,18 +38,25 @@ type errNotStreamed struct{}
 
 func (errNotStreamed) Error() string { return "not implemented" }
 
+// deadLLMConfig 返回端点必然拒绝连接的 LLM 配置。测试要的是「provider 出错」
+// 这个结果，不能依赖「默认端点恰好不可达」——localhost:8000 被本机其它进程
+// 占用时 DefaultLLM() 的假设就破产了（accept 慢响应/5xx 重试都会拖过测试窗口）。
+// 127.0.0.1:1 在所有平台即时 ECONNREFUSED。
+func deadLLMConfig() runtimeconfig.LLMConfig {
+	cfg := runtimeconfig.DefaultLLM()
+	for name, p := range cfg.Providers {
+		p.Endpoint = "http://127.0.0.1:1"
+		cfg.Providers[name] = p
+	}
+	return cfg
+}
+
 func TestACPWorker_ServesSessionOverACP(t *testing.T) {
 	clientEnd, agentEnd := net.Pipe()
 
-	// 端点钉死到必死端口：本测试依赖"provider 不可达 → agent error 回流"，
-	// 不能依赖宿主 8000 端口恰好没人监听（mock/其他服务可能占位）。
-	llm := runtimeconfig.DefaultLLM()
-	p := llm.Providers["openai"]
-	p.Endpoint = "http://127.0.0.1:1/v1"
-	llm.Providers["openai"] = p
 	runtimeCfg := &runtimeconfig.Config{
 		Dispatch: runtimeconfig.DispatchConfig{},
-		LLM:      llm,
+		LLM:      deadLLMConfig(),
 	}
 	server := ServeACPWorker(agentEnd, ACPWorkerDeps{Config: runtimeCfg})
 	t.Cleanup(func() { _ = server.Close() })
@@ -119,11 +126,7 @@ func TestACPWorker_ServesSessionOverACP(t *testing.T) {
 // TestACPWorker_UnknownSession 测试未开 session 直接 prompt 的错误回传。
 func TestACPWorker_UnknownSession(t *testing.T) {
 	clientEnd, agentEnd := net.Pipe()
-	llm2 := runtimeconfig.DefaultLLM()
-	p2 := llm2.Providers["openai"]
-	p2.Endpoint = "http://127.0.0.1:1/v1"
-	llm2.Providers["openai"] = p2
-	server := ServeACPWorker(agentEnd, ACPWorkerDeps{Config: &runtimeconfig.Config{LLM: llm2}})
+	server := ServeACPWorker(agentEnd, ACPWorkerDeps{Config: &runtimeconfig.Config{LLM: deadLLMConfig()}})
 	t.Cleanup(func() { _ = server.Close() })
 
 	conn := protocol.NewConn(clientEnd)

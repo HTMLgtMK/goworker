@@ -19,8 +19,8 @@ import (
 // Evaluator delegates a raw frontend prompt to the daemon command engine.
 type Evaluator func(ctx *model.Context, input string) error
 
-// SessionSource 是 vscode frontend 对 daemon 会话元数据的最小消费接口（由 agent
-// 插件实现，结构化类型、agent 包无需感知本接口）：
+// SessionSource 是 vscode frontend 对 daemon 会话元数据的最小消费接口（由 service
+// 包的 agent 插件实现，结构化类型、service 包无需感知本接口）：
 //   - ListSessions：session/list 数据源（当前会话置顶 + 归档，只读扫描）。
 //   - CurrentSessionID：当前活动会话的 head id（空 = 无活动会话）。
 //   - SetSession：把 ACP 提交方声明的会话 cwd 落到 daemon（校验与生效在实现方）。

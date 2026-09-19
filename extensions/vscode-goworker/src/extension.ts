@@ -263,13 +263,18 @@ function agentSocketPath(): string {
   return resolveSocketPath(configured, 'frontend/vscode.sock');
 }
 
-// 空配置时按 <home>/.config/goworker/<fallback> 派生；拒绝 URL 形式的配置。
+// 空配置时按 GOWORKER_CONFIG_DIR（daemon 侧同名变量优先，两例对齐）或
+// <home>/.config/goworker/<fallback> 派生；拒绝 URL 形式的配置。
+// 注意：GUI 启动的 VS Code 可能不继承 GOWORKER_CONFIG_DIR —— 对不上时
+// 显式设置 goworker.agentSocketPath。
 function resolveSocketPath(configured: string, fallback: string): string {
   const value = configured.trim();
   if (value) {
     if (value.includes('://')) throw new Error('GOWORKER socket override must be a Unix socket path, not a URL');
     return value;
   }
+  const configDir = process.env.GOWORKER_CONFIG_DIR;
+  if (configDir) return `${configDir.replace(/\/+$/, '')}/${fallback}`;
   const home = process.env.HOME ?? process.env.USERPROFILE;
   if (!home) throw new Error('Cannot determine home directory for GOWORKER socket');
   return `${home}/.config/goworker/${fallback}`;

@@ -37,14 +37,23 @@ type DispatcherPlugin struct {
 	orch     *dispatch.Orchestrator
 
 	// running 追踪在跑的任务：taskID → cancel。Stop 时统一取消并等待退出。
+	// 后台任务（launch）与同步派发（dispatchSync）都必须登记 —— 否则 cancel
+	// 会删掉 worker 正在使用的 worktree/分支，且 Stop 在任务存活时关闭 store。
 	mu      sync.Mutex
 	running map[string]context.CancelFunc
 	wg      sync.WaitGroup
+	// transitionMu 串行化任务终态迁移（approve/reject/cancel/complete）：
+	// 这些操作都是 Get→检查→Transition→Update，无 CAS 时 REPL 与 vscode
+	// 并发 approve+reject 会以最后写入者获胜，被拒任务可能变成 done（评审 I1）。
+	transitionMu sync.Mutex
 
 	// ACP 入口：socket listener、活跃连接与任务→连接的进度路由
 	listener   net.Listener
-	acpServers []*dispatch.Server
-	acpRoutes  map[string][]acpRoute
+	acpServers map[*dispatch.Server]struct{}
+	// stopped 在 Stop 时关闭：acceptLoop 与 Stop 的登记竞态窗口内，
+	// 晚到的连接直接关掉，不会登记进 Stop 快照之外的死角（评审 M5）。
+	stopped   chan struct{}
+	acpRoutes map[string][]acpRoute
 	// liveRoutes 是「观察者路由」：`--attach` 期间的连接。与 acpRoutes 的差别
 	// 在生命周期——acpRoutes 跟着同步派发的调用栈（defer 摘除），liveRoutes
 	// 跟着 attach 循环，任务跑完可能还在（用户仍停在详情页）。
@@ -127,20 +136,14 @@ func (p *DispatcherPlugin) snapshotLiveRoutes(taskID string) []acpRoute {
 	return append([]acpRoute(nil), p.liveRoutes[taskID]...)
 }
 
-// hasAnyObserver 报告该任务此刻是否有任何 ACP 订阅者（同步路由或观察者路由）。
-// 用于区分"根本没人看"与"有人看但对端不会答"。
-func (p *DispatcherPlugin) hasAnyObserver(taskID string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return len(p.acpRoutes[taskID]) > 0 || len(p.liveRoutes[taskID]) > 0
-}
-
 // NewPlugin 构造 dispatcher 插件。cfg.Dispatch.Enabled=false 时 main 不会注册本插件。
 func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *DispatcherPlugin {
 	return &DispatcherPlugin{
 		cfg:        cfg,
 		paths:      paths,
 		running:    make(map[string]context.CancelFunc),
+		acpServers: make(map[*dispatch.Server]struct{}),
+		stopped:    make(chan struct{}),
 		acpRoutes:  make(map[string][]acpRoute),
 		liveRoutes: make(map[string][]acpRoute),
 	}
@@ -216,11 +219,14 @@ func (p *DispatcherPlugin) Init(h *model.Hub) error {
 // 续接 worker 上下文（能力协商失败则降级重跑）。
 func (p *DispatcherPlugin) resumeInterrupted() {
 	for _, t := range p.store.List() {
-		if t.Status.Terminal() || t.Status == task.StatusAwaitingReview {
-			continue // awaiting_review 等人审批，不需要重派
+		// 跳过不重派的状态：终态已了结；awaiting_review 等人审批；merging
+		// 崩溃后重派会撞非法迁移（merging→dispatching）落 failed 并清掉
+		// worktree —— 留给人工 --complete 收尾（评审 M4）。
+		if t.Status.Terminal() || t.Status == task.StatusAwaitingReview || t.Status == task.StatusMerging {
+			continue
 		}
 		slog.Info("dispatcher: resuming interrupted task", "task", t.ID, "status", t.Status)
-		p.launch(&t, p.runOptions(t.Worker, t.ID)...)
+		p.launch(&t)
 	}
 }
 
@@ -253,17 +259,40 @@ func (p *DispatcherPlugin) acceptLoop() {
 		}
 		server := dispatch.ServeConn(conn, &acpIngress{plugin: p})
 		p.mu.Lock()
-		p.acpServers = append(p.acpServers, server)
+		select {
+		case <-p.stopped:
+			// Stop 快照之后才登记上来的连接：立即关闭，避免泄漏
+			p.mu.Unlock()
+			_ = server.Close()
+			continue
+		default:
+		}
+		p.acpServers[server] = struct{}{}
 		p.mu.Unlock()
+		// 连接结束即从表里摘除：长期运行的 daemon 不为每次重连积一个 Server
+		go func() {
+			<-server.Done()
+			p.mu.Lock()
+			delete(p.acpServers, server)
+			p.mu.Unlock()
+		}()
 	}
 }
 
 func (p *DispatcherPlugin) Stop() error {
+	p.mu.Lock()
+	select {
+	case <-p.stopped:
+		// 幂等：测试显式 Stop + cleanup Stop 会走到这里
+		p.mu.Unlock()
+		return nil
+	default:
+	}
+	close(p.stopped)
 	if p.listener != nil {
 		_ = p.listener.Close()
 	}
-	p.mu.Lock()
-	for _, server := range p.acpServers {
+	for server := range p.acpServers {
 		_ = server.Close()
 	}
 	for _, cancel := range p.running {
@@ -271,6 +300,23 @@ func (p *DispatcherPlugin) Stop() error {
 	}
 	p.mu.Unlock()
 	p.wg.Wait()
+	// 同步派发（dispatchSync）不经 wg 跟踪：cancel 已触发，等 p.running 清空
+	// 再关 store/eventLog，否则 Run 末尾的落盘会写进已关闭的文件，最终快照
+	// 丢失后重启会把已结束的任务再跑一遍。有界等待，顽固任务不阻塞关机。
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		p.mu.Lock()
+		n := len(p.running)
+		p.mu.Unlock()
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			slog.Warn("dispatch stop: tasks still running after grace", "count", n)
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	_ = os.Remove(filepath.Join(p.paths.DispatchDir, "acp.sock"))
 	if p.eventLog != nil {
 		if err := p.eventLog.Close(); err != nil {
@@ -677,25 +723,59 @@ func (p *DispatcherPlugin) newTaskFromIngress(cwd, worker, prompt string) *task.
 // 之后用 --status 查询、--approve/--reject 审批（补偿接口）。
 func (h *acpIngress) detach(ctx context.Context, sessionID, cwd, prompt string, rep dispatch.Reporter) (string, error) {
 	p := h.plugin
+	// 入口守卫只查了原始 prompt，`--detach `（指令后为空）会漏到这里（评审 M6）
+	if strings.TrimSpace(prompt) == "" {
+		return "", statusError("empty prompt")
+	}
+	if full, maxParallel := p.atCapacity(); full {
+		return "", statusError(fmt.Sprintf("已有 %d 个任务在运行（max_parallel=%d），稍后再派", maxParallel, maxParallel))
+	}
 	worker, ok := p.resolveWorker("", prompt, func(string) {})
 	if !ok {
 		return "", statusError("no worker configured")
 	}
 	t := p.newTaskFromIngress(cwd, worker, prompt)
 	p.audit("acp-submit", t.ID, cwd+" (detach)")
-	p.launch(t, p.runOptions(worker, t.ID)...)
+	p.launch(t)
 	rep.MessageChunk(sessionID, fmt.Sprintf("任务 %s 已异步入队（%s），可用 --status %s 查询", t.ID, t.Kind, t.ID))
 	return protocol.StopEndTurn, nil
+}
+
+// atCapacity 报告并行额度是否已满（max_parallel<=0 视为 1）。
+func (p *DispatcherPlugin) atCapacity() (bool, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	maxParallel := p.cfg.Dispatch.MaxParallel
+	if maxParallel <= 0 {
+		maxParallel = 1
+	}
+	return len(p.running) >= maxParallel, maxParallel
 }
 
 // dispatchSync 同步派发：连接存续期间跑完任务，进度实时回流。
 func (h *acpIngress) dispatchSync(ctx context.Context, sessionID, cwd, prompt string, rep dispatch.Reporter) (string, error) {
 	p := h.plugin
+	if full, maxParallel := p.atCapacity(); full {
+		return "", statusError(fmt.Sprintf("已有 %d 个任务在运行（max_parallel=%d），稍后再派", maxParallel, maxParallel))
+	}
 	worker, ok := p.resolveWorker("", prompt, func(string) {})
 	if !ok {
 		return "", statusError("no worker configured")
 	}
 	t := p.newTaskFromIngress(cwd, worker, prompt)
+
+	// 与 launch 同一套跟踪：cancel 进 p.running（doCancel 可打断）、Stop 可等待。
+	// 不同步的话 cancel 会在 worker 运行中删掉 worktree/分支（worker 的提交
+	// 随之丢失），orch.Run 收尾还会把已取消的任务覆写回 awaiting_review。
+	runCtx, cancel := context.WithCancel(ctx)
+	p.mu.Lock()
+	p.running[t.ID] = cancel
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.running, t.ID)
+		p.mu.Unlock()
+	}()
 
 	// 进度路由：orchestrator 的全局 ProgressFunc 按 taskID 转回本连接
 	if server, ok := rep.(*dispatch.Server); ok {
@@ -705,7 +785,7 @@ func (h *acpIngress) dispatchSync(ctx context.Context, sessionID, cwd, prompt st
 	}
 
 	p.audit("acp-submit", t.ID, cwd)
-	outcome, err := p.orch.Run(ctx, t, p.workerSpec(worker), p.runOptions(worker, t.ID)...)
+	outcome, err := p.orch.Run(runCtx, t, p.workerSpec(worker), p.runOptions(worker, t.ID, runCtx)...)
 	if err != nil {
 		return "", err
 	}
@@ -871,7 +951,7 @@ func (p *DispatcherPlugin) addTask(ctx *model.Context, explicitWorker string, ge
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	p.launch(t, p.runOptions(worker, t.ID)...)
+	p.launch(t)
 	// 入队落盘由 orchestrator 首次 save 完成（并触发 queued 状态事件）
 	ctx.Writer(fmt.Sprintf("⏳ 任务 %s 已入队（%s → %s worker）\n", t.ID, kind, worker))
 	return nil
@@ -910,7 +990,10 @@ func (p *DispatcherPlugin) updateTask(t *task.Task) error {
 
 // runOptions 按 worker 配置生成派发选项：无人值守权限应答策略。
 // taskID 为空时 "ask" 退化为拒绝（ask 需要任务身份才能定位订阅者）。
-func (p *DispatcherPlugin) runOptions(worker, taskID string) []dispatch.RunOption {
+// runCtx 用于把任务取消传导进挂起的权限 fan-out：jsonrpc 的请求 ctx 不随
+// 任务取消（见 protocol.Conn.dispatch），不并上去的话 cancel 期间挂在
+// vscode 观察者上的提问会一直等用户答复（评审 I2）。
+func (p *DispatcherPlugin) runOptions(worker, taskID string, runCtx context.Context) []dispatch.RunOption {
 	w, ok := p.cfg.Dispatch.Worker(worker)
 	if !ok {
 		return nil // 未知 worker：默认拒绝
@@ -936,7 +1019,19 @@ func (p *DispatcherPlugin) runOptions(worker, taskID string) []dispatch.RunOptio
 		if taskID == "" {
 			return nil // 无任务身份 = 问不到人，保守拒绝
 		}
-		return []dispatch.RunOption{dispatch.WithPermissionPolicy(p.askPermissionPolicy(taskID))}
+		policy := p.askPermissionPolicy(taskID)
+		return []dispatch.RunOption{dispatch.WithPermissionPolicy(func(pctx context.Context, req protocol.PermissionRequest) (string, error) {
+			ctx, cancel := context.WithCancel(pctx)
+			defer cancel()
+			go func() {
+				select {
+				case <-runCtx.Done():
+					cancel()
+				case <-ctx.Done():
+				}
+			}()
+			return policy(ctx, req)
+		})}
 	default:
 		return nil // "" / "deny"：默认拒绝
 	}
@@ -1003,16 +1098,16 @@ func (p *DispatcherPlugin) askPermissionPolicy(taskID string) func(context.Conte
 }
 
 // noObserverReason 给出"没人能批准"的具体原因，用于日志与错误信息。
-// 区分"压根没订阅者"与"任务根本不在运行"，后者通常是重启恢复的窗口期。
+// 唯一调用点在路由表为空时（review M9：原实现的分支与调用条件矛盾，
+// hasAnyObserver 查的就是同一批表，第一分支是死代码）—— 到这里必然是
+// 压根没人订阅，措辞直接引导用户去详情页 attach。
 func (p *DispatcherPlugin) noObserverReason(taskID string) string {
-	if p.hasAnyObserver(taskID) {
-		return fmt.Sprintf("no ACP client is observing task %s", taskID)
-	}
 	return fmt.Sprintf("no ACP client is observing task %s (attach to it from the task detail view to approve)", taskID)
 }
 
 // launch 后台执行任务。orchestrator 负责状态机流转与 worktree 清理。
-func (p *DispatcherPlugin) launch(t *task.Task, opts ...dispatch.RunOption) {
+// 权限策略在这里随 runCtx 一起装配（与 dispatchSync 同构）。
+func (p *DispatcherPlugin) launch(t *task.Task) {
 	runCtx, cancel := context.WithCancel(context.Background())
 	p.mu.Lock()
 	p.running[t.ID] = cancel
@@ -1027,8 +1122,15 @@ func (p *DispatcherPlugin) launch(t *task.Task, opts ...dispatch.RunOption) {
 			p.mu.Unlock()
 		}()
 
+		// M1：排队窗口期任务可能已被取消（store 已落 cancelled，手里的 t 还是
+		// 旧快照）—— 以 store 为准，别把已取消的任务再派出去。
+		if fresh, ok := p.store.Get(t.ID); ok && fresh.Status != t.Status {
+			slog.Info("dispatch launch skipped: task changed before start", "task", t.ID, "status", fresh.Status)
+			return
+		}
+
 		spec := p.workerSpec(t.Worker)
-		outcome, err := p.orch.Run(runCtx, t, spec, opts...)
+		outcome, err := p.orch.Run(runCtx, t, spec, p.runOptions(t.Worker, t.ID, runCtx)...)
 		if err != nil {
 			slog.Warn("dispatch task ended", "task", t.ID, "err", err)
 			return
@@ -1188,6 +1290,13 @@ func (p *DispatcherPlugin) handleApprove(ctx *model.Context, id string) error {
 }
 
 func (p *DispatcherPlugin) doApprove(execCtx context.Context, id string, write func(string)) {
+	// 状态迁移串行化：REPL 与 vscode 可能并发 approve/reject，无锁时
+	// Get→检查→Transition→Update 各自基于过期快照，被拒任务可能被 approve
+	// 的后写覆盖成 done（评审 I1）。锁住整个迁移段，慢操作（ff 合并）也在此
+	// 段内 —— 并发审批是人工节奏，串行可接受。
+	p.transitionMu.Lock()
+	defer p.transitionMu.Unlock()
+
 	t, ok := p.store.Get(id)
 	if !ok {
 		write(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
@@ -1231,6 +1340,9 @@ func (p *DispatcherPlugin) handleComplete(ctx *model.Context, id string) error {
 }
 
 func (p *DispatcherPlugin) doComplete(execCtx context.Context, id string, write func(string)) {
+	p.transitionMu.Lock()
+	defer p.transitionMu.Unlock()
+
 	snapshot, ok := p.store.Get(id)
 	if !ok || snapshot.Kind != task.KindCode {
 		write(fmt.Sprintf("✘ code 任务 %s 不存在\n", id))
@@ -1271,6 +1383,9 @@ func (p *DispatcherPlugin) handleReject(ctx *model.Context, id string) error {
 }
 
 func (p *DispatcherPlugin) doReject(execCtx context.Context, id string, write func(string)) {
+	p.transitionMu.Lock()
+	defer p.transitionMu.Unlock()
+
 	t, ok := p.store.Get(id)
 	if !ok {
 		write(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
@@ -1303,6 +1418,9 @@ func (p *DispatcherPlugin) handleCancel(ctx *model.Context, id string) error {
 }
 
 func (p *DispatcherPlugin) doCancel(execCtx context.Context, id string, write func(string)) {
+	p.transitionMu.Lock()
+	defer p.transitionMu.Unlock()
+
 	t, ok := p.store.Get(id)
 	if !ok {
 		write(fmt.Sprintf("✘ 任务 %s 不存在\n", id))
@@ -1319,6 +1437,12 @@ func (p *DispatcherPlugin) doCancel(execCtx context.Context, id string, write fu
 	if running {
 		p.audit("cancel", t.ID, "running")
 		cancel()
+		// 竞态自查（评审 M2）：cancel 与 orch.Run 写 awaiting_review、退出
+		// p.running 之间存在窗口 —— 重读 store，别对已待审的任务谎报"取消中"。
+		if fresh, ok := p.store.Get(id); ok && fresh.Status != t.Status {
+			write(fmt.Sprintf("ℹ 任务 %s 已进入 %s，无需取消\n", id, fresh.Status))
+			return
+		}
 		write(fmt.Sprintf("⏳ 任务 %s 取消中（worker 中断后落 cancelled）\n", id))
 		return
 	}
@@ -1356,15 +1480,18 @@ func (p *DispatcherPlugin) handleWorkers(ctx *model.Context) error {
 // ---- 审计 ----
 
 // audit 追加一条 dispatcher 决策记录到 audit/dispatch.jsonl。
+// 审计失败不阻塞任务路径，但必须留日志 —— 静默丢审计等于决策无迹可循。
 func (p *DispatcherPlugin) audit(action, taskID, detail string) {
 	if p.paths.AuditDir == "" {
 		return
 	}
 	if err := os.MkdirAll(p.paths.AuditDir, 0o755); err != nil {
+		slog.Warn("dispatch: audit mkdir", "err", err)
 		return
 	}
 	f, err := os.OpenFile(filepath.Join(p.paths.AuditDir, "dispatch.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
+		slog.Warn("dispatch: audit open", "err", err)
 		return
 	}
 	defer f.Close()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -74,7 +75,7 @@ func (o *Orchestrator) Run(ctx context.Context, t *task.Task, spec WorkerSpec, o
 		if err := o.save(t); err != nil {
 			return Outcome{}, err
 		}
-		if err := o.prepare(t); err != nil {
+		if err := o.prepare(ctx, t); err != nil {
 			return Outcome{}, o.fail(ctx, t, err)
 		}
 		if err := o.save(t); err != nil {
@@ -86,7 +87,7 @@ func (o *Orchestrator) Run(ctx context.Context, t *task.Task, spec WorkerSpec, o
 		if err := o.save(t); err != nil {
 			return Outcome{}, o.fail(ctx, t, err)
 		}
-	} else if err := o.verifyWorkspace(t); err != nil {
+	} else if err := o.verifyWorkspace(ctx, t); err != nil {
 		return Outcome{}, o.fail(ctx, t, err)
 	}
 
@@ -94,7 +95,13 @@ func (o *Orchestrator) Run(ctx context.Context, t *task.Task, spec WorkerSpec, o
 	if err != nil {
 		return Outcome{}, o.fail(ctx, t, err)
 	}
-	defer client.Close()
+	defer func() {
+		// processConn.Close 在 worker 卡死时会 5s 强杀并返回诊断错误 ——
+		// 吞掉它，强杀这件事就永远无迹可循
+		if err := client.Close(); err != nil {
+			slog.Warn("dispatch: close worker", "worker", spec.Name, "err", err)
+		}
+	}()
 
 	init, err := client.Initialize(ctx)
 	if err != nil {
@@ -181,11 +188,12 @@ func (o *Orchestrator) establishSession(
 }
 
 // verifyWorkspace 崩溃恢复前置校验：code 任务的 worktree 应仍存在且可用。
-func (o *Orchestrator) verifyWorkspace(t *task.Task) error {
+// ctx 透传给 git 子进程：大仓库/网络挂载上 git 变慢时，用户取消能即时生效。
+func (o *Orchestrator) verifyWorkspace(ctx context.Context, t *task.Task) error {
 	if t.Kind != task.KindCode || t.Worktree == "" {
 		return nil
 	}
-	if !DetectGit(context.Background(), t.Worktree) {
+	if !DetectGit(ctx, t.Worktree) {
 		return fmt.Errorf("worktree %s is gone or not a git work tree", t.Worktree)
 	}
 	return nil
@@ -193,23 +201,24 @@ func (o *Orchestrator) verifyWorkspace(t *task.Task) error {
 
 // prepare 按 Kind 做派发前置：code 任务校验 git 仓库并建 worktree；
 // general 任务仅补齐默认工作目录。成功后把结果写回 t（BaseCommit/Worktree/Branch）。
-func (o *Orchestrator) prepare(t *task.Task) error {
+// git 调用全部吃调用方 ctx（见 verifyWorkspace 注释）。
+func (o *Orchestrator) prepare(ctx context.Context, t *task.Task) error {
 	switch t.Kind {
 	case task.KindCode:
 		if t.Repo == "" {
 			return errors.New("code task requires repo")
 		}
-		if !DetectGit(context.Background(), t.Repo) {
+		if !DetectGit(ctx, t.Repo) {
 			return fmt.Errorf("repo %s is not a git work tree", t.Repo)
 		}
-		base, err := HeadCommit(context.Background(), t.Repo)
+		base, err := HeadCommit(ctx, t.Repo)
 		if err != nil {
 			return fmt.Errorf("resolve HEAD: %w", err)
 		}
 		t.BaseCommit = base
 		t.Branch = "dispatch/" + t.ID
 		t.Worktree = filepath.Join(t.Repo, ".goworker", "dispatch", t.ID)
-		if err := AddWorktree(context.Background(), t.Repo, t.Worktree, t.Branch); err != nil {
+		if err := AddWorktree(ctx, t.Repo, t.Worktree, t.Branch); err != nil {
 			return fmt.Errorf("add worktree: %w", err)
 		}
 	case task.KindGeneral:

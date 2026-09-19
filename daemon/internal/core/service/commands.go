@@ -62,7 +62,7 @@ func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
 	}
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		return p.session.Run(runCtx, runtimeagent.RunRequest{Input: strings.Join(ctx.Args, " ")}, callbacksFromPlugin(runContext))
+		return p.session.Load().Run(runCtx, runtimeagent.RunRequest{Input: strings.Join(ctx.Args, " ")}, callbacksFromPlugin(runContext))
 	})
 }
 
@@ -92,12 +92,12 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
 		// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
 		// 同步固化旧会话（阻塞，状态栏显示进度）；快照走只读，先取好再重建。
-		old := p.session
+		old := p.session.Load()
 
 		// pending 快照（store 生效时用游标后的增量，否则全量）
 		var pending []core.Message
-		if p.store != nil {
-			pending = p.store.PendingAfterCursor()
+		if st := p.store.Load(); st != nil {
+			pending = st.PendingAfterCursor()
 			if len(pending) == 0 {
 				pending = old.Conversation() // 兜底全量
 			}
@@ -114,8 +114,8 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 
 		// 先归档旧 store，再开新会话（新 store 写新文件）
 		// pending 快照已在 Archive 前取出，不受归档影响
-		if p.store != nil {
-			if err := p.store.Archive(); err != nil {
+		if st := p.store.Load(); st != nil {
+			if err := st.Archive(); err != nil {
 				slog.Warn("session: archive failed", "err", err)
 			}
 		}
@@ -317,7 +317,7 @@ func selectedContextWindow(cfg *runtimeconfig.Config) int {
 func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		calls, comps, total := p.session.UsageSnapshot()
+		calls, comps, total := p.session.Load().UsageSnapshot()
 		if len(calls) == 0 && len(comps) == 0 {
 			runContext.Writer("(no agent calls yet — run /agent first)\n")
 			return nil
@@ -365,7 +365,7 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 		}
 
 		// 当前历史占用：压缩后的直观体现，不必等下一次模型调用。
-		conv := p.session.Conversation()
+		conv := p.session.Load().Conversation()
 		if convLen := len(conv); convLen > 0 {
 			convEst := core.EstimateTokens(conv)
 			line := fmt.Sprintf("  history: %s est (%d msgs)", runtimeagent.Humanize(convEst), convLen)
@@ -383,7 +383,7 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 func (p *AgentPlugin) handleCompact(ctx *model.Context) error {
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		return p.session.Compact(runCtx, callbacksFromPlugin(runContext))
+		return p.session.Load().Compact(runCtx, callbacksFromPlugin(runContext))
 	})
 }
 
@@ -406,7 +406,7 @@ func (p *AgentPlugin) handleSkills(ctx *model.Context) error {
 func (p *AgentPlugin) handleHistory(ctx *model.Context) error {
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		conv := p.session.Conversation()
+		conv := p.session.Load().Conversation()
 		if len(conv) == 0 {
 			runContext.Writer("(no conversation history yet — run /agent first)\n")
 			return nil

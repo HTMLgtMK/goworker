@@ -5,8 +5,8 @@
 // 只做一次决策（once）语义：选项集固定为 allow_once / reject_once，不带
 // always —— 不引入任何需要持久化的"永久允许"状态，粒度定错就是安全隐患。
 //
-// 放在 plugin 包是因为两个 ACP 前端都要用它：agent chat（frontend/vscode 的
-// ingress）与 task worker（agent 的 acpWorker）。plugin 是两者共同依赖的层
+// 放在 model 包是因为两个 ACP 前端都要用它：agent chat（cli/vscode 的
+// ingress）与 task worker（service 的 acpWorker）。model 是两者共同依赖的层
 // （且已持有 hitl.Decision 的装配点 FrontendContext.Decide）；放进任一个前端
 // 都会让另一个反向依赖它。
 package model
