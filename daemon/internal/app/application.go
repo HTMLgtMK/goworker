@@ -1,6 +1,11 @@
-// Package app 是 daemon 的装配层：CLI 壳（cmd/goworker）与 Android 壳（mobile）
-// 共享同一套组装逻辑 —— 配置装载、日志初始化、Engine 装配、插件注册与生命周期。
-// 壳只负责前端与退出策略，不再各自复制装配代码。
+// Package app 是 daemon 的装配层，三种运行形态共用一套配置/日志装配：
+//
+//   - CLI 壳（cmd/goworker）与 Android 壳（mobile）：New() 装配完整后端
+//     （配置→日志→Engine→插件→StartAll），壳只负责前端与退出策略；
+//   - ACP worker（RunACPWorker）：dispatcher spawn 的无人值守单任务进程。
+//     它不走 New() —— worker 不装 Engine/插件/内置命令，没有前端，只共享
+//     ProviderFactory 与配置/日志装配，以 stdio 直接服务 ACP 协议；
+//     每任务一进程，轻启动是硬要求。
 package app
 
 import (
@@ -27,23 +32,22 @@ type Application struct {
 	Agent *service.AgentPlugin
 }
 
-// New 完成全部装配：配置 → 日志 → Engine → AgentPlugin → 内置命令 → StartAll。
-// 出错返回 error，不 panic、不 os.Exit —— 退出策略归壳层（CLI 打印后 exit，mobile 转 Java 异常）。
-func New() (*Application, error) {
-	// 加载全局配置
+// loadConfigAndLogger 装配前置两步：配置装载 + 日志初始化。New 与 RunACPWorker 共用。
+// slog 全局默认 logger 在这里接上（插件/provider 都走 slog）。
+func loadConfigAndLogger() (*config.Config, *logger.Logger, error) {
 	cfgPath := config.DefaultPath()
 	cfg := config.Load(cfgPath)
 	if cfg == nil {
 		// Load 遇到无效配置会返回 nil（具体原因它已经记日志了）。
 		// 不挡一下的话下一行 cfg.Log 就是空指针解引用——配置写错一个字段
 		// 换来一个段错误，排查成本高得离谱。
-		return nil, fmt.Errorf("配置无效: %s\n详见上方日志；修好后重试，或删掉该文件用默认配置。", cfgPath)
+		return nil, nil, fmt.Errorf("配置无效: %s\n详见上方日志；修好后重试，或删掉该文件用默认配置。", cfgPath)
 	}
 
 	// 初始化日志器（等级过滤 + 可选文件轮转/清理）
 	log, err := logger.Setup(cfg.Log)
 	if err != nil {
-		return nil, fmt.Errorf("init logger: %w", err)
+		return nil, nil, fmt.Errorf("init logger: %w", err)
 	}
 	// 插件/provider 用全局 slog 打日志（agent 插件没有自己的 logger 句柄），
 	// 默认它只进 stderr、忽略 config 的 log.level/log.file —— 接上配置的 handler 后，
@@ -54,6 +58,16 @@ func New() (*Application, error) {
 		log.Info("log file", "path", cfg.Log.File)
 	} else {
 		log.Info("log to stderr only")
+	}
+	return cfg, log, nil
+}
+
+// New 完成全部装配：配置 → 日志 → Engine → AgentPlugin → 内置命令 → StartAll。
+// 出错返回 error，不 panic、不 os.Exit —— 退出策略归壳层（CLI 打印后 exit，mobile 转 Java 异常）。
+func New() (*Application, error) {
+	cfg, log, err := loadConfigAndLogger()
+	if err != nil {
+		return nil, err
 	}
 
 	// ai-runtime 聚合配置（各插件的目录路径注入见 RegisterPlugins 装配链）
