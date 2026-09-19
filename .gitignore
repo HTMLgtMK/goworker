@@ -38,10 +38,12 @@ config.yaml
 
 # Dependencies
 vendor/
+node_modules/
 
 # Build artifacts
 /tmp/
 build/
+dist/
 /build/
 
 # Tooling runtime state
@@ -49,6 +51,11 @@ build/
 omc/
 .specify/
 .codegraph
+.zcode/
+
+# Python（.github/scripts 下的 CI 脚本）
+__pycache__/
+*.pyc
 
 # Claude local config (keep CLAUDE.md in repo, skip the rest)
 .claude/settings.local.json

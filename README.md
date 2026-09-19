@@ -77,19 +77,30 @@ Multiple LLM providers are supported per config (`llm.providers.<name>.type`: `o
 Configure LLM endpoint via `/model`:
 
 ```
-/model                     ← view config
+/model                            ← view config
+/model list                       ← list providers
+/model use <provider>             ← switch default provider
 /model set endpoint=http://localhost:8000/v1
 /model set model=gpt-4o
 /model set api_key=sk-xxx
 /model set context_window=32768   ← model context window (tokens), enables ctx % in status bar
-/model set compress_at=0.8        ← auto-compact threshold (0-1), 0 disables
-/model set compact_keep=10        ← keep last N messages verbatim when compacting
+/model set global.compress_at=0.8     ← auto-compact threshold (0-1), 0 disables
+/model set global.compact_keep=10     ← keep last N messages verbatim when compacting
+/model set global.max_iterations=20   ← ReAct loop iteration cap
+/model set global.thinking_show=true  ← stream the model's thinking to the terminal
 ```
+
+Provider fields: `endpoint`, `model`, `api_key`, `context_window`,
+`thinking_request_mode`, `thinking_effort`, `auth_type`, `max_tokens`.
+Global fields are prefixed with `global.` — see `/model help`.
 
 History compaction:
 - `/compact` — LLM-rolls up old messages into a summary, keeps the recent tail
 - Auto — fires before a model call when estimated usage ≥ `compress_at` × window
 - `/history` — inspect the current conversation contents
+- `/rewind` — list checkpoints, or `/rewind <n>` to restore that conversation view
+- `/usage` — token usage breakdown for the current session
+- `/new` — end the session: consolidate memory → clear STM → inject reminders next run
 
 Skills:
 - Drop `SKILL.md` files in `~/.config/goworker/skills/<name>/` (user) or `.goworker/skills/<name>/` (project)
@@ -127,6 +138,37 @@ Memory (`ai-memory/`):
 - Standalone module with zero external deps — `Retriever` interface leaves room for RAG/embedding backends
 - `/memory` manage facts, `/task` manage task archive, `/new` / `/compact` consolidate the session
 
+## Configuration
+
+Everything lives in a single `~/.config/goworker/config.yaml`, written atomically
+(tmp + rename) by `/config` and `/model set`. Set `GOWORKER_CONFIG_DIR` to
+relocate the whole directory — skills, logs and audit logs derive from it.
+
+```yaml
+llm:
+  default_provider: openai
+  compress_at: 0.8
+  providers:
+    openai:
+      type: openai
+      endpoint: https://api.openai.com/v1
+      model: gpt-4o
+      api_key: sk-xxx
+      context_window: 128000
+      thinking:
+        request_mode: auto    # auto | enable_thinking | reasoning_effort — required
+        effort: medium        # low | medium | high
+```
+
+⚠️ A provider entry you define in `config.yaml` **replaces** the built-in
+default wholesale — defaults are not merged in, so you have to spell out every
+required field yourself. `thinking.request_mode` is one of them: leave it out
+and the whole config is rejected at startup (the process exits with
+`配置无效`, logging the reason above it). Easiest route is to let `/model set`
+write the file for you.
+
+(This sample is pinned by a test — `TestReadmeSampleConfigParses` — so it can't
+drift away from what the loader actually accepts.)
 Dispatcher (`docs/dispatcher.md`, `dispatch.enabled: true` in config.yaml):
 - `/dispatch <prompt>` — queue a task: git repo → code task (mandatory worktree isolation, commits collected via `BaseCommit..HEAD`); otherwise general task (no git needed)
 - `/dispatch @claude <prompt>` — target a specific worker; `ls/show/approve/complete/reject/cancel` manage the lifecycle
@@ -158,6 +200,35 @@ cd daemon && go run cmd/goworker/main.go
 
 多运行时：`GOWORKER_CONFIG_DIR=<dir>` 隔离每个实例的 config/sessions/memory/dispatch 与 acp.sock，
 dispatcher 在 `<dir>/dispatch/acp.sock` 接受外部 ACP 任务提交（见 docs/dispatcher.md）。
+
+Build with the version stamped in:
+
+```bash
+cd daemon
+go build -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version=v0.1.0" \
+  -o goworker ./cmd/goworker
+./goworker -version
+```
+
+`commit` / commit date / dirty-worktree flag come from Go's own build metadata
+(`-buildvcs`, on by default) — no ldflags needed, and they work for local
+`go run` builds too. Only the semver string has to be injected.
+
+## CI & Release
+
+| Workflow | Trigger | Does |
+|----------|---------|------|
+| `ci.yml` | push / PR to `master` | gofmt, `go vet`, `go test -race`, build — module list read live from `go.work` |
+| `release.yml` | push to `master` | auto-bump patch tag → **manual approval gate** → build linux/darwin × amd64/arm64 → publish release + checksums |
+| `pr-review.yml` | PR opened / updated | fetch diff → LLM review → one review comment with a 修改点 / 是否准入 breakdown plus inline comments on the changed lines; findings that can't be anchored collapse at the bottom |
+
+Release needs a `release` environment with required reviewers configured (the
+approval gate), plus a `LLM_API_KEY` secret for PR review. `LLM_BASE_URL` and
+`LLM_MODEL` are optional repo variables — without them the review falls back to
+`https://api.openai.com/v1` and `gpt-4o-mini`.
+
+Windows binaries are not published: the bash tool's process-group handling
+(`Setpgid` / `kill(-pid)`) is Unix-only, so `GOOS=windows` doesn't compile yet.
 
 ## Why goworker?
 

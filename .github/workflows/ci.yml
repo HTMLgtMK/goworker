@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# 只读就够——CI 不写任何东西回仓库
+permissions:
+  contents: read
+
+# 同一分支连续推送时，旧的那次没有跑完的价值
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # go.work 是版本唯一来源。写死版本号迟早和 workspace 漂移。
+          go-version-file: go.work
+          cache-dependency-path: |
+            ai-core/go.sum
+            ai-memory/go.sum
+            ai-runtime/go.sum
+            ai-sandbox/go.sum
+            daemon/go.sum
+
+      # 模块列表从 go.work 现读，不硬编码——加了新模块不用回来改 CI
+      - name: 解析 workspace 模块
+        id: modules
+        run: |
+          list=$(go work edit -json | python3 -c "
+          import json, sys
+          use = json.load(sys.stdin).get('Use') or []
+          print(' '.join(u['DiskPath'].removeprefix('./') for u in use))
+          ")
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+          echo "workspace 模块: $list"
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未格式化，跑一下 gofmt -w："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: |
+          for m in ${{ steps.modules.outputs.list }}; do
+            echo "::group::vet $m"
+            (cd "$m" && go vet ./...)
+            echo "::endgroup::"
+          done
+
+      # -race 是硬要求。这项目有并发（session、插件、流式响应），
+      # 不加 race detector 的 CI 等于没跑。
+      - name: go test -race
+        run: |
+          for m in ${{ steps.modules.outputs.list }}; do
+            echo "::group::test $m"
+            (cd "$m" && go test -race ./...)
+            echo "::endgroup::"
+          done
+
+      - name: build
+        run: |
+          for m in ${{ steps.modules.outputs.list }}; do
+            echo "::group::build $m"
+            (cd "$m" && go build ./...)
+            echo "::endgroup::"
+          done
+
+      # next-version.sh 自称"抽出来是为了能测"——那就真的测。
+      # 版本号算错会推一个错误 tag 出去，删起来很烦。
+      - name: next-version.sh 用例
+        run: |
+          set -euo pipefail
+          t() {
+            got=$(bash .github/scripts/next-version.sh "$1" 2>&1)
+            if [ "$got" != "$2" ]; then
+              echo "::error::next-version '$1' 期望 '$2' 实际 '$got'"
+              exit 1
+            fi
+          }
+          t ""        "v0.1.0"
+          t "v1.2.3"  "v1.2.4"
+          t "v9.9.99" "v9.9.100"
+          if bash .github/scripts/next-version.sh "v1.2.4-rc1" >/dev/null 2>&1; then
+            echo "::error::预发布 tag 应被拒绝"
+            exit 1
+          fi
+          echo "next-version 用例全过"
