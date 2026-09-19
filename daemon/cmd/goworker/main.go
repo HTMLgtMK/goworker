@@ -3,24 +3,18 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
-	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
-	"github.com/tinguo/goworker/ai-runtime/logger"
-	"github.com/tinguo/goworker/daemon/internal/agent"
-	"github.com/tinguo/goworker/daemon/internal/config"
-	"github.com/tinguo/goworker/daemon/internal/core"
-	"github.com/tinguo/goworker/daemon/internal/frontend/stdin"
-	"github.com/tinguo/goworker/daemon/internal/plugin"
+	"github.com/tinguo/goworker/daemon/internal/app"
+	"github.com/tinguo/goworker/daemon/internal/cli/stdin"
 	"github.com/tinguo/goworker/daemon/internal/version"
 )
 
-// ---- 入口 ----
-
+// cmd/goworker 是终端 CLI 壳：装配交给 internal/app，本文件只做
+// -version 参数、stdin 前端启动与 OS 信号处理。
+// Android 壳在 mobile/（gobind 入口），共享同一套 app.New 装配。
 func main() {
 	// 走 flag 包而不是手搓 os.Args：`-version` / `--version` 都能认。
 	// 默认 ExitOnError 正是想要的行为——未知参数直接 usage + exit 2，
@@ -32,70 +26,15 @@ func main() {
 		return
 	}
 
-	// 加载全局配置
-	cfgPath := config.DefaultPath()
-	cfg := config.Load(cfgPath)
-	if cfg == nil {
-		// Load 遇到无效配置会返回 nil（具体原因它已经记日志了）。
-		// 不挡一下的话下一行 cfg.Log 就是空指针解引用——配置写错一个字段
-		// 换来一个段错误，排查成本高得离谱。
-		fmt.Fprintf(os.Stderr, "配置无效: %s\n详见上方日志；修好后重试，或删掉该文件用默认配置。\n", cfgPath)
-		os.Exit(1)
-	}
-
-	// 初始化日志器（等级过滤 + 可选文件轮转/清理）
-	log, err := logger.Setup(cfg.Log)
+	appl, err := app.New()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "init logger: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
-	// 插件/provider 用全局 slog 打日志（agent 插件没有自己的 logger 句柄），
-	// 默认它只进 stderr、忽略 config 的 log.level/log.file —— 接上配置的 handler 后，
-	// log.level: debug 才能看到 llm.chat request/response 这类调试日志。
-	slog.SetDefault(log.Logger)
-	defer log.Close()
-	log.Info("config loaded", "path", cfgPath)
-	if cfg.Log.File != "" {
-		log.Info("log file", "path", cfg.Log.File)
-	} else {
-		log.Info("log to stderr only")
-	}
-
-	// ai-runtime 聚合配置 + 目录路径注入（daemon 是路径中枢，ai-runtime 不反向依赖 DefaultDir）
-	runtimeCfg := cfg.ToRuntime()
-	paths := runtimeconfig.Paths{
-		ConfigDir:     config.DefaultDir(),
-		SkillsUser:    filepath.Join(config.DefaultDir(), "skills"),
-		SkillsProject: filepath.Join(".goworker", "skills"),
-		AuditDir:      filepath.Join(config.DefaultDir(), "audit"),
-	}
-
-	engine := core.NewEngine(cfg, runtimeCfg, log)
-	defer engine.StopAll()
-
-	// 注册拦截器
-	engine.Use(core.LoggingInterceptor(log))
-
-	// 注册插件（ai-runtime 的 agent 插件：配置与路径构造函数注入）
-	if err := engine.Register(agent.NewPlugin(runtimeCfg, paths)); err != nil {
-		log.Error("register AgentPlugin failed", "error", err)
-		return
-	}
-
-	// 内置命令
-	engine.RegisterBuiltinCommands()
-
-	// 启动插件
-	if err := engine.StartAll(); err != nil {
-		log.Error("start plugins failed", "error", err)
-		return
-	}
-
-	// 发送启动事件
-	engine.Notify(plugin.Event{Type: plugin.EventPluginStarted, Payload: "system"})
+	defer appl.Stop()
 
 	// 启动前端（goroutine，不阻塞）
-	frontend := stdin.NewStdinFrontend(engine, &cfg.Frontend.Stdin)
+	frontend := stdin.NewStdinFrontend(appl.Engine, &appl.Config.Frontend.Stdin)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- frontend.Run()
@@ -108,9 +47,9 @@ func main() {
 	select {
 	case err := <-errCh:
 		if err != nil {
-			log.Error("frontend error", "error", err)
+			appl.Log.Error("frontend error", "error", err)
 		}
 	case sig := <-sigCh:
-		log.Info("received signal, shutting down", "signal", sig.String())
+		appl.Log.Info("received signal, shutting down", "signal", sig.String())
 	}
 }

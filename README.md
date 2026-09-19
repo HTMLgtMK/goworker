@@ -21,11 +21,12 @@ ai-runtime/                    ← aggregation: out-of-the-box agent for externa
 │  ├── middlewares/            ← HITL middleware (sandbox decision gating)
 │  ├── session/                ← conversation store (checkpoint/rewind)
 │  ├── mcp/ skills/ logger/    ← moved from daemon, reusable
-daemon/                        ← REPL shell: core.Engine + frontend + config parsing + path hub
-│  ├── cmd/goworker/           ← entry point
-│  ├── internal/config/        ← top-level flattened config.yaml + ToRuntime()/ApplyRuntime()
-│  ├── internal/core/          ← Engine: plugin lifecycle, command routing, middleware chain
-│  └── internal/frontend/      ← stdin REPL + statusbar (subscribes ai-runtime events)
+daemon/                        ← agent backend: engine + service + shell per frontend
+│  ├── cmd/goworker/           ← CLI 壳：stdin 前端 + 信号处理
+│  ├── mobile/                 ← Android 壳占位（gobind 入口，共享同一套装配）
+│  ├── internal/app/           ← 装配层：Application（配置→日志→Engine→插件→StartAll）+ config/
+│  ├── internal/core/          ← engine（Engine）+ model（plugin 协议）+ service（AgentPlugin）
+│  └── internal/cli/           ← stdin REPL + statusbar (subscribes ai-runtime events)
 docs/architecture.md           ← detailed architecture doc
 ```
 
