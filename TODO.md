@@ -44,3 +44,36 @@
 
 > 按依赖顺序：P0 可以并行修，P1 建议从 Makefile → 结构化日志 → CI → 限流/重试 依次推进。
 > 每个任务完工后回 TODO.md 打勾 ✅，并更新相关文档。
+
+---
+
+## Android 前端（`android-frontend-acp` 分支 + goworkerandroid 工程）
+
+架构：gomobile 管道桥（`daemon/mobile`）+ 进程内嵌入 ACP worker，Kotlin 实现 ACP Client。
+协议见 `daemon/mobile/PROTOCOL.md`，构建见 `docs/mobile-build.md`。
+真机已验证：worker 进程内启动 / 流式对话 / thinking 渲染 / write_file 真执行 / bash→HITL 对话框 / 错误路径。
+
+### 系统工具协议（client-ward capabilities）
+
+- [ ] **协议定义** — `ai-dispatch/protocol` 新增 client-ward 方法（worker → client 请求执行设备能力，对齐 Zed `fs/*` 模式）；方法常量 + 请求/响应类型 + PROTOCOL.md 更新
+- [ ] **worker 侧工具注册** — `sys_notification` 等具名工具：Execute 经 ACP client-ward 请求阻塞等结果（60s 工具硬超时内，确认走 HITL 不走 Execute）
+- [ ] **风险分级门控** — 工具声明 never/always/mode，接入 HITL 权限链路（PROTOCOL.md 已预留分级框架）
+- [ ] **Kotlin 侧执行器** — client-ward 方法分发：通知（POST_NOTIFICATIONS API 33+ 运行时权限）、联系人（READ_CONTACTS）、剪贴板等
+- [ ] **真机 e2e** — LLM 触发 send_notification → 手机系统通知弹出
+
+### UI 打磨
+
+- [ ] **会话管理** — `session/list`（历史列表 UI）+ `session/load`（回放渲染，update 先于响应到达）+ 新建会话入口
+- [ ] **Markdown 渲染** — assistant 正文（代码块/列表/粗体）；代码块等宽字体
+- [ ] **thinking 折叠** — 当前灰色平铺，改为可折叠（"思考过程"默认收起）
+- [ ] **工具行按 toolCallId 关联** — tool_call 与 tool_result 成对展示（现状不同工具的 RESULT 文本会拼接进同一条）
+- [ ] **usage 状态条** — 订阅 `usage` 事件渲染 tokens/上下文窗口百分比（事件已在流里，UI 未接）
+- [ ] **输入体验** — 多行输入优化、发送中禁用态、错误气泡与 agent 消息的视觉分层
+
+### 工程收尾
+
+- [ ] **Android 工程推远端** — goworkerandroid 已 git init（main@4dab96b），建 GitHub 仓库并 push
+- [ ] **make aar 目标** — goworker 仓库 Makefile/CMake 封装 gomobile bind + 拷贝到 Android 工程（现手工命令，见 docs/mobile-build.md）
+- [ ] **CI** — Android assembleDebug + goworker go test/gofmt；host_test 补 -race 与 Write-after-Close 用例
+- [ ] **rebase 到 master** — 等 feat/task-detail-acp-observer 合并后，android-frontend-acp rebase 清理分叉
+- [ ] **发布形态** — release 签名 + minify 时 gobind JNI keep 规则（proguard-rules.pro 现为空）
