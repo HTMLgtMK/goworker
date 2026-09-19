@@ -60,6 +60,7 @@
 - [x] **风险分级门控** — `ai-core`：Tool.Metadata + BeforeToolEvent.ToolDef（通用字段，声明随工具走）；`hitl.go checkSys`：risk_level(never/mode/always) × 沙箱模式 裁决矩阵；SessionDeps 零改动
 - [x] **Kotlin 侧执行器** — `DeviceTools` 注册表（描述符 + handler 同处声明）+ `AcpClient` client-ward 分发（未知方法自动 -32601）；send_notification 含 POST_NOTIFICATIONS 运行时权限
 - [x] **真机 e2e** — deepseek 触发 sys_send_notification → HITL 对话框（declared risk_level=mode 展示）→ Allow once → 系统通知真实弹出（dumpsys + 用户确认）
+- [ ] **MediaSession 媒体控制**（规划中）— 播放/暂停/上一首/下一首/快进快退 + 元数据读取（MediaController.TransportControls）。注意：控制浏览器/第三方 App 的媒体会话需 NotificationListenerService（用户授权通知读取后 MediaSessionManager 才能枚举会话），自家 App 会话免授权；建议 risk_level=mode
 
 ### UI 打磨
 
