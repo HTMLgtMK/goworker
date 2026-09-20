@@ -1,7 +1,9 @@
 # cli/vscode — VS Code ACP 前端
 
 daemon 主进程内的 VS Code ACP 服务端：在 Unix socket 上服务 ACP 协议（REV_1 子集），
-是 vscode-goworker 扩展（Agent Chat 面板 + Chats 会话树）的后端。
+是 vscode-goworker 扩展（Agent Chat 面板 + Chats 会话树）的后端。扩展已于 2026-09-20
+拆到独立仓库 https://github.com/HTMLgtMK/goworker-vscode-extension ，两侧只经 socket
+通信，无编译期依赖。
 
 与 REPL 共享同一个 Engine 和 agent 插件 —— 扩展里的一次提问和终端里的 `/agent`
 落在同一个会话状态上。三条 ACP 链路中它只负责这一条：
@@ -47,7 +49,7 @@ socket 权限 `0600`，仅本机同用户可达；启动时清理陈旧 socket �
 
 ## 与扩展对接
 
-扩展（`extensions/vscode-goworker`）用 `SocketAcpAgentTransport` 连接：
+扩展（独立仓库 goworker-vscode-extension）用 `SocketAcpAgentTransport` 连接：
 
 - socket 路径解析：VS Code 设置 `goworker.agentSocketPath` 覆盖 → 回落
   `<config 目录>/frontend/vscode.sock`，与 daemon 侧默认派生对称，两端都尊重
