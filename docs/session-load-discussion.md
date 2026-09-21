@@ -95,7 +95,7 @@ mcpServers：client 声明的 per-session MCP 集合是更大的改动（连接�
 - daemon `ListSessions`（`daemon/internal/agent/sessions.go`）**已经**是：
   当前会话置顶（不参与排序）+ `archive/*.jsonl` 按文件 mtime 倒序，上限 50。
   排序诉求 daemon 侧已满足。
-- vscode 前端 `toChatEntries`（`extensions/vscode-goworker/src/views/chatEntries.ts`）
+- vscode 前端 `toChatEntries`（独立仓库 goworker-vscode-extension：`src/views/chatEntries.ts`）
   **故意只渲染当前会话**：注释明说「daemon 尚不支持归档重放（session/load 对
   归档 id 必报错），只保留置顶的当前会话，避免用户点开注定失败的条目」。
 - `LoadSession`（`daemon/internal/frontend/vscode/frontend.go`）对归档 id 返回
@@ -215,7 +215,7 @@ parent 指向被覆盖段之前的前驱（`Compact` 里 `compactParent = active
 - `daemon/frontend/vscode`：LoadSession 三分支（当前会话不变/归档只读重放/未知报错）；只读集合 prompt 返回 "archived session is read-only"。
 - 验证：各模块 go build/vet 干净；session/dispatch/agent/vscode 包测试全绿（-race）。预存在 flake：TestLoadMCP_ConnectsFakeServer 全量并发下握手超时（基线复现，与本批无关）。
 
-### TS 批次（extensions/vscode-goworker）
+### TS 批次（独立仓库 goworker-vscode-extension）
 - sessionListClient：isCurrent 窄化（仅 true 保留，对齐 omitempty）。
 - chatEntries：toChatEntries 恢复完整清单，isCurrent 优先 wire 标记、缺失回退 index 0 约定。
 - extension.ts：移除归档确认弹窗，树点击直接 load 重放。

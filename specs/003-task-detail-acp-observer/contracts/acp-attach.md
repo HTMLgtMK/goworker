@@ -1,5 +1,8 @@
 # ACP Attach Contract
 
+> 本文件是权威定义。扩展仓库 `goworker-vscode-extension/contracts/acp-attach.md` 持有副本，
+> 改协议必须同轮同步副本。
+
 ## Transport
 
 The dispatcher remains an ACP server on its existing local Unix socket. An ACP client creates a normal session and uses the prompt directive below.
