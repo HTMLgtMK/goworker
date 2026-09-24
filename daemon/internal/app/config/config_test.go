@@ -82,6 +82,39 @@ llm:
 	}
 }
 
+func TestLoad_OpenAIProviderUsesDefaultsForOmittedFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+llm:
+  default_provider: openai
+  providers:
+    openai:
+      type: openai
+      endpoint: http://localhost:8000/v1
+      model: gpt-4o
+  compress_at: 0.8
+  compact_keep: 10
+  max_iterations: 15
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Load(path)
+	if cfg == nil {
+		t.Fatal("Load returned nil for provider with omitted optional defaults")
+	}
+	provider := cfg.LLM.Providers["openai"]
+	if provider.ContextWindow != 256000 {
+		t.Errorf("context_window = %d, want 256000", provider.ContextWindow)
+	}
+	if provider.Thinking.RequestMode != runtimeconfig.ThinkingRequestAuto {
+		t.Errorf("thinking.request_mode = %q, want auto", provider.Thinking.RequestMode)
+	}
+	if provider.Thinking.Effort != runtimeconfig.ThinkingEffortMedium {
+		t.Errorf("thinking.effort = %q, want medium", provider.Thinking.Effort)
+	}
+}
+
 func TestSetField_ProviderPaths(t *testing.T) {
 	cfg := Default()
 	if err := cfg.SetField("llm.default_provider", "openai"); err != nil {

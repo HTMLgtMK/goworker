@@ -478,6 +478,7 @@ func Load(path string) *Config {
 		cfg.LLM.Providers = map[string]runtimeconfig.ProviderConfig{"openai": provider}
 		cfg.LLM.DefaultProvider = "openai"
 	}
+	cfg.LLM = cfg.LLM.WithDefaults()
 	if err := cfg.LLM.Validate(); err != nil {
 		slog.Error("config: invalid LLM configuration", "err", err)
 		return nil
