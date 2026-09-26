@@ -20,7 +20,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 project(goworker
-    VERSION 0.1.0
+    VERSION 0.1.5
     DESCRIPTION "goworker - modular REPL agent terminal"
     LANGUAGES NONE
 )

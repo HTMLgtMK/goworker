@@ -58,7 +58,7 @@ func (p *AgentPlugin) loadMCP() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if _, err := c.Initialize(ctx, &mcp.InitializeRequest{
 			ProtocolVersion: mcp.LatestProtocolVersion,
-			ClientInfo:      mcp.Implementation{Name: "goworker", Version: "0.1.0"},
+			ClientInfo:      mcp.Implementation{Name: "goworker", Version: "0.1.5"},
 		}); err != nil {
 			cancel()
 			c.Close()
