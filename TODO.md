@@ -44,3 +44,42 @@
 
 > 按依赖顺序：P0 可以并行修，P1 建议从 Makefile → 结构化日志 → CI → 限流/重试 依次推进。
 > 每个任务完工后回 TODO.md 打勾 ✅，并更新相关文档。
+
+---
+
+## Android 前端（`android-frontend-acp` 分支 + goworkerandroid 工程）
+
+架构：gomobile 管道桥（`daemon/mobile`）+ 进程内嵌入 ACP worker，Kotlin 实现 ACP Client。
+协议见 `daemon/mobile/PROTOCOL.md`，构建见 `docs/mobile-build.md`。
+真机已验证：worker 进程内启动 / 流式对话 / thinking 渲染 / write_file 真执行 / bash→HITL 对话框 / 错误路径。
+
+### 系统工具协议（client-ward capabilities）
+
+- [x] **协议定义** — 落地为 `x-device/*` 应用层扩展方法（`x-device/tools` 探测 + `x-device/call` 转发），**不进 ai-dispatch/protocol 标准面**（用户决策：具体能力不写入共享协议）；方法常量在 `service/sys_relay.go`，机制复用 `Server.Call`
+- [x] **worker 侧工具注册** — `service/sys_relay.go`：ProbeDeviceTools（2s 超时 / method-not-found=无能力 / 条目清洗 + 32 上限）+ RelayDeviceTools（sys_ 前缀 + risk_level 元数据 + 转发 Execute）；acpWorker 经 SessionServerAware 捕获通道、CollectTools 组合
+- [x] **风险分级门控** — `ai-core`：Tool.Metadata + BeforeToolEvent.ToolDef（通用字段，声明随工具走）；`hitl.go checkSys`：risk_level(never/mode/always) × 沙箱模式 裁决矩阵；SessionDeps 零改动
+- [x] **Kotlin 侧执行器** — `DeviceTools` 注册表（描述符 + handler 同处声明）+ `AcpClient` client-ward 分发（未知方法自动 -32601）；send_notification 含 POST_NOTIFICATIONS 运行时权限
+- [x] **真机 e2e** — deepseek 触发 sys_send_notification → HITL 对话框（declared risk_level=mode 展示）→ Allow once → 系统通知真实弹出（dumpsys + 用户确认）
+- [ ] **MediaSession 媒体控制**（规划中）— 播放/暂停/上一首/下一首/快进快退 + 元数据读取（MediaController.TransportControls）。注意：控制浏览器/第三方 App 的媒体会话需 NotificationListenerService（用户授权通知读取后 MediaSessionManager 才能枚举会话），自家 App 会话免授权；建议 risk_level=mode
+
+### UI 打磨
+
+- [ ] **会话管理** — `session/list`（历史列表 UI）+ `session/load`（回放渲染，update 先于响应到达）+ 新建会话入口
+- [ ] **Markdown 渲染** — assistant 正文（代码块/列表/粗体）；代码块等宽字体
+- [ ] **thinking 折叠** — 当前灰色平铺，改为可折叠（"思考过程"默认收起）
+- [ ] **工具行按 toolCallId 关联** — tool_call 与 tool_result 成对展示（现状不同工具的 RESULT 文本会拼接进同一条）
+- [ ] **usage 状态条** — 订阅 `usage` 事件渲染 tokens/上下文窗口百分比（事件已在流里，UI 未接）
+- [ ] **输入体验** — 多行输入优化、发送中禁用态、错误气泡与 agent 消息的视觉分层
+
+### 质量（review 遗留）
+
+- [ ] **sys_/mcp_ 工具审计缺失** — bash 全路径审计（含用户裁决，训练数据），checkSys/checkMCP 均无审计 —— 补 recordAudit 接入
+- [x] **TestACPWorker_ServesSessionOverACP 封闭化** — LLM 端点钉死 127.0.0.1:1，不再依赖宿主 8000 端口空闲（mock 占位曾致误报）
+
+### 工程收尾
+
+- [ ] **Android 工程推远端** — goworkerandroid 已 git init（main@4dab96b），建 GitHub 仓库并 push
+- [ ] **make aar 目标** — goworker 仓库 Makefile/CMake 封装 gomobile bind + 拷贝到 Android 工程（现手工命令，见 docs/mobile-build.md）
+- [ ] **CI** — Android assembleDebug + goworker go test/gofmt；host_test 补 -race 与 Write-after-Close 用例
+- [ ] **rebase 到 master** — 等 feat/task-detail-acp-observer 合并后，android-frontend-acp rebase 清理分叉
+- [ ] **发布形态** — release 签名 + minify 时 gobind JNI keep 规则（proguard-rules.pro 现为空）

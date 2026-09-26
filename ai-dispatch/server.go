@@ -334,3 +334,17 @@ func (s *Server) RequestPermission(ctx context.Context, sessionID string, req pr
 	}
 	return resp.Outcome.OptionID, nil
 }
+
+// Call 向提交方发起一次 client-ward 方法调用（agent → client 的反向 JSON-RPC
+// 请求，与 RequestPermission 同机制），阻塞到应答或 ctx 结束。
+// 这是扩展能力的通用机制：方法名由调用方约定（如 x-device/*），本层不感知
+// 具体能力语义 —— 具体能力定义在应用层，不进 protocol 标准面。
+//
+// 死锁安全性同 RequestPermission：入站 handler 跑在独立 goroutine，反向请求
+// 不会卡读循环。
+func (s *Server) Call(ctx context.Context, method string, params, result any) error {
+	if err := s.conn.Call(ctx, method, params, result); err != nil {
+		return fmt.Errorf("dispatch: call %s: %w", method, err)
+	}
+	return nil
+}

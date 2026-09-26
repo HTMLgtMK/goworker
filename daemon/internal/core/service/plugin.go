@@ -24,6 +24,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/mcp"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-runtime/skills"
+	"github.com/tinguo/goworker/ai-sandbox"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -61,9 +62,10 @@ type AgentPlugin struct {
 	// 会话工作目录状态（mu 保护）。ACP 提交方经 session/new|load 声明的 cwd 经
 	// sandbox 边界校验后落到这里并应用到当前会话；非法声明只记 cwdErr（无效标记），
 	// session/prompt 时明确报错，绝不静默生效或回落旧值。
-	mu         sync.Mutex
-	sessionCwd string // 最近一次有效声明的会话 cwd（绝对路径；空 = 未声明）
-	cwdErr     error  // 最近一次声明的校验错误（nil = 无声明或已通过）
+	mu          sync.Mutex
+	allowRuleMu sync.Mutex
+	sessionCwd  string // 最近一次有效声明的会话 cwd（绝对路径；空 = 未声明）
+	cwdErr      error  // 最近一次声明的校验错误（nil = 无声明或已通过）
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
@@ -214,6 +216,38 @@ func (p *AgentPlugin) closeMCP() {
 	p.mcpClients = make(map[string]mcp.Client)
 }
 
+func (p *AgentPlugin) persistAllowRule(rule sandbox.AllowRule) error {
+	p.allowRuleMu.Lock()
+	defer p.allowRuleMu.Unlock()
+
+	match := strings.Join(rule.MatchTokens, " ")
+	if match == "" {
+		return fmt.Errorf("allow_always: empty command rule")
+	}
+	candidate := sandbox.AllowRuleConfig{
+		Match:   match,
+		MaxRisk: rule.MaxRisk.String(),
+		Effects: rule.Effects.Names(),
+	}
+	for _, existing := range p.cfg.Sandbox.AllowRules {
+		if existing.Match == candidate.Match && existing.MaxRisk == candidate.MaxRisk && strings.Join(existing.Effects, ",") == strings.Join(candidate.Effects, ",") {
+			return nil
+		}
+	}
+
+	previous := append([]sandbox.AllowRuleConfig(nil), p.cfg.Sandbox.AllowRules...)
+	p.cfg.Sandbox.AllowRules = append(p.cfg.Sandbox.AllowRules, candidate)
+	if p.hub == nil || p.hub.SaveConfig == nil {
+		p.cfg.Sandbox.AllowRules = previous
+		return fmt.Errorf("allow_always: config persistence is unavailable")
+	}
+	if err := p.hub.SaveConfig(p.cfg); err != nil {
+		p.cfg.Sandbox.AllowRules = previous
+		return fmt.Errorf("allow_always: save config: %w", err)
+	}
+	return nil
+}
+
 func (p *AgentPlugin) startSession() {
 	// 打开会话持久化 store。失败降级不阻塞插件启动。
 	p.store.Store(nil)
@@ -247,12 +281,13 @@ func (p *AgentPlugin) startSession() {
 	modelProvider := ProviderFactory(client)
 
 	p.deps = runtimeagent.SessionDeps{
-		Config:       p.cfg,
-		AuditDir:     p.paths.AuditDir,
-		Memory:       p.memory,
-		CollectTools: p.collectTools,
-		NewProvider:  modelProvider,
-		Store:        p.store.Load(),
+		Config:           p.cfg,
+		AuditDir:         p.paths.AuditDir,
+		Memory:           p.memory,
+		CollectTools:     p.collectTools,
+		NewProvider:      modelProvider,
+		Store:            p.store.Load(),
+		PersistAllowRule: p.persistAllowRule,
 	}
 	// 指令快照与记忆组件同开关：memory disabled 时留 nil，buildSystemPrompt 跳过指令段。
 	// 会话边界（Init / /new）经 startSession 重载 —— system prompt 在会话创建前就绪。

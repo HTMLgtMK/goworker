@@ -205,7 +205,7 @@ Build with the version stamped in:
 
 ```bash
 cd daemon
-go build -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version=v0.1.0" \
+go build -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version=v0.1.5" \
   -o goworker ./cmd/goworker
 ./goworker -version
 ```

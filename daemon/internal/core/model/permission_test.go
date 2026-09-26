@@ -56,15 +56,32 @@ func TestPermissionFromInterrupt_FallsBackToToolName(t *testing.T) {
 	}
 }
 
-func TestPermissionFromInterrupt_OffersOnceOnly(t *testing.T) {
-	got := PermissionFromInterrupt(&hitl.InterruptRequest{ID: "req-3", Command: "ls"})
+func TestPermissionFromInterrupt_OffersOnceAndAlwaysForBash(t *testing.T) {
+	got := PermissionFromInterrupt(&hitl.InterruptRequest{ID: "req-3", ToolName: "bash", Command: "ls"})
+	if len(got.Options) != 3 {
+		t.Fatalf("options = %d, want 3", len(got.Options))
+	}
+	if got.Options[0].Kind != "allow_once" || got.Options[1].Kind != "reject_once" || got.Options[2].Kind != "allow_always" {
+		t.Errorf("option order = %+v, want allow_once, reject_once, allow_always", got.Options)
+	}
+}
+
+func TestPermissionFromInterrupt_OffersNoAlwaysForMCP(t *testing.T) {
+	got := PermissionFromInterrupt(&hitl.InterruptRequest{ID: "req-3b", ToolName: "mcp_write"})
 	if len(got.Options) != 2 {
-		t.Fatalf("options = %d, want 2 (once 语义)", len(got.Options))
+		t.Fatalf("options = %d, want 2", len(got.Options))
 	}
 	for _, opt := range got.Options {
-		if strings.Contains(opt.Kind, "always") {
-			t.Errorf("option %q 带 always 语义，本轮只做 once", opt.OptionID)
+		if opt.Kind == "allow_always" {
+			t.Fatalf("MCP option %q must not offer command-scoped always", opt.OptionID)
 		}
+	}
+}
+
+func TestDecisionFromOption_AllowAlwaysApprovesAlways(t *testing.T) {
+	got := DecisionFromOption("req-4a", hitlOptionAllowAlways)
+	if got.Type != hitl.DecisionApproveAlways {
+		t.Errorf("type = %q, want approve_always", got.Type)
 	}
 }
 
@@ -82,7 +99,7 @@ func TestDecisionFromOption_RejectsAndNeverFailsOpen(t *testing.T) {
 	// 这张表是安全边界：任何非 allow 的输入都必须落到明确的 reject。
 	// hitl 中间件的 switch 没有 default 分支，零值 DecisionType("") 会穿透
 	// 全部 case 落到末尾的空 MiddlewareResponse —— 那是放行。
-	for _, optionID := range []string{hitlOptionReject, "", "unknown-option", "allow_always"} {
+	for _, optionID := range []string{hitlOptionReject, "", "unknown-option", "reject_always"} {
 		t.Run(optionID, func(t *testing.T) {
 			got := DecisionFromOption("req-5", optionID)
 			if got.Type != hitl.DecisionReject {

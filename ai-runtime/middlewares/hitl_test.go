@@ -3,6 +3,7 @@ package middlewares
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,6 +125,81 @@ func TestHITL_MCPAllowedInOffMode(t *testing.T) {
 	}
 }
 
+func TestHITL_MCPAllowedInAutoMode(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "auto"})
+	decisions := make(chan hitl.Decision, 1)
+	decisions <- hitl.Decision{Type: hitl.DecisionReject}
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
+	ev, em := newToolEvent("mcp_fs_write", map[string]any{"path": "/tmp/x"})
+
+	mw.OnBeforeTool(ev)
+
+	if ev.Abort != nil {
+		t.Fatal("MCP tool should pass through in auto mode")
+	}
+	if _, ok := interruptFor(t, em.tokens, "mcp_fs_write"); ok {
+		t.Fatal("auto mode should not trigger interrupt")
+	}
+}
+
+func TestHITL_AllowAlwaysPersistsRuleBeforeExecution(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
+	decisions := make(chan hitl.Decision, 1)
+	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
+	var saved sandbox.AllowRule
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithAllowAlways(func(rule sandbox.AllowRule) error {
+		saved = rule
+		return nil
+	}))
+	ev, _ := newToolEvent("bash", map[string]any{"command": "git push origin main"})
+
+	mw.OnBeforeTool(ev)
+
+	if ev.Abort != nil {
+		t.Fatalf("allow_always should execute after persistence, abort=%v", ev.Abort)
+	}
+	if len(saved.MatchTokens) == 0 || saved.MaxRisk == 0 {
+		t.Fatalf("saved rule = %+v, want normalized command and risk", saved)
+	}
+}
+
+func TestHITL_AllowAlwaysPersistenceFailureRejects(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
+	decisions := make(chan hitl.Decision, 1)
+	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithAllowAlways(func(sandbox.AllowRule) error {
+		return errors.New("save failed")
+	}))
+	ev, _ := newToolEvent("bash", map[string]any{"command": "git push origin main"})
+
+	mw.OnBeforeTool(ev)
+
+	if ev.Abort == nil {
+		t.Fatal("allow_always persistence failure must reject execution")
+	}
+}
+
+func TestHITL_EditDoesNotPersistAlwaysRule(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
+	decisions := make(chan hitl.Decision, 1)
+	decisions <- hitl.Decision{Type: hitl.DecisionEdit, Command: "echo safe"}
+	persisted := false
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithAllowAlways(func(sandbox.AllowRule) error {
+		persisted = true
+		return nil
+	}))
+	ev, _ := newToolEvent("bash", map[string]any{"command": "rm -rf /tmp/goworker-test"})
+
+	mw.OnBeforeTool(ev)
+
+	if ev.Abort != nil || ev.Args["command"] != "echo safe" {
+		t.Fatalf("edited command result: abort=%v args=%v", ev.Abort, ev.Args)
+	}
+	if persisted {
+		t.Fatal("edit must not persist an always rule")
+	}
+}
+
 func TestHITL_RespondBackfillsToolMessageWithCallID(t *testing.T) {
 	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
 	decisions := make(chan hitl.Decision, 1)
@@ -214,5 +290,92 @@ func TestHITL_NonBashNonMCPNotTouched(t *testing.T) {
 
 	if ev.Abort != nil {
 		t.Fatal("unrelated tool should pass through untouched")
+	}
+}
+
+// ---- sys_*：risk_level × 沙箱模式 裁决矩阵 ----
+
+func newSysToolEvent(name string, args map[string]any, riskLevel string) (*core.BeforeToolEvent, *captureEmitter) {
+	ev, em := newToolEvent(name, args)
+	ev.ToolDef = &core.Tool{Name: name, Metadata: map[string]string{"risk_level": riskLevel}}
+	return ev, em
+}
+
+func TestHITL_SysRiskLevelMatrix(t *testing.T) {
+	cases := []struct {
+		mode  string
+		level string
+		want  string // allow | hitl | deny
+	}{
+		{"normal", "never", "allow"},
+		{"normal", "mode", "hitl"},
+		{"normal", "always", "hitl"},
+		{"normal", "", "hitl"},      // 缺省 = mode
+		{"normal", "bogus", "hitl"}, // 非法值 = mode
+		{"strict", "never", "allow"},
+		{"strict", "mode", "deny"},
+		{"strict", "always", "deny"},
+		{"readonly", "mode", "deny"},
+		{"off", "never", "allow"},
+		{"off", "mode", "allow"},
+		{"off", "always", "hitl"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.mode+"/"+tc.level, func(t *testing.T) {
+			cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: tc.mode})
+			decisions := make(chan hitl.Decision, 1)
+			mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
+			var ev *core.BeforeToolEvent
+			var em *captureEmitter
+			if tc.level == "" || tc.level == "bogus" {
+				ev, em = newToolEvent("sys_send_notification", map[string]any{"title": "t"}) // ToolDef 无 risk_level → 按 mode
+			} else {
+				ev, em = newSysToolEvent("sys_send_notification", map[string]any{"title": "t"}, tc.level)
+			}
+
+			switch tc.want {
+			case "allow":
+				resp := mw.OnBeforeTool(ev)
+				if ev.Abort != nil {
+					t.Fatalf("want allow, got aborted: %+v", ev.Abort)
+				}
+				if resp == nil {
+					t.Fatal("nil response")
+				}
+			case "deny":
+				mw.OnBeforeTool(ev)
+				if ev.Abort == nil {
+					t.Fatal("want deny (Abort), got pass-through")
+				}
+			case "hitl":
+				go func() { decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionApprove} }()
+				mw.OnBeforeTool(ev)
+				if ev.Abort != nil {
+					t.Fatalf("want confirm then approve, got aborted: %+v", ev.Abort)
+				}
+				if _, ok := interruptFor(t, em.tokens, "sys_send_notification"); !ok {
+					t.Fatal("want interrupt token, got none")
+				}
+			}
+		})
+	}
+}
+
+// TestHITL_SysHitlCarriesDeclaredLevel：HITL 请求应携带声明档位（展示给用户）。
+func TestHITL_SysHitlCarriesDeclaredLevel(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
+	decisions := make(chan hitl.Decision, 1)
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
+	ev, em := newSysToolEvent("sys_send_sms", map[string]any{"to": "x"}, "always")
+
+	go func() { decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionReject} }()
+	mw.OnBeforeTool(ev)
+
+	req, ok := interruptFor(t, em.tokens, "sys_send_sms")
+	if !ok {
+		t.Fatal("no interrupt emitted for sys tool")
+	}
+	if req.RiskLevel != "always" {
+		t.Errorf("RiskLevel = %q, want always", req.RiskLevel)
 	}
 }
