@@ -11,7 +11,9 @@ import (
 
 	"github.com/tinguo/goworker/ai-core/core"
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	sandbox "github.com/tinguo/goworker/ai-sandbox"
 )
 
 // cannedProvider 返回固定回复的 LLM provider，用于无 LLM 端点的 worker 测试。
@@ -169,6 +171,33 @@ func TestTokenToUpdate_PreservesToolCallCorrelation(t *testing.T) {
 	}
 	if result.ToolCallID != call.ToolCallID {
 		t.Errorf("tool result ID = %q, want %q", result.ToolCallID, call.ToolCallID)
+	}
+}
+
+func TestACPWorker_PersistAllowRuleUpdatesRuntimeConfig(t *testing.T) {
+	runtimeCfg := &runtimeconfig.Config{}
+	worker := &acpWorker{
+		deps:     ACPWorkerDeps{Config: runtimeCfg},
+		sessions: make(map[string]*runtimeagent.Session),
+	}
+	rule := sandbox.AllowRule{
+		MatchTokens: []string{"git", "push"},
+		MaxRisk:     sandbox.RiskR4,
+	}
+
+	if err := worker.persistAllowRule(rule); err != nil {
+		t.Fatalf("persistAllowRule: %v", err)
+	}
+
+	if len(runtimeCfg.Sandbox.AllowRules) != 1 {
+		t.Fatalf("allow rules = %d, want 1", len(runtimeCfg.Sandbox.AllowRules))
+	}
+	got := runtimeCfg.Sandbox.AllowRules[0]
+	if got.Match != "git push" {
+		t.Fatalf("match = %q, want %q", got.Match, "git push")
+	}
+	if got.MaxRisk != "R4" {
+		t.Fatalf("max risk = %q, want R4", got.MaxRisk)
 	}
 }
 

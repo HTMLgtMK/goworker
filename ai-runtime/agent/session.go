@@ -203,7 +203,11 @@ func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, 
 		}
 	}
 
-	hitlMw := middlewares.NewHITLMiddleware(*sandboxCfg, hitl.NewChannelDecisionProvider(decisions), middlewares.WithAudit(s.audit))
+	hitlOptions := []middlewares.HITLOption{middlewares.WithAudit(s.audit)}
+	if s.deps.PersistAllowRule != nil {
+		hitlOptions = append(hitlOptions, middlewares.WithAllowAlways(s.deps.PersistAllowRule))
+	}
+	hitlMw := middlewares.NewHITLMiddleware(*sandboxCfg, hitl.NewChannelDecisionProvider(decisions), hitlOptions...)
 	// usage：观察 AfterModel 记账（累计到会话边界才清零），publish 抛 core.Usage 快照。
 	// 事件契约在 ai-runtime/config（UsageEvent），前端 addon 订阅后自行渲染 —— statusbar 不进 SDK。
 	usageMw := middlewares.NewUsageMiddleware(s.usage, func(u core.Usage) {

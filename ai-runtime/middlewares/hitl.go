@@ -20,9 +20,32 @@ type HITLMiddleware struct {
 	sandboxCfg       sandbox.Config
 	decisionProvider hitl.DecisionProvider
 	audit            *sandbox.AuditLogger // nil = 不审计
+	allowAlways      AllowAlwaysHandler
 }
 
 type HITLOption func(*HITLMiddleware)
+
+type AllowAlwaysHandler func(sandbox.AllowRule) error
+
+func allowRuleForRequest(req *hitl.InterruptRequest) (sandbox.AllowRule, error) {
+	if req == nil || req.ToolName != "bash" {
+		return sandbox.AllowRule{}, fmt.Errorf("allow_always only supports bash")
+	}
+	maxRisk, err := sandbox.ParseRiskLevel(req.RiskLevel)
+	if err != nil {
+		return sandbox.AllowRule{}, fmt.Errorf("parse risk level: %w", err)
+	}
+	rule, ok := sandbox.AllowRuleForCommand(req.Command, maxRisk, req.Effects)
+	if !ok {
+		return sandbox.AllowRule{}, fmt.Errorf("empty or invalid command")
+	}
+	return rule, nil
+}
+
+// WithAllowAlways injects the persistence boundary for command allow rules.
+func WithAllowAlways(handler AllowAlwaysHandler) HITLOption {
+	return func(mw *HITLMiddleware) { mw.allowAlways = handler }
+}
 
 var reqID atomic.Int64
 
@@ -88,14 +111,7 @@ func (mw *HITLMiddleware) checkBash(ev *core.BeforeToolEvent) *core.MiddlewareRe
 			CreatedAt:  now,
 			ExpiresAt:  now.Add(hitl.DefaultTimeout),
 		}
-		return mw.confirm(ev, req, func(d hitl.Decision) {
-			outcome := "executed"
-			if d.Type == hitl.DecisionReject {
-				outcome = "blocked"
-			}
-			if d.Type == hitl.DecisionRespond {
-				outcome = "aborted"
-			}
+		return mw.confirm(ev, req, func(d hitl.Decision, outcome string) {
 			mw.recordAudit(out, string(d.Type), outcome)
 		})
 	}
@@ -141,7 +157,7 @@ func riskReason(out sandbox.Outcome) string {
 
 func (mw *HITLMiddleware) checkMCP(ev *core.BeforeToolEvent) *core.MiddlewareResponse {
 	switch mw.sandboxCfg.Mode {
-	case sandbox.ModeOff:
+	case sandbox.ModeOff, sandbox.ModeAuto:
 		return &core.MiddlewareResponse{}
 	case sandbox.ModeStrict, sandbox.ModeReadOnly:
 		reason := fmt.Sprintf("MCP tool %s executes outside the sandbox, blocked in %s mode", ev.Tool.Function.Name, mw.sandboxCfg.Mode)
@@ -165,8 +181,8 @@ func (mw *HITLMiddleware) checkMCP(ev *core.BeforeToolEvent) *core.MiddlewareRes
 // ---- 公共 HITL 流程 ----
 
 // confirm 走完整 HITL 决策流程：发 interrupt token → 等用户决策 → 处理。
-// onDecide 在拿到用户决策后立即回调（审计用），nil 时跳过。
-func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *hitl.InterruptRequest, onDecide func(d hitl.Decision)) *core.MiddlewareResponse {
+// onDecide 在工具决策完成后回调（审计用），nil 时跳过。
+func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *hitl.InterruptRequest, onDecide func(d hitl.Decision, outcome string)) *core.MiddlewareResponse {
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return mw.reject(ev, "⛔ failed to encode interrupt request")
@@ -183,13 +199,31 @@ func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *hitl.InterruptR
 	}
 
 	d := mw.decisionProvider.GetDecision(ev.Ctx, req)
-	if onDecide != nil {
-		onDecide(d)
+	audit := func(outcome string) {
+		if onDecide != nil {
+			onDecide(d, outcome)
+		}
 	}
 
 	switch d.Type {
 	case hitl.DecisionApprove:
-		// execute as-is
+		audit("executed")
+	case hitl.DecisionApproveAlways:
+		if mw.allowAlways == nil {
+			audit("blocked")
+			return mw.reject(ev, "⛔ allow_always is unavailable")
+		}
+		rule, err := allowRuleForRequest(req)
+		if err != nil {
+			audit("blocked")
+			return mw.reject(ev, "⛔ "+err.Error())
+		}
+		if err := mw.allowAlways(rule); err != nil {
+			audit("blocked")
+			return mw.reject(ev, "⛔ failed to persist allow_always")
+		}
+		mw.sandboxCfg.AllowRules = append(mw.sandboxCfg.AllowRules, rule)
+		audit("executed")
 	case hitl.DecisionEdit:
 		// 仅 bash 支持命令编辑；MCP 工具没有 command 字段，编辑视为批准
 		if req.ToolName == "bash" {
@@ -202,9 +236,12 @@ func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *hitl.InterruptR
 				}
 			}
 		}
+		audit("executed")
 	case hitl.DecisionReject:
+		audit("blocked")
 		return mw.reject(ev, "⛔ rejected by user")
 	case hitl.DecisionRespond:
+		audit("aborted")
 		msg := strings.TrimSpace(d.Message)
 		if msg == "" {
 			msg = "user declined to answer"
@@ -212,6 +249,9 @@ func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *hitl.InterruptR
 		ev.Abort = &core.ToolAbort{Messages: []core.Message{
 			{Role: "tool", Content: fmt.Sprintf("[tool not executed] user replied: %s", msg), ToolCallID: ev.Tool.ID},
 		}}
+	default:
+		audit("blocked")
+		return mw.reject(ev, "⛔ unknown HITL decision")
 	}
 
 	return &core.MiddlewareResponse{}

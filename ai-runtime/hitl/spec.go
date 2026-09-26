@@ -9,10 +9,11 @@ import (
 type DecisionType string
 
 const (
-	DecisionApprove DecisionType = "approve"
-	DecisionReject  DecisionType = "reject"
-	DecisionEdit    DecisionType = "edit"
-	DecisionRespond DecisionType = "respond"
+	DecisionApprove       DecisionType = "approve"
+	DecisionApproveAlways DecisionType = "approve_always"
+	DecisionReject        DecisionType = "reject"
+	DecisionEdit          DecisionType = "edit"
+	DecisionRespond       DecisionType = "respond"
 )
 
 const DefaultTimeout = 2 * time.Minute

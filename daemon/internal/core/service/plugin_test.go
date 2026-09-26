@@ -46,7 +46,34 @@ func testHub(cfg *runtimeconfig.Config) (*model.Hub, *[]*runtimeconfig.Config) {
 	return hub, &saved
 }
 
-// newAgentPlugin 构造带完整依赖的插件：NewProvider 走当前默认的 OpenAI provider。
+func TestAgentPluginPersistAllowRule(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	hub, saved := testHub(cfg)
+	p := &AgentPlugin{hub: hub, cfg: cfg}
+	rule := sandbox.AllowRule{
+		MatchTokens: []string{"git", "push"},
+		MaxRisk:     sandbox.RiskR4,
+		Effects:     sandbox.Effects(sandbox.EffectNetwork),
+	}
+
+	if err := p.persistAllowRule(rule); err != nil {
+		t.Fatalf("persistAllowRule: %v", err)
+	}
+	if len(cfg.Sandbox.AllowRules) != 1 || len(*saved) != 1 {
+		t.Fatalf("rules=%v saves=%d, want one rule and one save", cfg.Sandbox.AllowRules, len(*saved))
+	}
+	got := cfg.Sandbox.AllowRules[0]
+	if got.Match != "git push" || got.MaxRisk != "R4" || len(got.Effects) != 1 || got.Effects[0] != "network" {
+		t.Errorf("persisted rule = %+v", got)
+	}
+	if err := p.persistAllowRule(rule); err != nil {
+		t.Fatalf("duplicate persistAllowRule: %v", err)
+	}
+	if len(cfg.Sandbox.AllowRules) != 1 || len(*saved) != 1 {
+		t.Errorf("duplicate rule was persisted: rules=%v saves=%d", cfg.Sandbox.AllowRules, len(*saved))
+	}
+}
+
 // 需要固定 provider 的测试用 newAgentPluginP。
 func newAgentPlugin(hub *model.Hub) *AgentPlugin {
 	cfg, _ := hub.Config.(*runtimeconfig.Config)
@@ -64,6 +91,7 @@ func newAgentPlugin(hub *model.Hub) *AgentPlugin {
 			}
 			return runtimeopenai.NewProvider("mock", provider.Endpoint, provider.APIKey, provider.Model, &http.Client{}), nil
 		},
+		PersistAllowRule: p.persistAllowRule,
 	}
 	p.refreshSession()
 	return p
@@ -81,6 +109,7 @@ func newAgentPluginP(hub *model.Hub, pv core.Provider) *AgentPlugin {
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
 			return pv, nil
 		},
+		PersistAllowRule: p.persistAllowRule,
 	}
 	p.refreshSession()
 	return p

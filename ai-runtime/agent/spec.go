@@ -53,12 +53,13 @@ type Session struct {
 // SessionDeps 是会话构造输入包：插件级资源 + 本会话参数，Init 组装后每次 NewSession 复用。
 // 其余字段跨会话不变。可变资源（instructions）的装载在 plugin 层，这里只收最终值。
 type SessionDeps struct {
-	Config       *runtimeconfig.Config                                  // 运行配置（含 Sandbox 段）
-	AuditDir     string                                                 // sandbox 审计落盘目录
-	CWD          string                                                 // 会话工作目录（client 经 wire 声明、宿主校验后注入）；空 = 未声明，工具回退 cfg.AllowedWorkDir
-	Memory       *memory.Client                                         // nil = 禁用
-	CollectTools func(cfg *sandbox.Config) []core.Tool                  // 方法值捕获 p，按需收集工具
-	NewProvider  func(cfg *runtimeconfig.Config) (core.Provider, error) // 按当前 default_provider 构造协议适配器
-	Instruction  *memory.InstructionSet                                 // 会话边界刷新（Init / /new 经 startSession 重载）
-	Store        *session.Store                                         // nil = 持久化禁用
+	Config           *runtimeconfig.Config                                  // 运行配置（含 Sandbox 段）
+	AuditDir         string                                                 // sandbox 审计落盘目录
+	CWD              string                                                 // 会话工作目录（client 经 wire 声明、宿主校验后注入）；空 = 未声明，工具回退 cfg.AllowedWorkDir
+	Memory           *memory.Client                                         // nil = 禁用
+	CollectTools     func(cfg *sandbox.Config) []core.Tool                  // 方法值捕获 p，按需收集工具
+	NewProvider      func(cfg *runtimeconfig.Config) (core.Provider, error) // 按当前 default_provider 构造协议适配器
+	Instruction      *memory.InstructionSet                                 // 会话边界刷新（Init / /new 经 startSession 重载）
+	Store            *session.Store                                         // nil = 持久化禁用
+	PersistAllowRule func(sandbox.AllowRule) error                          // 持久化 bash allow_always 规则
 }
