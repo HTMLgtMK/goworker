@@ -27,10 +27,10 @@ func RunACPWorker() error {
 	runtimeCfg := cfg.ToRuntime()
 	if mode := os.Getenv("GOWORKER_SANDBOX_MODE"); mode != "" {
 		switch mode {
-		case "normal", "strict", "readonly", "off":
+		case "normal", "auto", "strict", "readonly", "off":
 			runtimeCfg.Sandbox.Mode = mode
 		default:
-			return fmt.Errorf("invalid GOWORKER_SANDBOX_MODE %q (normal|strict|readonly|off)", mode)
+			return fmt.Errorf("invalid GOWORKER_SANDBOX_MODE %q (normal|auto|strict|readonly|off)", mode)
 		}
 		slog.Info("acp worker: sandbox mode overridden", "mode", mode)
 	}

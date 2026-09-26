@@ -85,6 +85,11 @@ func (p *Policy) Decide(req CommandRequest, cfg *Config, ra RiskAssessment) Outc
 // decisionFor 是风险等级 × 运行模式的决策矩阵。
 func decisionFor(level RiskLevel, mode Mode) Decision {
 	switch mode {
+	case ModeAuto:
+		if level == RiskR5 {
+			return DecisionDeny
+		}
+		return DecisionAllow
 	case ModeStrict, ModeReadOnly:
 		// strict 拒全部风险，readonly 拒全部写——R0/R1 之外一律硬拒。
 		if level <= RiskR1 {
@@ -162,7 +167,19 @@ func mainTokens(cmd string) []string {
 	return append([]string{base}, args...)
 }
 
-// tokensMatch 判断 cmdTokens 是否以 matchTokens 为前缀（token 精确匹配，非子串）。
+// AllowRuleForCommand builds a rule from the normalized command prefix.
+func AllowRuleForCommand(command string, maxRisk RiskLevel, effects []string) (AllowRule, bool) {
+	tokens := mainTokens(command)
+	if len(tokens) == 0 {
+		return AllowRule{}, false
+	}
+	return AllowRule{
+		MatchTokens: append([]string(nil), tokens...),
+		MaxRisk:     maxRisk,
+		Effects:     parseEffects(effects),
+	}, true
+}
+
 func tokensMatch(cmdTokens, matchTokens []string) bool {
 	if len(matchTokens) > len(cmdTokens) {
 		return false

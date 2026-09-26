@@ -11,6 +11,8 @@ import (
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
+const defaultContextWindow = 256000
+
 // DefaultLLM 返回默认 LLM 注册表（不含 APIKey）。
 func DefaultLLM() LLMConfig {
 	return LLMConfig{
@@ -20,7 +22,7 @@ func DefaultLLM() LLMConfig {
 				Type:          ProviderTypeOpenAI,
 				Endpoint:      "http://localhost:8000/v1",
 				Model:         "gpt-4o",
-				ContextWindow: 128000,
+				ContextWindow: defaultContextWindow,
 				Thinking: ProviderThinkingConfig{
 					RequestMode: ThinkingRequestAuto,
 					Effort:      ThinkingEffortMedium,
@@ -32,6 +34,26 @@ func DefaultLLM() LLMConfig {
 		MaxIterations: 15,
 		Thinking:      ThinkingConfig{Show: true},
 	}
+}
+
+// WithDefaults 返回补齐 Provider 缺省值的配置副本。
+func (c LLMConfig) WithDefaults() LLMConfig {
+	clone := c.Clone()
+	for name, provider := range clone.Providers {
+		if provider.Type == ProviderTypeOpenAI {
+			if provider.ContextWindow == 0 {
+				provider.ContextWindow = defaultContextWindow
+			}
+			if provider.Thinking.RequestMode == "" {
+				provider.Thinking.RequestMode = ThinkingRequestAuto
+			}
+			if provider.Thinking.Effort == "" {
+				provider.Thinking.Effort = ThinkingEffortMedium
+			}
+		}
+		clone.Providers[name] = provider
+	}
+	return clone
 }
 
 // Clone 返回不共享 Provider map 的 LLM 配置副本。
@@ -46,6 +68,10 @@ func (c LLMConfig) Clone() LLMConfig {
 
 // ResolveDefault 返回当前默认 Provider 的稳定名称和配置。
 func (c LLMConfig) ResolveDefault() (string, ProviderConfig, error) {
+	return c.WithDefaults().resolveDefault()
+}
+
+func (c LLMConfig) resolveDefault() (string, ProviderConfig, error) {
 	if c.DefaultProvider == "" {
 		return "", ProviderConfig{}, fmt.Errorf("default provider is not configured")
 	}
@@ -61,7 +87,8 @@ func (c LLMConfig) ResolveDefault() (string, ProviderConfig, error) {
 
 // Validate 确保全局策略和每个命名 Provider 在请求前可用。
 func (c LLMConfig) Validate() error {
-	if _, _, err := c.ResolveDefault(); err != nil {
+	c = c.WithDefaults()
+	if _, _, err := c.resolveDefault(); err != nil {
 		return err
 	}
 	if c.CompressAt < 0 || c.CompressAt > 1 || math.IsNaN(c.CompressAt) {

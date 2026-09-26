@@ -2,8 +2,9 @@
 // hitl.InterruptRequest 译成 session/request_permission 的线上形状，再把用户
 // 选中的 optionId 译回 hitl.Decision。
 //
-// 只做一次决策（once）语义：选项集固定为 allow_once / reject_once，不带
-// always —— 不引入任何需要持久化的"永久允许"状态，粒度定错就是安全隐患。
+// 一次性授权与命令级永久授权并存：bash 提供 allow_once / reject_once /
+// allow_always，其他工具只提供 allow_once / reject_once。永久授权只落到
+// bash 的命令 token 规则，不把 MCP 参数粗暴伪装成命令。
 //
 // 放在 model 包是因为两个 ACP 前端都要用它：agent chat（cli/vscode 的
 // ingress）与 task worker（service 的 acpWorker）。model 是两者共同依赖的层
@@ -21,8 +22,9 @@ import (
 
 // HITL 选项 id：协议内约定，也是 DecisionFromOption 的识别依据。
 const (
-	hitlOptionAllow  = "allow_once"
-	hitlOptionReject = "reject_once"
+	hitlOptionAllow       = "allow_once"
+	hitlOptionAllowAlways = "allow_always"
+	hitlOptionReject      = "reject_once"
 )
 
 // PermissionAsker 是发起 ACP 授权请求所需的最小能力。dispatch.Reporter 天然
@@ -46,15 +48,21 @@ func PermissionFromInterrupt(req *hitl.InterruptRequest) protocol.PermissionRequ
 	if req.RiskReason != "" {
 		title = title + "\n" + req.RiskReason
 	}
+	options := []protocol.PermissionOption{
+		{OptionID: hitlOptionAllow, Name: "Allow once", Kind: "allow_once"},
+		{OptionID: hitlOptionReject, Name: "Reject", Kind: "reject_once"},
+	}
+	if req.ToolName == "bash" {
+		options = append(options,
+			protocol.PermissionOption{OptionID: hitlOptionAllowAlways, Name: "Allow always", Kind: "allow_always"},
+		)
+	}
 	return protocol.PermissionRequest{
 		ToolCall: protocol.ToolCallInfo{
 			ToolCallID: req.ID,
 			Title:      title,
 		},
-		Options: []protocol.PermissionOption{
-			{OptionID: hitlOptionAllow, Name: "Allow once", Kind: "allow_once"},
-			{OptionID: hitlOptionReject, Name: "Reject", Kind: "reject_once"},
-		},
+		Options: options,
 	}
 }
 
@@ -73,10 +81,14 @@ func PermissionFromInterrupt(req *hitl.InterruptRequest) protocol.PermissionRequ
 // 零值 DecisionType("") 会穿透全部 case 落到末尾的空 MiddlewareResponse，
 // 也就是放行 —— 返回 hitl.Decision{} 等于批准执行。
 func DecisionFromOption(interruptID, optionID string) hitl.Decision {
-	if optionID == hitlOptionAllow {
+	switch optionID {
+	case hitlOptionAllow:
 		return hitl.Decision{InterruptID: interruptID, Type: hitl.DecisionApprove}
+	case hitlOptionAllowAlways:
+		return hitl.Decision{InterruptID: interruptID, Type: hitl.DecisionApproveAlways}
+	default:
+		return hitl.Decision{InterruptID: interruptID, Type: hitl.DecisionReject}
 	}
-	return hitl.Decision{InterruptID: interruptID, Type: hitl.DecisionReject}
 }
 
 // DecideViaACP 把 ACP 提交方包装成 FrontendContext.Decide 需要的回调形状。

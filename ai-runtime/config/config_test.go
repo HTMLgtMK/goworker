@@ -15,7 +15,7 @@ func TestDefaultLLMRegistry(t *testing.T) {
 	if name != "openai" {
 		t.Errorf("default provider = %q, want openai", name)
 	}
-	if provider.Type != ProviderTypeOpenAI || provider.Endpoint != "http://localhost:8000/v1" || provider.Model != "gpt-4o" || provider.ContextWindow != 128000 {
+	if provider.Type != ProviderTypeOpenAI || provider.Endpoint != "http://localhost:8000/v1" || provider.Model != "gpt-4o" || provider.ContextWindow != 256000 {
 		t.Errorf("default provider = %#v", provider)
 	}
 	if !llm.Thinking.Show {
@@ -23,6 +23,26 @@ func TestDefaultLLMRegistry(t *testing.T) {
 	}
 	if provider.Thinking.RequestMode != ThinkingRequestAuto || provider.Thinking.Effort != ThinkingEffortMedium {
 		t.Errorf("provider thinking = %#v", provider.Thinking)
+	}
+}
+
+func TestLLMConfigDefaultsOmittedOpenAIFields(t *testing.T) {
+	llm := DefaultLLM()
+	llm.Providers["openai"] = ProviderConfig{
+		Type:     ProviderTypeOpenAI,
+		Endpoint: "http://localhost:8000/v1",
+		Model:    "gpt-4o",
+	}
+
+	if err := llm.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	_, provider, err := llm.ResolveDefault()
+	if err != nil {
+		t.Fatalf("ResolveDefault: %v", err)
+	}
+	if provider.ContextWindow != 256000 || provider.Thinking.RequestMode != ThinkingRequestAuto || provider.Thinking.Effort != ThinkingEffortMedium {
+		t.Errorf("resolved provider defaults = %#v", provider)
 	}
 }
 

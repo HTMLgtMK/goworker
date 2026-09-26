@@ -22,6 +22,11 @@ func TestPolicy_DecisionMatrix(t *testing.T) {
 		{RiskR5, "normal", DecisionDeny}, // denylist 恒硬拒
 		{RiskR6, "normal", DecisionHitl}, // unknown → HITL（核心行为）
 		{RiskR7, "normal", DecisionHitl},
+		// auto：保留 deny，其余原本 HITL 的风险自动放行
+		{RiskR2, "auto", DecisionAllow},
+		{RiskR4, "auto", DecisionAllow},
+		{RiskR5, "auto", DecisionDeny},
+		{RiskR6, "auto", DecisionAllow},
 		// strict：只放 R0/R1，其余硬拒
 		{RiskR0, "strict", DecisionAllow},
 		{RiskR1, "strict", DecisionAllow},
@@ -177,7 +182,25 @@ func TestPolicy_AllowRuleOverride(t *testing.T) {
 	})
 }
 
-// Check shim 保持三态契约：迁移门禁。
+func TestAllowRuleForCommand_NormalizesMainTokens(t *testing.T) {
+	rule, ok := AllowRuleForCommand("env FOO=bar git push origin main", RiskR4, []string{"network"})
+	if !ok {
+		t.Fatal("AllowRuleForCommand returned ok=false")
+	}
+	want := []string{"git", "push", "origin", "main"}
+	if len(rule.MatchTokens) != len(want) {
+		t.Fatalf("MatchTokens = %v, want %v", rule.MatchTokens, want)
+	}
+	for i := range want {
+		if rule.MatchTokens[i] != want[i] {
+			t.Errorf("MatchTokens[%d] = %q, want %q", i, rule.MatchTokens[i], want[i])
+		}
+	}
+	if rule.MaxRisk != RiskR4 || !rule.Effects.Has(EffectNetwork) {
+		t.Errorf("rule = %+v, want R4 with network effect", rule)
+	}
+}
+
 func TestPolicy_CheckShimContract(t *testing.T) {
 	cfg := newTestConfig("normal")
 

@@ -17,12 +17,18 @@
 ## 构建并启动 Extension Development Host
 
 ```bash
-cd extensions/vscode-goworker
+git clone https://github.com/HTMLgtMK/goworker-vscode-extension.git
+cd goworker-vscode-extension
 npm install
 npm run package
 ```
 
-在 VS Code 打开 `extensions/vscode-goworker`，按 `F5` 启动 Extension Development Host。打开 Activity Bar 的 **GOWORKER**，执行 **GOWORKER: Refresh Tasks**，再点击任意 task。
+前置：扩展依赖同级目录的 acp-ui SDK（`package.json` 里是
+`file:../vscode-acp-ui/dist-sdk`），需先克隆并在
+`../vscode-acp-ui` 构建出 `dist-sdk`，否则 `npm install` 直接失败。
+
+在 VS Code 打开该目录并启动 Extension Development Host
+（`code --extensionDevelopmentPath="$PWD"`）。打开 Activity Bar 的 **GOWORKER**，执行 **GOWORKER: Refresh Tasks**，再点击任意 task。
 
 ## 验收路径
 

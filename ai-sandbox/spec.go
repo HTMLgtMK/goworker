@@ -17,6 +17,7 @@ type Mode string
 
 const (
 	ModeNormal   Mode = "normal"   // 默认：risky 命令需要 agent 向用户请求确认
+	ModeAuto     Mode = "auto"     // 自动批准需要确认的命令，但仍拒绝 denylist
 	ModeStrict   Mode = "strict"   // 拒绝所有 risky 命令
 	ModeReadOnly Mode = "readonly" // 只读模式，拒绝所有写操作
 	ModeOff      Mode = "off"      // 关闭沙箱（不推荐）

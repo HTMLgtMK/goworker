@@ -1,5 +1,8 @@
 # Task Console Renderer Contract
 
+> 本文件是权威定义。扩展仓库 `goworker-vscode-extension/contracts/acp-console.md` 持有副本，
+> 改协议必须同轮同步副本，否则扩展侧按旧契约解析。
+
 ## Scope
 
 VS Code extension reads dispatcher state through two one-shot ACP updates and observes execution through the existing `--attach <task_id>` stream. It never parses human-oriented `--ls` or `--status` output and never reads the EventLog directly.

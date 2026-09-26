@@ -3,6 +3,7 @@ package middlewares
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -121,6 +122,81 @@ func TestHITL_MCPAllowedInOffMode(t *testing.T) {
 
 	if ev.Abort != nil {
 		t.Fatal("MCP tool should pass through in off mode")
+	}
+}
+
+func TestHITL_MCPAllowedInAutoMode(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "auto"})
+	decisions := make(chan hitl.Decision, 1)
+	decisions <- hitl.Decision{Type: hitl.DecisionReject}
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
+	ev, em := newToolEvent("mcp_fs_write", map[string]any{"path": "/tmp/x"})
+
+	mw.OnBeforeTool(ev)
+
+	if ev.Abort != nil {
+		t.Fatal("MCP tool should pass through in auto mode")
+	}
+	if _, ok := interruptFor(t, em.tokens, "mcp_fs_write"); ok {
+		t.Fatal("auto mode should not trigger interrupt")
+	}
+}
+
+func TestHITL_AllowAlwaysPersistsRuleBeforeExecution(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
+	decisions := make(chan hitl.Decision, 1)
+	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
+	var saved sandbox.AllowRule
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithAllowAlways(func(rule sandbox.AllowRule) error {
+		saved = rule
+		return nil
+	}))
+	ev, _ := newToolEvent("bash", map[string]any{"command": "git push origin main"})
+
+	mw.OnBeforeTool(ev)
+
+	if ev.Abort != nil {
+		t.Fatalf("allow_always should execute after persistence, abort=%v", ev.Abort)
+	}
+	if len(saved.MatchTokens) == 0 || saved.MaxRisk == 0 {
+		t.Fatalf("saved rule = %+v, want normalized command and risk", saved)
+	}
+}
+
+func TestHITL_AllowAlwaysPersistenceFailureRejects(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
+	decisions := make(chan hitl.Decision, 1)
+	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithAllowAlways(func(sandbox.AllowRule) error {
+		return errors.New("save failed")
+	}))
+	ev, _ := newToolEvent("bash", map[string]any{"command": "git push origin main"})
+
+	mw.OnBeforeTool(ev)
+
+	if ev.Abort == nil {
+		t.Fatal("allow_always persistence failure must reject execution")
+	}
+}
+
+func TestHITL_EditDoesNotPersistAlwaysRule(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
+	decisions := make(chan hitl.Decision, 1)
+	decisions <- hitl.Decision{Type: hitl.DecisionEdit, Command: "echo safe"}
+	persisted := false
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithAllowAlways(func(sandbox.AllowRule) error {
+		persisted = true
+		return nil
+	}))
+	ev, _ := newToolEvent("bash", map[string]any{"command": "rm -rf /tmp/goworker-test"})
+
+	mw.OnBeforeTool(ev)
+
+	if ev.Abort != nil || ev.Args["command"] != "echo safe" {
+		t.Fatalf("edited command result: abort=%v args=%v", ev.Abort, ev.Args)
+	}
+	if persisted {
+		t.Fatal("edit must not persist an always rule")
 	}
 }
 

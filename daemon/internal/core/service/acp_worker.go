@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +35,7 @@ type acpWorker struct {
 	deps ACPWorkerDeps
 
 	mu          sync.Mutex
+	runMu       sync.Mutex // serializes Session.Run with runtime allow-rule updates
 	sessions    map[string]*runtimeagent.Session
 	caller      DeviceCaller           // client-ward 调用通道（dispatch.Server），nil = 未知
 	deviceTools []DeviceToolDescriptor // 探测到的客户端设备工具（连接级，一次探测全会话复用）
@@ -85,14 +88,47 @@ func (w *acpWorker) setSession(sessionID, cwd string) {
 	}
 
 	w.sessions[sessionID] = runtimeagent.NewSession(runtimeagent.SessionDeps{
-		Config:       w.deps.Config,
-		AuditDir:     w.deps.AuditDir,
-		CWD:          cwd,
-		Memory:       nil,
-		CollectTools: collectTools,
-		NewProvider:  ProviderFactory(acpHTTPClient()),
-		Store:        nil, // worker 会话由调用方管理生命周期，本地不持久化
+		Config:           w.deps.Config,
+		AuditDir:         w.deps.AuditDir,
+		CWD:              cwd,
+		Memory:           nil,
+		CollectTools:     collectTools,
+		NewProvider:      ProviderFactory(acpHTTPClient()),
+		Store:            nil, // worker 会话由调用方管理生命周期，本地不持久化
+		PersistAllowRule: w.persistAllowRule,
 	})
+}
+
+func (w *acpWorker) persistAllowRule(rule sandbox.AllowRule) error {
+	if w.deps.Config == nil {
+		return fmt.Errorf("acp worker: runtime config is nil")
+	}
+	if len(rule.MatchTokens) == 0 {
+		return fmt.Errorf("acp worker: allow rule has empty match")
+	}
+
+	candidate := sandbox.AllowRuleConfig{
+		Match:   strings.Join(rule.MatchTokens, " "),
+		MaxRisk: rule.MaxRisk.String(),
+		Effects: rule.Effects.Names(),
+		Desc:    rule.Desc,
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, existing := range w.deps.Config.Sandbox.AllowRules {
+		if existing.Match == candidate.Match &&
+			existing.MaxRisk == candidate.MaxRisk &&
+			existing.Desc == candidate.Desc &&
+			slices.Equal(existing.Effects, candidate.Effects) {
+			return nil
+		}
+	}
+	w.deps.Config.Sandbox.AllowRules = append(
+		w.deps.Config.Sandbox.AllowRules,
+		candidate,
+	)
+	return nil
 }
 
 // Run 执行一回合：session/prompt 文本进 Session.Run，token 流映射为 session/update。
@@ -104,6 +140,8 @@ func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispa
 		return "", statusError(fmt.Sprintf("unknown session %q (call session/new first)", sessionID))
 	}
 
+	w.runMu.Lock()
+	defer w.runMu.Unlock()
 	cb := runtimeagent.RunCallbacks{
 		Write: func(text string) {
 			rep.MessageChunk(sessionID, text)
