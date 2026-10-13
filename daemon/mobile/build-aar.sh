@@ -17,7 +17,7 @@ fi
 
 if [[ ! -x "$gomobile" ]]; then
     printf 'gomobile not found: %s\n' "$gomobile" >&2
-    printf 'install it with: go install golang.org/x/mobile/cmd/gomobile@latest\n' >&2
+    printf 'install it with: go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260908204917-8b95e45f8d3e\n' >&2
     exit 1
 fi
 
