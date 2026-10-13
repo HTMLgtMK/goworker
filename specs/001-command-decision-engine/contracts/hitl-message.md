@@ -12,11 +12,11 @@
 | Command | string | 待执行命令（MCP 工具为 args JSON） |
 | RiskReason | string | 人类可读风险原因 |
 | Description | string, omitempty | 补充描述（MCP） |
-| RiskLevel | string, omitempty | **新增**："R0".."R7"，未走分级时为 "" |
+| RiskLevel | string, omitempty | **新增**："benign".."reserved"，未走分级时为 "" |
 | Effects | []string, omitempty | **新增**：副作用 Names()，如 `["destructive"]` |
 | CreatedAt / ExpiresAt | time.Time | 30s 有效期 |
 
-**兼容性**: `RiskLevel`/`Effects` 为 additive 字段，老前端忽略、新前端用于展示 `[R4]` 标签，不破坏现有 `hitl_consumer.go` 渲染。
+**兼容性**: `RiskLevel`/`Effects` 为 additive 字段，老前端忽略、新前端用于展示 `[high]` 标签，不破坏现有 `hitl_consumer.go` 渲染。
 
 ## `HITLDecision`（前端 → 中间件）
 

@@ -35,7 +35,7 @@
 
 | 类型 | 不变量 |
 |---|---|
-| `RiskLevel` | `String()` 输出 "R0".."R7"；`ParseRiskLevel` 可逆 |
+| `RiskLevel` | `String()` 输出 "benign".."reserved"；`ParseRiskLevel` 可逆 |
 | `Effects` | `Names()` 顺序稳定（审计/HITL 展示一致） |
 | `Outcome.Error()` | nil ↔ allow/sandbox；`NeedsConfirmationError` ↔ hitl；其他 ↔ deny |
 | `AllowRule` | `MatchTokens` 非空；`Effects` 子集校验在 Decide 内强校验 |
@@ -52,7 +52,7 @@ sandbox:
   safe_commands: []
   allow_rules:            # 新增
     - match: "git push"
-      max_risk: "R4"
+      max_risk: "high"
       effects: ["network", "file_write"]
       desc: "..."
   audit_log: false        # 新增，默认关闭

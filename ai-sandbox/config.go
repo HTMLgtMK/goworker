@@ -37,6 +37,14 @@ func NewFromConfig(cfg *SandboxConfig) *Config {
 		}
 	}
 
+	autoMaxRisk := RiskLow
+	if cfg.AutoMaxRisk != "" {
+		parsed, err := ParseRiskLevel(cfg.AutoMaxRisk)
+		if err == nil {
+			autoMaxRisk = parsed
+		}
+	}
+
 	// 配置追加的只读安全命令
 	var safeCmds map[string]bool
 	if len(cfg.SafeCommands) > 0 {
@@ -48,6 +56,7 @@ func NewFromConfig(cfg *SandboxConfig) *Config {
 
 	return &Config{
 		Mode:           Mode(cfg.Mode),
+		AutoMaxRisk:    autoMaxRisk,
 		AllowedWorkDir: workDir,
 		DeniedPatterns: MustCompile(denied),
 		RiskyPatterns:  MustCompile(riskyStrs),
@@ -55,6 +64,7 @@ func NewFromConfig(cfg *SandboxConfig) *Config {
 		ReadOnly:       Mode(cfg.Mode) == ModeReadOnly,
 		SafeCommands:   safeCmds,
 		AllowRules:     compileAllowRules(cfg.AllowRules),
+		ToolAllowRules: compileToolAllowRules(cfg.ToolAllowRules),
 	}
 }
 
@@ -81,7 +91,19 @@ func compileAllowRules(rules []AllowRuleConfig) []AllowRule {
 	return out
 }
 
-// parseEffects 把副作用名列表解析为位集；未知名字静默忽略。
+func compileToolAllowRules(rules []ToolAllowRuleConfig) []ToolAllowRule {
+	out := make([]ToolAllowRule, 0, len(rules))
+	for _, rule := range rules {
+		key := strings.TrimSpace(rule.Key)
+		maxRisk, err := ParseRiskLevel(rule.MaxRisk)
+		if key == "" || err != nil {
+			continue
+		}
+		out = append(out, ToolAllowRule{Key: key, MaxRisk: maxRisk, Desc: rule.Desc})
+	}
+	return out
+}
+
 func parseEffects(names []string) Effects {
 	var e Effects
 	for _, n := range names {

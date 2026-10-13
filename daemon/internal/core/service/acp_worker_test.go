@@ -182,7 +182,7 @@ func TestACPWorker_PersistAllowRuleUpdatesRuntimeConfig(t *testing.T) {
 	}
 	rule := sandbox.AllowRule{
 		MatchTokens: []string{"git", "push"},
-		MaxRisk:     sandbox.RiskR4,
+		MaxRisk:     sandbox.RiskHigh,
 	}
 
 	if err := worker.persistAllowRule(rule); err != nil {
@@ -196,8 +196,64 @@ func TestACPWorker_PersistAllowRuleUpdatesRuntimeConfig(t *testing.T) {
 	if got.Match != "git push" {
 		t.Fatalf("match = %q, want %q", got.Match, "git push")
 	}
-	if got.MaxRisk != "R4" {
-		t.Fatalf("max risk = %q, want R4", got.MaxRisk)
+	if got.MaxRisk != "high" {
+		t.Fatalf("max risk = %q, want high", got.MaxRisk)
+	}
+}
+
+func TestACPWorker_PersistToolAllowRuleUpdatesRuntimeConfig(t *testing.T) {
+	runtimeCfg := &runtimeconfig.Config{}
+	worker := &acpWorker{
+		deps:     ACPWorkerDeps{Config: runtimeCfg},
+		sessions: make(map[string]*runtimeagent.Session),
+	}
+	rule := sandbox.ToolAllowRule{Key: "sys_send_notification", MaxRisk: sandbox.RiskMedium, Desc: "trusted notification"}
+
+	if err := worker.persistToolAllowRule(rule); err != nil {
+		t.Fatalf("persistToolAllowRule: %v", err)
+	}
+	if len(runtimeCfg.Sandbox.ToolAllowRules) != 1 {
+		t.Fatalf("tool allow rules = %d, want 1", len(runtimeCfg.Sandbox.ToolAllowRules))
+	}
+	got := runtimeCfg.Sandbox.ToolAllowRules[0]
+	if got.Key != rule.Key || got.MaxRisk != "medium" || got.Desc != rule.Desc {
+		t.Errorf("persisted rule = %+v", got)
+	}
+	if err := worker.persistToolAllowRule(rule); err != nil {
+		t.Fatalf("duplicate persistToolAllowRule: %v", err)
+	}
+	if len(runtimeCfg.Sandbox.ToolAllowRules) != 1 {
+		t.Errorf("duplicate rule was persisted: %+v", runtimeCfg.Sandbox.ToolAllowRules)
+	}
+}
+
+func TestACPWorker_PersistToolAllowRuleConcurrentDeduplicates(t *testing.T) {
+	runtimeCfg := &runtimeconfig.Config{}
+	worker := &acpWorker{
+		deps:     ACPWorkerDeps{Config: runtimeCfg},
+		sessions: make(map[string]*runtimeagent.Session),
+	}
+	rule := sandbox.ToolAllowRule{Key: "sys_send_notification", MaxRisk: sandbox.RiskMedium}
+
+	const calls = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, calls)
+	for i := 0; i < calls; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- worker.persistToolAllowRule(rule)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("persistToolAllowRule: %v", err)
+		}
+	}
+	if len(runtimeCfg.Sandbox.ToolAllowRules) != 1 {
+		t.Fatalf("concurrent tool allow rules = %d, want 1", len(runtimeCfg.Sandbox.ToolAllowRules))
 	}
 }
 

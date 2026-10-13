@@ -75,6 +75,25 @@ func newTestProvider(endpoint string, options ...ProviderOptions) *Provider {
 	return NewProvider("openai", endpoint, "key", "m", &http.Client{}, options...)
 }
 
+func TestToolSpecOmitsPolicyMetadata(t *testing.T) {
+	got, err := json.Marshal(toolSpec([]core.Tool{{
+		Name:        "custom_write",
+		Description: "custom tool",
+		Parameters:  map[string]any{"type": "object"},
+		Metadata: map[string]string{
+			"risk_level":          "medium",
+			"requires_permission": "true",
+			"allow_always_key":    "custom_write",
+		},
+	}}))
+	if err != nil {
+		t.Fatalf("marshal tool spec: %v", err)
+	}
+	if strings.Contains(string(got), "risk_level") || strings.Contains(string(got), "allow_always_key") {
+		t.Fatalf("policy metadata leaked into provider schema: %s", got)
+	}
+}
+
 func TestProvider_Defaults(t *testing.T) {
 	p := NewProvider("", "", "key", "", &http.Client{})
 	if got := p.Endpoint(); got != "http://localhost:8000/v1" {

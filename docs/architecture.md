@@ -123,16 +123,19 @@ User Input → system prompt + tools → LLM
 
 最大 15 轮迭代。工具集可扩展：默认内置 bash、read_file、write_file，插件可通过 Hub 注册额外工具。
 
-### 命令安全层（sandbox）
+### 命令与工具安全层（sandbox）
 
-bash 工具执行前经结构化决策链路（`ai-sandbox` 独立 module）：
+bash 工具执行前经结构化决策链路（`ai-sandbox` 独立 module）；MCP、sys 和显式注册的外部工具通过 `core.Tool.Metadata` 接入同一策略：
 
 ```text
-命令 → Assess（风险分级 R0-R7 + 副作用 Effects）→ Policy 决策矩阵 → allow / hitl / deny
+命令 → Assess（风险分级 benign-reserved + 副作用 Effects）→ Policy 决策矩阵 → allow / hitl / deny
+工具 → NormalizeToolMetadata（缺失/非法 = unclassified）→ mode × risk → allow / hitl / deny
 ```
 
-- **Rule ≠ Model**：正则规则引擎负责确定性判定；未知命令（R6）默认进入 HITL（Unknown ≠ Safe），不静默放行。
-- **deny > hitl > allow**：strict 拒全部风险、readonly 拒全部写；预批准规则（`allow_rules`，token 前缀匹配 + 副作用子集校验）只覆盖 normal 模式的确认，不越过模式硬拒。
+- **Rule ≠ Model**：正则规则引擎负责确定性判定；未知命令/工具（unclassified）默认进入 HITL（Unknown ≠ Safe），不静默放行。
+- **deny > hitl > allow**：strict/readonly 拒绝 medium-reserved；normal 的 medium-reserved 进入 HITL；auto 按 `auto_max_risk` 自动放行阈值；`critical` 本身不等于硬拒。
+- **外部工具显式 opt-in**：`requires_permission=true` 才进入统一工具策略；未标记的内部工具保持直通。`allow_always_key` 是稳定身份，不保存调用参数。
+- **HardDeny 独立于风险等级**：denylist 命中直接拒绝，即使分类为 critical 也不进入 HITL；bash 的 `allow_rules` 与外部工具 `tool_allow_rules` 分开。
 - 注入向量检测（命令替换/子shell/解释器 `-c`/eval/heredoc）与换行拆分封堵绕过。
 - 审计：`audit_log: true` 时每次决策（含用户最终选择）落 `audit/audit.jsonl`，是未来模型训练数据。
 

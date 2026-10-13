@@ -48,7 +48,7 @@ func NewPolicy(cfg *Config) *Policy {
 }
 
 // Decide 依据风险评估 + 运行模式输出决策。纯函数，无 I/O。
-// 流程：effects floor 抬升等级 → 决策矩阵 →（normal 模式 AllowRule 降级）。
+// 流程：hard deny → effects floor 抬升等级 → 决策矩阵 →（normal 模式 AllowRule 降级）。
 func (p *Policy) Decide(req CommandRequest, cfg *Config, ra RiskAssessment) Outcome {
 	out := Outcome{
 		Command:  req.Command,
@@ -56,11 +56,18 @@ func (p *Policy) Decide(req CommandRequest, cfg *Config, ra RiskAssessment) Outc
 		Effects:  ra.Effects,
 		Reasons:  ra.Reasons,
 		Source:   ra.Source,
+		HardDeny: ra.HardDeny,
 		Override: nil,
 	}
 	if cfg == nil || cfg.Mode == ModeOff {
 		out.Decision = DecisionAllow
-		out.Level = RiskR0
+		out.Level = RiskBenign
+		return out
+	}
+
+	// hard deny 独立于风险等级，critical 本身仍可进入 HITL。
+	if ra.HardDeny {
+		out.Decision = DecisionDeny
 		return out
 	}
 
@@ -70,7 +77,7 @@ func (p *Policy) Decide(req CommandRequest, cfg *Config, ra RiskAssessment) Outc
 		effLv = f
 	}
 	out.Level = effLv
-	out.Decision = decisionFor(effLv, cfg.Mode)
+	out.Decision = decisionFor(effLv, cfg.Mode, cfg.AutoMaxRisk)
 
 	// AllowRule 降级：仅 normal 模式、风险/副作用在规则范围内时 hitl→allow。
 	if out.Decision == DecisionHitl && cfg.Mode == ModeNormal {
@@ -83,27 +90,25 @@ func (p *Policy) Decide(req CommandRequest, cfg *Config, ra RiskAssessment) Outc
 }
 
 // decisionFor 是风险等级 × 运行模式的决策矩阵。
-func decisionFor(level RiskLevel, mode Mode) Decision {
+func decisionFor(level RiskLevel, mode Mode, autoMaxRisk RiskLevel) Decision {
 	switch mode {
 	case ModeAuto:
-		if level == RiskR5 {
-			return DecisionDeny
+		if level <= autoMaxRisk {
+			return DecisionAllow
 		}
-		return DecisionAllow
+		return DecisionHitl
 	case ModeStrict, ModeReadOnly:
-		// strict 拒全部风险，readonly 拒全部写——R0/R1 之外一律硬拒。
-		if level <= RiskR1 {
+		// strict 拒全部风险，readonly 拒全部写——benign/low 之外一律硬拒。
+		if level <= RiskLow {
 			return DecisionAllow
 		}
 		return DecisionDeny
 	default: // ModeNormal
 		switch {
-		case level <= RiskR1:
+		case level <= RiskLow:
 			return DecisionAllow
-		case level == RiskR5:
-			return DecisionDeny // denylist 恒硬拒，不进 HITL
 		default:
-			return DecisionHitl // R2-R4、R6、R7
+			return DecisionHitl // medium-reserved
 		}
 	}
 }
@@ -112,13 +117,13 @@ func decisionFor(level RiskLevel, mode Mode) Decision {
 func floorByEffects(e Effects) RiskLevel {
 	switch {
 	case e.Has(EffectCodeExecution) || e.Has(EffectPrivileged) || e.Has(EffectSecretAccess):
-		return RiskR4
+		return RiskHigh
 	case e.Has(EffectDestructive):
-		return RiskR3
+		return RiskElevated
 	case e.Has(EffectFileWrite) || e.Has(EffectProcessSpawn):
-		return RiskR2
+		return RiskMedium
 	}
-	return RiskR0
+	return RiskBenign
 }
 
 // matchAllowRule 按命令 token 前缀 + 风险上限 + effects 子集匹配用户预批准规则。
@@ -195,7 +200,7 @@ func tokensMatch(cmdTokens, matchTokens []string) bool {
 // Evaluate 是组合入口：Assess → Policy.Decide。
 func Evaluate(req CommandRequest, cfg *Config) Outcome {
 	if cfg == nil || cfg.Mode == ModeOff {
-		return Outcome{Decision: DecisionAllow, Level: RiskR0, Source: SourceBypass, Command: req.Command}
+		return Outcome{Decision: DecisionAllow, Level: RiskBenign, Source: SourceBypass, Command: req.Command}
 	}
 	ra := Assess(req.Command, cfg)
 	return NewPolicy(cfg).Decide(req, cfg, ra)

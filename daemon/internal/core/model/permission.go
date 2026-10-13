@@ -3,8 +3,8 @@
 // 选中的 optionId 译回 hitl.Decision。
 //
 // 一次性授权与命令级永久授权并存：bash 提供 allow_once / reject_once /
-// allow_always，其他工具只提供 allow_once / reject_once。永久授权只落到
-// bash 的命令 token 规则，不把 MCP 参数粗暴伪装成命令。
+// allow_always，声明 allow_always_key 的外部工具也提供相同能力。永久授权
+// 分别落到 bash 命令规则或独立的外部工具规则，不把 MCP 参数粗暴伪装成命令。
 //
 // 放在 model 包是因为两个 ACP 前端都要用它：agent chat（cli/vscode 的
 // ingress）与 task worker（service 的 acpWorker）。model 是两者共同依赖的层
@@ -52,7 +52,7 @@ func PermissionFromInterrupt(req *hitl.InterruptRequest) protocol.PermissionRequ
 		{OptionID: hitlOptionAllow, Name: "Allow once", Kind: "allow_once"},
 		{OptionID: hitlOptionReject, Name: "Reject", Kind: "reject_once"},
 	}
-	if req.ToolName == "bash" {
+	if req.AllowAlways || req.AllowAlwaysKey != "" {
 		options = append(options,
 			protocol.PermissionOption{OptionID: hitlOptionAllowAlways, Name: "Allow always", Kind: "allow_always"},
 		)

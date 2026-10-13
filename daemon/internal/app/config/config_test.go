@@ -513,11 +513,11 @@ sandbox:
   mode: normal
   allow_rules:
     - match: "git push"
-      max_risk: "R4"
+      max_risk: "high"
       effects: ["network", "file_write"]
       desc: "git push 免确认"
     - match: "pip install"
-      max_risk: "R2"
+      max_risk: "medium"
   audit_log: true
 `), 0644)
 
@@ -529,11 +529,61 @@ sandbox:
 		t.Fatalf("AllowRules len = %d, want 2", len(cfg.Sandbox.AllowRules))
 	}
 	r := cfg.Sandbox.AllowRules[0]
-	if r.Match != "git push" || r.MaxRisk != "R4" || r.Desc != "git push 免确认" {
+	if r.Match != "git push" || r.MaxRisk != "high" || r.Desc != "git push 免确认" {
 		t.Errorf("rule0 = %+v", r)
 	}
 	if len(r.Effects) != 2 || r.Effects[0] != "network" || r.Effects[1] != "file_write" {
 		t.Errorf("rule0 effects = %v, want [network file_write]", r.Effects)
+	}
+}
+
+func TestLoad_ParsesUnifiedSandboxPolicy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+sandbox:
+  mode: auto
+  auto_max_risk: elevated
+  tool_allow_rules:
+    - key: "mcp_filesystem_write"
+      max_risk: medium
+      desc: "trusted filesystem writer"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Load(path)
+	if cfg.Sandbox.AutoMaxRisk != "elevated" {
+		t.Fatalf("AutoMaxRisk = %q, want elevated", cfg.Sandbox.AutoMaxRisk)
+	}
+	if len(cfg.Sandbox.ToolAllowRules) != 1 {
+		t.Fatalf("ToolAllowRules len = %d, want 1", len(cfg.Sandbox.ToolAllowRules))
+	}
+	if rule := cfg.Sandbox.ToolAllowRules[0]; rule.Key != "mcp_filesystem_write" || rule.MaxRisk != "medium" {
+		t.Errorf("tool rule = %+v", rule)
+	}
+
+	runtimeCfg := cfg.ToRuntime()
+	if runtimeCfg.Sandbox.AutoMaxRisk != "elevated" || len(runtimeCfg.Sandbox.ToolAllowRules) != 1 {
+		t.Fatalf("runtime sandbox policy = %+v", runtimeCfg.Sandbox)
+	}
+	if err := Save(cfg, filepath.Join(dir, "roundtrip.yaml")); err != nil {
+		t.Fatalf("Save roundtrip: %v", err)
+	}
+	loaded := Load(filepath.Join(dir, "roundtrip.yaml"))
+	if loaded.Sandbox.AutoMaxRisk != "elevated" || len(loaded.Sandbox.ToolAllowRules) != 1 {
+		t.Fatalf("roundtrip sandbox policy = %+v", loaded.Sandbox)
+	}
+}
+
+func TestLoad_RejectsInvalidAutoMaxRisk(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("sandbox:\n  auto_max_risk: unknown-level\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := Load(path); cfg != nil {
+		t.Fatalf("Load(invalid auto_max_risk) = %+v, want nil", cfg)
 	}
 }
 

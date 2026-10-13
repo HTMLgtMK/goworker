@@ -22,15 +22,17 @@ const EventInterrupt = "hitl:interrupt"
 
 // InterruptRequest 描述工具执行因等待用户确认而暂停的原因。
 type InterruptRequest struct {
-	ID          string    `json:"id"`
-	ToolName    string    `json:"tool_name"`
-	Command     string    `json:"command"`
-	RiskReason  string    `json:"risk_reason"`
-	Description string    `json:"description"`
-	RiskLevel   string    `json:"risk_level,omitempty"`
-	Effects     []string  `json:"effects,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	ExpiresAt   time.Time `json:"expires_at"`
+	ID             string    `json:"id"`
+	ToolName       string    `json:"tool_name"`
+	Command        string    `json:"command"`
+	RiskReason     string    `json:"risk_reason"`
+	Description    string    `json:"description"`
+	RiskLevel      string    `json:"risk_level,omitempty"`
+	AllowAlways    bool      `json:"allow_always,omitempty"`
+	AllowAlwaysKey string    `json:"allow_always_key,omitempty"`
+	Effects        []string  `json:"effects,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
 }
 
 // Decision 是用户对 InterruptRequest 的响应。

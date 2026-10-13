@@ -245,8 +245,8 @@ func TestHITL_BashInterruptCarriesRiskInfo(t *testing.T) {
 	if !ok {
 		t.Fatal("risky bash should trigger interrupt")
 	}
-	if req.RiskLevel != "R3" {
-		t.Errorf("RiskLevel = %q, want R3", req.RiskLevel)
+	if req.RiskLevel != "elevated" {
+		t.Errorf("RiskLevel = %q, want elevated", req.RiskLevel)
 	}
 	if len(req.Effects) == 0 || req.Effects[0] != "destructive" {
 		t.Errorf("Effects = %v, want destructive first", req.Effects)
@@ -274,7 +274,7 @@ func TestHITL_AuditRecordsUserDecision(t *testing.T) {
 		t.Fatalf("read audit: %v", err)
 	}
 	line := string(b)
-	for _, want := range []string{`"command":"rm -rf /tmp/goworker-test"`, `"risk_level":"R3"`, `"engine_decision":"hitl"`, `"user_decision":"approve"`, `"outcome":"executed"`} {
+	for _, want := range []string{`"command":"rm -rf /tmp/goworker-test"`, `"risk_level":"elevated"`, `"engine_decision":"hitl"`, `"user_decision":"approve"`, `"outcome":"executed"`} {
 		if !strings.Contains(line, want) {
 			t.Errorf("audit missing %s: %s", want, line)
 		}
@@ -297,7 +297,10 @@ func TestHITL_NonBashNonMCPNotTouched(t *testing.T) {
 
 func newSysToolEvent(name string, args map[string]any, riskLevel string) (*core.BeforeToolEvent, *captureEmitter) {
 	ev, em := newToolEvent(name, args)
-	ev.ToolDef = &core.Tool{Name: name, Metadata: map[string]string{"risk_level": riskLevel}}
+	ev.ToolDef = &core.Tool{Name: name, Metadata: map[string]string{
+		sandbox.ToolMetadataRiskLevel:          riskLevel,
+		sandbox.ToolMetadataRequiresPermission: "true",
+	}}
 	return ev, em
 }
 
@@ -307,31 +310,22 @@ func TestHITL_SysRiskLevelMatrix(t *testing.T) {
 		level string
 		want  string // allow | hitl | deny
 	}{
-		{"normal", "never", "allow"},
-		{"normal", "mode", "hitl"},
-		{"normal", "always", "hitl"},
-		{"normal", "", "hitl"},      // 缺省 = mode
-		{"normal", "bogus", "hitl"}, // 非法值 = mode
-		{"strict", "never", "allow"},
-		{"strict", "mode", "deny"},
-		{"strict", "always", "deny"},
-		{"readonly", "mode", "deny"},
-		{"off", "never", "allow"},
-		{"off", "mode", "allow"},
-		{"off", "always", "hitl"},
+		{"normal", "low", "allow"},
+		{"normal", "unclassified", "hitl"},
+		{"normal", "critical", "hitl"},
+		{"strict", "low", "allow"},
+		{"strict", "unclassified", "deny"},
+		{"strict", "critical", "deny"},
+		{"readonly", "unclassified", "deny"},
+		{"off", "low", "allow"},
+		{"off", "critical", "allow"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.mode+"/"+tc.level, func(t *testing.T) {
 			cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: tc.mode})
 			decisions := make(chan hitl.Decision, 1)
 			mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
-			var ev *core.BeforeToolEvent
-			var em *captureEmitter
-			if tc.level == "" || tc.level == "bogus" {
-				ev, em = newToolEvent("sys_send_notification", map[string]any{"title": "t"}) // ToolDef 无 risk_level → 按 mode
-			} else {
-				ev, em = newSysToolEvent("sys_send_notification", map[string]any{"title": "t"}, tc.level)
-			}
+			ev, em := newSysToolEvent("sys_send_notification", map[string]any{"title": "t"}, tc.level)
 
 			switch tc.want {
 			case "allow":
@@ -366,7 +360,7 @@ func TestHITL_SysHitlCarriesDeclaredLevel(t *testing.T) {
 	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
 	decisions := make(chan hitl.Decision, 1)
 	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
-	ev, em := newSysToolEvent("sys_send_sms", map[string]any{"to": "x"}, "always")
+	ev, em := newSysToolEvent("sys_send_sms", map[string]any{"to": "x"}, "critical")
 
 	go func() { decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionReject} }()
 	mw.OnBeforeTool(ev)
@@ -375,7 +369,221 @@ func TestHITL_SysHitlCarriesDeclaredLevel(t *testing.T) {
 	if !ok {
 		t.Fatal("no interrupt emitted for sys tool")
 	}
-	if req.RiskLevel != "always" {
-		t.Errorf("RiskLevel = %q, want always", req.RiskLevel)
+	if req.RiskLevel != "critical" {
+		t.Errorf("RiskLevel = %q, want critical", req.RiskLevel)
+	}
+}
+
+func TestHITL_MarkedToolRiskMatrix(t *testing.T) {
+	cases := []struct {
+		mode  string
+		level string
+		want  string
+	}{
+		{mode: "normal", level: "benign", want: "allow"},
+		{mode: "normal", level: "low", want: "allow"},
+		{mode: "normal", level: "medium", want: "hitl"},
+		{mode: "normal", level: "critical", want: "hitl"},
+		{mode: "normal", level: "unclassified", want: "hitl"},
+		{mode: "auto", level: "low", want: "allow"},
+		{mode: "auto", level: "medium", want: "hitl"},
+		{mode: "strict", level: "low", want: "allow"},
+		{mode: "strict", level: "medium", want: "deny"},
+		{mode: "readonly", level: "reserved", want: "deny"},
+		{mode: "off", level: "reserved", want: "allow"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.mode+"/"+tc.level, func(t *testing.T) {
+			cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: tc.mode})
+			decisions := make(chan hitl.Decision, 1)
+			mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
+			ev, em := newSysToolEvent("custom_operation", map[string]any{"value": "x"}, tc.level)
+			ev.Tool.Function.Name = "custom_operation"
+
+			switch tc.want {
+			case "allow":
+				mw.OnBeforeTool(ev)
+				if ev.Abort != nil {
+					t.Fatalf("want allow, got abort: %+v", ev.Abort)
+				}
+				if _, ok := interruptFor(t, em.tokens, ev.Tool.Function.Name); ok {
+					t.Fatal("allow must not emit interrupt")
+				}
+			case "deny":
+				mw.OnBeforeTool(ev)
+				if ev.Abort == nil {
+					t.Fatal("want deny, got pass-through")
+				}
+			case "hitl":
+				decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionApprove}
+				mw.OnBeforeTool(ev)
+				if ev.Abort != nil {
+					t.Fatalf("approved tool aborted: %+v", ev.Abort)
+				}
+				if _, ok := interruptFor(t, em.tokens, ev.Tool.Function.Name); !ok {
+					t.Fatal("want interrupt, got none")
+				}
+			}
+		})
+	}
+}
+
+func TestHITL_MissingOrInvalidMarkedRiskFailsClosedThroughHITL(t *testing.T) {
+	for _, risk := range []string{"", "not-a-risk"} {
+		t.Run(risk, func(t *testing.T) {
+			cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
+			decisions := make(chan hitl.Decision, 1)
+			mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
+			ev, em := newToolEvent("custom_operation", nil)
+			ev.ToolDef = &core.Tool{Name: "custom_operation", Metadata: map[string]string{
+				sandbox.ToolMetadataRiskLevel:          risk,
+				sandbox.ToolMetadataRequiresPermission: "true",
+			}}
+			decisions <- hitl.Decision{Type: hitl.DecisionReject}
+			mw.OnBeforeTool(ev)
+			if ev.Abort == nil {
+				t.Fatal("unclassified marked tool must not pass through")
+			}
+			if _, ok := interruptFor(t, em.tokens, "custom_operation"); !ok {
+				t.Fatal("unclassified marked tool must emit interrupt")
+			}
+		})
+	}
+}
+
+func TestHITL_UnmarkedInternalToolPassesThrough(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "strict"})
+	mw := NewHITLMiddleware(*cfg, nil)
+	ev, _ := newToolEvent("internal_operation", map[string]any{"value": "x"})
+	ev.ToolDef = &core.Tool{Name: "internal_operation"}
+
+	mw.OnBeforeTool(ev)
+	if ev.Abort != nil {
+		t.Fatalf("unmarked internal tool must pass through: %+v", ev.Abort)
+	}
+}
+
+func TestHITL_NilDecisionProviderRejectsMarkedTool(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
+	mw := NewHITLMiddleware(*cfg, nil)
+	ev, _ := newSysToolEvent("custom_operation", nil, "critical")
+
+	mw.OnBeforeTool(ev)
+	if ev.Abort == nil {
+		t.Fatal("nil decision provider must fail closed")
+	}
+}
+
+func TestHITL_ExternalAllowAlwaysPersistsStableRuleAndBypassesNextCall(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
+	decisions := make(chan hitl.Decision, 1)
+	var saved sandbox.ToolAllowRule
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithToolAllowAlways(func(rule sandbox.ToolAllowRule) error {
+		saved = rule
+		return nil
+	}))
+
+	ev, em := newSysToolEvent("custom_operation", map[string]any{"secret": "must-not-persist"}, "elevated")
+	ev.ToolDef.Metadata[sandbox.ToolMetadataAllowAlwaysKey] = "custom-operation"
+	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
+	mw.OnBeforeTool(ev)
+	if ev.Abort != nil {
+		t.Fatalf("approved external tool aborted: %+v", ev.Abort)
+	}
+	if saved.Key != "custom-operation" || saved.MaxRisk != sandbox.RiskElevated {
+		t.Fatalf("saved rule = %+v", saved)
+	}
+	if strings.Contains(saved.Desc, "secret") {
+		t.Fatal("tool arguments must not be persisted in rule")
+	}
+	if _, ok := interruptFor(t, em.tokens, "custom_operation"); !ok {
+		t.Fatal("first call should emit an interrupt")
+	}
+	req, ok := interruptFor(t, em.tokens, "custom_operation")
+	if !ok || req.AllowAlwaysKey != "custom-operation" {
+		t.Fatalf("interrupt allow_always_key = %q, want custom-operation", req.AllowAlwaysKey)
+	}
+
+	next, nextEmitter := newSysToolEvent("custom_operation", map[string]any{"secret": "different"}, "elevated")
+	next.ToolDef.Metadata[sandbox.ToolMetadataAllowAlwaysKey] = "custom-operation"
+	mw.OnBeforeTool(next)
+	if next.Abort != nil {
+		t.Fatalf("matching external rule should bypass HITL: %+v", next.Abort)
+	}
+	if _, ok := interruptFor(t, nextEmitter.tokens, "custom_operation"); ok {
+		t.Fatal("matching external rule must not emit interrupt")
+	}
+}
+
+func TestHITL_ExternalAllowAlwaysPersistenceFailureRejects(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
+	decisions := make(chan hitl.Decision, 1)
+	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithToolAllowAlways(func(sandbox.ToolAllowRule) error {
+		return errors.New("save failed")
+	}))
+	ev, _ := newSysToolEvent("custom_operation", nil, "elevated")
+	ev.ToolDef.Metadata[sandbox.ToolMetadataAllowAlwaysKey] = "custom-operation"
+
+	mw.OnBeforeTool(ev)
+	if ev.Abort == nil {
+		t.Fatal("external allow_always persistence failure must reject")
+	}
+}
+
+func TestHITL_ExternalAllowAlwaysCannotBypassStrictMode(t *testing.T) {
+	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{
+		Mode:           "strict",
+		ToolAllowRules: []sandbox.ToolAllowRuleConfig{{Key: "custom-operation", MaxRisk: "reserved"}},
+	})
+	decisions := make(chan hitl.Decision, 1)
+	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
+	ev, _ := newSysToolEvent("custom_operation", nil, "elevated")
+	ev.ToolDef.Metadata[sandbox.ToolMetadataAllowAlwaysKey] = "custom-operation"
+
+	mw.OnBeforeTool(ev)
+	if ev.Abort == nil {
+		t.Fatal("strict mode must reject despite matching external rule")
+	}
+}
+
+func TestHITL_ToolAllowRuleMatchesStableKeyAndRisk(t *testing.T) {
+	cases := []struct {
+		name   string
+		policy sandbox.ToolPolicyMetadata
+		rules  []sandbox.ToolAllowRule
+		want   bool
+	}{
+		{
+			name:   "same key within risk",
+			policy: sandbox.ToolPolicyMetadata{RiskLevel: sandbox.RiskElevated, AllowAlwaysKey: "tool"},
+			rules:  []sandbox.ToolAllowRule{{Key: "tool", MaxRisk: sandbox.RiskElevated}},
+			want:   true,
+		},
+		{
+			name:   "different key",
+			policy: sandbox.ToolPolicyMetadata{RiskLevel: sandbox.RiskMedium, AllowAlwaysKey: "other"},
+			rules:  []sandbox.ToolAllowRule{{Key: "tool", MaxRisk: sandbox.RiskReserved}},
+			want:   false,
+		},
+		{
+			name:   "risk upgrade",
+			policy: sandbox.ToolPolicyMetadata{RiskLevel: sandbox.RiskHigh, AllowAlwaysKey: "tool"},
+			rules:  []sandbox.ToolAllowRule{{Key: "tool", MaxRisk: sandbox.RiskElevated}},
+			want:   false,
+		},
+		{
+			name:   "empty key",
+			policy: sandbox.ToolPolicyMetadata{RiskLevel: sandbox.RiskMedium},
+			rules:  []sandbox.ToolAllowRule{{Key: "tool", MaxRisk: sandbox.RiskReserved}},
+			want:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := toolAllowRuleMatches(tc.rules, tc.policy); got != tc.want {
+				t.Errorf("toolAllowRuleMatches() = %t, want %t", got, tc.want)
+			}
+		})
 	}
 }

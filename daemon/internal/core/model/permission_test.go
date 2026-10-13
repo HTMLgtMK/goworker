@@ -57,7 +57,7 @@ func TestPermissionFromInterrupt_FallsBackToToolName(t *testing.T) {
 }
 
 func TestPermissionFromInterrupt_OffersOnceAndAlwaysForBash(t *testing.T) {
-	got := PermissionFromInterrupt(&hitl.InterruptRequest{ID: "req-3", ToolName: "bash", Command: "ls"})
+	got := PermissionFromInterrupt(&hitl.InterruptRequest{ID: "req-3", ToolName: "bash", Command: "ls", AllowAlways: true})
 	if len(got.Options) != 3 {
 		t.Fatalf("options = %d, want 3", len(got.Options))
 	}
@@ -75,6 +75,47 @@ func TestPermissionFromInterrupt_OffersNoAlwaysForMCP(t *testing.T) {
 		if opt.Kind == "allow_always" {
 			t.Fatalf("MCP option %q must not offer command-scoped always", opt.OptionID)
 		}
+	}
+}
+
+func TestPermissionFromInterrupt_OffersAlwaysForExternalCapability(t *testing.T) {
+	got := PermissionFromInterrupt(&hitl.InterruptRequest{
+		ID:             "req-3c",
+		ToolName:       "mcp_write",
+		AllowAlwaysKey: "mcp_filesystem_write",
+	})
+	if len(got.Options) != 3 {
+		t.Fatalf("options = %d, want 3", len(got.Options))
+	}
+	if got.Options[2].Kind != "allow_always" {
+		t.Errorf("last option = %+v, want allow_always", got.Options[2])
+	}
+}
+
+func TestPermissionFromInterrupt_UsesCapabilitiesAcrossToolKinds(t *testing.T) {
+	cases := []struct {
+		name        string
+		toolName    string
+		allowAlways bool
+		allowKey    string
+		wantOptions int
+	}{
+		{name: "bash capability", toolName: "bash", allowAlways: true, wantOptions: 3},
+		{name: "mcp without capability", toolName: "mcp_write", wantOptions: 2},
+		{name: "sys stable key", toolName: "sys_notify", allowKey: "sys_notify", wantOptions: 3},
+		{name: "custom stable key", toolName: "custom_write", allowKey: "custom-write", wantOptions: 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := PermissionFromInterrupt(&hitl.InterruptRequest{
+				ToolName:       tc.toolName,
+				AllowAlways:    tc.allowAlways,
+				AllowAlwaysKey: tc.allowKey,
+			})
+			if len(got.Options) != tc.wantOptions {
+				t.Fatalf("options = %d, want %d: %+v", len(got.Options), tc.wantOptions, got.Options)
+			}
+		})
 	}
 }
 

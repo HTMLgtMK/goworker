@@ -10,8 +10,8 @@
 
 **Rationale**:
 - 项目无重依赖偏好（宪法 II），`daemon/go.mod` 最小化；mvdan/sh 是仓库最大的新增传递依赖。
-- 分类器只需要"检测"不需要"解析"：对 `$(`、反引号、`bash -c`，只需判断"这段含注入向量"→ 整段升级 R4 + CodeExecution，无需走嵌套脚本 AST。
-- 项目特有豁免逻辑（伪设备 `pseudoDevRedirectOnly`、内置 `/dev/` 规则作用域、`env` 包装器契约）与 mvdan/sh 节点类型映射生硬，引入易回归 R1/R2 golden 测试。
+- 分类器只需要"检测"不需要"解析"：对 `$(`、反引号、`bash -c`，只需判断"这段含注入向量"→ 整段升级 high + CodeExecution，无需走嵌套脚本 AST。
+- 项目特有豁免逻辑（伪设备 `pseudoDevRedirectOnly`、内置 `/dev/` 规则作用域、`env` 包装器契约）与 mvdan/sh 节点类型映射生硬，引入易回归 low/medium golden 测试。
 
 **Alternatives considered**:
 - mvdan/sh（`syntax.NewParser`）：完整 AST，能精确解析但重、且与项目豁免逻辑不匹配。
@@ -19,12 +19,12 @@
 
 ## 2. 风险等级粒度
 
-**Decision**: R0-R7 八级，其中 **R6 = unclassified（信任缺口）**，R7 = reserved（模型预留）。
+**Decision**: benign-reserved 八级，其中 **unclassified = unclassified（信任缺口）**，reserved = reserved（模型预留）。
 
 **Rationale**:
-- R0-R5 覆盖 只读 → 工作区写 → 提升/破坏 → 提权/密钥/代码执行 → denylist 的语义阶梯，与现有 `safeReadonlyCmds`/`flagCheckCmds`/denylist 能力映射自然。
-- R6 独立于安全等级：它是"无法分类"的状态，默认进 HITL（宪法 III：Unknown≠Safe），不是"介于 R5/R7 之间的风险"。
-- R7 reserved 为 future model 的分类输出留位，避免后续 schema 翻动。
+- benign-critical 覆盖 只读 → 工作区写 → 提升/破坏 → 提权/密钥/代码执行 → denylist 的语义阶梯，与现有 `safeReadonlyCmds`/`flagCheckCmds`/denylist 能力映射自然。
+- unclassified 独立于安全等级：它是"无法分类"的状态，默认进 HITL（宪法 III：Unknown≠Safe），不是"介于 critical/reserved 之间的风险"。
+- reserved reserved 为 future model 的分类输出留位，避免后续 schema 翻动。
 
 **Alternatives considered**:
 - 三态布尔（现状）：无法表达"工作区内写 vs 提权"的差异，策略只能一刀切。

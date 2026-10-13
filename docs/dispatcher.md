@@ -199,9 +199,12 @@ general 任务无 git 收尾，approve 即完成。
 
 ## 10. 风险与开放问题
 
-- **worker 的 bash 不受 ai-sandbox 门禁**：worker 是独立进程，自己的工具自成沙箱；
+- **worker 的 bash 不受 dispatcher 进程的 ai-sandbox 门禁**：worker 是独立进程，自己的工具自成沙箱；
   dispatcher 的安全边界是 worktree 隔离 + 合并审批。zcode worker 可经 worker env
   `GOWORKER_SANDBOX_MODE=strict|readonly|...` 下发收紧（worker 启动时覆盖本地配置）
+- **worker 外部工具策略**：MCP/sys/显式注册工具通过 `risk_level=benign..reserved`、
+  `requires_permission=true` 和稳定 `allow_always_key` 接入 worker 的统一 HITL；缺失/非法等级按 unclassified，
+  `auto_max_risk` 控制 auto 模式，永久授权不保存原始参数。
 - **request_permission 无人值守策略**：已配置化——worker 级 `on_permission: deny`（默认）| `allow`（自动选首个 allow 类 option），deny 时拒绝并记审计
 - **MCP 对照**：MCP 方案更简单但缺任务生命周期语义（无 permission 回调标准流、无 session 恢复）；
   ACP 的 `session/load` 支持崩溃恢复 dispatcher 侧任务，这是选 ACP 的核心收益之一

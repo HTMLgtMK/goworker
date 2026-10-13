@@ -46,13 +46,41 @@ func testHub(cfg *runtimeconfig.Config) (*model.Hub, *[]*runtimeconfig.Config) {
 	return hub, &saved
 }
 
+func TestCollectToolsPreservesRegisteredToolMetadata(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	hub, _ := testHub(cfg)
+	hub.Tools = func() []model.Tool {
+		return []model.Tool{{
+			Name:        "custom_write",
+			Description: "custom tool",
+			Metadata: map[string]string{
+				"risk_level":          "medium",
+				"requires_permission": "true",
+				"allow_always_key":    "custom_write",
+			},
+		}}
+	}
+	p := &AgentPlugin{hub: hub, cfg: cfg}
+
+	for _, tool := range p.collectTools(nil) {
+		if tool.Name != "custom_write" {
+			continue
+		}
+		if tool.Metadata["risk_level"] != "medium" || tool.Metadata["requires_permission"] != "true" || tool.Metadata["allow_always_key"] != "custom_write" {
+			t.Fatalf("metadata = %#v, want registered policy metadata", tool.Metadata)
+		}
+		return
+	}
+	t.Fatal("custom tool was not collected")
+}
+
 func TestAgentPluginPersistAllowRule(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	hub, saved := testHub(cfg)
 	p := &AgentPlugin{hub: hub, cfg: cfg}
 	rule := sandbox.AllowRule{
 		MatchTokens: []string{"git", "push"},
-		MaxRisk:     sandbox.RiskR4,
+		MaxRisk:     sandbox.RiskHigh,
 		Effects:     sandbox.Effects(sandbox.EffectNetwork),
 	}
 
@@ -63,7 +91,7 @@ func TestAgentPluginPersistAllowRule(t *testing.T) {
 		t.Fatalf("rules=%v saves=%d, want one rule and one save", cfg.Sandbox.AllowRules, len(*saved))
 	}
 	got := cfg.Sandbox.AllowRules[0]
-	if got.Match != "git push" || got.MaxRisk != "R4" || len(got.Effects) != 1 || got.Effects[0] != "network" {
+	if got.Match != "git push" || got.MaxRisk != "high" || len(got.Effects) != 1 || got.Effects[0] != "network" {
 		t.Errorf("persisted rule = %+v", got)
 	}
 	if err := p.persistAllowRule(rule); err != nil {
@@ -71,6 +99,73 @@ func TestAgentPluginPersistAllowRule(t *testing.T) {
 	}
 	if len(cfg.Sandbox.AllowRules) != 1 || len(*saved) != 1 {
 		t.Errorf("duplicate rule was persisted: rules=%v saves=%d", cfg.Sandbox.AllowRules, len(*saved))
+	}
+}
+
+func TestAgentPluginPersistToolAllowRule(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	hub, saved := testHub(cfg)
+	p := &AgentPlugin{hub: hub, cfg: cfg}
+	rule := sandbox.ToolAllowRule{Key: "mcp_filesystem_write", MaxRisk: sandbox.RiskElevated, Desc: "trusted writer"}
+
+	if err := p.persistToolAllowRule(rule); err != nil {
+		t.Fatalf("persistToolAllowRule: %v", err)
+	}
+	if len(cfg.Sandbox.ToolAllowRules) != 1 || len(*saved) != 1 {
+		t.Fatalf("rules=%v saves=%d, want one rule and one save", cfg.Sandbox.ToolAllowRules, len(*saved))
+	}
+	got := cfg.Sandbox.ToolAllowRules[0]
+	if got.Key != rule.Key || got.MaxRisk != "elevated" || got.Desc != rule.Desc {
+		t.Errorf("persisted rule = %+v", got)
+	}
+	if err := p.persistToolAllowRule(rule); err != nil {
+		t.Fatalf("duplicate persistToolAllowRule: %v", err)
+	}
+	if len(cfg.Sandbox.ToolAllowRules) != 1 || len(*saved) != 1 {
+		t.Errorf("duplicate rule was persisted: rules=%v saves=%d", cfg.Sandbox.ToolAllowRules, len(*saved))
+	}
+}
+
+func TestAgentPluginPersistToolAllowRuleConcurrentDeduplicates(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	hub, saved := testHub(cfg)
+	p := &AgentPlugin{hub: hub, cfg: cfg}
+	rule := sandbox.ToolAllowRule{Key: "mcp_filesystem_write", MaxRisk: sandbox.RiskElevated}
+
+	const calls = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, calls)
+	for i := 0; i < calls; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- p.persistToolAllowRule(rule)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("persistToolAllowRule: %v", err)
+		}
+	}
+	if len(cfg.Sandbox.ToolAllowRules) != 1 || len(*saved) != 1 {
+		t.Fatalf("concurrent rules=%v saves=%d, want one rule and one save", cfg.Sandbox.ToolAllowRules, len(*saved))
+	}
+}
+
+func TestAgentPluginPersistToolAllowRuleRollsBackOnSaveFailure(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	hub, _ := testHub(cfg)
+	hub.SaveConfig = func(any) error { return errors.New("disk full") }
+	p := &AgentPlugin{hub: hub, cfg: cfg}
+
+	err := p.persistToolAllowRule(sandbox.ToolAllowRule{Key: "mcp_write", MaxRisk: sandbox.RiskMedium})
+	if err == nil {
+		t.Fatal("save failure should be returned")
+	}
+	if len(cfg.Sandbox.ToolAllowRules) != 0 {
+		t.Fatalf("failed save mutated tool rules: %+v", cfg.Sandbox.ToolAllowRules)
 	}
 }
 
@@ -551,8 +646,8 @@ func TestMCPToolToCore_ExecuteCallsServer(t *testing.T) {
 	if !ok {
 		t.Fatal("conversion failed")
 	}
-	if tool.Name != "mcp_db_query" {
-		t.Errorf("name = %q, want mcp_db_query", tool.Name)
+	if tool.Metadata["risk_level"] != "unclassified" || tool.Metadata["requires_permission"] != "true" || tool.Metadata["allow_always_key"] != tool.Name {
+		t.Errorf("metadata = %#v, want canonical MCP policy metadata", tool.Metadata)
 	}
 	out, err := tool.Execute(context.Background(), map[string]any{"sql": "select 1"})
 	if err != nil || out != "result!" {

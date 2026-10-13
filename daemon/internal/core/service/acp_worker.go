@@ -88,14 +88,15 @@ func (w *acpWorker) setSession(sessionID, cwd string) {
 	}
 
 	w.sessions[sessionID] = runtimeagent.NewSession(runtimeagent.SessionDeps{
-		Config:           w.deps.Config,
-		AuditDir:         w.deps.AuditDir,
-		CWD:              cwd,
-		Memory:           nil,
-		CollectTools:     collectTools,
-		NewProvider:      ProviderFactory(acpHTTPClient()),
-		Store:            nil, // worker 会话由调用方管理生命周期，本地不持久化
-		PersistAllowRule: w.persistAllowRule,
+		Config:               w.deps.Config,
+		AuditDir:             w.deps.AuditDir,
+		CWD:                  cwd,
+		Memory:               nil,
+		CollectTools:         collectTools,
+		NewProvider:          ProviderFactory(acpHTTPClient()),
+		Store:                nil, // worker 会话由调用方管理生命周期，本地不持久化
+		PersistAllowRule:     w.persistAllowRule,
+		PersistToolAllowRule: w.persistToolAllowRule,
 	})
 }
 
@@ -128,6 +129,30 @@ func (w *acpWorker) persistAllowRule(rule sandbox.AllowRule) error {
 		w.deps.Config.Sandbox.AllowRules,
 		candidate,
 	)
+	return nil
+}
+
+func (w *acpWorker) persistToolAllowRule(rule sandbox.ToolAllowRule) error {
+	if w.deps.Config == nil {
+		return fmt.Errorf("acp worker: runtime config is nil")
+	}
+	if strings.TrimSpace(rule.Key) == "" {
+		return fmt.Errorf("acp worker: tool allow rule has empty key")
+	}
+
+	candidate := sandbox.ToolAllowRuleConfig{
+		Key:     rule.Key,
+		MaxRisk: rule.MaxRisk.String(),
+		Desc:    rule.Desc,
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, existing := range w.deps.Config.Sandbox.ToolAllowRules {
+		if existing.Key == candidate.Key && existing.MaxRisk == candidate.MaxRisk && existing.Desc == candidate.Desc {
+			return nil
+		}
+	}
+	w.deps.Config.Sandbox.ToolAllowRules = append(w.deps.Config.Sandbox.ToolAllowRules, candidate)
 	return nil
 }
 

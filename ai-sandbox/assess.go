@@ -7,29 +7,29 @@ import (
 
 // writeCommandLevels 结构化写命令表：命令 → 风险等级 + 副作用。
 // 这是"规则 ≠ 模型"方向：结构化命令知识替代纯字符串正则，同时喂给 Effects。
-// 分级依据：写工作区=R2、破坏/移动/权限变更=R3、提权/进程控制=R4、denylist 级=R5。
+// 分级依据：写工作区=medium、破坏/移动/权限变更=elevated、提权/进程控制=high、denylist 级=critical。
 var writeCommandLevels = map[string]struct {
 	level   RiskLevel
 	effects Effects
 }{
-	"rm":       {RiskR3, Effects(EffectDestructive)},
-	"mv":       {RiskR3, Effects(EffectFileWrite)},
-	"dd":       {RiskR3, Effects(EffectDestructive)},
-	"cp":       {RiskR2, Effects(EffectFileWrite)},
-	"touch":    {RiskR2, Effects(EffectFileWrite)},
-	"mkdir":    {RiskR2, Effects(EffectFileWrite)},
-	"rmdir":    {RiskR2, Effects(EffectFileWrite)},
-	"ln":       {RiskR2, Effects(EffectFileWrite)},
-	"tee":      {RiskR2, Effects(EffectFileWrite)},
-	"truncate": {RiskR2, Effects(EffectFileWrite)},
-	"chmod":    {RiskR4, Effects(EffectPrivileged)},
-	"chown":    {RiskR4, Effects(EffectPrivileged)},
-	"kill":     {RiskR4, Effects(EffectProcessSpawn)},
-	"pkill":    {RiskR4, Effects(EffectProcessSpawn)},
-	"killall":  {RiskR4, Effects(EffectProcessSpawn)},
-	"mkfs":     {RiskR5, Effects(EffectDestructive)},
-	"shutdown": {RiskR4, Effects(EffectProcessSpawn)},
-	"reboot":   {RiskR4, Effects(EffectProcessSpawn)},
+	"rm":       {RiskElevated, Effects(EffectDestructive)},
+	"mv":       {RiskElevated, Effects(EffectFileWrite)},
+	"dd":       {RiskElevated, Effects(EffectDestructive)},
+	"cp":       {RiskMedium, Effects(EffectFileWrite)},
+	"touch":    {RiskMedium, Effects(EffectFileWrite)},
+	"mkdir":    {RiskMedium, Effects(EffectFileWrite)},
+	"rmdir":    {RiskMedium, Effects(EffectFileWrite)},
+	"ln":       {RiskMedium, Effects(EffectFileWrite)},
+	"tee":      {RiskMedium, Effects(EffectFileWrite)},
+	"truncate": {RiskMedium, Effects(EffectFileWrite)},
+	"chmod":    {RiskHigh, Effects(EffectPrivileged)},
+	"chown":    {RiskHigh, Effects(EffectPrivileged)},
+	"kill":     {RiskHigh, Effects(EffectProcessSpawn)},
+	"pkill":    {RiskHigh, Effects(EffectProcessSpawn)},
+	"killall":  {RiskHigh, Effects(EffectProcessSpawn)},
+	"mkfs":     {RiskCritical, Effects(EffectDestructive)},
+	"shutdown": {RiskHigh, Effects(EffectProcessSpawn)},
+	"reboot":   {RiskHigh, Effects(EffectProcessSpawn)},
 }
 
 // readNetworkCmds 只读但跨网络的命令 → 审计标 Network 副作用。
@@ -41,7 +41,7 @@ var readNetworkCmds = map[string]bool{"curl": true, "wget": true}
 //	denylist → 三态分类(safe/unsafe) → 写命令表 → readonly 扫描 → risky pattern → unclassified
 func Assess(cmd string, cfg *Config) RiskAssessment {
 	if cfg == nil || cfg.Mode == ModeOff {
-		return RiskAssessment{Level: RiskR0, Source: SourceBypass, Confidence: 1}
+		return RiskAssessment{Level: RiskBenign, Source: SourceBypass, Confidence: 1}
 	}
 
 	// 1. denylist：硬拒。伪设备豁免只作用于内置 `>\s*/dev/` 规则。
@@ -54,11 +54,12 @@ func Assess(cmd string, cfg *Config) RiskAssessment {
 		}
 		// denylist 保守双标副作用：破坏 + 代码执行都可能。审计偏保守无害，决策不受影响（恒 deny）。
 		return RiskAssessment{
-			Level:      RiskR5,
+			Level:      RiskCritical,
 			Effects:    Effects(EffectDestructive).Add(EffectCodeExecution),
 			Reasons:    []Reason{{Code: "deny_pattern", Pattern: p.String(), Detail: "拒绝执行的危险命令"}},
 			Source:     SourceRule,
 			Confidence: 1,
+			HardDeny:   true,
 		}
 	}
 
@@ -74,10 +75,10 @@ func Assess(cmd string, cfg *Config) RiskAssessment {
 		}
 	}
 
-	// 2. 三态分类：safe 直接放行（R1）；unsafe（带写参数/重定向）交给 assessUnsafe。
+	// 2. 三态分类：safe 直接放行（low）；unsafe（带写参数/重定向）交给 assessUnsafe。
 	if verdict, reason := classifyCmd(cmd, cfg.SafeCommands); verdict == verdictSafe {
 		return RiskAssessment{
-			Level:      RiskR1,
+			Level:      RiskLow,
 			Effects:    assessReadEffects(cmd),
 			Reasons:    []Reason{{Code: "safe_readonly", Detail: reason}},
 			Source:     SourceClassifier,
@@ -101,7 +102,7 @@ func Assess(cmd string, cfg *Config) RiskAssessment {
 	// 3b. readonly 模式：覆盖 verdictUnknown 的写特征（cp/mv 等）。
 	if cfg.ReadOnly && hasWriteOps(cmd) {
 		return RiskAssessment{
-			Level:      RiskR2,
+			Level:      RiskMedium,
 			Effects:    Effects(EffectFileWrite),
 			Reasons:    []Reason{{Code: "write_op", Detail: "只读模式检测到写操作"}},
 			Source:     SourceHeuristic,
@@ -109,7 +110,7 @@ func Assess(cmd string, cfg *Config) RiskAssessment {
 		}
 	}
 
-	// 3c. risky pattern 命中 → 等级/副作用映射（默认 R2）。
+	// 3c. risky pattern 命中 → 等级/副作用映射（默认 medium）。
 	if lv, eff, pat, ok := assessRiskyPattern(cmd, cfg); ok {
 		return RiskAssessment{
 			Level:      lv,
@@ -120,9 +121,9 @@ func Assess(cmd string, cfg *Config) RiskAssessment {
 		}
 	}
 
-	// 3d. 什么都没命中 → R6 unclassified，默认不信任（Unknown ≠ Safe）。
+	// 3d. 什么都没命中 → unclassified unclassified，默认不信任（Unknown ≠ Safe）。
 	return RiskAssessment{
-		Level:      RiskR6,
+		Level:      RiskUnclassified,
 		Reasons:    []Reason{{Code: "unclassified", Detail: "无法分类的命令，默认不信任"}},
 		Source:     SourceUnclassified,
 		Confidence: 0,
@@ -150,7 +151,7 @@ func assessUnsafe(cmd string) RiskAssessment {
 	if hasFileRedirect(cmd) {
 		effects = effects.Add(EffectFileWrite)
 	}
-	level := RiskR2 // unsafe 至少 R2
+	level := RiskMedium // unsafe 至少 medium
 
 	for _, seg := range splitShellSegments(cmd) {
 		name, args := splitMain(seg)
@@ -189,10 +190,10 @@ func assessUnsafe(cmd string) RiskAssessment {
 			eff := Effects(EffectNetwork).Add(EffectFileWrite)
 			if hasArg(args, "--force", "-f", "--force-with-lease") {
 				eff = eff.Add(EffectDestructive)
-				level = maxLevel(level, RiskR3)
+				level = maxLevel(level, RiskElevated)
 			}
 			effects = effects | eff
-			level = maxLevel(level, RiskR2)
+			level = maxLevel(level, RiskMedium)
 		}
 	}
 
@@ -255,7 +256,7 @@ func wgetSavesFile(args []string) bool {
 }
 
 // assessRiskyPattern 命中 risky 模式时返回等级 + 副作用 + 模式原文。
-// 未映射的模式保守默认 R2。
+// 未映射的模式保守默认 medium。
 func assessRiskyPattern(cmd string, cfg *Config) (RiskLevel, Effects, string, bool) {
 	for _, p := range cfg.RiskyPatterns {
 		if !p.MatchString(cmd) {
@@ -264,7 +265,7 @@ func assessRiskyPattern(cmd string, cfg *Config) (RiskLevel, Effects, string, bo
 		patStr := p.String()
 		lv := riskPatternLevel[patStr]
 		if lv == 0 {
-			lv = RiskR2
+			lv = RiskMedium
 		}
 		return lv, riskPatternEffects[patStr], patStr, true
 	}

@@ -76,21 +76,23 @@ session/new 后：agent ── x-device/tools（探测请求）──→ client
                  ← {tools: [{name, description, schema, risk_level}]}
                  （method-not-found / 超时 / 非法条目 → 视为无能力，不注册工具）
 
-LLM 调 sys_<name> → HITL 门控（risk_level × 沙箱模式，见下）→ 通过后：
+LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下）→ 通过后：
                  agent ── x-device/call {name, arguments} ──→ client 执行
                  ← {result: "<文本结果回给 LLM>"}
 ```
 
-- **工具名强制 `sys_` 前缀**（worker 添加）：与 bash/mcp 命名空间隔离，且自动进 HITL 门控
-- **risk_level 声明**（`never | mode | always`，缺省 mode）：
+- **工具名强制 `sys_` 前缀**（worker 添加）：与 bash/mcp 命名空间隔离。
+- **metadata 声明**：客户端应发送 `risk_level: benign..reserved`；需要统一门控的工具还应发送 `requires_permission: true`。worker 为 gated 工具补充稳定的 `allow_always_key: sys_<name>`。
+- **兼容旧客户端**：`never → low`（直通）、`mode → unclassified`、`always → critical + permission_policy=always_hitl`；旧值只在 relay 边界转换，runtime 内部统一使用 benign-reserved。
 
-  | | normal | strict / readonly | off |
-  |---|---|---|---|
-  | never | 放行 | 放行 | 放行 |
-  | mode（默认） | **询问** | 拒绝 | 放行 |
-  | always | **询问** | 拒绝 | **询问** |
+  | mode | benign/low | medium-reserved |
+  |---|---|---|
+  | normal | 放行 | HITL |
+  | auto | `<= auto_max_risk` 放行，否则 HITL | HITL |
+  | strict / readonly | 放行 | 拒绝 |
+  | off | 放行（`always_hitl` 仍询问） | 放行（`always_hitl` 仍询问） |
 
-- **实现位置**：worker 中继 `daemon/internal/core/service/sys_relay.go`；裁决 `ai-runtime/middlewares/hitl.go checkSys`（读 `BeforeToolEvent.ToolDef.Metadata["risk_level"]`）；执行器在 Kotlin `DeviceTools` 注册表
+- **实现位置**：worker 中继 `daemon/internal/core/service/sys_relay.go`；统一裁决 `ai-runtime/middlewares/hitl.go`；执行器在 Kotlin `DeviceTools` 注册表
 - **每加一个能力的成本 = Kotlin 一处**（注册描述符 + handler），Go/协议零改动、无需重绑 AAR 之外的任何东西
 
 **客户端义务**：对不认识的带 id 请求必须自动回 -32601（JSON-RPC 标准行为）——

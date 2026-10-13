@@ -86,6 +86,33 @@ func TestAskPermissionPolicy_ForwardsUserChoice(t *testing.T) {
 }
 
 // 对端应答为空串不能当成"没意见"，必须显式失败（失败方向 = 拒绝）。
+func TestAskPermissionPolicy_ForwardsAllowAlwaysChoice(t *testing.T) {
+	p, _ := newTestPlugin(t)
+	server := newACPPeer(t, func(req protocol.PermissionRequest) (any, error) {
+		for _, option := range req.Options {
+			if option.Kind == "allow_always" {
+				return protocol.SelectedPermissionOutcome(option.OptionID), nil
+			}
+		}
+		return protocol.SelectedPermissionOutcome("unknown"), nil
+	})
+	p.addACPRoute("task_always", acpRoute{server: server, sessionID: "sess-1"})
+
+	req := testPermissionRequest()
+	req.Options = append(req.Options, protocol.PermissionOption{
+		OptionID: "allow_always",
+		Name:     "Allow always",
+		Kind:     "allow_always",
+	})
+	optionID, err := p.askPermissionPolicy("task_always")(context.Background(), req)
+	if err != nil {
+		t.Fatalf("askPermissionPolicy: %v", err)
+	}
+	if optionID != "allow_always" {
+		t.Errorf("optionID = %q, want allow_always", optionID)
+	}
+}
+
 func TestAskPermissionPolicy_EmptyAnswerDenies(t *testing.T) {
 	p, _ := newTestPlugin(t)
 	server := newACPPeer(t, func(protocol.PermissionRequest) (any, error) {

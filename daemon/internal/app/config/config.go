@@ -73,28 +73,37 @@ func (r *RiskPatternConfig) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type SandboxConfig struct {
-	Mode           string              `yaml:"mode"`
-	AllowedWorkDir string              `yaml:"allowed_work_dir"`      // 空 = 使用当前目录
-	DeniedPatterns []string            `yaml:"denied_patterns"`       // 空 = 使用 sandbox 默认
-	RiskyPatterns  []RiskPatternConfig `yaml:"risky_patterns"`        // 空 = 使用 sandbox 默认
-	SafeCommands   []string            `yaml:"safe_commands"`         // 追加的只读安全命令名（直接放行）
-	AllowRules     []AllowRuleConfig   `yaml:"allow_rules,omitempty"` // 用户预批准规则（normal 模式免确认）
-	AuditLog       bool                `yaml:"audit_log,omitempty"`   // 决策审计 jsonl 落盘（默认关）
+	Mode           string                `yaml:"mode"`
+	AutoMaxRisk    string                `yaml:"auto_max_risk,omitempty"`
+	AllowedWorkDir string                `yaml:"allowed_work_dir"`      // 空 = 使用当前目录
+	DeniedPatterns []string              `yaml:"denied_patterns"`       // 空 = 使用 sandbox 默认
+	RiskyPatterns  []RiskPatternConfig   `yaml:"risky_patterns"`        // 空 = 使用 sandbox 默认
+	SafeCommands   []string              `yaml:"safe_commands"`         // 追加的只读安全命令名（直接放行）
+	AllowRules     []AllowRuleConfig     `yaml:"allow_rules,omitempty"` // 用户预批准规则（normal 模式免确认）
+	ToolAllowRules []ToolAllowRuleConfig `yaml:"tool_allow_rules,omitempty"`
+	AuditLog       bool                  `yaml:"audit_log,omitempty"` // 决策审计 jsonl 落盘（默认关）
 }
 
 // AllowRuleConfig 是一条用户预批准规则：命令 token 前缀 + 风险上限 + 允许副作用子集。
 // Match 用 token 前缀匹配（非正则，避免配置注入），如 "git push" 命中 `git push --force origin`。
 type AllowRuleConfig struct {
 	Match   string   `yaml:"match"`             // 归一化主命令 token 前缀："git push"
-	MaxRisk string   `yaml:"max_risk"`          // "R0".."R7"，超过该等级的命令不放行
+	MaxRisk string   `yaml:"max_risk"`          // "benign".."reserved"，超过该等级的命令不放行
 	Effects []string `yaml:"effects,omitempty"` // 允许的副作用子集，空 = 全部允许
 	Desc    string   `yaml:"desc,omitempty"`    // 人类可读描述
 }
 
-// ToSandbox 把解析层（含双格式兼容）转成 ai-sandbox 的运行时 DTO。
+// ToolAllowRuleConfig 是外部工具的用户持久化授权。
+type ToolAllowRuleConfig struct {
+	Key     string `yaml:"key"`
+	MaxRisk string `yaml:"max_risk"`
+	Desc    string `yaml:"desc,omitempty"`
+}
+
 func (s SandboxConfig) ToSandbox() sandbox.SandboxConfig {
 	out := sandbox.SandboxConfig{
 		Mode:           s.Mode,
+		AutoMaxRisk:    s.AutoMaxRisk,
 		AllowedWorkDir: s.AllowedWorkDir,
 		DeniedPatterns: s.DeniedPatterns,
 		SafeCommands:   s.SafeCommands,
@@ -106,6 +115,9 @@ func (s SandboxConfig) ToSandbox() sandbox.SandboxConfig {
 	for _, a := range s.AllowRules {
 		out.AllowRules = append(out.AllowRules, sandbox.AllowRuleConfig{Match: a.Match, MaxRisk: a.MaxRisk, Effects: a.Effects, Desc: a.Desc})
 	}
+	for _, a := range s.ToolAllowRules {
+		out.ToolAllowRules = append(out.ToolAllowRules, sandbox.ToolAllowRuleConfig{Key: a.Key, MaxRisk: a.MaxRisk, Desc: a.Desc})
+	}
 	return out
 }
 
@@ -113,6 +125,7 @@ func (s SandboxConfig) ToSandbox() sandbox.SandboxConfig {
 func fromSandbox(s sandbox.SandboxConfig) SandboxConfig {
 	out := SandboxConfig{
 		Mode:           s.Mode,
+		AutoMaxRisk:    s.AutoMaxRisk,
 		AllowedWorkDir: s.AllowedWorkDir,
 		DeniedPatterns: s.DeniedPatterns,
 		SafeCommands:   s.SafeCommands,
@@ -123,6 +136,9 @@ func fromSandbox(s sandbox.SandboxConfig) SandboxConfig {
 	}
 	for _, a := range s.AllowRules {
 		out.AllowRules = append(out.AllowRules, AllowRuleConfig{Match: a.Match, MaxRisk: a.MaxRisk, Effects: a.Effects, Desc: a.Desc})
+	}
+	for _, a := range s.ToolAllowRules {
+		out.ToolAllowRules = append(out.ToolAllowRules, ToolAllowRuleConfig{Key: a.Key, MaxRisk: a.MaxRisk, Desc: a.Desc})
 	}
 	return out
 }
@@ -479,6 +495,12 @@ func Load(path string) *Config {
 		cfg.LLM.DefaultProvider = "openai"
 	}
 	cfg.LLM = cfg.LLM.WithDefaults()
+	if cfg.Sandbox.AutoMaxRisk != "" {
+		if _, err := sandbox.ParseRiskLevel(cfg.Sandbox.AutoMaxRisk); err != nil {
+			slog.Error("config: invalid sandbox.auto_max_risk", "err", err)
+			return nil
+		}
+	}
 	if err := cfg.LLM.Validate(); err != nil {
 		slog.Error("config: invalid LLM configuration", "err", err)
 		return nil

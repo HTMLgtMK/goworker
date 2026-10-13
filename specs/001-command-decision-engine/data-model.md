@@ -20,9 +20,9 @@ CommandRequest ──Assess()──▶ RiskAssessment ──Policy.Decide()─�
 
 ### RiskLevel
 
-- **Purpose**: 命令的风险分级。R0-R5 语义阶梯，R6 是"无法分类"（信任缺口，非安全等级），R7 模型预留。
-- **Values**: R0 benign / R1 low / R2 medium（工作区内写）/ R3 elevated（工作区内破坏·移动·权限）/ R4 high（提权·密钥·代码执行）/ R5 critical（denylist）/ R6 unclassified / R7 reserved
-- **Validation**: 序列化为 "R0".."R7"；`ParseRiskLevel` 拒绝非法输入。
+- **Purpose**: 命令的风险分级。benign-critical 语义阶梯，unclassified 是"无法分类"（信任缺口，非安全等级），reserved 模型预留。
+- **Values**: benign（只读、无副作用）/ low / medium（工作区内写）/ elevated（工作区内破坏·移动·权限）/ high（提权·密钥·代码执行）/ critical / unclassified / reserved
+- **Validation**: 序列化为 "benign".."reserved"；`ParseRiskLevel` 拒绝非法输入。
 
 ### Effects (uint32 位集)
 
@@ -85,7 +85,7 @@ CommandRequest ──Assess()──▶ RiskAssessment ──Policy.Decide()─�
 | Timestamp | time.Time | 记录时间 |
 | Command | string | 原始命令 |
 | Cwd | string, omitempty | 工作目录 |
-| RiskLevel | string | "R3" |
+| RiskLevel | string | "elevated" |
 | Effects | []string | Names() |
 | Reasons | []Reason | 含稳定 code |
 | Source | string | 判定来源 |

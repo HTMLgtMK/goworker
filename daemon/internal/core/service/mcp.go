@@ -103,6 +103,11 @@ func (p *AgentPlugin) mcpToolToCore(c mcp.Client, server string, t mcp.Tool) (co
 		Name:        name,
 		Description: t.Description,
 		Parameters:  runtimeagent.NormalizeSchema(t.InputSchema),
+		Metadata: map[string]string{
+			"risk_level":          "unclassified",
+			"requires_permission": "true",
+			"allow_always_key":    name,
+		},
 		Execute: func(ctx context.Context, args map[string]any) (string, error) {
 			ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
