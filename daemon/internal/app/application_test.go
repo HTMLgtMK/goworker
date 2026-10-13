@@ -45,4 +45,12 @@ func TestNew_DefaultConfig(t *testing.T) {
 	if got := appl.Engine.HasPlugin("agent"); got != wantAgentPlugin() {
 		t.Fatalf("agent plugin registered = %v, want %v", got, wantAgentPlugin())
 	}
+	source, sourceErr := appl.SessionSource()
+	if wantAgentPlugin() {
+		if sourceErr != nil || source == nil {
+			t.Fatalf("SessionSource() = (%#v, %v), want capability", source, sourceErr)
+		}
+	} else if sourceErr == nil || source != nil {
+		t.Fatalf("SessionSource() = (%#v, %v), want unavailable", source, sourceErr)
+	}
 }

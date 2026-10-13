@@ -2,4 +2,4 @@
 
 package builtin
 
-import _ "github.com/tinguo/goworker/daemon/internal/dispatcher"
+import _ "github.com/tinguo/goworker/daemon/internal/plugins/dispatcher"

@@ -25,6 +25,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/ai-sandbox"
+	"github.com/tinguo/goworker/daemon/internal/core/acp"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -85,6 +86,9 @@ func (p *AgentPlugin) Init(h *model.Hub) error {
 	defer func() {
 		if !ok {
 			p.closeMCP()
+			if h.UnregisterCapability != nil {
+				h.UnregisterCapability(model.SessionSourceCapability)
+			}
 		}
 	}()
 
@@ -173,6 +177,11 @@ func (p *AgentPlugin) Init(h *model.Hub) error {
 
 	// 未匹配的任何命令都转发给 agent 处理
 	h.SetFallbackHandler(p.handleAgent)
+	if h.RegisterCapability != nil {
+		if err := h.RegisterCapability(model.SessionSourceCapability, p); err != nil {
+			return fmt.Errorf("agent: register session capability: %w", err)
+		}
+	}
 
 	ok = true
 	return nil
@@ -181,6 +190,9 @@ func (p *AgentPlugin) Init(h *model.Hub) error {
 func (p *AgentPlugin) Start() error { return nil }
 
 func (p *AgentPlugin) Stop() error {
+	if p.hub != nil && p.hub.UnregisterCapability != nil {
+		p.hub.UnregisterCapability(model.SessionSourceCapability)
+	}
 	// MCP server 是外部进程，退出时统一回收，避免残留孤儿进程
 	p.closeMCP()
 	if p.memory != nil {
@@ -309,7 +321,7 @@ func (p *AgentPlugin) startSession() {
 
 	// 会话层组装：资源就绪后构造 deps 与首会话。
 
-	modelProvider := ProviderFactory(client)
+	modelProvider := acp.ProviderFactory(client)
 
 	p.deps = runtimeagent.SessionDeps{
 		Config:               p.cfg,

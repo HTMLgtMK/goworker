@@ -28,6 +28,7 @@ type Engine struct {
 	tools           map[string]model.Tool
 	interceptors    []model.PluginInterceptor
 	listeners       []func(model.Event)
+	capabilities    map[string]any
 	fallbackHandler func(ctx *model.Context) error // 未匹配命令的兜底处理器
 }
 
@@ -49,6 +50,7 @@ func NewEngine(cfg *config.Config, runtimeCfg *runtimeconfig.Config, l *logger.L
 		tools:        make(map[string]model.Tool),
 		interceptors: make([]model.PluginInterceptor, 0),
 		listeners:    make([]func(model.Event), 0),
+		capabilities: make(map[string]any),
 	}
 }
 
@@ -91,6 +93,29 @@ func (e *Engine) saveConfig(cfg any, save func(*config.Config, string) error) er
 // 当用户输入不是任何已注册命令时，引擎会调用此 handler 而非返回错误。
 func (e *Engine) SetFallbackHandler(fn func(ctx *model.Context) error) {
 	e.fallbackHandler = fn
+}
+
+func (e *Engine) RegisterCapability(name string, capability any) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("capability name is required")
+	}
+	if capability == nil {
+		return fmt.Errorf("capability %q is nil", name)
+	}
+	if _, exists := e.capabilities[name]; exists {
+		return fmt.Errorf("capability %q already registered", name)
+	}
+	e.capabilities[name] = capability
+	return nil
+}
+
+func (e *Engine) Capability(name string) (any, bool) {
+	capability, ok := e.capabilities[name]
+	return capability, ok
+}
+
+func (e *Engine) UnregisterCapability(name string) {
+	delete(e.capabilities, name)
 }
 
 // ---- Middleware ----
@@ -167,6 +192,9 @@ func (e *Engine) pluginHub() *model.Hub {
 		SetFallbackHandler: func(fn func(ctx *model.Context) error) {
 			e.SetFallbackHandler(fn)
 		},
+		RegisterCapability:   e.RegisterCapability,
+		Capability:           e.Capability,
+		UnregisterCapability: e.UnregisterCapability,
 	}
 }
 

@@ -75,6 +75,30 @@ func TestRegisterPluginInitializesAndRejectsInvalidRegistrations(t *testing.T) {
 	}
 }
 
+func TestCapabilityRegistrationAndLookup(t *testing.T) {
+	e := newTestEngine()
+	plugin := &testPlugin{name: "provider"}
+	if err := e.Register(plugin); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	capability := &struct{ ready bool }{ready: true}
+	if err := plugin.hub.RegisterCapability("session.source", capability); err != nil {
+		t.Fatalf("RegisterCapability: %v", err)
+	}
+	if err := plugin.hub.RegisterCapability("session.source", capability); err == nil {
+		t.Fatal("duplicate capability should fail")
+	}
+	got, ok := plugin.hub.Capability("session.source")
+	if !ok || got != capability {
+		t.Fatalf("Capability() = (%#v, %v), want (%#v, true)", got, ok, capability)
+	}
+	plugin.hub.UnregisterCapability("session.source")
+	if _, ok := e.Capability("session.source"); ok {
+		t.Fatal("unregistered capability is still available")
+	}
+}
+
 func TestRegisterCommandAliasFallbackAndInterceptors(t *testing.T) {
 	e := newTestEngine()
 	calls := make([]string, 0)

@@ -580,7 +580,7 @@ func buildFakeMCPServer(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// daemon/internal/core/service → 仓库根（4 级上溯）→ ai-runtime/mcp/testdata/fakeserver
+	// daemon/internal/plugins/agent → 仓库根（4 级上溯）→ ai-runtime/mcp/testdata/fakeserver
 	pkgDir := filepath.Join(wd, "..", "..", "..", "..", "ai-runtime", "mcp", "testdata", "fakeserver")
 	out := filepath.Join(t.TempDir(), "fakeserver")
 	cmd := exec.Command("go", "build", "-o", out, pkgDir)

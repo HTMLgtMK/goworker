@@ -19,32 +19,12 @@ import (
 // Evaluator delegates a raw frontend prompt to the daemon command engine.
 type Evaluator func(ctx *model.Context, input string) error
 
-// SessionSource 是 vscode frontend 对 daemon 会话元数据的最小消费接口（由 service
-// 包的 agent 插件实现，结构化类型、service 包无需感知本接口）：
-//   - ListSessions：session/list 数据源（当前会话置顶 + 归档，只读扫描）。
-//   - CurrentSessionID：当前活动会话的 head id（空 = 无活动会话）。
-//   - SetSession：把 ACP 提交方声明的会话 cwd 落到 daemon（校验与生效在实现方）。
-//   - ReloadCurrentSession：load 命中当前会话时刷新会话视图（ReloadFromStore）。
-//   - CurrentSessionHistory：当前会话对话历史 → session/update 序列，load 成功
-//     路径上向客户端重放。
-//   - ArchivedSessionHistory：归档会话只读解析 → 重放序列（归档 load 用）。
-//   - SessionModes：session/new|load 响应的 models 状态（nil = 不带 modes）。
-type SessionSource interface {
-	ListSessions() []protocol.SessionInfo
-	CurrentSessionID() string
-	SetSession(sessionID, cwd string)
-	ReloadCurrentSession() error
-	CurrentSessionHistory() []protocol.SessionUpdateBody
-	ArchivedSessionHistory(sessionID string) ([]protocol.SessionUpdateBody, error)
-	SessionModes() *protocol.SessionModeState
-}
-
 // Frontend exposes the daemon's persistent main conversation over a local ACP socket.
 type Frontend struct {
 	path      string
 	evaluate  Evaluator
 	commands  func() []model.Command
-	sessions  SessionSource
+	sessions  model.SessionSource
 	listener  net.Listener
 	mu        sync.Mutex
 	lifecycle sync.Mutex
@@ -60,7 +40,7 @@ type Frontend struct {
 // New creates a VS Code ACP frontend bound to one local Unix socket path.
 // commands 提供 daemon 命令清单，session/new 时下发给客户端做 slash 补全。
 // sessions 提供会话清单与 load 判定（nil = session/list 返回空、load 报不支持）。
-func New(path string, evaluate Evaluator, commands func() []model.Command, sessions SessionSource) *Frontend {
+func New(path string, evaluate Evaluator, commands func() []model.Command, sessions model.SessionSource) *Frontend {
 	return &Frontend{
 		path:     path,
 		evaluate: evaluate,
@@ -370,7 +350,7 @@ func availableCommandsUpdateBody(cmds []model.Command) protocol.SessionUpdateBod
 type ingress struct {
 	evaluate      Evaluator
 	commands      func() []model.Command
-	sessionSource SessionSource
+	sessionSource model.SessionSource
 	mu            sync.Mutex
 	sessions      map[string]struct{} // 可 prompt 集合：session/new 与当前会话 load 记入
 	readOnly      map[string]struct{} // 只读集合：归档 load 记入，prompt 诚实报错

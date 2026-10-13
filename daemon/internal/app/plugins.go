@@ -13,7 +13,6 @@ import (
 	"fmt"
 
 	_ "github.com/tinguo/goworker/daemon/internal/builtin"
-	"github.com/tinguo/goworker/daemon/internal/core/service"
 	"github.com/tinguo/goworker/daemon/internal/pluginregistry"
 )
 
@@ -41,13 +40,6 @@ func RegisterPlugins(a *Application) error {
 		}
 		if err := a.Engine.Register(plugin); err != nil {
 			return fmt.Errorf("register plugin %q: %w", descriptor.Name, err)
-		}
-		if descriptor.Name == "agent" {
-			agent, ok := plugin.(*service.AgentPlugin)
-			if !ok {
-				return fmt.Errorf("plugin %q does not implement AgentPlugin", descriptor.Name)
-			}
-			a.Agent = agent
 		}
 	}
 	return nil

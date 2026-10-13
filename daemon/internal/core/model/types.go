@@ -37,17 +37,20 @@ type EventAwarePlugin interface {
 // Hub 是插件注册、事件广播的抽象接口。
 // 具体实现由 daemon/internal/core.Engine 完成，插件在 Init 时通过 *Hub 注册命令。
 type Hub struct {
-	RegisterCommand    func(cmd Command) error
-	RegisterTool       func(tool Tool) error
-	AddEventListener   func(fn func(Event))
-	Plugin             func(name string) Plugin
-	Plugins            func() []string
-	Tools              func() []Tool
-	Notify             func(event Event)
-	Eval               func(ctx *Context, input string) error
-	Config             any                            // 全局配置（只读/修改后需调 SaveConfig）；具体类型由宿主注入
-	SaveConfig         func(any) error                // 持久化配置到 YAML 文件
-	SetFallbackHandler func(func(ctx *Context) error) // 设置未匹配命令的兜底处理器
+	RegisterCommand      func(cmd Command) error
+	RegisterTool         func(tool Tool) error
+	AddEventListener     func(fn func(Event))
+	Plugin               func(name string) Plugin
+	Plugins              func() []string
+	Tools                func() []Tool
+	Notify               func(event Event)
+	Eval                 func(ctx *Context, input string) error
+	Config               any                            // 全局配置（只读/修改后需调 SaveConfig）；具体类型由宿主注入
+	SaveConfig           func(any) error                // 持久化配置到 YAML 文件
+	SetFallbackHandler   func(func(ctx *Context) error) // 设置未匹配命令的兜底处理器
+	RegisterCapability   func(name string, capability any) error
+	Capability           func(name string) (any, bool)
+	UnregisterCapability func(name string)
 }
 
 // ---- 命令 ----

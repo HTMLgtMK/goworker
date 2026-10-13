@@ -2,4 +2,4 @@
 
 package builtin
 
-import _ "github.com/tinguo/goworker/daemon/internal/core/service"
+import _ "github.com/tinguo/goworker/daemon/internal/plugins/agent"

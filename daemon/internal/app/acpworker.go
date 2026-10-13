@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/tinguo/goworker/daemon/internal/core/service"
+	"github.com/tinguo/goworker/daemon/internal/core/acp"
 )
 
 // RunACPWorker 以 stdio ACP Agent 模式服务 ZCode 会话：配置解析、HTTP 客户端、
@@ -35,7 +35,7 @@ func RunACPWorker() error {
 		slog.Info("acp worker: sandbox mode overridden", "mode", mode)
 	}
 
-	server := service.ServeACPWorker(service.Stdio(), service.ACPWorkerDeps{
+	server := acp.ServeACPWorker(acp.Stdio(), acp.ACPWorkerDeps{
 		Config:   runtimeCfg,
 		AuditDir: defaultPaths().AuditDir,
 	})

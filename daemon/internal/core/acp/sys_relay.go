@@ -1,4 +1,4 @@
-package service
+package acp
 
 // x-device 扩展：client-ward 设备能力中继。
 //

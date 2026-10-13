@@ -9,6 +9,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -17,7 +18,6 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/engine"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
-	"github.com/tinguo/goworker/daemon/internal/core/service"
 )
 
 // Application 是装配完成的 agent 后端：Engine + 插件 + 配置 + 日志。
@@ -27,9 +27,20 @@ type Application struct {
 	Runtime *runtimeconfig.Config
 	Engine  *engine.Engine
 	Log     *logger.Logger
-	// Agent 是 agent 插件实例（GOWORKER_NO_PLUGINS 剔除 agent 时为 nil）。
-	// vscode 前端经它做会话清单/load；最小壳下 CLI 壳跳过 vscode 前端启动。
-	Agent *service.AgentPlugin
+}
+
+var ErrCapabilityUnavailable = errors.New("capability unavailable")
+
+func (a *Application) SessionSource() (model.SessionSource, error) {
+	capability, ok := a.Engine.Capability(model.SessionSourceCapability)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrCapabilityUnavailable, model.SessionSourceCapability)
+	}
+	source, ok := capability.(model.SessionSource)
+	if !ok {
+		return nil, fmt.Errorf("capability %q has type %T, want model.SessionSource", model.SessionSourceCapability, capability)
+	}
+	return source, nil
 }
 
 // loadConfigAndLogger 装配前置两步：配置装载 + 日志初始化。New 与 RunACPWorker 共用。

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -93,9 +94,13 @@ func runFrontends(appl *app.Application) error {
 // agent 插件被裁剪（最小壳）时返回 nil stop：会话清单/load 没有承载者，
 // 不静默降级成半残前端。
 func startVSCodeFrontend(appl *app.Application) (func(), error) {
-	if appl.Agent == nil {
-		appl.Log.Warn("vscode frontend disabled: agent plugin not compiled in (GOWORKER_NO_PLUGINS)")
-		return nil, nil
+	sessions, err := appl.SessionSource()
+	if err != nil {
+		if errors.Is(err, app.ErrCapabilityUnavailable) {
+			appl.Log.Warn("vscode frontend disabled: session capability unavailable")
+			return nil, nil
+		}
+		return nil, err
 	}
 
 	// socket 未显式配置时按 DefaultDir 派生默认路径。与 dispatcher 的
@@ -106,7 +111,7 @@ func startVSCodeFrontend(appl *app.Application) (func(), error) {
 	}
 	frontend := vscode.New(appl.Runtime.Frontend.Vscode.Socket, func(ctx *model.Context, input string) error {
 		return appl.Engine.Eval(ctx, input)
-	}, appl.Engine.Commands, appl.Agent)
+	}, appl.Engine.Commands, sessions)
 	if err := frontend.Start(); err != nil {
 		return nil, fmt.Errorf("start vscode frontend: %w", err)
 	}
