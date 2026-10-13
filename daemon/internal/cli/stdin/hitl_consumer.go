@@ -73,10 +73,15 @@ func (c *HITLConsumer) Run(req *hitl.InterruptRequest) (decision hitl.Decision, 
 		riskTag = " [" + req.RiskLevel + "]"
 	}
 	c.writer("\n" + hitlText("⚠ "+req.Command+riskTag+" ("+req.RiskReason+")") + "\n")
-	decisionPrompt := hitlText("[a]pprove, [e]dit, [r]eject, res[p]ond [a]: ") + " "
-	c.writer(decisionPrompt)
 
-	line, canceled := c.readLine(decisionPrompt)
+	canAlways := req.AllowAlways || req.AllowAlwaysKey != ""
+	decisionPrompt := hitlText("[a]pprove, [e]dit, [r]eject, res[p]ond [a]: ")
+	if canAlways {
+		decisionPrompt = hitlText("[a]pprove, [A]lways, [e]dit, [r]eject, res[p]ond [a]: ")
+	}
+	c.writer(decisionPrompt + " ")
+
+	line, canceled := c.readLine(decisionPrompt + " ")
 	if canceled {
 		return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionReject}, true
 	}
@@ -84,6 +89,14 @@ func (c *HITLConsumer) Run(req *hitl.InterruptRequest) (decision hitl.Decision, 
 
 	switch {
 	case line == "" || line == "a" || line == "approve":
+		return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionApprove}, false
+
+	case line == "A" || strings.EqualFold(line, "always"):
+		// 能力缺失时降级为一次性批准而非拒绝：用户敲的是"放行"意图，
+		// 且 prompt 没展示 [A]lways 时的输入多半是大小写误敲。
+		if canAlways {
+			return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionApproveAlways}, false
+		}
 		return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionApprove}, false
 
 	case line == "r" || line == "reject":

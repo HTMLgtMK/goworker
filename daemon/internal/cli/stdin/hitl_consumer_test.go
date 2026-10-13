@@ -94,6 +94,58 @@ func TestHITLRun_Approve(t *testing.T) {
 	}
 }
 
+// allow_always：能力声明存在时 A/always 译成 DecisionApproveAlways。
+// bash 走 AllowAlways bool（无 key），外部工具走 AllowAlwaysKey，两条腿都要钉住。
+func TestHITLRun_ApproveAlways(t *testing.T) {
+	reqs := []*hitl.InterruptRequest{
+		{ID: "req-1", Command: "git push", AllowAlways: true},                      // bash 路径
+		{ID: "req-1", Command: "git push", AllowAlwaysKey: "mcp_git_push"},         // 外部工具路径
+		{ID: "req-1", Command: "git push", AllowAlways: true, AllowAlwaysKey: "k"}, // 两者兼备
+	}
+	for _, input := range []string{"A", "always", "Always"} {
+		for _, req := range reqs {
+			c, out, _ := newTestHITL()
+			ch := runHITLAsync(c, req)
+
+			if !strings.Contains(out.String(), "[A]lways") {
+				t.Fatalf("prompt missing [A]lways: %q", out.String())
+			}
+
+			typeString(c, input)
+			typeKey(c, key(KeyEnter))
+
+			select {
+			case r := <-ch:
+				requireDecision(t, r, hitl.DecisionApproveAlways)
+			case <-time.After(time.Second):
+				t.Fatalf("timeout for input %q", input)
+			}
+		}
+	}
+}
+
+// 能力缺失时 A 降级为一次性批准，且 prompt 不展示 [A]lways。
+func TestHITLRun_AlwaysWithoutCapabilityFallsBackToApprove(t *testing.T) {
+	for _, input := range []string{"A", "always"} {
+		c, out, _ := newTestHITL()
+		ch := runHITLAsync(c, &hitl.InterruptRequest{ID: "req-1", Command: "ls"})
+
+		if strings.Contains(out.String(), "[A]lways") {
+			t.Fatalf("prompt should not show [A]lways without capability: %q", out.String())
+		}
+
+		typeString(c, input)
+		typeKey(c, key(KeyEnter))
+
+		select {
+		case r := <-ch:
+			requireDecision(t, r, hitl.DecisionApprove)
+		case <-time.After(time.Second):
+			t.Fatalf("timeout for input %q", input)
+		}
+	}
+}
+
 func TestHITLRun_Reject(t *testing.T) {
 	for _, input := range []string{"r", "reject"} {
 		c, _, _ := newTestHITL()
