@@ -8,6 +8,7 @@ import (
 
 	"github.com/tinguo/goworker/ai-memory"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
+	runtimesession "github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -168,13 +169,17 @@ func (p *AgentPlugin) memoryHelp(ctx *model.Context) {
 // ---- /task 命令 ----
 
 func (p *AgentPlugin) handleTask(ctx *model.Context) error {
-	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+	return p.withSelectedSession(ctx, func(runCtx context.Context, agent *runtimeagent.Session, _ *runtimesession.Store) error {
 		runContext := withPluginContext(ctx, runCtx)
-		return p.handleTaskLocked(runContext)
+		return p.handleTaskLockedFor(runContext, agent)
 	})
 }
 
 func (p *AgentPlugin) handleTaskLocked(ctx *model.Context) error {
+	return p.handleTaskLockedFor(ctx, p.session.Load())
+}
+
+func (p *AgentPlugin) handleTaskLockedFor(ctx *model.Context, agent *runtimeagent.Session) error {
 	if p.memory == nil {
 		ctx.Writer("memory 未启用（检查 config.yaml 的 memory.enabled 与存储目录权限）\n")
 		return nil
@@ -239,7 +244,7 @@ func (p *AgentPlugin) handleTaskLocked(ctx *model.Context) error {
 		ctx.Writer(fmt.Sprintf("✔ 已关闭 task %s\n", id))
 
 	case "checkpoint":
-		sum, err := p.session.Load().Consolidate(ctx.Ctx)
+		sum, err := agent.Consolidate(ctx.Ctx)
 		if err != nil {
 			ctx.Writer(fmt.Sprintf("✘ Consolidation failed: %v\n", err))
 			return nil

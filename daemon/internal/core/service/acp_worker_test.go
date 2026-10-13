@@ -11,7 +11,6 @@ import (
 
 	"github.com/tinguo/goworker/ai-core/core"
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
-	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	sandbox "github.com/tinguo/goworker/ai-sandbox"
 )
@@ -177,8 +176,7 @@ func TestTokenToUpdate_PreservesToolCallCorrelation(t *testing.T) {
 func TestACPWorker_PersistAllowRuleUpdatesRuntimeConfig(t *testing.T) {
 	runtimeCfg := &runtimeconfig.Config{}
 	worker := &acpWorker{
-		deps:     ACPWorkerDeps{Config: runtimeCfg},
-		sessions: make(map[string]*runtimeagent.Session),
+		deps: ACPWorkerDeps{Config: runtimeCfg},
 	}
 	rule := sandbox.AllowRule{
 		MatchTokens: []string{"git", "push"},

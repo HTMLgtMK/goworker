@@ -20,6 +20,10 @@ func (p *AgentPlugin) sandboxConfig() sandbox.Config {
 }
 
 func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
+	return p.collectToolsForSession("", cfg)
+}
+
+func (p *AgentPlugin) collectToolsForSession(sessionID string, cfg *sandbox.Config) []core.Tool {
 	var tools []core.Tool
 	tools = append(tools, runtimeagent.DefaultTools(cfg)...)
 
@@ -31,7 +35,9 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 			Parameters:  parseSchema(tool.Schema),
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
 				var buf strings.Builder
-				err := p.hub.Eval(model.NewContext(ctx, func(s string) { buf.WriteString(s) }, nil, nil), "/"+tool.Name)
+				commandCtx := model.NewContext(ctx, func(s string) { buf.WriteString(s) }, nil, nil)
+				commandCtx.SessionID = sessionID
+				err := p.hub.Eval(commandCtx, "/"+tool.Name)
 				if err != nil {
 					return buf.String(), err
 				}

@@ -40,6 +40,9 @@ const (
 //   - title：文件内首条 user 消息内容，空白折叠为单行后截断到 titleMaxRunes。
 //   - updatedAt：文件 mtime（RFC3339）。
 func (p *AgentPlugin) ListSessions() []protocol.SessionInfo {
+	if p.manager != nil {
+		return p.listManagedSessions()
+	}
 	out := make([]protocol.SessionInfo, 0, 4)
 	if p.store.Load() == nil || p.cfg.Session.Dir == "" {
 		return out
@@ -56,6 +59,51 @@ func (p *AgentPlugin) ListSessions() []protocol.SessionInfo {
 	for _, m := range listArchivedSessions(filepath.Join(dir, "archive")) {
 		out = append(out, m.info)
 	}
+	if len(out) > maxListSessions {
+		out = out[:maxListSessions]
+	}
+	return out
+}
+
+func (p *AgentPlugin) listManagedSessions() []protocol.SessionInfo {
+	managed := p.manager.Sessions()
+	current, _ := p.manager.Current()
+	out := make([]protocol.SessionInfo, 0, len(managed))
+	for _, item := range managed {
+		info := protocol.SessionInfo{
+			SessionID: item.id,
+			Cwd:       item.cwdSnapshot(),
+			Status:    string(item.statusSnapshot()),
+			IsCurrent: current == item,
+		}
+		if item.store != nil {
+			if meta, ok := item.store.SessionMeta(); ok {
+				info.SessionID = meta.ID
+				info.Status = string(meta.Status)
+				info.UpdatedAt = meta.UpdatedAt.Format(time.RFC3339)
+			}
+			path := item.store.Path()
+			if title := firstUserTitle(path); title != "" {
+				info.Title = title
+			}
+			if fileInfo, err := os.Stat(path); err == nil {
+				info.UpdatedAt = fileInfo.ModTime().Format(time.RFC3339)
+			}
+		}
+		out = append(out, info)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].IsCurrent != out[j].IsCurrent {
+			return out[i].IsCurrent
+		}
+		if out[i].Status != out[j].Status {
+			return out[i].Status == string(session.SessionStatusLive)
+		}
+		if out[i].UpdatedAt != out[j].UpdatedAt {
+			return out[i].UpdatedAt > out[j].UpdatedAt
+		}
+		return out[i].SessionID < out[j].SessionID
+	})
 	if len(out) > maxListSessions {
 		out = out[:maxListSessions]
 	}
@@ -98,6 +146,11 @@ func (p *AgentPlugin) currentSessionCwd() string {
 // CurrentSessionID 返回当前活动会话的 head id（空 = 无活动会话/持久化未启用）。
 // vscode 前端用它判定 session/load 的目标是否为当前会话。
 func (p *AgentPlugin) CurrentSessionID() string {
+	if p.manager != nil {
+		if current, ok := p.manager.Current(); ok {
+			return current.id
+		}
+	}
 	if p.store.Load() == nil {
 		return ""
 	}
@@ -108,6 +161,11 @@ func (p *AgentPlugin) CurrentSessionID() string {
 // 命中当前会话时调用——单活动会话模型下当前会话始终处于已加载状态，这里只做
 // 视图刷新（ReloadFromStore），不重建会话。
 func (p *AgentPlugin) ReloadCurrentSession() error {
+	if p.manager != nil {
+		if current, ok := p.manager.Current(); ok {
+			return current.agent.ReloadFromStore()
+		}
+	}
 	if p.session.Load() == nil {
 		return fmt.Errorf("agent: no active session")
 	}
@@ -126,6 +184,15 @@ func (p *AgentPlugin) ReloadCurrentSession() error {
 //
 // 全量重放，不设轮次/条数上限。无持久化（store 为 nil）或空会话返回非 nil 空切片。
 func (p *AgentPlugin) CurrentSessionHistory() []protocol.SessionUpdateBody {
+	if p.manager != nil {
+		if current, ok := p.manager.Current(); ok && current.store != nil {
+			view := current.store.ActiveView()
+			if len(view) == 0 {
+				return []protocol.SessionUpdateBody{}
+			}
+			return replayUpdates(view, checkpointAnchors(current.store))
+		}
+	}
 	if p.store.Load() == nil {
 		return []protocol.SessionUpdateBody{}
 	}
@@ -142,6 +209,14 @@ func (p *AgentPlugin) CurrentSessionHistory() []protocol.SessionUpdateBody {
 // 经与 CurrentSessionHistory 相同的 segmentByCheckpoints + roundUpdates 管线输出。
 // 不持写句柄、不 rename、不触碰 current 与 store。
 func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]protocol.SessionUpdateBody, error) {
+	if p.manager != nil {
+		managed, ok := p.manager.lookup(sessionID)
+		if !ok || managed.store == nil || managed.statusSnapshot() != session.SessionStatusArchived {
+			return nil, fmt.Errorf("agent: unknown archived session %q", sessionID)
+		}
+		view := managed.store.ActiveView()
+		return replayUpdates(view, checkpointAnchors(managed.store)), nil
+	}
 	if p.cfg == nil || p.cfg.Session.Dir == "" {
 		return nil, fmt.Errorf("agent: session persistence disabled")
 	}

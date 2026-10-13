@@ -54,6 +54,7 @@ type Session struct {
 // 其余字段跨会话不变。可变资源（instructions）的装载在 plugin 层，这里只收最终值。
 type SessionDeps struct {
 	Config           *runtimeconfig.Config                                  // 运行配置（含 Sandbox 段）
+	SessionID        string                                                 // 稳定 session identity for audit/event attribution
 	AuditDir         string                                                 // sandbox 审计落盘目录
 	CWD              string                                                 // 会话工作目录（client 经 wire 声明、宿主校验后注入）；空 = 未声明，工具回退 cfg.AllowedWorkDir
 	Memory           *memory.Client                                         // nil = 禁用

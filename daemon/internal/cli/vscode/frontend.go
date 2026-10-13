@@ -476,25 +476,14 @@ func (h *ingress) LoadSession(sessionID, cwd string, rep dispatch.Reporter) erro
 		return &protocol.RPCError{Code: -32000, Message: "vscode frontend: session load not supported"}
 	}
 	if sessionID == h.sessionSource.CurrentSessionID() {
-		h.sessionSource.SetSession(sessionID, cwd)
-		if err := h.sessionSource.ReloadCurrentSession(); err != nil {
-			return fmt.Errorf("vscode frontend: reload current session: %w", err)
-		}
-		h.remember(sessionID)
-		if h.commands != nil {
-			if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
-				rep.Update(sessionID, body)
-			}
-		}
-		for _, body := range h.sessionSource.CurrentSessionHistory() {
-			rep.Update(sessionID, body)
-		}
-		return nil
+		return h.loadLiveSession(sessionID, cwd, rep)
 	}
-	// 归档会话：只读重放。先解析成功再入只读集合，解析失败保持未知会话语义。
 	for _, info := range h.sessionSource.ListSessions() {
 		if info.SessionID != sessionID {
 			continue
+		}
+		if info.Status == "live" {
+			return h.loadLiveSession(sessionID, cwd, rep)
 		}
 		history, err := h.sessionSource.ArchivedSessionHistory(sessionID)
 		if err != nil {
@@ -517,6 +506,23 @@ func (h *ingress) LoadSession(sessionID, cwd string, rep dispatch.Reporter) erro
 	}
 }
 
+func (h *ingress) loadLiveSession(sessionID, cwd string, rep dispatch.Reporter) error {
+	h.sessionSource.SetSession(sessionID, cwd)
+	if err := h.sessionSource.ReloadCurrentSession(); err != nil {
+		return fmt.Errorf("vscode frontend: reload live session: %w", err)
+	}
+	h.remember(sessionID)
+	if h.commands != nil {
+		if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
+			rep.Update(sessionID, body)
+		}
+	}
+	for _, body := range h.sessionSource.CurrentSessionHistory() {
+		rep.Update(sessionID, body)
+	}
+	return nil
+}
+
 func (h *ingress) Run(ctx context.Context, sessionID, prompt string, rep dispatch.Reporter) (string, error) {
 	promptable, readOnly := h.knownSession(sessionID)
 	if readOnly {
@@ -531,7 +537,8 @@ func (h *ingress) Run(ctx context.Context, sessionID, prompt string, rep dispatc
 	}
 	output := &commandOutput{rep: rep, sessionID: sessionID}
 	commandContext := &model.Context{
-		Ctx: ctx,
+		Ctx:       ctx,
+		SessionID: sessionID,
 		FrontendContext: model.FrontendContext{
 			// 命令输出统一包成代码块（见 commandOutput）：命令侧仍按等宽终端排版，
 			// 由这里告诉渲染器「这段别重排」。

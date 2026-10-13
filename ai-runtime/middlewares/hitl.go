@@ -20,6 +20,7 @@ type HITLMiddleware struct {
 	sandboxCfg       sandbox.Config
 	decisionProvider hitl.DecisionProvider
 	audit            *sandbox.AuditLogger // nil = 不审计
+	sessionID        string
 	allowAlways      AllowAlwaysHandler
 }
 
@@ -52,6 +53,10 @@ var reqID atomic.Int64
 // WithAudit 注入审计记录器；nil 时跳过审计（默认）。
 func WithAudit(a *sandbox.AuditLogger) HITLOption {
 	return func(mw *HITLMiddleware) { mw.audit = a }
+}
+
+func WithSessionID(id string) HITLOption {
+	return func(mw *HITLMiddleware) { mw.sessionID = id }
 }
 
 func NewHITLMiddleware(cfg sandbox.Config, dp hitl.DecisionProvider, opts ...HITLOption) *HITLMiddleware {
@@ -125,6 +130,7 @@ func (mw *HITLMiddleware) recordAudit(out sandbox.Outcome, userDec, outcome stri
 	}
 	mw.audit.Record(sandbox.AuditEntry{
 		Timestamp:      time.Now(),
+		SessionID:      mw.sessionID,
 		Command:        out.Command,
 		RiskLevel:      out.Level.String(),
 		Effects:        out.Effects.Names(),

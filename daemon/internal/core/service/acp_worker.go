@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"slices"
@@ -20,6 +21,7 @@ import (
 	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	runtimesession "github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-sandbox"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
@@ -30,21 +32,72 @@ type ACPWorkerDeps struct {
 	AuditDir string // sandbox 审计目录（可空）
 }
 
-// acpWorker 实现 dispatch.TaskHandler：一个 ACP session 对应一个 Session 会话。
+// acpWorker 实现 dispatch.TaskHandler：一个 ACP session 对应一个 managed session。
 type acpWorker struct {
-	deps ACPWorkerDeps
+	deps    ACPWorkerDeps
+	manager *SessionManager
+	initErr error
 
-	mu       sync.Mutex
-	runMu    sync.Mutex // serializes Session.Run with runtime allow-rule updates
-	sessions map[string]*runtimeagent.Session
+	configMu sync.Mutex
 }
 
 // ServeACPWorker 在给定连接上服务 ACP worker 协议，返回 Server 便于测试与关闭。
 func ServeACPWorker(rwc io.ReadWriteCloser, deps ACPWorkerDeps) *dispatch.Server {
-	return dispatch.ServeConn(rwc, &acpWorker{deps: deps, sessions: map[string]*runtimeagent.Session{}})
+	worker := &acpWorker{deps: deps}
+	root, persistent := acpSessionStorage(deps.Config)
+	worker.manager, worker.initErr = newSessionManager(sessionManagerDeps{
+		Root:       root,
+		Persistent: persistent,
+		Migrate:    true,
+		BuildDeps: func(id, cwd string, store *runtimesession.Store) runtimeagent.SessionDeps {
+			return runtimeagent.SessionDeps{
+				Config:           cloneRuntimeConfig(deps.Config),
+				SessionID:        id,
+				AuditDir:         deps.AuditDir,
+				CWD:              cwd,
+				Memory:           nil,
+				CollectTools:     runtimeagent.DefaultTools,
+				NewProvider:      ProviderFactory(acpHTTPClient()),
+				Store:            store,
+				PersistAllowRule: worker.persistAllowRule,
+			}
+		},
+	})
+	return dispatch.ServeConn(rwc, worker)
 }
 
-// SetSession 建会话并落地提交方声明的 cwd。cwd 经 SessionDeps.CWD 渗透到
+func acpSessionStorage(cfg *runtimeconfig.Config) (string, bool) {
+	if cfg == nil || !cfg.Session.Enabled || cfg.Session.Dir == "" {
+		return "", false
+	}
+	return cfg.Session.Dir, true
+}
+
+func cloneRuntimeConfig(cfg *runtimeconfig.Config) *runtimeconfig.Config {
+	if cfg == nil {
+		return nil
+	}
+	clone := *cfg
+	clone.LLM = cfg.LLM.Clone()
+	clone.Sandbox.DeniedPatterns = slices.Clone(cfg.Sandbox.DeniedPatterns)
+	clone.Sandbox.RiskyPatterns = slices.Clone(cfg.Sandbox.RiskyPatterns)
+	clone.Sandbox.SafeCommands = slices.Clone(cfg.Sandbox.SafeCommands)
+	clone.Sandbox.AllowRules = slices.Clone(cfg.Sandbox.AllowRules)
+	clone.MCP.Servers = slices.Clone(cfg.MCP.Servers)
+	for i := range clone.MCP.Servers {
+		clone.MCP.Servers[i].Args = slices.Clone(cfg.MCP.Servers[i].Args)
+	}
+	clone.Dispatch.Workers = slices.Clone(cfg.Dispatch.Workers)
+	clone.Dispatch.Routes = slices.Clone(cfg.Dispatch.Routes)
+	for i := range clone.Dispatch.Workers {
+		clone.Dispatch.Workers[i].Args = slices.Clone(cfg.Dispatch.Workers[i].Args)
+	}
+	for i := range clone.Dispatch.Routes {
+		clone.Dispatch.Routes[i].Keywords = slices.Clone(cfg.Dispatch.Routes[i].Keywords)
+	}
+	return &clone
+}
+
 // Session 的 sandbox 配置副本（bash 的 cmd.Dir 与 read/write 的相对路径基准都
 // 取自 AllowedWorkDir）—— orchestrator 在 session/new 传的是 t.Worktree/t.Repo，
 // 于是工具就跑在该任务的 worktree 里，而不是 daemon 进程的 cwd。
@@ -54,18 +107,12 @@ func ServeACPWorker(rwc io.ReadWriteCloser, deps ACPWorkerDeps) *dispatch.Server
 // 不可信输入；套上 cfg.Sandbox.AllowedWorkDir 前缀校验反而会把合法 worktree
 // （位于 <repo>/.goworker/dispatch/ 下）误拒。
 func (w *acpWorker) SetSession(sessionID, cwd string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.sessions[sessionID] = runtimeagent.NewSession(runtimeagent.SessionDeps{
-		Config:           w.deps.Config,
-		AuditDir:         w.deps.AuditDir,
-		CWD:              cwd,
-		Memory:           nil,
-		CollectTools:     runtimeagent.DefaultTools,
-		NewProvider:      ProviderFactory(acpHTTPClient()),
-		Store:            nil, // worker 会话由调用方管理生命周期，本地不持久化
-		PersistAllowRule: w.persistAllowRule,
-	})
+	if w.manager == nil {
+		return
+	}
+	if _, err := w.manager.CreateWithID(sessionID, cwd); err != nil {
+		slog.Warn("acp worker: create session failed", "session", sessionID, "err", err)
+	}
 }
 
 func (w *acpWorker) persistAllowRule(rule sandbox.AllowRule) error {
@@ -83,8 +130,8 @@ func (w *acpWorker) persistAllowRule(rule sandbox.AllowRule) error {
 		Desc:    rule.Desc,
 	}
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.configMu.Lock()
+	defer w.configMu.Unlock()
 	for _, existing := range w.deps.Config.Sandbox.AllowRules {
 		if existing.Match == candidate.Match &&
 			existing.MaxRisk == candidate.MaxRisk &&
@@ -102,15 +149,17 @@ func (w *acpWorker) persistAllowRule(rule sandbox.AllowRule) error {
 
 // Run 执行一回合：session/prompt 文本进 Session.Run，token 流映射为 session/update。
 func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispatch.Reporter) (string, error) {
-	w.mu.Lock()
-	session, ok := w.sessions[sessionID]
-	w.mu.Unlock()
+	if w.initErr != nil {
+		return "", w.initErr
+	}
+	if w.manager == nil {
+		return "", statusError("acp worker: session manager unavailable")
+	}
+	managed, ok := w.manager.lookup(sessionID)
 	if !ok {
 		return "", statusError(fmt.Sprintf("unknown session %q (call session/new first)", sessionID))
 	}
 
-	w.runMu.Lock()
-	defer w.runMu.Unlock()
 	cb := runtimeagent.RunCallbacks{
 		Write: func(text string) {
 			rep.MessageChunk(sessionID, text)
@@ -122,7 +171,9 @@ func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispa
 		// 策略决定是自动放行还是转给订阅者）。决策失败一律拒绝，见 DecideViaACP。
 		Decide: model.DecideViaACP(ctx, rep, sessionID),
 	}
-	if err := session.Run(ctx, runtimeagent.RunRequest{Input: prompt}, cb); err != nil {
+	if err := managed.run(ctx, func(session *runtimeagent.Session) error {
+		return session.Run(ctx, runtimeagent.RunRequest{Input: prompt}, cb)
+	}); err != nil {
 		return "", err
 	}
 	return protocol.StopEndTurn, nil

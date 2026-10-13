@@ -13,6 +13,7 @@ import (
 	"github.com/tinguo/goworker/ai-memory"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	runtimesession "github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -37,6 +38,11 @@ func (p *AgentPlugin) releaseRun() {
 
 type sessionGateKey struct{}
 
+type managedSessionGateKey struct {
+	plugin    *AgentPlugin
+	sessionID string
+}
+
 func (p *AgentPlugin) withSession(ctx context.Context, run func(context.Context) error) error {
 	if owner, _ := ctx.Value(sessionGateKey{}).(*AgentPlugin); owner == p {
 		return run(ctx)
@@ -48,6 +54,39 @@ func (p *AgentPlugin) withSession(ctx context.Context, run func(context.Context)
 	return run(context.WithValue(ctx, sessionGateKey{}, p))
 }
 
+func (p *AgentPlugin) withSelectedSession(ctx *model.Context, run func(context.Context, *runtimeagent.Session, *runtimesession.Store) error) error {
+	if p.manager != nil {
+		var (
+			managed *managedSession
+			err     error
+		)
+		if ctx.SessionID != "" {
+			managed, err = p.manager.Load(ctx.SessionID, "")
+		} else {
+			managed, _ = p.manager.Current()
+		}
+		if err != nil {
+			return err
+		}
+		if managed != nil {
+			if err := managed.cwdError(); err != nil {
+				return err
+			}
+			key := managedSessionGateKey{plugin: p, sessionID: managed.id}
+			if _, nested := ctx.Ctx.Value(key).(struct{}); nested {
+				return run(ctx.Ctx, managed.agent, managed.store)
+			}
+			managedCtx := context.WithValue(ctx.Ctx, key, struct{}{})
+			return managed.run(managedCtx, func(agent *runtimeagent.Session) error {
+				return run(managedCtx, agent, managed.store)
+			})
+		}
+	}
+	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+		return run(runCtx, p.session.Load(), p.store.Load())
+	})
+}
+
 func withPluginContext(ctx *model.Context, runCtx context.Context) *model.Context {
 	copy := *ctx
 	copy.Ctx = runCtx
@@ -55,14 +94,14 @@ func withPluginContext(ctx *model.Context, runCtx context.Context) *model.Contex
 }
 
 func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
-	// 最近一次会话 cwd 声明未通过 sandbox 边界校验 → 明确报错（无效标记语义，
-	// 见 SetSession）。/new /compact 等维护命令不受影响，只有真正的 prompt 被挡。
-	if err := p.sessionCWDError(); err != nil {
-		return err
+	if p.manager == nil {
+		if err := p.sessionCWDError(); err != nil {
+			return err
+		}
 	}
-	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+	return p.withSelectedSession(ctx, func(runCtx context.Context, agent *runtimeagent.Session, _ *runtimesession.Store) error {
 		runContext := withPluginContext(ctx, runCtx)
-		return p.session.Load().Run(runCtx, runtimeagent.RunRequest{Input: strings.Join(ctx.Args, " ")}, callbacksFromPlugin(runContext))
+		return agent.Run(runCtx, runtimeagent.RunRequest{Input: strings.Join(ctx.Args, " ")}, callbacksFromPlugin(runContext))
 	})
 }
 
@@ -88,50 +127,86 @@ func callbacksFromPlugin(ctx *model.Context) runtimeagent.RunCallbacks {
 // ---- /new 命令 ----
 
 func (p *AgentPlugin) handleNew(ctx *model.Context) error {
+	if p.manager != nil {
+		return p.withSelectedSession(ctx, func(runCtx context.Context, agent *runtimeagent.Session, store *runtimesession.Store) error {
+			managed, ok := p.manager.Current()
+			if ctx.SessionID != "" {
+				managed, ok = p.manager.lookup(ctx.SessionID)
+			}
+			if !ok {
+				return fmt.Errorf("agent: no active managed session")
+			}
+			return p.handleManagedNew(ctx, runCtx, managed, agent, store)
+		})
+	}
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
-		// 同步固化旧会话（阻塞，状态栏显示进度）；快照走只读，先取好再重建。
 		old := p.session.Load()
-
-		// pending 快照（store 生效时用游标后的增量，否则全量）
 		var pending []core.Message
 		if st := p.store.Load(); st != nil {
 			pending = st.PendingAfterCursor()
 			if len(pending) == 0 {
-				pending = old.Conversation() // 兜底全量
+				pending = old.Conversation()
 			}
 		} else {
 			pending = old.Conversation()
 		}
 		consolidate := p.memory != nil && len(pending) > 0
-
 		if p.memory == nil {
 			runContext.Writer("✔ New session started (memory disabled)\n")
 		} else {
 			runContext.Writer("✔ New session started\n")
 		}
-
-		// 先归档旧 store，再开新会话（新 store 写新文件）
-		// pending 快照已在 Archive 前取出，不受归档影响
 		if st := p.store.Load(); st != nil {
 			if err := st.Archive(); err != nil {
 				slog.Warn("session: archive failed", "err", err)
 			}
 		}
-
-		// 创建新会话（新对象 = 新会话，旧状态随对象回收）
 		p.startSession()
-
 		runContext.Writer("✔ STM cleared, memory will be retrieved on every query\n")
-
-		// 同步固化旧会话：阻塞至完成（内部 120s 超时），进度经 ctx.Publish 进状态栏，
-		// 结果/警告经 ctx.Writer 回显。主 goroutine 执行，可直接读共享配置。
 		if consolidate {
 			old.CheckpointSync(runCtx, pending, callbacksFromPlugin(runContext))
 		}
 		return nil
 	})
+}
+
+func (p *AgentPlugin) handleManagedNew(ctx *model.Context, runCtx context.Context, managed *managedSession, old *runtimeagent.Session, store *runtimesession.Store) error {
+	runContext := withPluginContext(ctx, runCtx)
+	pending := old.Conversation()
+	if store != nil {
+		if fromStore := store.PendingAfterCursor(); len(fromStore) > 0 {
+			pending = fromStore
+		}
+	}
+	consolidate := p.memory != nil && len(pending) > 0
+	if p.memory == nil {
+		runContext.Writer("✔ New session started (memory disabled)\n")
+	} else {
+		runContext.Writer("✔ New session started\n")
+	}
+	if err := managed.archive(); err != nil {
+		return fmt.Errorf("session: archive lifecycle: %w", err)
+	}
+	created, err := p.manager.Create(managed.cwdSnapshot())
+	if err != nil {
+		if restoreErr := managed.restoreLive(); restoreErr != nil {
+			return fmt.Errorf("session: create replacement: %w (restore archived session: %v)", err, restoreErr)
+		}
+		p.manager.selectSession(managed.id)
+		p.session.Store(managed.agent)
+		p.store.Store(managed.store)
+		return fmt.Errorf("session: create replacement: %w", err)
+	}
+	created.setCWD(managed.cwdSnapshot())
+	p.manager.selectSession(created.id)
+	p.session.Store(created.agent)
+	p.store.Store(created.store)
+	runContext.Writer("✔ STM cleared, memory will be retrieved on every query\n")
+	if consolidate {
+		old.CheckpointSync(runCtx, pending, callbacksFromPlugin(runContext))
+	}
+	return nil
 }
 
 // ---- /model 命令 ----
@@ -315,9 +390,9 @@ func selectedContextWindow(cfg *runtimeconfig.Config) int {
 // ---- /usage 命令 ----
 
 func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
-	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+	return p.withSelectedSession(ctx, func(runCtx context.Context, agent *runtimeagent.Session, _ *runtimesession.Store) error {
 		runContext := withPluginContext(ctx, runCtx)
-		calls, comps, total := p.session.Load().UsageSnapshot()
+		calls, comps, total := agent.UsageSnapshot()
 		if len(calls) == 0 && len(comps) == 0 {
 			runContext.Writer("(no agent calls yet — run /agent first)\n")
 			return nil
@@ -365,7 +440,7 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 		}
 
 		// 当前历史占用：压缩后的直观体现，不必等下一次模型调用。
-		conv := p.session.Load().Conversation()
+		conv := agent.Conversation()
 		if convLen := len(conv); convLen > 0 {
 			convEst := core.EstimateTokens(conv)
 			line := fmt.Sprintf("  history: %s est (%d msgs)", runtimeagent.Humanize(convEst), convLen)
@@ -381,9 +456,9 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 // ---- /compact 命令 ----
 
 func (p *AgentPlugin) handleCompact(ctx *model.Context) error {
-	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+	return p.withSelectedSession(ctx, func(runCtx context.Context, agent *runtimeagent.Session, _ *runtimesession.Store) error {
 		runContext := withPluginContext(ctx, runCtx)
-		return p.session.Load().Compact(runCtx, callbacksFromPlugin(runContext))
+		return agent.Compact(runCtx, callbacksFromPlugin(runContext))
 	})
 }
 
@@ -404,9 +479,9 @@ func (p *AgentPlugin) handleSkills(ctx *model.Context) error {
 // ---- /history 命令 ----
 
 func (p *AgentPlugin) handleHistory(ctx *model.Context) error {
-	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+	return p.withSelectedSession(ctx, func(runCtx context.Context, agent *runtimeagent.Session, _ *runtimesession.Store) error {
 		runContext := withPluginContext(ctx, runCtx)
-		conv := p.session.Load().Conversation()
+		conv := agent.Conversation()
 		if len(conv) == 0 {
 			runContext.Writer("(no conversation history yet — run /agent first)\n")
 			return nil

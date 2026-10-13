@@ -7,6 +7,7 @@ import (
 
 	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
+	runtimesession "github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -27,29 +28,36 @@ func (p *AgentPlugin) registerRewindCommand(h *model.Hub) error {
 //	无参             → 列出最近 10 个 checkpoint（编号+时间+preview）
 //	/rewind <n>      → 回溯到编号为 n 的 checkpoint
 func (p *AgentPlugin) handleRewind(ctx *model.Context) error {
-	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
+	return p.withSelectedSession(ctx, func(runCtx context.Context, agent *runtimeagent.Session, store *runtimesession.Store) error {
 		runContext := withPluginContext(ctx, runCtx)
-		return p.handleRewindLocked(runContext)
+		return p.handleRewindFor(runContext, agent, store)
 	})
 }
 
 func (p *AgentPlugin) handleRewindLocked(ctx *model.Context) error {
-	st := p.store.Load()
-	if st == nil {
+	return p.handleRewindFor(ctx, p.session.Load(), p.store.Load())
+}
+
+func (p *AgentPlugin) handleRewindFor(ctx *model.Context, agent *runtimeagent.Session, store *runtimesession.Store) error {
+	if store == nil {
 		ctx.Writer("会话持久化未启用，/rewind 不可用（检查 config.yaml 的 session.enabled）\n")
 		return nil
 	}
 
 	args := ctx.Args
 	if len(args) == 0 {
-		return p.listRewindPoints(ctx)
+		return p.listRewindPointsFor(ctx, store)
 	}
-	return p.doRewind(ctx, args[0])
+	return p.doRewindFor(ctx, agent, store, args[0])
 }
 
 // listRewindPoints 列出最近 10 个检查点。
 func (p *AgentPlugin) listRewindPoints(ctx *model.Context) error {
-	cks := p.store.Load().Checkpoints(10)
+	return p.listRewindPointsFor(ctx, p.store.Load())
+}
+
+func (p *AgentPlugin) listRewindPointsFor(ctx *model.Context, store *runtimesession.Store) error {
+	cks := store.Checkpoints(10)
 	if len(cks) == 0 {
 		ctx.Writer("(无检查点 — 先跑几轮 /agent，每次提交会自动打 checkpoint)\n")
 		return nil
@@ -66,13 +74,17 @@ func (p *AgentPlugin) listRewindPoints(ctx *model.Context) error {
 
 // doRewind 执行回溯到指定编号的检查点。
 func (p *AgentPlugin) doRewind(ctx *model.Context, arg string) error {
+	return p.doRewindFor(ctx, p.session.Load(), p.store.Load(), arg)
+}
+
+func (p *AgentPlugin) doRewindFor(ctx *model.Context, agent *runtimeagent.Session, store *runtimesession.Store, arg string) error {
 	n, err := strconv.Atoi(arg)
 	if err != nil {
 		ctx.Writer("用法: /rewind <n>  （n 是列表中的编号，用 /rewind 查看）\n")
 		return nil
 	}
 
-	cks := p.store.Load().Checkpoints(10)
+	cks := store.Checkpoints(10)
 	if n < 1 || n > len(cks) {
 		ctx.Writer(fmt.Sprintf("编号 %d 越界（当前共 %d 个检查点，用 /rewind 查看列表）\n", n, len(cks)))
 		return nil
@@ -82,19 +94,19 @@ func (p *AgentPlugin) doRewind(ctx *model.Context, arg string) error {
 	ck := cks[n-1]
 
 	// 已在目标点（比较 conversation 末尾消息 id 是否与 checkpoint.at 一致）
-	conv := p.session.Load().Conversation()
+	conv := agent.Conversation()
 	if len(conv) > 0 && conv[len(conv)-1].MsgID == ck.At {
 		ctx.Writer(fmt.Sprintf("已在检查点 #%d（%s）\n", n, ck.CreatedAt.Format("15:04:05")))
 		return nil
 	}
 
 	// 执行回溯：移动 head → 刷新 session
-	if err := p.store.Load().SetHead(ck.At); err != nil {
+	if err := store.SetHead(ck.At); err != nil {
 		ctx.Writer(fmt.Sprintf("✘ 回溯失败: %v\n", err))
 		return nil
 	}
 
-	if err := p.session.Load().ReloadFromStore(); err != nil {
+	if err := agent.ReloadFromStore(); err != nil {
 		ctx.Writer(fmt.Sprintf("✘ 刷新会话失败: %v\n", err))
 		return nil
 	}
@@ -103,7 +115,7 @@ func (p *AgentPlugin) doRewind(ctx *model.Context, arg string) error {
 	msg := fmt.Sprintf("✔ 已回溯到 %s: %s\n", ck.CreatedAt.Format("15:04:05"), preview)
 
 	// 检测是否恢复到 compact 折叠前的原文（详情分支）
-	newConv := p.session.Load().Conversation()
+	newConv := agent.Conversation()
 	hasCompactNode := false
 	for _, m := range newConv {
 		if isCompactMsg(m) {

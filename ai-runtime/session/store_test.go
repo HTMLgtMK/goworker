@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
 )
@@ -1669,5 +1670,62 @@ func TestSortCheckpoints(t *testing.T) {
 		return times[i] > times[j]
 	}) {
 		t.Errorf("checkpoints not in reverse chronological order: %v", times)
+	}
+}
+
+func TestOpenPath_IsolatesSessionFiles(t *testing.T) {
+	root := t.TempDir()
+	pathA := filepath.Join(root, "sessions", "sess-a.jsonl")
+	pathB := filepath.Join(root, "sessions", "sess-b.jsonl")
+
+	a, err := OpenPath(pathA)
+	if err != nil {
+		t.Fatalf("OpenPath A: %v", err)
+	}
+	defer a.Close()
+	b, err := OpenPath(pathB)
+	if err != nil {
+		t.Fatalf("OpenPath B: %v", err)
+	}
+	defer b.Close()
+
+	if _, err := a.Commit([]core.Message{commMsg("a-1", "user", "A")}); err != nil {
+		t.Fatalf("commit A: %v", err)
+	}
+	if _, err := b.Commit([]core.Message{commMsg("b-1", "user", "B")}); err != nil {
+		t.Fatalf("commit B: %v", err)
+	}
+
+	if got := viewContent(a.ActiveView()); !reflect.DeepEqual(got, []string{"A"}) {
+		t.Fatalf("A view = %v, want [A]", got)
+	}
+	if got := viewContent(b.ActiveView()); !reflect.DeepEqual(got, []string{"B"}) {
+		t.Fatalf("B view = %v, want [B]", got)
+	}
+}
+
+func TestStore_LifecycleRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sess-a.jsonl")
+	now := time.Now().UTC().Truncate(time.Second)
+
+	st, err := OpenPath(path)
+	if err != nil {
+		t.Fatalf("OpenPath: %v", err)
+	}
+	if err := st.SetSessionMeta("sess-a", SessionStatusLive, now); err != nil {
+		t.Fatalf("SetSessionMeta: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := OpenPath(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	meta, ok := reopened.SessionMeta()
+	if !ok || meta.ID != "sess-a" || meta.Status != SessionStatusLive {
+		t.Fatalf("meta = %+v, ok=%v", meta, ok)
 	}
 }

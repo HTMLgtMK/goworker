@@ -32,6 +32,23 @@ func NewSession(deps SessionDeps) *Session {
 	return s
 }
 
+func (s *Session) auditLogger(enabled bool) *sandbox.AuditLogger {
+	if !enabled {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.audit == nil {
+		lg, err := sandbox.OpenAudit(s.deps.AuditDir)
+		if err != nil {
+			slog.Warn("sandbox: audit open failed, audit disabled", "err", err)
+			return nil
+		}
+		s.audit = lg
+	}
+	return s.audit
+}
+
 // SetCWD 更新会话工作目录（client 经 wire 重新声明、宿主校验后写入，如
 // session/load 重新声明 cwd）。锁内写入，与 Run 的读取互斥。
 func (s *Session) SetCWD(cwd string) {
@@ -70,14 +87,7 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 	cfg := s.deps.Config
 
 	// 命令决策审计：配置开启时首次 Run 惰性打开，复用文件句柄（不每轮重开）。
-	if s.audit == nil && cfg.Sandbox.AuditLog {
-		lg, err := sandbox.OpenAudit(s.deps.AuditDir)
-		if err != nil {
-			slog.Warn("sandbox: audit open failed, audit disabled", "err", err)
-		} else {
-			s.audit = lg
-		}
-	}
+	audit := s.auditLogger(cfg.Sandbox.AuditLog)
 
 	provider, err := s.deps.NewProvider(cfg)
 	if err != nil {
@@ -87,7 +97,7 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 		return nil
 	}
 	decisions := make(chan hitl.Decision, 1)
-	mws := s.buildMiddlewareChain(cb, provider, &sandboxCfg, cfg, decisions)
+	mws := s.buildMiddlewareChain(cb, provider, &sandboxCfg, cfg, audit, decisions)
 	systemPrompt := s.buildSystemPrompt(cfg, tools)
 
 	opts := []coreagent.Option{coreagent.WithMaxIterations(cfg.LLM.MaxIterations)}
@@ -100,9 +110,7 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 	defer cancel()
 
 	// 快照历史给本轮的 Run（工具重入触发的 /compact 不会污染本次运行的输入）
-	s.mu.Lock()
-	conv := s.conversation
-	s.mu.Unlock()
+	conv := s.Conversation()
 
 	tokenCh, msgCh, err := agent.Run(agentCtx, conv, input)
 	if err != nil {
@@ -196,14 +204,17 @@ func (s *Session) streamTokens(cb RunCallbacks, agentCtx context.Context, tokenC
 // buildMiddlewareChain 组装本轮 Run 的中间件链。
 // 顺序：hitl → usage → iteration →（memory 启用时插入）→ compress。
 // memory 必须在 compress 前：压缩器测量的是注入记忆后的完整 history。
-func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, sandboxCfg *sandbox.Config, cfg *runtimeconfig.Config, decisions chan hitl.Decision) []core.Middleware {
+func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, sandboxCfg *sandbox.Config, cfg *runtimeconfig.Config, audit *sandbox.AuditLogger, decisions chan hitl.Decision) []core.Middleware {
 	publish := func(event string, data any) {
 		if cb.Publish != nil {
 			cb.Publish(event, data)
 		}
 	}
 
-	hitlOptions := []middlewares.HITLOption{middlewares.WithAudit(s.audit)}
+	hitlOptions := []middlewares.HITLOption{
+		middlewares.WithAudit(audit),
+		middlewares.WithSessionID(s.deps.SessionID),
+	}
 	if s.deps.PersistAllowRule != nil {
 		hitlOptions = append(hitlOptions, middlewares.WithAllowAlways(s.deps.PersistAllowRule))
 	}
@@ -394,12 +405,29 @@ func (s *Session) compactStore(ctx context.Context, cb RunCallbacks) error {
 	return nil
 }
 
-// Conversation 返回当前 conversation 的锁内快照。只读用途统一走这里：
+// Conversation 返回当前 conversation 的深拷贝快照。只读用途统一走这里：
 // /history 展示、/usage 估算、checkpoint 固化、/new 归档共用。
 func (s *Session) Conversation() []core.Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.conversation
+	return cloneMessages(s.conversation)
+}
+
+func cloneMessages(messages []core.Message) []core.Message {
+	out := make([]core.Message, len(messages))
+	for i, message := range messages {
+		out[i] = message
+		if message.ToolCalls != nil {
+			out[i].ToolCalls = append([]core.ToolCall(nil), message.ToolCalls...)
+		}
+		if message.Custom != nil {
+			out[i].Custom = make(map[string]json.RawMessage, len(message.Custom))
+			for key, value := range message.Custom {
+				out[i].Custom[key] = append(json.RawMessage(nil), value...)
+			}
+		}
+	}
+	return out
 }
 
 // ReloadFromStore 从持久化 store 刷新 conversation 为当前活跃视图。

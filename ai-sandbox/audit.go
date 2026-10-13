@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
+
+var auditWriteMu sync.Mutex
 
 // OpenAudit 打开（必要时创建）审计文件。目录不存在则自动创建。
 func OpenAudit(dir string) (*AuditLogger, error) {
@@ -30,6 +33,8 @@ func (l *AuditLogger) Record(e AuditEntry) error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	auditWriteMu.Lock()
+	defer auditWriteMu.Unlock()
 	if _, err := l.f.Write(append(b, '\n')); err != nil {
 		return fmt.Errorf("audit write: %w", err)
 	}

@@ -17,6 +17,7 @@ const (
 	kindHead       = "head"
 	kindCheckpoint = "checkpoint"
 	kindCursor     = "cursor"
+	kindSession    = "session"
 )
 
 // msgFields 真实消息（含 compact 时的保留段副本）。
@@ -29,7 +30,7 @@ type msgFields struct {
 	ToolCallID string                     `json:"tool_call_id,omitempty"`
 	Thinking   string                     `json:"thinking,omitempty"`
 	Custom     map[string]json.RawMessage `json:"custom,omitempty"`
-	CloneOf    string                     `json:"clone_of,omitempty"` // 副本标记：从哪个原消息复制而来
+	CloneOf    string                     `json:"clone_of,omitempty"`
 	CreatedAt  time.Time                  `json:"created_at"`
 }
 
@@ -63,16 +64,24 @@ type cursorFields struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// sessionFields 会话生命周期快照。
+type sessionFields struct {
+	ID        string        `json:"session_id,omitempty"`
+	Status    SessionStatus `json:"status,omitempty"`
+	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at"`
+}
+
 // Record 是 jsonl 记录的统一视图：kind 判别 + 对应类型的字段组。
 // 磁盘格式保持扁平单行，序列化/反序列化见 MarshalJSON/UnmarshalJSON。
 type Record struct {
-	Kind string `json:"kind"`
-
-	Msg  *msgFields        // kind == kindMsg（含副本）
-	Comp *compactFields    // kind == kindCompact
-	Head *headFields       // kind == kindHead
-	CK   *checkpointFields // kind == kindCheckpoint
-	Cur  *cursorFields     // kind == kindCursor
+	Kind    string `json:"kind"`
+	Msg     *msgFields
+	Comp    *compactFields
+	Head    *headFields
+	CK      *checkpointFields
+	Cur     *cursorFields
+	Session *sessionFields
 }
 
 // NodeID 返回节点 id（msg/compact/checkpoint 有，head/cursor 无则空串）。
@@ -132,20 +141,22 @@ func (r Record) Created() time.Time {
 		if r.Cur != nil {
 			return r.Cur.CreatedAt
 		}
+	case kindSession:
+		if r.Session != nil {
+			return r.Session.CreatedAt
+		}
 	}
 	return time.Time{}
 }
 
 // MarshalJSON 把 Record 展平为磁盘单行。用临时扁平结构保证字段名与 key 顺序
 // 跟旧聚合格式一致（追加文件兼容读旧数据，也便于人工比对）。
-//
-// 注意：新增字段需同步改 3 处——类型化 struct（msgFields 等）、下方 flat struct、
-// MarshalJSON 的 switch 填充。漏改任一处 = 字段静默丢失或输出漂移，
-// record_format_test.go 的字节级断言会兜底抓漏。
 func (r Record) MarshalJSON() ([]byte, error) {
 	type flat struct {
 		Kind        string                     `json:"kind"`
 		ID          string                     `json:"id,omitempty"`
+		SessionID   string                     `json:"session_id,omitempty"`
+		Status      SessionStatus              `json:"status,omitempty"`
 		Parent      string                     `json:"parent,omitempty"`
 		Summary     string                     `json:"summary,omitempty"`
 		Role        string                     `json:"role,omitempty"`
@@ -162,6 +173,7 @@ func (r Record) MarshalJSON() ([]byte, error) {
 		Preview     string                     `json:"preview,omitempty"`
 		MsgID       string                     `json:"msg_id,omitempty"`
 		CreatedAt   time.Time                  `json:"created_at"`
+		UpdatedAt   *time.Time                 `json:"updated_at,omitempty"`
 	}
 
 	f := flat{Kind: r.Kind, CreatedAt: r.Created()}
@@ -190,12 +202,19 @@ func (r Record) MarshalJSON() ([]byte, error) {
 		if r.Cur != nil {
 			f.MsgID = r.Cur.MsgID
 		}
+	case kindSession:
+		if r.Session != nil {
+			f.SessionID = r.Session.ID
+			f.Status = r.Session.Status
+			updated := r.Session.UpdatedAt
+			f.UpdatedAt = &updated
+		}
 	}
 	return json.Marshal(f)
 }
 
 // UnmarshalJSON 先读 kind 再分发到对应字段组。json.Unmarshal 忽略多余 key，
-// 因此旧文件里带"其他类型字段"的行也能正确解析到本类型。
+// 因此旧文件里带其他类型字段的行也能正确解析到本类型。
 func (r *Record) UnmarshalJSON(data []byte) error {
 	var probe struct {
 		Kind string `json:"kind"`
@@ -236,70 +255,57 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		r.Cur = &f
+	case kindSession:
+		var f sessionFields
+		if err := json.Unmarshal(data, &f); err != nil {
+			return err
+		}
+		r.Session = &f
 	}
 	return nil
 }
 
 // ── 类型化构造函数 ──────────────────────────────────────────────────────
 
-// newMsgRecord 构造消息记录（含 compact 副本，cloneOf 为空表示原始消息）。
 func newMsgRecord(id, parent, role, content string, tc []core.ToolCall, toolCallID, cloneOf string, created time.Time) Record {
-	return Record{
-		Kind: kindMsg,
-		Msg: &msgFields{
-			ID: id, Parent: parent, Role: role, Content: content,
-			ToolCalls: tc, ToolCallID: toolCallID, CloneOf: cloneOf, CreatedAt: created,
-		},
-	}
+	return Record{Kind: kindMsg, Msg: &msgFields{
+		ID: id, Parent: parent, Role: role, Content: content,
+		ToolCalls: tc, ToolCallID: toolCallID, CloneOf: cloneOf, CreatedAt: created,
+	}}
 }
 
-// newCompactRecord 构造摘要节点。
 func newCompactRecord(id, parent, summary, from, to string, created time.Time) Record {
-	return Record{
-		Kind: kindCompact,
-		Comp: &compactFields{ID: id, Parent: parent, Summary: summary, CoveredFrom: from, CoveredTo: to, CreatedAt: created},
-	}
+	return Record{Kind: kindCompact, Comp: &compactFields{ID: id, Parent: parent, Summary: summary, CoveredFrom: from, CoveredTo: to, CreatedAt: created}}
 }
 
-// newHeadRecord 构造 head 记录。
 func newHeadRecord(tail string, created time.Time) Record {
 	return Record{Kind: kindHead, Head: &headFields{Tail: tail, CreatedAt: created}}
 }
 
-// newCheckpointRecord 构造检查点记录。
 func newCheckpointRecord(id, at, preview string, created time.Time) Record {
 	return Record{Kind: kindCheckpoint, CK: &checkpointFields{ID: id, At: at, Preview: preview, CreatedAt: created}}
 }
 
-// newCursorRecord 构造游标记录。
 func newCursorRecord(msgID string, created time.Time) Record {
 	return Record{Kind: kindCursor, Cur: &cursorFields{MsgID: msgID, CreatedAt: created}}
+}
+
+func newSessionRecord(id string, status SessionStatus, created, updated time.Time) Record {
+	return Record{Kind: kindSession, Session: &sessionFields{
+		ID: id, Status: status, CreatedAt: created, UpdatedAt: updated,
+	}}
 }
 
 // ── 记录与消息互转 ──────────────────────────────────────────────────────
 
 func recordToMessage(r Record) core.Message {
 	if r.Kind == kindCompact && r.Comp != nil {
-		return core.Message{
-			Role:      "system",
-			Content:   r.Comp.Summary,
-			MsgID:     r.Comp.ID,
-			CreatedAt: r.Comp.CreatedAt,
-		}
+		return core.Message{Role: "system", Content: r.Comp.Summary, MsgID: r.Comp.ID, CreatedAt: r.Comp.CreatedAt}
 	}
-	// msg 或 clone
 	if r.Msg != nil {
 		return core.Message{
-			Role:       r.Msg.Role,
-			Content:    r.Msg.Content,
-			ToolCalls:  r.Msg.ToolCalls,
-			ToolCallID: r.Msg.ToolCallID,
-			Thinking: core.Thinking{
-				Text: r.Msg.Thinking,
-			},
-			MsgID:     r.Msg.ID,
-			CreatedAt: r.Msg.CreatedAt,
-			Custom:    r.Msg.Custom,
+			Role: r.Msg.Role, Content: r.Msg.Content, ToolCalls: r.Msg.ToolCalls, ToolCallID: r.Msg.ToolCallID,
+			Thinking: core.Thinking{Text: r.Msg.Thinking}, MsgID: r.Msg.ID, CreatedAt: r.Msg.CreatedAt, Custom: r.Msg.Custom,
 		}
 	}
 	return core.Message{}
@@ -312,8 +318,6 @@ func messageToRecord(m core.Message) Record {
 	return record
 }
 
-// isRealMessage 判断 Message 是否为真实对话消息（非 compact 摘要）。
-// 摘要消息 Role=system 但非真实消息，靠 MsgID 前缀区分（compact 节点 id 以 s_ 开头，克隆以 m_ 开头）。
 func isRealMessage(m core.Message) bool {
 	if m.Role == "system" && len(m.MsgID) > 2 && m.MsgID[:2] == "s_" {
 		return false

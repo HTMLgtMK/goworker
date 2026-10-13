@@ -189,6 +189,7 @@ type Policy struct {
 // AuditEntry 一条命令决策审计记录。UserDecision 是未来训练数据的标签（宪法 V）。
 type AuditEntry struct {
 	Timestamp      time.Time `json:"timestamp"`
+	SessionID      string    `json:"session_id,omitempty"`
 	Command        string    `json:"command"`
 	Cwd            string    `json:"cwd,omitempty"`
 	RiskLevel      string    `json:"risk_level"`

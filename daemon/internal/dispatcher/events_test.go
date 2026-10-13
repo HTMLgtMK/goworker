@@ -23,7 +23,7 @@ func TestPlugin_EmitsStatusAndProgressEvents(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		statuses := hub.eventsOfType(task.EventTaskStatus)
-		if len(statuses) >= 3 { // queued, dispatching, working, awaiting_review 至少 4 条
+		if len(statuses) >= 4 { // queued, dispatching, working, awaiting_review 至少 4 条
 			break
 		}
 		select {

@@ -769,7 +769,12 @@ func TestAgentPlugin_SetSessionValidatesSandboxBoundary(t *testing.T) {
 	if err := p.sessionCWDError(); err != nil {
 		t.Errorf("cwdErr after redeclare+startSession = %v, want nil", err)
 	}
-	if got := p.currentSessionCwd(); got != inside {
+	if p.manager != nil {
+		current, ok := p.manager.Current()
+		if !ok || current.cwdSnapshot() != inside {
+			t.Errorf("managed session cwd = %q, want %q", current.cwdSnapshot(), inside)
+		}
+	} else if got := p.currentSessionCwd(); got != inside {
 		t.Errorf("sessionCwd after redeclare+startSession = %q, want %q", got, inside)
 	}
 }

@@ -101,10 +101,11 @@ type FrontendContext struct {
 // 由前端创建，经 Engine 传入命令 Handler。
 type Context struct {
 	FrontendContext
-	Ctx     context.Context // 请求上下文，用于超时/取消传播（从请求链继承）
-	Args    []string        // 命令参数，由 Engine.Eval 解析填入
-	Session Session         // 用户会话，由前端/中间件注入
-	Values  map[string]any  // 扩展数据，中间件间传递
+	Ctx       context.Context // 请求上下文，用于超时/取消传播（从请求链继承）
+	Args      []string        // 命令参数，由 Engine.Eval 解析填入
+	Session   Session         // 用户会话，由前端/中间件注入
+	SessionID string          // ACP transport session identity, empty for the local REPL
+	Values    map[string]any  // 扩展数据，中间件间传递
 }
 
 // Session 是只读的用户会话信息。

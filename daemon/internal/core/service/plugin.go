@@ -58,6 +58,7 @@ type AgentPlugin struct {
 	mcpClients map[string]mcp.Client         // server name → 连接，Stop 时统一关闭
 	mcpTools   []core.Tool                   // 从已连接 server 拉取的工具（静态，collectTools 复用）
 	memory     *memory.Client                // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
+	manager    *SessionManager               // transport session registry; nil for legacy-only tests
 
 	// 会话工作目录状态（mu 保护）。ACP 提交方经 session/new|load 声明的 cwd 经
 	// sandbox 边界校验后落到这里并应用到当前会话；非法声明只记 cwdErr（无效标记），
@@ -197,7 +198,11 @@ func (p *AgentPlugin) Stop() error {
 			slog.Warn("memory close error", "err", err)
 		}
 	}
-	// store 生命周期收尾：consolidate 后关闭
+	if p.manager != nil {
+		if err := p.manager.CloseAll(); err != nil {
+			slog.Warn("session manager: close failed", "err", err)
+		}
+	}
 	if st := p.store.Load(); st != nil {
 		if err := st.Close(); err != nil {
 			slog.Warn("session: store close failed", "err", err)
@@ -249,14 +254,11 @@ func (p *AgentPlugin) persistAllowRule(rule sandbox.AllowRule) error {
 }
 
 func (p *AgentPlugin) startSession() {
-	// 打开会话持久化 store。失败降级不阻塞插件启动。
+	// 持久化启动先迁移旧布局，避免 legacy Store 持有 current.jsonl 后再 rename。
 	p.store.Store(nil)
-	if p.cfg.Session.Enabled {
-		st, err := session.Open(p.cfg.Session.Dir)
-		if err != nil {
-			slog.Warn("session: store open failed, persistence disabled", "err", err)
-		} else {
-			p.store.Store(st)
+	if p.cfg.Session.Enabled && p.cfg.Session.Dir != "" {
+		if err := session.MigrateLegacy(p.cfg.Session.Dir); err != nil {
+			slog.Warn("session: legacy migration failed, persistence disabled", "err", err)
 		}
 	}
 
@@ -286,7 +288,7 @@ func (p *AgentPlugin) startSession() {
 		Memory:           p.memory,
 		CollectTools:     p.collectTools,
 		NewProvider:      modelProvider,
-		Store:            p.store.Load(),
+		Store:            nil,
 		PersistAllowRule: p.persistAllowRule,
 	}
 	// 指令快照与记忆组件同开关：memory disabled 时留 nil，buildSystemPrompt 跳过指令段。
@@ -294,16 +296,70 @@ func (p *AgentPlugin) startSession() {
 	if p.cfg.Memory.Enabled {
 		p.deps.Instruction = p.loadInstructions()
 	}
-	p.session.Store(runtimeagent.NewSession(p.deps))
-
-	// 会话重建 = 新的会话边界。无效 cwd 标记随旧会话作废（否则会毒化新会话的
-	// 每个 prompt）；有效声明跨会话保留并应用到新会话 —— 工作区没变，/new 不该
-	// 让工具悄悄回退到别的目录。取舍：不追踪「声明了 cwd 的 transport 会话与
-	// store 会话的对应关系」，单活动会话模型下一律落当前会话。
 	p.mu.Lock()
 	p.cwdErr = nil
 	cwd := p.sessionCwd
 	p.mu.Unlock()
+
+	managerCreated := false
+	if p.manager == nil {
+		baseDeps := p.deps
+		persistent := p.cfg.Session.Enabled && p.cfg.Session.Dir != ""
+		manager, err := newSessionManager(sessionManagerDeps{
+			Root:       p.cfg.Session.Dir,
+			Persistent: persistent,
+			Migrate:    persistent,
+			BuildDeps: func(id, cwd string, store *session.Store) runtimeagent.SessionDeps {
+				deps := baseDeps
+				deps.Config = cloneRuntimeConfig(p.cfg)
+				deps.SessionID = id
+				deps.CWD = cwd
+				deps.Store = store
+				deps.CollectTools = func(cfg *sandbox.Config) []core.Tool {
+					return p.collectToolsForSession(id, cfg)
+				}
+				return deps
+			},
+		})
+		if err != nil {
+			slog.Warn("session manager init failed, transport sessions disabled", "err", err)
+		} else {
+			p.manager = manager
+			managerCreated = true
+		}
+	}
+
+	if p.manager != nil {
+		current, ok := p.manager.Current()
+		if !ok {
+			var createErr error
+			current, createErr = p.manager.Create(cwd)
+			if createErr != nil {
+				slog.Warn("session manager: create initial session failed", "err", createErr)
+				p.manager = nil
+			}
+		}
+		if current != nil {
+			if managerCreated && cwd != "" {
+				current.setCWD(cwd)
+			}
+			p.manager.selectSession(current.id)
+			p.session.Store(current.agent)
+			p.store.Store(current.store)
+			return
+		}
+	}
+
+	if p.cfg.Session.Enabled && p.cfg.Session.Dir != "" {
+		st, err := session.Open(p.cfg.Session.Dir)
+		if err != nil {
+			slog.Warn("session: store open failed, persistence disabled", "err", err)
+		} else {
+			p.store.Store(st)
+			p.deps.Store = st
+		}
+	}
+	p.session.Store(runtimeagent.NewSession(p.deps))
 	p.session.Load().SetCWD(cwd)
 }
 
@@ -323,10 +379,35 @@ func (p *AgentPlugin) SetSession(sessionID, cwd string) {
 		}
 	}
 	if err := p.validateSessionCWD(cwd); err != nil {
+		if p.manager != nil && sessionID != "" {
+			managed, createErr := p.manager.CreateWithID(sessionID, "")
+			if createErr != nil {
+				slog.Warn("agent: create transport session for invalid cwd failed", "session", sessionID, "err", createErr)
+				return
+			}
+			managed.setCWDError(err)
+			return
+		}
 		p.mu.Lock()
 		p.sessionCwd, p.cwdErr = "", err
 		p.mu.Unlock()
 		slog.Warn("agent: reject session cwd", "session", sessionID, "cwd", cwd, "err", err)
+		return
+	}
+	if p.manager != nil && sessionID != "" {
+		managed, err := p.manager.CreateWithID(sessionID, cwd)
+		if err != nil {
+			slog.Warn("agent: create transport session failed", "session", sessionID, "err", err)
+			return
+		}
+		if managed.statusSnapshot() == session.SessionStatusArchived {
+			slog.Info("agent: keep archived session read-only", "session", sessionID)
+			return
+		}
+		managed.setCWD(cwd)
+		p.manager.selectSession(sessionID)
+		p.session.Store(managed.agent)
+		p.store.Store(managed.store)
 		return
 	}
 	p.mu.Lock()

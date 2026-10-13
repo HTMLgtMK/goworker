@@ -20,6 +20,7 @@ func TestAudit_OpenRecordReadBack(t *testing.T) {
 
 	entry := AuditEntry{
 		Timestamp:      time.Now(),
+		SessionID:      "sess-a",
 		Command:        "rm -rf /tmp/x",
 		RiskLevel:      "R3",
 		Effects:        []string{"destructive"},
@@ -41,7 +42,7 @@ func TestAudit_OpenRecordReadBack(t *testing.T) {
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.Command != entry.Command || got.RiskLevel != "R3" ||
+	if got.SessionID != entry.SessionID || got.Command != entry.Command || got.RiskLevel != "R3" ||
 		got.UserDecision != "approve" || got.EngineDecision != "hitl" {
 		t.Errorf("readback mismatch: %+v", got)
 	}
@@ -86,6 +87,53 @@ func TestAudit_ConcurrentSafe(t *testing.T) {
 	}
 }
 
+func TestAudit_ConcurrentLoggersShareWriteBoundary(t *testing.T) {
+	dir := t.TempDir()
+	first, err := OpenAudit(dir)
+	if err != nil {
+		t.Fatalf("OpenAudit first: %v", err)
+	}
+	second, err := OpenAudit(dir)
+	if err != nil {
+		first.Close()
+		t.Fatalf("OpenAudit second: %v", err)
+	}
+	defer first.Close()
+	defer second.Close()
+
+	const recordsPerLogger = 50
+	var wg sync.WaitGroup
+	for i, lg := range []*AuditLogger{first, second} {
+		wg.Add(1)
+		go func(session string, logger *AuditLogger) {
+			defer wg.Done()
+			for n := 0; n < recordsPerLogger; n++ {
+				if err := logger.Record(AuditEntry{Timestamp: time.Now(), SessionID: session, Command: "echo hi"}); err != nil {
+					t.Errorf("Record %s/%d: %v", session, n, err)
+				}
+			}
+		}(string(rune('a'+i)), lg)
+	}
+	wg.Wait()
+
+	b, err := os.ReadFile(filepath.Join(dir, "audit.jsonl"))
+	if err != nil {
+		t.Fatalf("read audit file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != recordsPerLogger*2 {
+		t.Fatalf("lines = %d, want %d", len(lines), recordsPerLogger*2)
+	}
+	for i, line := range lines {
+		var entry AuditEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("line %d is torn JSON: %v", i, err)
+		}
+		if entry.SessionID != "a" && entry.SessionID != "b" {
+			t.Errorf("line %d session_id = %q, want a or b", i, entry.SessionID)
+		}
+	}
+}
 func TestAudit_CreatesNestedDir(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "nested", "audit")
 	lg, err := OpenAudit(dir)

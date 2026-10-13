@@ -37,29 +37,37 @@ type Store struct {
 	recs   []Record // 全部记录（仅加载时填充，后续追加写文件不维护内存全量——但为了回溯便捷保留）
 	head   string   // 当前 head 节点 id
 	cursor string   // 固化游标指向的消息 id
+
+	meta    SessionMeta
+	hasMeta bool
 }
 
-// Open 打开或创建 dir 下的会话存储。目录不存在则创建，jsonl 文件不存在则新建。
+// Open 打开旧布局中的 current.jsonl。新代码应使用 OpenPath 为每个 session 指定独立文件。
 func Open(dir string) (*Store, error) {
+	if err := restrictArchivePermissions(filepath.Join(dir, "archive")); err != nil {
+		return nil, err
+	}
+	return OpenPath(filepath.Join(dir, "current.jsonl"))
+}
+
+// OpenPath 打开或创建一个 session 的 JSONL 文件。
+func OpenPath(path string) (*Store, error) {
+	if path == "" {
+		return nil, fmt.Errorf("session: empty store path")
+	}
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("session: create dir %s: %w", dir, err)
 	}
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("session: restrict dir %s: %w", dir, err)
 	}
-	if err := restrictArchivePermissions(filepath.Join(dir, "archive")); err != nil {
-		return nil, err
-	}
 
-	path := filepath.Join(dir, "current.jsonl")
-
-	// 加载已有记录
 	recs, err := loadRecords(path)
 	if err != nil {
 		return nil, fmt.Errorf("session: load %s: %w", path, err)
 	}
 
-	// 以 append 模式打开文件句柄
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("session: open file %s: %w", path, err)
@@ -69,14 +77,7 @@ func Open(dir string) (*Store, error) {
 		return nil, fmt.Errorf("session: restrict file %s: %w", path, err)
 	}
 
-	s := &Store{
-		path: path,
-		dir:  dir,
-		file: f,
-		recs: recs,
-	}
-
-	// 扫描最后出现的 head / cursor
+	s := &Store{path: path, dir: dir, file: f, recs: recs}
 	for i := len(recs) - 1; i >= 0; i-- {
 		r := recs[i]
 		if s.head == "" && r.Kind == kindHead && r.Head != nil {
@@ -85,11 +86,19 @@ func Open(dir string) (*Store, error) {
 		if s.cursor == "" && r.Kind == kindCursor && r.Cur != nil {
 			s.cursor = r.Cur.MsgID
 		}
-		if s.head != "" && s.cursor != "" {
+		if !s.hasMeta && r.Kind == kindSession && r.Session != nil {
+			s.meta = SessionMeta{
+				ID:        r.Session.ID,
+				Status:    r.Session.Status,
+				CreatedAt: r.Session.CreatedAt,
+				UpdatedAt: r.Session.UpdatedAt,
+			}
+			s.hasMeta = true
+		}
+		if s.head != "" && s.cursor != "" && s.hasMeta {
 			break
 		}
 	}
-
 	return s, nil
 }
 
@@ -116,6 +125,50 @@ func (s *Store) Head() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.head
+}
+
+// Path 返回 Store 绑定的 JSONL 路径。
+func (s *Store) Path() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.path
+}
+
+func (s *Store) SessionMeta() (SessionMeta, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.meta, s.hasMeta
+}
+
+// SetSessionMeta 追加一条 session 生命周期记录。
+func (s *Store) SetSessionMeta(id string, status SessionStatus, created time.Time) error {
+	if id == "" {
+		return fmt.Errorf("session: empty session id")
+	}
+	if status != SessionStatusLive && status != SessionStatusArchived {
+		return fmt.Errorf("session: invalid status %q", status)
+	}
+	if created.IsZero() {
+		created = time.Now()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hasMeta && s.meta.ID != id {
+		return fmt.Errorf("session: session id mismatch: have %q, got %q", s.meta.ID, id)
+	}
+	now := time.Now()
+	if s.hasMeta && s.meta.CreatedAt.Before(created) {
+		created = s.meta.CreatedAt
+	}
+	rec := newSessionRecord(id, status, created, now)
+	if err := s.appendRecord(rec); err != nil {
+		return fmt.Errorf("session: append lifecycle: %w", err)
+	}
+	s.meta = SessionMeta{ID: id, Status: status, CreatedAt: created, UpdatedAt: now}
+	s.hasMeta = true
+	s.recs = append(s.recs, rec)
+	return nil
 }
 
 // ActiveView 从 head 沿 parent 回溯，构建当前活跃视图。

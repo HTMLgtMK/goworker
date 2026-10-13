@@ -63,3 +63,25 @@ func TestRecord_UnmarshalOldFormat(t *testing.T) {
 		t.Errorf("compact fields wrong: %+v", c.Comp)
 	}
 }
+
+func TestRecord_MarshalLifecycleFormat(t *testing.T) {
+	now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	r := newSessionRecord("sess-a", SessionStatusLive, now, now)
+
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("marshal lifecycle: %v", err)
+	}
+	want := `{"kind":"session","session_id":"sess-a","status":"live","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z"}`
+	if string(data) != want {
+		t.Fatalf("lifecycle = %s, want %s", data, want)
+	}
+
+	var decoded Record
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal lifecycle: %v", err)
+	}
+	if decoded.Session == nil || decoded.Session.ID != "sess-a" || decoded.Session.Status != SessionStatusLive {
+		t.Fatalf("decoded lifecycle = %+v, want sess-a/live", decoded.Session)
+	}
+}
