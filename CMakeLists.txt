@@ -1,9 +1,13 @@
 # goworker 构建编排：CMake 驱动 Go toolchain（go.work 单仓多模块）。
 #
 # 用法：
-#   cmake -B build && cmake --build build          # 构建 bin/goworker
-#   cmake --build build --target test              # 全量 go test
-#   cmake --build build --target vet               # go vet
+#   cmake -B build && cmake --build build          # 构建兼容的 bin/goworker（默认 full）
+#   cmake --build build --target goworker-agent    # 构建 Agent-only 产物
+#   cmake --build build --target goworker-dispatcher
+#   cmake --build build --target goworker-minimal
+#   cmake --build build --target test               # 按 GOWORKER_NO_PLUGINS 执行全量 go test
+#   cmake --build build --target test-agent         # 执行 Agent-only go test
+#   cmake --build build --target vet                # 按 GOWORKER_NO_PLUGINS 执行 go vet
 #   cmake --build build --target run               # 构建并启动 REPL
 #   cmake --install build --prefix /usr/local      # 安装到 <prefix>/bin
 #
@@ -67,11 +71,6 @@ endforeach()
 message(STATUS "go.work 模块: ${GO_MODULES}")
 
 # ---- 插件装配（GOWORKER_NO_PLUGINS → go build tags）----
-# 插件写了就是拿来用的：默认全量编入（裸 go build 的 CI/release 同样如此），
-# 参数只表达例外——名单里的每个插件翻译成 goworker_no_<name> off-tag 编译期剔除。
-# 这样新插件落地即生效，不需要谁回头改配置。
-# Go 侧装配层在 daemon/internal/app，每个插件对应一对 plugins_<name>.go / plugins_<name>_off.go。
-# 与 Go 侧耦合：新增插件时这里必须同步追加，否则新插件的 off-tag 会被当未知名拒掉。
 set(_known_plugins "agent" "dispatcher")
 string(REPLACE "," ";" _exclude_list "${GOWORKER_NO_PLUGINS}")
 set(GO_OFF_TAGS "")
@@ -85,29 +84,33 @@ foreach(_p IN LISTS _exclude_list)
     endif()
     list(APPEND GO_OFF_TAGS "goworker_no_${_p}")
 endforeach()
-set(_go_tag_args "")
-if(GO_OFF_TAGS)
-    list(JOIN GO_OFF_TAGS "," _off_tag_str)
-    set(_go_tag_args "-tags" "${_off_tag_str}")
-endif()
+
+function(_go_tag_args tags out_var)
+    set(_args "")
+    if(tags)
+        list(JOIN tags "," _tag_string)
+        set(_args "-tags" "${_tag_string}")
+    endif()
+    set(${out_var} "${_args}" PARENT_SCOPE)
+endfunction()
+
+_go_tag_args("${GO_OFF_TAGS}" _legacy_tag_args)
 list(LENGTH GO_OFF_TAGS _off_count)
 list(LENGTH _known_plugins _known_count)
 if(_off_count EQUAL 0)
-    message(STATUS "plugins: 全量编入")
+    message(STATUS "legacy goworker: 全量编入")
 elseif(_off_count EQUAL _known_count)
-    message(STATUS "plugins: 最小壳，全部插件已剔除")
+    message(STATUS "legacy goworker: 最小壳，全部插件已剔除")
 else()
-    message(STATUS "plugins: 剔除 ${GO_OFF_TAGS}，其余全量编入")
+    message(STATUS "legacy goworker: 剔除 ${GO_OFF_TAGS}，其余全量编入")
 endif()
 
 # ---- 输出 ----
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(GOWORKER_BIN_NAME goworker)
+set(_cross_suffix "")
 if(GOOS OR GOARCH)
-    string(TOLOWER "${GOOS}-${GOARCH}" _cross_suffix)
-    set(GOWORKER_BIN_NAME "goworker-${_cross_suffix}")
+    string(TOLOWER "-${GOOS}-${GOARCH}" _cross_suffix)
 endif()
-set(GOWORKER_BIN ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${GOWORKER_BIN_NAME})
 
 # ---- 源文件清单（增量重建触发器）----
 file(GLOB_RECURSE GO_SOURCES
@@ -117,43 +120,88 @@ file(GLOB_RECURSE GO_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/*/go.sum
 )
 
-# ---- 构建 ----
-set(_go_env "GOOS=${GOOS}" "GOARCH=${GOARCH}")
-add_custom_command(
-    OUTPUT ${GOWORKER_BIN}
-    COMMAND ${CMAKE_COMMAND} -E env ${_go_env}
-        ${GO_EXECUTABLE} build ${GO_BUILD_FLAGS} ${_go_tag_args}
-            -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version=${PROJ_VERSION}"
-            -o ${GOWORKER_BIN}
-            ./daemon/cmd/goworker
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    DEPENDS ${GO_SOURCES}
-    COMMENT "go build -> ${GOWORKER_BIN_NAME} (${PROJ_VERSION})"
-    VERBATIM
-)
-add_custom_target(goworker ALL DEPENDS ${GOWORKER_BIN})
+function(add_goworker_binary target_name output_stem all_target)
+    set(_tags "${ARGN}")
+    _go_tag_args("${_tags}" _tag_args)
+    set(_output "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${output_stem}")
+    set(_go_env "GOOS=${GOOS}" "GOARCH=${GOARCH}")
+    add_custom_command(
+        OUTPUT ${_output}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+        COMMAND ${CMAKE_COMMAND} -E env ${_go_env}
+            ${GO_EXECUTABLE} build ${GO_BUILD_FLAGS} ${_tag_args}
+                -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version=${PROJ_VERSION}"
+                -o ${_output}
+                ./daemon/cmd/goworker
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        DEPENDS ${GO_SOURCES}
+        COMMENT "go build -> ${output_stem} (${PROJ_VERSION})"
+        VERBATIM
+    )
+    if(all_target)
+        add_custom_target(${target_name} ALL DEPENDS ${_output})
+    else()
+        add_custom_target(${target_name} DEPENDS ${_output})
+    endif()
+    if(target_name STREQUAL "goworker")
+        set(GOWORKER_BIN ${_output} PARENT_SCOPE)
+    endif()
+endfunction()
+
+# 旧 goworker target 保持原输出名与 GOWORKER_NO_PLUGINS 语义。
+add_goworker_binary(goworker "goworker${_cross_suffix}" ON ${GO_OFF_TAGS})
+
+# 显式 variant 输出互不覆盖；full 不受旧兼容参数影响。
+set(_agent_tags "goworker_no_dispatcher")
+set(_dispatcher_tags "goworker_no_agent")
+set(_minimal_tags "goworker_no_agent" "goworker_no_dispatcher")
+add_goworker_binary(goworker-full "goworker-full${_cross_suffix}" OFF)
+add_goworker_binary(goworker-agent "goworker-agent${_cross_suffix}" OFF ${_agent_tags})
+add_goworker_binary(goworker-dispatcher "goworker-dispatcher${_cross_suffix}" OFF ${_dispatcher_tags})
+add_goworker_binary(goworker-minimal "goworker-minimal${_cross_suffix}" OFF ${_minimal_tags})
 
 # ---- 辅助目标 ----
-add_custom_target(test
-    COMMAND ${GO_EXECUTABLE} test ${GO_TEST_PKGS}
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMENT "go test（全 workspace）"
-    VERBATIM
-)
+function(add_goworker_check_target target_name mode)
+    set(_tags "${ARGN}")
+    _go_tag_args("${_tags}" _tag_args)
+    if(mode STREQUAL "test")
+        set(_go_command test)
+        set(_mode_args "")
+    elseif(mode STREQUAL "race")
+        set(_go_command test)
+        set(_mode_args "-race")
+    elseif(mode STREQUAL "vet")
+        set(_go_command vet)
+        set(_mode_args "")
+    else()
+        message(FATAL_ERROR "未知 goworker 检查类型：${mode}")
+    endif()
+    add_custom_target(${target_name}
+        COMMAND ${GO_EXECUTABLE} ${_go_command} ${_mode_args} ${_tag_args} ${GO_TEST_PKGS}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "go ${_go_command} ${mode} (${target_name})"
+        VERBATIM
+    )
+endfunction()
 
-add_custom_target(test-race
-    COMMAND ${GO_EXECUTABLE} test -race ${GO_TEST_PKGS}
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMENT "go test -race（全 workspace）"
-    VERBATIM
-)
-
-add_custom_target(vet
-    COMMAND ${GO_EXECUTABLE} vet ${GO_TEST_PKGS}
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMENT "go vet"
-    VERBATIM
-)
+# 旧检查 target 遵循 GOWORKER_NO_PLUGINS；新增 target 与显式产物一一对应。
+add_goworker_check_target(test test ${GO_OFF_TAGS})
+add_goworker_check_target(test-race race ${GO_OFF_TAGS})
+add_goworker_check_target(vet vet ${GO_OFF_TAGS})
+foreach(_variant IN ITEMS full agent dispatcher minimal)
+    if(_variant STREQUAL "full")
+        set(_variant_tags "")
+    elseif(_variant STREQUAL "agent")
+        set(_variant_tags "goworker_no_dispatcher")
+    elseif(_variant STREQUAL "dispatcher")
+        set(_variant_tags "goworker_no_agent")
+    else()
+        set(_variant_tags "goworker_no_agent" "goworker_no_dispatcher")
+    endif()
+    add_goworker_check_target("test-${_variant}" test ${_variant_tags})
+    add_goworker_check_target("test-race-${_variant}" race ${_variant_tags})
+    add_goworker_check_target("vet-${_variant}" vet ${_variant_tags})
+endforeach()
 
 # run：先构建再启动 REPL（交互式，不作为 ALL 依赖）
 add_custom_target(run
