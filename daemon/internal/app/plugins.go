@@ -8,16 +8,47 @@
 // 新增插件：加一对文件 + 在 RegisterPlugins 里追加一段装配调用。
 package app
 
-import "fmt"
+import (
+	"context"
+	"fmt"
 
-// RegisterPlugins 按序装配编译进二进制的插件。
-// a.Agent 在 registerAgent 里回填：vscode 前端要拿它做会话清单/load（最小壳时为 nil）。
+	_ "github.com/tinguo/goworker/daemon/internal/builtin"
+	"github.com/tinguo/goworker/daemon/internal/core/service"
+	"github.com/tinguo/goworker/daemon/internal/pluginregistry"
+)
+
+// RegisterPlugins constructs and registers every compiled-in plugin in dependency order.
 func RegisterPlugins(a *Application) error {
-	if err := registerAgent(a); err != nil {
-		return fmt.Errorf("agent: %w", err)
+	descriptors, err := pluginregistry.Snapshot()
+	if err != nil {
+		return fmt.Errorf("snapshot plugin registry: %w", err)
 	}
-	if err := registerDispatcher(a); err != nil {
-		return fmt.Errorf("dispatcher: %w", err)
+
+	deps := pluginregistry.Dependencies{
+		Runtime: a.Runtime,
+		Paths:   defaultPaths(),
+	}
+	for _, descriptor := range descriptors {
+		plugin, err := descriptor.New(context.Background(), deps)
+		if err != nil {
+			return fmt.Errorf("construct plugin %q: %w", descriptor.Name, err)
+		}
+		if plugin == nil {
+			continue
+		}
+		if plugin.Name() != descriptor.Name {
+			return fmt.Errorf("plugin factory %q returned %q", descriptor.Name, plugin.Name())
+		}
+		if err := a.Engine.Register(plugin); err != nil {
+			return fmt.Errorf("register plugin %q: %w", descriptor.Name, err)
+		}
+		if descriptor.Name == "agent" {
+			agent, ok := plugin.(*service.AgentPlugin)
+			if !ok {
+				return fmt.Errorf("plugin %q does not implement AgentPlugin", descriptor.Name)
+			}
+			a.Agent = agent
+		}
 	}
 	return nil
 }

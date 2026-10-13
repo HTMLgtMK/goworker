@@ -80,7 +80,7 @@ func New() (*Application, error) {
 
 	a := &Application{Config: cfg, Runtime: runtimeCfg, Engine: e, Log: log}
 
-	// 注册插件：按构建标签装配（CMake GOWORKER_NO_PLUGINS → goworker_no_<name> off-tag）
+	// 注册插件：builtin 的条件导入决定编译集合，registry factory 负责统一装配。
 	if err := RegisterPlugins(a); err != nil {
 		// 失败路径与原 main 的 defer 语义对齐：先 StopAll（已启动的插件回收）再关日志，
 		// 最后经 error 交壳层决定退出方式（CLI exit 1 / mobile 转 Java 异常）。

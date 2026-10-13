@@ -42,7 +42,7 @@ func TestNew_DefaultConfig(t *testing.T) {
 	if appl.Runtime == nil {
 		t.Fatal("Runtime is nil")
 	}
-	if appl.Engine.HasPlugin("agent") != true {
-		t.Fatal("agent plugin not registered")
+	if got := appl.Engine.HasPlugin("agent"); got != wantAgentPlugin() {
+		t.Fatalf("agent plugin registered = %v, want %v", got, wantAgentPlugin())
 	}
 }
