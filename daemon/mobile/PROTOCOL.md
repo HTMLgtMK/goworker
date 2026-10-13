@@ -10,7 +10,7 @@ ZCode dispatcher 共享同一套协议语义（`ai-dispatch/protocol`），区�
 │  Kotlin ACP Client (JSON-RPC 编解码 / session 生命周期 / HITL UI)   │
 │        ▲ Write(chunk)                │ OnData(chunk) ▼            │
 │  ┌─────┴──────────── daemon/mobile (gobind bind 面) ────────────┐  │
-│  │      io.Pipe 桥 → service.ServeACPWorker(rwc, deps)          │  │
+│  │      io.Pipe 桥 → acp.ServeACPWorker(rwc, deps)                 │  │
 │  └──────────────────────────┬───────────────────────────────────┘  │
 │                             ▼                                      │
 │        ACP worker（ai-runtime Session：LLM/工具/沙箱/HITL）          │
@@ -92,11 +92,36 @@ LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下�
   | strict / readonly | 放行 | 拒绝 |
   | off | 放行（`always_hitl` 仍询问） | 放行（`always_hitl` 仍询问） |
 
-- **实现位置**：worker 中继 `daemon/internal/core/service/sys_relay.go`；统一裁决 `ai-runtime/middlewares/hitl.go`；执行器在 Kotlin `DeviceTools` 注册表
+- **实现位置**：worker 中继 `daemon/internal/core/acp/sys_relay.go`；统一裁决 `ai-runtime/middlewares/hitl.go`；执行器在 Kotlin `DeviceTools` 注册表
 - **每加一个能力的成本 = Kotlin 一处**（注册描述符 + handler），Go/协议零改动、无需重绑 AAR 之外的任何东西
 
 **客户端义务**：对不认识的带 id 请求必须自动回 -32601（JSON-RPC 标准行为）——
 worker 的探测靠这个快速失败；沉默客户端会把 session/new 拖到探测超时（2s）。
+
+## Android 构建与 Host 适配
+
+AAR 默认只编入 Agent：
+
+```bash
+daemon/mobile/build-aar.sh
+# 等价于 gomobile bind -target=android -tags=goworker_no_dispatcher -o build/goworker-agent.aar ./mobile
+```
+
+脚本在 bind 前检查依赖图：必须包含 `daemon/internal/plugins/agent`，不得包含
+`daemon/internal/plugins/dispatcher`。可用 `GOWORKER_MOBILE_GO_TAGS` 覆盖 Go tags，
+但脚本仍会拒绝包含 Dispatcher 的组合，避免把 full 产物伪装成 Agent-only AAR。
+
+Host 只负责进程内管道和 ACP 帧桥接，Android 侧负责能力适配：
+
+- `configDir` 应指向 app 的持久化目录；同一目录用于进程重建后的 session/config 恢复。
+- 文件、权限、设备 Tool 与 MCP 能力通过 `x-device/*` client-ward 请求提供；不支持的
+  方法必须返回 JSON-RPC `-32601` 或明确的工具错误，不能回退到桌面文件系统/命令执行。
+- Activity/Service 停止时调用 `Close()`，销毁后不得继续 `Write()`；重新创建 Host 时复用
+  持久化目录并重新完成 `initialize`，不要持有旧 Host 或旧回调引用。
+- `OnData`/`OnClose` 来自 Go 后台 goroutine，回调实现必须切回 Android 主线程后再更新 UI。
+
+AAR 的 API 只暴露 `NewHost`、`Start`、`Write`、`Close` 和 `Callbacks`，不把 Go 的
+`context.Context`、channel 或 runtime 内部对象直接穿过 gobind 边界。
 
 ## 演进规则
 

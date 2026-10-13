@@ -3,8 +3,9 @@ set -euo pipefail
 
 mobile_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$mobile_dir/../.." && pwd)"
-output="${GOWORKER_AAR:-$repo_root/build/goworker.aar}"
+output="${GOWORKER_AAR:-$repo_root/build/goworker-agent.aar}"
 if [[ "$output" != /* ]]; then output="$repo_root/$output"; fi
+go_tags="${GOWORKER_MOBILE_GO_TAGS:-goworker_no_dispatcher}"
 
 if [[ -n "${GOMOBILE:-}" ]]; then
     gomobile="$GOMOBILE"
@@ -23,4 +24,15 @@ fi
 export PATH="$(dirname -- "$gomobile"):$PATH"
 mkdir -p "$(dirname -- "$output")"
 cd -- "$repo_root/daemon"
-exec "$gomobile" bind -target=android -o "$output" ./mobile
+deps="$(go list -tags="$go_tags" -deps ./mobile)"
+agent_package='github.com/tinguo/goworker/daemon/internal/plugins/agent'
+dispatcher_package='github.com/tinguo/goworker/daemon/internal/plugins/dispatcher'
+if ! grep -Fxq "$agent_package" <<< "$deps"; then
+    printf 'mobile build must include the Agent plugin (tags: %s)\n' "$go_tags" >&2
+    exit 1
+fi
+if grep -Fxq "$dispatcher_package" <<< "$deps"; then
+    printf 'mobile Agent-only build unexpectedly includes the Dispatcher plugin (tags: %s)\n' "$go_tags" >&2
+    exit 1
+fi
+exec "$gomobile" bind -target=android -tags="$go_tags" -o "$output" ./mobile
