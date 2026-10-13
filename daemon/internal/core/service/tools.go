@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/tinguo/goworker/ai-core/core"
@@ -29,6 +30,7 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 			Name:        tool.Name,
 			Description: tool.Description,
 			Parameters:  parseSchema(tool.Schema),
+			Metadata:    cloneToolMetadata(tool.Metadata),
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
 				var buf strings.Builder
 				err := p.hub.Eval(model.NewContext(ctx, func(s string) { buf.WriteString(s) }, nil, nil), "/"+tool.Name)
@@ -118,12 +120,17 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 	}
 
 	// MCP 工具：Init 时已从 server 拉取定义，这里是静态复用。
-	// 工具是外部进程执行，不受本地 sandbox 管控，信任由"用户显式配置了哪个 server"建立。
+	// 工具是外部进程执行，桥接层默认附加 unclassified + requires_permission，统一交给 HITL 门控。
 	tools = append(tools, p.mcpTools...)
 	return tools
 }
 
-// ---- profile 工具（agent 写 USER.md） ----
+func cloneToolMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	return maps.Clone(metadata)
+}
 
 // profileTool 返回 agent 更新用户画像的工具。画像条目必须短、信息密度高；
 // replace/remove 用唯一子串定位（Hermes 式），写多命中直接报错防误伤。

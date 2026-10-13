@@ -6,22 +6,35 @@ import (
 	"strings"
 )
 
+var riskLevelNames = [...]string{
+	"benign",
+	"low",
+	"medium",
+	"elevated",
+	"high",
+	"critical",
+	"unclassified",
+	"reserved",
+}
+
 func (l RiskLevel) String() string {
-	if l < RiskR0 || l > RiskR7 {
-		return fmt.Sprintf("RiskLevel(%d)", int(l))
+	if l < RiskBenign || l > RiskReserved {
+		return "invalid"
 	}
-	return "R" + string(rune('0'+int(l)))
+	return riskLevelNames[l]
 }
 
-// ParseRiskLevel 解析 "R0".."R7"，非法输入报错。
+// ParseRiskLevel parses one of the semantic risk level names.
 func ParseRiskLevel(s string) (RiskLevel, error) {
-	if len(s) == 2 && s[0] == 'R' && s[1] >= '0' && s[1] <= '7' {
-		return RiskLevel(int(s[1] - '0')), nil
+	for i, name := range riskLevelNames {
+		if s == name {
+			return RiskLevel(i), nil
+		}
 	}
-	return 0, fmt.Errorf("invalid risk level %q, want R0..R7", s)
+	return 0, fmt.Errorf("invalid risk level %q, want benign|low|medium|elevated|high|critical|unclassified|reserved", s)
 }
 
-// MarshalText 让 YAML/JSON 以 "R4" 呈现而非数字。
+// MarshalText 让 YAML/JSON 以 "high" 呈现而非数字。
 func (l RiskLevel) MarshalText() ([]byte, error) {
 	return []byte(l.String()), nil
 }

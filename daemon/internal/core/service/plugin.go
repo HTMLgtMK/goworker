@@ -248,6 +248,37 @@ func (p *AgentPlugin) persistAllowRule(rule sandbox.AllowRule) error {
 	return nil
 }
 
+func (p *AgentPlugin) persistToolAllowRule(rule sandbox.ToolAllowRule) error {
+	p.allowRuleMu.Lock()
+	defer p.allowRuleMu.Unlock()
+
+	if strings.TrimSpace(rule.Key) == "" {
+		return fmt.Errorf("allow_always: empty tool key")
+	}
+	candidate := sandbox.ToolAllowRuleConfig{
+		Key:     rule.Key,
+		MaxRisk: rule.MaxRisk.String(),
+		Desc:    rule.Desc,
+	}
+	for _, existing := range p.cfg.Sandbox.ToolAllowRules {
+		if existing.Key == candidate.Key && existing.MaxRisk == candidate.MaxRisk && existing.Desc == candidate.Desc {
+			return nil
+		}
+	}
+
+	previous := append([]sandbox.ToolAllowRuleConfig(nil), p.cfg.Sandbox.ToolAllowRules...)
+	p.cfg.Sandbox.ToolAllowRules = append(p.cfg.Sandbox.ToolAllowRules, candidate)
+	if p.hub == nil || p.hub.SaveConfig == nil {
+		p.cfg.Sandbox.ToolAllowRules = previous
+		return fmt.Errorf("allow_always: config persistence is unavailable")
+	}
+	if err := p.hub.SaveConfig(p.cfg); err != nil {
+		p.cfg.Sandbox.ToolAllowRules = previous
+		return fmt.Errorf("allow_always: save config: %w", err)
+	}
+	return nil
+}
+
 func (p *AgentPlugin) startSession() {
 	// 打开会话持久化 store。失败降级不阻塞插件启动。
 	p.store.Store(nil)
@@ -281,13 +312,14 @@ func (p *AgentPlugin) startSession() {
 	modelProvider := ProviderFactory(client)
 
 	p.deps = runtimeagent.SessionDeps{
-		Config:           p.cfg,
-		AuditDir:         p.paths.AuditDir,
-		Memory:           p.memory,
-		CollectTools:     p.collectTools,
-		NewProvider:      modelProvider,
-		Store:            p.store.Load(),
-		PersistAllowRule: p.persistAllowRule,
+		Config:               p.cfg,
+		AuditDir:             p.paths.AuditDir,
+		Memory:               p.memory,
+		CollectTools:         p.collectTools,
+		NewProvider:          modelProvider,
+		Store:                p.store.Load(),
+		PersistAllowRule:     p.persistAllowRule,
+		PersistToolAllowRule: p.persistToolAllowRule,
 	}
 	// 指令快照与记忆组件同开关：memory disabled 时留 nil，buildSystemPrompt 跳过指令段。
 	// 会话边界（Init / /new）经 startSession 重载 —— system prompt 在会话创建前就绪。

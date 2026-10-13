@@ -17,7 +17,7 @@ type Mode string
 
 const (
 	ModeNormal   Mode = "normal"   // 默认：risky 命令需要 agent 向用户请求确认
-	ModeAuto     Mode = "auto"     // 自动批准需要确认的命令，但仍拒绝 denylist
+	ModeAuto     Mode = "auto"     // 按 AutoMaxRisk 自动放行，超出阈值进入 HITL
 	ModeStrict   Mode = "strict"   // 拒绝所有 risky 命令
 	ModeReadOnly Mode = "readonly" // 只读模式，拒绝所有写操作
 	ModeOff      Mode = "off"      // 关闭沙箱（不推荐）
@@ -34,8 +34,10 @@ type Config struct {
 	ReadOnly       bool              // 只读模式
 	MaxOutputBytes int               // 最大输出字节数，0=不限制
 	Mode           Mode              // 沙箱模式
+	AutoMaxRisk    RiskLevel         // auto 模式自动放行的最高风险，默认 low
 	SafeCommands   map[string]bool   // 追加的只读安全命令名 → 直接放行，不触发 HITL
 	AllowRules     []AllowRule       // 用户预批准规则（normal 模式降级 hitl→allow）
+	ToolAllowRules []ToolAllowRule   // 外部工具用户授权（normal 模式降级 hitl→allow）
 }
 
 // ---- YAML DTO ----
@@ -45,13 +47,15 @@ type Config struct {
 
 // SandboxConfig 是 sandbox 的 YAML 配置段。
 type SandboxConfig struct {
-	Mode           string              `yaml:"mode"`
-	AllowedWorkDir string              `yaml:"allowed_work_dir"`      // 空 = 使用当前目录
-	DeniedPatterns []string            `yaml:"denied_patterns"`       // 空 = 使用 sandbox 默认
-	RiskyPatterns  []RiskPatternConfig `yaml:"risky_patterns"`        // 空 = 使用 sandbox 默认
-	SafeCommands   []string            `yaml:"safe_commands"`         // 追加的只读安全命令名（直接放行）
-	AllowRules     []AllowRuleConfig   `yaml:"allow_rules,omitempty"` // 用户预批准规则（normal 模式免确认）
-	AuditLog       bool                `yaml:"audit_log,omitempty"`   // 决策审计 jsonl 落盘（默认关）
+	Mode           string                `yaml:"mode"`
+	AutoMaxRisk    string                `yaml:"auto_max_risk,omitempty"` // auto 模式自动放行的最高风险，默认 low
+	AllowedWorkDir string                `yaml:"allowed_work_dir"`        // 空 = 使用当前目录
+	DeniedPatterns []string              `yaml:"denied_patterns"`         // 空 = 使用 sandbox 默认
+	RiskyPatterns  []RiskPatternConfig   `yaml:"risky_patterns"`          // 空 = 使用 sandbox 默认
+	SafeCommands   []string              `yaml:"safe_commands"`           // 追加的只读安全命令名（直接放行）
+	AllowRules     []AllowRuleConfig     `yaml:"allow_rules,omitempty"`   // 用户预批准规则（normal 模式免确认）
+	ToolAllowRules []ToolAllowRuleConfig `yaml:"tool_allow_rules,omitempty"`
+	AuditLog       bool                  `yaml:"audit_log,omitempty"` // 决策审计 jsonl 落盘（默认关）
 }
 
 // RiskPatternConfig 表示一个风险命令模式及其人类可读描述。
@@ -63,28 +67,32 @@ type RiskPatternConfig struct {
 // AllowRuleConfig 是一条用户预批准规则：命令 token 前缀 + 风险上限 + 允许副作用子集。
 type AllowRuleConfig struct {
 	Match   string   `yaml:"match"`             // 归一化主命令 token 前缀："git push"
-	MaxRisk string   `yaml:"max_risk"`          // "R0".."R7"，超过该等级的命令不放行
+	MaxRisk string   `yaml:"max_risk"`          // "benign".."reserved"，超过该等级的命令不放行
 	Effects []string `yaml:"effects,omitempty"` // 允许的副作用子集，空 = 全部允许
 	Desc    string   `yaml:"desc,omitempty"`    // 人类可读描述
 }
 
-// ---- 风险分级 ----
+// ToolAllowRuleConfig 是外部工具的用户持久化授权。
+type ToolAllowRuleConfig struct {
+	Key     string `yaml:"key"`
+	MaxRisk string `yaml:"max_risk"`
+	Desc    string `yaml:"desc,omitempty"`
+}
 
-// RiskLevel 命令风险分级。
+// RiskLevel 命令与工具的统一风险分级。
 //
-// R0-R5 是语义阶梯；R6 是"无法分类"——它不是一个安全等级，而是信任缺口，
-// 默认进入 HITL（Unknown ≠ Safe）；R7 保留给未来模型分类输出，避免 schema 翻动。
+// critical 表示严重风险，但不代表硬拒；HardDeny 单独表达不可执行规则。
 type RiskLevel int
 
 const (
-	RiskR0 RiskLevel = iota // benign：只读、无副作用
-	RiskR1                  // low：只读，可能跨网络/外部进程
-	RiskR2                  // medium：工作区内写
-	RiskR3                  // elevated：工作区内破坏/移动/权限
-	RiskR4                  // high：提权/密钥/代码执行
-	RiskR5                  // critical：denylist 硬拒，不进 HITL
-	RiskR6                  // unclassified：无法分类的命令，默认不信任
-	RiskR7                  // reserved：未来模型
+	RiskBenign       RiskLevel = iota // benign：只读、无副作用
+	RiskLow                           // low：只读，可能跨网络/外部进程
+	RiskMedium                        // medium：工作区内写
+	RiskElevated                      // elevated：工作区内破坏/移动/权限
+	RiskHigh                          // high：提权/密钥/代码执行
+	RiskCritical                      // critical：可进入 HITL，硬拒由 HardDeny 独立表达
+	RiskUnclassified                  // unclassified：无法分类的命令，默认不信任
+	RiskReserved                      // reserved：未来模型
 )
 
 // ---- 副作用 ----
@@ -145,6 +153,7 @@ type RiskAssessment struct {
 	Reasons    []Reason
 	Source     Source
 	Confidence float64
+	HardDeny   bool // 明确不可执行的规则命中；不由 Level 推导
 }
 
 // ---- 决策 ----
@@ -168,7 +177,13 @@ type AllowRule struct {
 	Desc        string
 }
 
-// Outcome 是 Decide 的输出，兼作旧三态 error 契约的载体（Error() 还原）。
+// ToolAllowRule 是编译后的外部工具授权，独立于 bash AllowRule。
+type ToolAllowRule struct {
+	Key     string
+	MaxRisk RiskLevel
+	Desc    string
+}
+
 type Outcome struct {
 	Decision Decision
 	Level    RiskLevel
@@ -176,6 +191,7 @@ type Outcome struct {
 	Reasons  []Reason
 	Source   Source
 	Command  string
+	HardDeny bool
 	Override *AllowRule
 }
 

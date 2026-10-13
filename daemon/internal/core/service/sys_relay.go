@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
+	"github.com/tinguo/goworker/ai-sandbox"
 )
 
 const (
@@ -39,10 +40,11 @@ type DeviceCaller interface {
 
 // DeviceToolDescriptor 是客户端声明的工具描述符（x-device/tools 应答元素）。
 type DeviceToolDescriptor struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Schema      string `json:"schema"`     // JSON Schema 字符串；非法 schema 的条目整体跳过
-	RiskLevel   string `json:"risk_level"` // never | mode | always；空/非法 = mode
+	Name             string `json:"name"`
+	Description      string `json:"description"`
+	Schema           string `json:"schema"`     // JSON Schema 字符串；非法 schema 的条目整体跳过
+	RiskLevel        string `json:"risk_level"` // canonical benign..reserved; legacy values are normalized at the boundary
+	permissionPolicy string
 }
 
 type deviceToolsResponse struct {
@@ -77,33 +79,64 @@ func ProbeDeviceTools(ctx context.Context, caller DeviceCaller) []DeviceToolDesc
 			continue // 重复名剔除：toolMap 静默保留最后一个，不如源头去掉
 		}
 		seen[d.Name] = true
-		switch d.RiskLevel {
-		case "never", "mode", "always":
-		default:
-			d.RiskLevel = "mode"
-		}
-		clean = append(clean, d)
+		clean = append(clean, normalizeDeviceToolDescriptor(d))
 	}
 	return clean
 }
 
-// RelayDeviceTools 把客户端描述符包装成 agent 工具：
-// sys_ 前缀（进 HITL 门控）+ risk_level 元数据（中间件裁决用）+ 转发 Execute。
-// 参数校验职责在客户端（谁定义 schema 谁校验）；调用失败翻译成错误文本回给 LLM。
+func normalizeDeviceToolDescriptor(d DeviceToolDescriptor) DeviceToolDescriptor {
+	switch d.RiskLevel {
+	case "never":
+		// Legacy never explicitly opts out of the permission gate.
+		d.RiskLevel = sandbox.RiskLow.String()
+		d.permissionPolicy = "allow"
+	case "mode":
+		// Legacy mode follows the normal external-tool permission policy.
+		d.RiskLevel = sandbox.RiskUnclassified.String()
+		d.permissionPolicy = "mode"
+	case "always":
+		d.RiskLevel = sandbox.RiskCritical.String()
+		d.permissionPolicy = "always_hitl"
+	default:
+		if _, err := sandbox.ParseRiskLevel(d.RiskLevel); err != nil {
+			d.RiskLevel = sandbox.RiskUnclassified.String()
+		}
+		// Canonical descriptors are policy-controlled by default. The legacy
+		// never escape hatch is the only descriptor that is not gated.
+		if d.permissionPolicy == "" {
+			d.permissionPolicy = "mode"
+		}
+	}
+	return d
+}
+
+// RelayDeviceTools wraps client descriptors as agent tools. Metadata is kept
+// on the core.Tool boundary so policy middleware can inspect it without
+// leaking policy fields into the provider schema.
 func RelayDeviceTools(caller DeviceCaller, descriptors []DeviceToolDescriptor) []core.Tool {
 	tools := make([]core.Tool, 0, len(descriptors))
-	for _, d := range descriptors {
-		d := d
+	for _, raw := range descriptors {
+		d := normalizeDeviceToolDescriptor(raw)
 		var schema map[string]any
 		if err := json.Unmarshal([]byte(d.Schema), &schema); err != nil || schema == nil {
-			// "null" 能被 Unmarshal 成 nil map —— 落到线上就是 parameters:null，兜底成空对象
-			schema = map[string]any{"type": "object"} // 无合法 schema 也能注册，靠 description 引导
+			// "null" unmarshals into a nil map; use a valid fallback schema.
+			schema = map[string]any{"type": "object"}
 		}
+
+		metadata := map[string]string{"risk_level": d.RiskLevel}
+		if d.permissionPolicy != "allow" {
+			metadata["requires_permission"] = "true"
+			metadata["allow_always_key"] = sysToolPrefix + d.Name
+		}
+		if d.permissionPolicy == "always_hitl" {
+			metadata["permission_policy"] = "always_hitl"
+		}
+
 		tools = append(tools, core.Tool{
 			Name:        sysToolPrefix + d.Name,
 			Description: d.Description,
 			Parameters:  schema,
-			Metadata:    map[string]string{"risk_level": d.RiskLevel},
+			Metadata:    metadata,
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
 				argsJSON, err := json.Marshal(args)
 				if err != nil {

@@ -31,8 +31,8 @@
 
 **⚠️ CRITICAL**: 用户故事实现开始前必须完成
 
-- [X] T003 创建 `daemon/internal/sandbox/risk.go`：`RiskLevel`（R0-R7，含 String/ParseRiskLevel/MarshalText）、`Effects` 位集（8 个 Effect + Has/Names/MarshalJSON）、`Source`、`Reason{Code,Pattern,Detail}`、`CommandRequest`、`RiskAssessment{Level,Effects,Reasons,Source,Confidence}`（按 data-model.md）
-- [X] T004 [P] 创建 `daemon/internal/sandbox/risk_test.go`：table-driven 断言 String/Parse 往返、"R6" 语义、Effects.Names 顺序稳定、非法 Parse 报错
+- [X] T003 创建 `daemon/internal/sandbox/risk.go`：`RiskLevel`（benign-reserved，含 String/ParseRiskLevel/MarshalText）、`Effects` 位集（8 个 Effect + Has/Names/MarshalJSON）、`Source`、`Reason{Code,Pattern,Detail}`、`CommandRequest`、`RiskAssessment{Level,Effects,Reasons,Source,Confidence}`（按 data-model.md）
+- [X] T004 [P] 创建 `daemon/internal/sandbox/risk_test.go`：table-driven 断言 String/Parse 往返、"unclassified" 语义、Effects.Names 顺序稳定、非法 Parse 报错
 
 **Checkpoint**: 类型层就绪，`go build ./internal/sandbox/...` 通过
 
@@ -47,15 +47,15 @@
 
 > **NOTE: Write these tests FIRST, ensure they FAIL before implementation**
 
-- [X] T005 [P] [US1] 创建 `daemon/internal/sandbox/assess_test.go`：已知命令→{Level,Effects} 映射 table-driven——`git status`→R1、`git push`→R3、`curl -s`→R1、`curl -o`→R2、`rm -rf /tmp/x`→R3、`sudo apt install`→R4、`rm -rf /`→R5、`openssl x509 -text`→R6、`env FOO=bar /usr/bin/curl -s`→R1（env 解析保留）
-- [X] T008 [P] [US1] 创建 `daemon/internal/sandbox/policy_test.go`：决策矩阵全组合 + Effects floor 升级（CodeExecution→R4）+ readonly/strict 硬拒 + **Unknown→hitl**（`pip install foo` 在 normal 必 hitl）+ R5 恒 deny
+- [X] T005 [P] [US1] 创建 `daemon/internal/sandbox/assess_test.go`：已知命令→{Level,Effects} 映射 table-driven——`git status`→low、`git push`→elevated、`curl -s`→low、`curl -o`→medium、`rm -rf /tmp/x`→elevated、`sudo apt install`→high、`rm -rf /`→critical、`openssl x509 -text`→unclassified、`env FOO=bar /usr/bin/curl -s`→low（env 解析保留）
+- [X] T008 [P] [US1] 创建 `daemon/internal/sandbox/policy_test.go`：决策矩阵全组合 + Effects floor 升级（CodeExecution→high）+ readonly/strict 硬拒 + **Unknown→hitl**（`pip install foo` 在 normal 必 hitl）+ critical 恒 deny
 
 ### Implementation for User Story 1
 
 - [X] T006 [US1] 创建 `daemon/internal/sandbox/assess.go`：`Assess(cmd, cfg) RiskAssessment` 纯函数，吸收 `safe.go` 三态逻辑与 defaults 等级映射（T010 依赖）
 - [X] T007 [US1] 迁移门禁：重构后 `daemon/internal/sandbox/safe_test.go`、`regression_test.go` 零改动通过
 - [X] T009 [US1] 创建 `daemon/internal/sandbox/policy.go`：`Decision`、`Outcome{Decision,Level,Effects,Reasons,Override}`、`Outcome.Error()` 还原三态、`Policy.Decide` 决策矩阵、`Evaluate(req,cfg) Outcome`；改造 `config.go` 的 `Check` 为 `Evaluate(...).Error()` shim
-- [X] T010 [US1] 扩展 `daemon/internal/sandbox/defaults.go`：`riskPatternLevel`/`riskPatternEffects` 映射（sudo→R4、rm/mv→R3、`>`/`>>`→R2、`|`→R2、kill→R4、dd/mkfs/`rm -rf /`→R5），供 Assess 结构化推导
+- [X] T010 [US1] 扩展 `daemon/internal/sandbox/defaults.go`：`riskPatternLevel`/`riskPatternEffects` 映射（sudo→high、rm/mv→elevated、`>`/`>>`→medium、`|`→medium、kill→high、dd/mkfs/`rm -rf /`→critical），供 Assess 结构化推导
 - [X] T011 [US1] 修改 `daemon/internal/spec/hitl.go`：`InterruptRequest` 增 additive 字段 `RiskLevel string`、`Effects []string`（JSON omitempty，老前端兼容）
 - [X] T012 [US1] 修改 `daemon/internal/plugins/agent/middlewares/mw_hitl.go`：`checkBash` 改 `sandbox.Evaluate` + `Outcome`，deny→block、hitl→confirm（RiskLevel/Effects 填入 InterruptRequest）、allow→放行
 - [X] T013 [US1] 修改 `daemon/internal/plugins/agent/session.go` `buildMiddlewareChain`（约 L165）：`NewHITLMiddleware` 构造处接入新签名（审计参数先传 nil，US4 填充）
@@ -72,12 +72,12 @@
 
 ### Tests for User Story 2 (TDD) ⚠️
 
-- [X] T015 [P] [US2] 创建 `daemon/internal/sandbox/normalize_test.go`：换行拆分（`echo hi\nsudo rm -rf /tmp` 必须升级）、`$(...)`/反引号/`${x}`→R4+CodeExecution、`bash -c 'rm -rf /'`/`python3 -c`/`perl -e`→R4、`eval`→R4、heredoc `<<`；**负例**：`echo "$(date)"`→R1、quoted 反引号不升级、`echo "a > b"` 保持 allow
+- [X] T015 [P] [US2] 创建 `daemon/internal/sandbox/normalize_test.go`：换行拆分（`echo hi\nsudo rm -rf /tmp` 必须升级）、`$(...)`/反引号/`${x}`→high+CodeExecution、`bash -c 'rm -rf /'`/`python3 -c`/`perl -e`→high、`eval`→high、heredoc `<<`；**负例**：`echo "$(date)"`→low、quoted 反引号不升级、`echo "a > b"` 保持 allow
 
 ### Implementation for User Story 2
 
 - [X] T016 [US2] 创建 `daemon/internal/sandbox/normalize.go`：`splitShellSegments` 补 `\n`/`\r` 拆分（修真实绕过 bug）、子shell/命令替换/解释器 `-c`/`-e`/eval/heredoc 引号感知检测、结构化写命令表替换 `hasWriteOps` 正则（rm→Destructive、mv/cp/touch/ln→FileWrite、chmod/chown→FileWrite+Privileged、kill/pkill→ProcessSpawn）
-- [X] T017 [US2] 重跑 R1/R2 回归：`go test ./internal/sandbox/...` 确认 normalize 强化无回退
+- [X] T017 [US2] 重跑 low/medium 回归：`go test ./internal/sandbox/...` 确认 normalize 强化无回退
 
 **Checkpoint**: 绕过封死，负例守门
 
@@ -124,7 +124,7 @@
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [X] T027 [P] 可选：修改 `daemon/internal/frontend/stdin/hitl_consumer.go` 渲染 `[R4]` 风险标签（新前端字段，老逻辑兼容）
+- [X] T027 [P] 可选：修改 `daemon/internal/frontend/stdin/hitl_consumer.go` 渲染 `[high]` 风险标签（新前端字段，老逻辑兼容）
 - [X] T028 跑通 `specs/001-command-decision-engine/quickstart.md` 全部 5 个验证场景（含 REPL 端到端）
 - [X] T029 收尾：gofmt/goimports + `go vet ./...` + `go test -race ./internal/sandbox/... ./internal/plugins/agent/middlewares/...` 全绿
 - [X] T030 更新 `docs/architecture.md` 与 `README.md`：sandbox 层从"正则三态"描述升级为"Risk Assessment + Policy Engine"

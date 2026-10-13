@@ -6,7 +6,7 @@ import (
 
 // 回归测试：review 挖出的 5 个安全洞，修好后必须保持关闭。
 
-// R1: env 不应成为万能包装器 —— env 包住写命令/写参数必须仍被拦截。
+// low: env 不应成为万能包装器 —— env 包住写命令/写参数必须仍被拦截。
 func TestRegression_EnvNoBypass(t *testing.T) {
 	cfg := newTestConfig("normal")
 	confirm := []string{
@@ -34,7 +34,7 @@ func TestRegression_EnvNoBypass(t *testing.T) {
 	}
 }
 
-// R2: /dev/ 豁免只能作用于内置 `>\s*/dev/` 规则，自定义含 /dev/ 的 deny 必须仍生效。
+// medium: /dev/ 豁免只能作用于内置 `>\s*/dev/` 规则，自定义含 /dev/ 的 deny 必须仍生效。
 func TestRegression_DevExemptionScoped(t *testing.T) {
 	cfg := NewFromConfig(&SandboxConfig{
 		Mode:           "normal",
@@ -50,7 +50,7 @@ func TestRegression_DevExemptionScoped(t *testing.T) {
 	}
 }
 
-// R3: curl 长格式 --request 写方法必须被识别。
+// elevated: curl 长格式 --request 写方法必须被识别。
 func TestRegression_CurlRequestLongForm(t *testing.T) {
 	cfg := newTestConfig("normal")
 	confirm := []string{
@@ -73,7 +73,7 @@ func TestRegression_CurlRequestLongForm(t *testing.T) {
 	}
 }
 
-// R4: readonly 模式下写操作必须硬拒，不允许 HITL 批准。
+// high: readonly 模式下写操作必须硬拒，不允许 HITL 批准。
 func TestRegression_ReadonlyHardDeny(t *testing.T) {
 	cfg := newTestConfig("readonly")
 	deny := []string{
@@ -92,7 +92,7 @@ func TestRegression_ReadonlyHardDeny(t *testing.T) {
 	}
 }
 
-// R5: safe_commands 支持 "kubectl get"（命令+子命令）形式。
+// critical: safe_commands 支持 "kubectl get"（命令+子命令）形式。
 func TestRegression_SafeCommandsSubcommand(t *testing.T) {
 	cfg := NewFromConfig(&SandboxConfig{
 		Mode:         "normal",

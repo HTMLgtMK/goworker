@@ -13,7 +13,7 @@ var interpreterCmds = map[string]bool{
 	"perl": true, "ruby": true, "node": true, "php": true, "lua": true,
 }
 
-// dangerousSubMarkers 命令替换内容里的危险标记。命中即视为注入向量 → 升级 R4。
+// dangerousSubMarkers 命令替换内容里的危险标记。命中即视为注入向量 → 升级 high。
 var dangerousSubMarkers = []string{
 	"rm ", "mv ", "dd ", "sudo ", "chmod ", "chown ", "kill ", "pkill ",
 	"mkfs", ">>", "> ", "|", "sh ", "bash", "curl", "wget", "eval",
@@ -34,7 +34,7 @@ func assessInjection(cmd string) (RiskLevel, Effects, bool) {
 			continue
 		}
 		if interpreterCmds[filepath.Base(name)] && hasExecFlag(args, "-c", "-e", "--command") {
-			return RiskR4, Effects(EffectCodeExecution), true
+			return RiskHigh, Effects(EffectCodeExecution), true
 		}
 	}
 
@@ -45,12 +45,12 @@ func assessInjection(cmd string) (RiskLevel, Effects, bool) {
 
 	// 3. 命令替换/子shell：内容含危险标记才升级（$(date) 这类安全内容不误报）。
 	if code := extractSubshellCode(cmd); code != "" && containsDanger(code) {
-		return RiskR4, Effects(EffectCodeExecution).Add(EffectProcessSpawn), true
+		return RiskHigh, Effects(EffectCodeExecution).Add(EffectProcessSpawn), true
 	}
 
 	// 4. heredoc：<< 输入重定向可能喂给会执行的命令。
 	if hasHeredoc(cmd) {
-		return RiskR2, Effects(EffectFileWrite).Add(EffectProcessSpawn), true
+		return RiskMedium, Effects(EffectFileWrite).Add(EffectProcessSpawn), true
 	}
 
 	return 0, 0, false
@@ -79,7 +79,7 @@ func evalCommand(cmd string) (RiskLevel, Effects, bool) {
 		return 0, 0, false
 	}
 	if filepath.Base(name) == "eval" {
-		return RiskR4, Effects(EffectCodeExecution), true
+		return RiskHigh, Effects(EffectCodeExecution), true
 	}
 	return 0, 0, false
 }

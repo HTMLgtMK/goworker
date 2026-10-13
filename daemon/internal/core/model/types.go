@@ -67,6 +67,7 @@ type Tool struct {
 	Name        string
 	Description string
 	Schema      []byte // JSON Schema
+	Metadata    map[string]string
 	Handler     func(ctx *Context, params []byte) (any, error)
 }
 

@@ -21,7 +21,7 @@ func TestAudit_OpenRecordReadBack(t *testing.T) {
 	entry := AuditEntry{
 		Timestamp:      time.Now(),
 		Command:        "rm -rf /tmp/x",
-		RiskLevel:      "R3",
+		RiskLevel:      "elevated",
 		Effects:        []string{"destructive"},
 		Reasons:        []Reason{{Code: "write_command", Detail: "写操作命令"}},
 		Source:         "heuristic",
@@ -41,7 +41,7 @@ func TestAudit_OpenRecordReadBack(t *testing.T) {
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.Command != entry.Command || got.RiskLevel != "R3" ||
+	if got.Command != entry.Command || got.RiskLevel != "elevated" ||
 		got.UserDecision != "approve" || got.EngineDecision != "hitl" {
 		t.Errorf("readback mismatch: %+v", got)
 	}
@@ -53,7 +53,7 @@ func TestAudit_AppendMultipleLines(t *testing.T) {
 	defer lg.Close()
 
 	for i := 0; i < 3; i++ {
-		if err := lg.Record(AuditEntry{Timestamp: time.Now(), Command: "echo hi", RiskLevel: "R1"}); err != nil {
+		if err := lg.Record(AuditEntry{Timestamp: time.Now(), Command: "echo hi", RiskLevel: "low"}); err != nil {
 			t.Fatalf("Record %d: %v", i, err)
 		}
 	}
@@ -74,7 +74,7 @@ func TestAudit_ConcurrentSafe(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lg.Record(AuditEntry{Timestamp: time.Now(), Command: "x", RiskLevel: "R1"})
+			lg.Record(AuditEntry{Timestamp: time.Now(), Command: "x", RiskLevel: "low"})
 		}()
 	}
 	wg.Wait()

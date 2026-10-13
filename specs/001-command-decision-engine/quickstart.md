@@ -45,7 +45,7 @@ go test ./internal/sandbox/... -run 'Normalize' -v
 sandbox:
   allow_rules:
     - match: "git push"
-      max_risk: "R4"
+      max_risk: "high"
       effects: ["network", "file_write"]
 ```
 
@@ -76,7 +76,7 @@ go run cmd/goworker/main.go
 /agent                              # 进入代理模式，让它执行上面各类命令
 ```
 
-逐条核对确认提示出现/不出现、风险标签 `[R4]` 是否渲染。
+逐条核对确认提示出现/不出现、风险标签 `[high]` 是否渲染。
 
 ## 退出条件
 

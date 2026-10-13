@@ -27,9 +27,22 @@ import (
 // NewSession 创建一个会话。usage 初始清零，conversation 从空开始。
 // 有 store 时从持久化恢复会话（重启恢复），无 store（nil）时纯内存。
 func NewSession(deps SessionDeps) *Session {
-	s := &Session{usage: core.NewUsageTracker(), deps: deps, workDir: deps.CWD}
+	var toolAllowRules []sandbox.ToolAllowRule
+	if deps.Config != nil {
+		toolAllowRules = cloneToolAllowRules(sandbox.NewFromConfig(&deps.Config.Sandbox).ToolAllowRules)
+	}
+	s := &Session{
+		usage:          core.NewUsageTracker(),
+		deps:           deps,
+		workDir:        deps.CWD,
+		toolAllowRules: toolAllowRules,
+	}
 	_ = s.refreshConversation() // 构造时无并发，锁无害；与运行时共用统一刷新路径
 	return s
+}
+
+func cloneToolAllowRules(rules []sandbox.ToolAllowRule) []sandbox.ToolAllowRule {
+	return append([]sandbox.ToolAllowRule(nil), rules...)
 }
 
 // SetCWD 更新会话工作目录（client 经 wire 重新声明、宿主校验后写入，如
@@ -47,6 +60,27 @@ func (s *Session) cwd() string {
 	return s.workDir
 }
 
+func (s *Session) toolAllowRulesSnapshot() []sandbox.ToolAllowRule {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneToolAllowRules(s.toolAllowRules)
+}
+
+func (s *Session) updateToolAllowRule(next sandbox.ToolAllowRule) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, rule := range s.toolAllowRules {
+		if rule.Key != next.Key {
+			continue
+		}
+		updated := cloneToolAllowRules(s.toolAllowRules)
+		updated[i] = next
+		s.toolAllowRules = updated
+		return
+	}
+	s.toolAllowRules = append(append([]sandbox.ToolAllowRule(nil), s.toolAllowRules...), next)
+}
+
 // Run 执行一轮 /agent 对话：组装 agent → 跑 ReAct 循环 → 流式输出 → 写回 conversation。
 func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) error {
 	input := strings.TrimSpace(req.Input)
@@ -59,6 +93,7 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 
 	// usage 是会话累计账本：跨多次 /agent 累计，直到 /new 用新对象替换当前会话才清零。
 	sandboxCfg := *sandbox.NewFromConfig(&s.deps.Config.Sandbox)
+	sandboxCfg.ToolAllowRules = s.toolAllowRulesSnapshot()
 	// 会话工作目录渗透：client 声明（且经宿主 sandbox 边界校验）的 cwd 优先作为
 	// 工具执行目录 —— bash 的 cmd.Dir 与 read/write 的相对路径基准都取自
 	// AllowedWorkDir，为空则回退现行为（cfg.AllowedWorkDir，NewFromConfig 兜底进程
@@ -206,6 +241,15 @@ func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, 
 	hitlOptions := []middlewares.HITLOption{middlewares.WithAudit(s.audit)}
 	if s.deps.PersistAllowRule != nil {
 		hitlOptions = append(hitlOptions, middlewares.WithAllowAlways(s.deps.PersistAllowRule))
+	}
+	if s.deps.PersistToolAllowRule != nil {
+		hitlOptions = append(hitlOptions, middlewares.WithToolAllowAlways(func(rule sandbox.ToolAllowRule) error {
+			if err := s.deps.PersistToolAllowRule(rule); err != nil {
+				return err
+			}
+			s.updateToolAllowRule(rule)
+			return nil
+		}))
 	}
 	hitlMw := middlewares.NewHITLMiddleware(*sandboxCfg, hitl.NewChannelDecisionProvider(decisions), hitlOptions...)
 	// usage：观察 AfterModel 记账（累计到会话边界才清零），publish 抛 core.Usage 快照。

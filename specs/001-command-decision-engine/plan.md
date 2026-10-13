@@ -6,7 +6,7 @@
 
 ## Summary
 
-把 goworker 现有的正则三态命令安全层（`daemon/internal/sandbox.Check`）升级为结构化风险分级 + 策略决策引擎：命令 → `RiskAssessment`（R0-R7 分级 + Effects 副作用位集 + 稳定 reason 码）→ Policy 决策矩阵（normal/strict/readonly/off × 风险等级 → allow/hitl/deny）。Unknown≠Safe（R6 默认 HITL）。Normalize 强化封堵换行绕过、命令替换、解释器 `-c`/`-e` 代码执行。新增用户预批准规则（AllowRules）与审计 jsonl。不含 tiny model / confidence calibration / gVisor（macOS）。
+把 goworker 现有的正则三态命令安全层（`daemon/internal/sandbox.Check`）升级为结构化风险分级 + 策略决策引擎：命令 → `RiskAssessment`（benign-reserved 分级 + Effects 副作用位集 + 稳定 reason 码）→ Policy 决策矩阵（normal/strict/readonly/off × 风险等级 → allow/hitl/deny）。Unknown≠Safe（unclassified 默认 HITL）。Normalize 强化封堵换行绕过、命令替换、解释器 `-c`/`-e` 代码执行。新增用户预批准规则（AllowRules）与审计 jsonl。不含 tiny model / confidence calibration / gVisor（macOS）。
 
 ## Technical Context
 
@@ -59,7 +59,7 @@ specs/001-command-decision-engine/
 
 ```text
 daemon/internal/sandbox/           # 核心：全部新增/修改
-├── risk.go                        # 新增：RiskLevel(R0-R7)、Effects 位集、RiskAssessment、Source、Reason、CommandRequest
+├── risk.go                        # 新增：RiskLevel(benign-reserved)、Effects 位集、RiskAssessment、Source、Reason、CommandRequest
 ├── normalize.go                    # 新增：换行拆分、子shell/命令替换/解释器 -c/heredoc 检测、结构化写命令表
 ├── assess.go                       # 新增：Assess() 分类器（吸收 safe.go 三态逻辑）
 ├── policy.go                       # 新增：Decision、Outcome、AllowRule、Policy.Decide、Evaluate、Check shim
@@ -73,7 +73,7 @@ daemon/internal/config/config.go    # 修改：AllowRuleConfig、AllowRules、Au
 daemon/internal/plugins/agent/middlewares/mw_hitl.go  # 修改：改 Evaluate/Outcome、审计钩子、风险信息进 InterruptRequest
 daemon/internal/plugins/agent/session.go              # 修改：buildMiddlewareChain 构造审计并注入 HITL 中间件
 daemon/internal/spec/hitl.go        # 修改：InterruptRequest 加 additive 字段 RiskLevel/Effects
-daemon/internal/frontend/stdin/hitl_consumer.go       # 可选修改：渲染 [R4] 风险标签
+daemon/internal/frontend/stdin/hitl_consumer.go       # 可选修改：渲染 [high] 风险标签
 ```
 
 **Structure Decision**: 所有决策类型留在现有 `sandbox` 包（拆文件实现 Assess/Decide 纯函数分离，而非新建 decision 包）——沿用包注释契约"不依赖 agent 或 engine，可被任何插件复用"，避免新 import 图；审计日志复用 `session/store.go` 的 append+fsync 模式。若后续 policy+audit 超 2k 行再提升为独立包。
@@ -82,4 +82,4 @@ daemon/internal/frontend/stdin/hitl_consumer.go       # 可选修改：渲染 [R
 
 > **Fill ONLY if Constitution Check has violations that must be justified**
 
-无违规。`RiskLevel` 的 R6/R7 两级语义（unclassified/reserved）在 data-model.md 中说明，不视为额外复杂度——它是 future model 的契约，避免未来 schema 翻动。
+无违规。`RiskLevel` 的 unclassified/reserved 两级语义（unclassified/reserved）在 data-model.md 中说明，不视为额外复杂度——它是 future model 的契约，避免未来 schema 翻动。

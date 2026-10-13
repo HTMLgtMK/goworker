@@ -8,7 +8,7 @@ Six Go modules in one workspace (`go.work`), layered as an SDK. `ai-core` / `ai-
 
 ```
 ai-memory/                     ← standalone: MTM task archive + LTM facts (mem0-like), zero deps
-ai-sandbox/                    ← standalone: command safety layer (risk R0-R7 → policy → allow/hitl/deny), stdlib only
+ai-sandbox/                    ← standalone: command safety layer (risk benign-reserved → policy → allow/hitl/deny), stdlib only
 ai-core/                       ← pure engine kernel: spec protocol + ReAct engine + core types + engine middlewares
 │  ├── spec/                   ← Hub, Command, Plugin, Context (pure protocol)
 │  ├── core/                   ← Tool, Message(+Thinking/Custom), Usage, Compressor
@@ -64,7 +64,7 @@ The `/agent` command runs a ReAct agent with built-in tools:
 - `write_file` — write files with auto-mkdir
 
 Command safety (`sandbox`): every `bash` call goes through a structured decision
-chain — `Assess` (risk level R0-R7 + side-effect dimensions) → `Policy` matrix →
+chain — `Assess` (risk level benign-reserved + side-effect dimensions) → `Policy` matrix →
 `allow / hitl / deny`. Unknown commands default to HITL confirmation (Unknown ≠
 Safe); regex rules stay deterministic, pre-approval rules (`allow_rules`) only
 soften normal-mode confirmations, and strict/readonly modes hard-deny. Injection
@@ -128,8 +128,11 @@ MCP servers:
         args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
   ```
 - Server tools register as `mcp_<server>_<tool>` and are available to the agent
+- MCP bridges attach `risk_level=unclassified`, `requires_permission=true`, and a stable `allow_always_key` by default when the server provides no trusted classification
+- normal/auto/strict/readonly sandbox modes apply to MCP tools; `auto_max_risk` controls automatic execution in auto mode
+- Bash command rules remain compatible with the `001-command-decision-engine`; external-tool approval uses independent `tool_allow_rules`
+- Full policy contract: `specs/005-unified-tool-risk-policy/`
 - `/mcp` — check server connection status
-- ⚠️ MCP tools run in external processes, **not gated by the local sandbox** — only connect servers you trust
 
 
 Memory (`ai-memory/`):

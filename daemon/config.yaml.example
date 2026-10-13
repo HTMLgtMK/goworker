@@ -7,8 +7,17 @@ llm:
     api_key: ""
 
 sandbox:
-    # 沙箱模式：off | normal | strict | readonly
+    # 沙箱模式：off | normal | auto | strict | readonly
     mode: normal
+
+    # auto 模式自动放行的最高风险等级；更高等级进入 HITL，默认 low
+    # auto_max_risk: low
+
+    # 外部工具的永久授权（只保存稳定 key，不保存调用参数）
+    # tool_allow_rules:
+    #   - key: "mcp_filesystem_write"
+    #     max_risk: medium
+    #     desc: "trusted filesystem writer"
 
     # 允许的工作目录（空 = 使用当前目录）
     allowed_work_dir: ""
@@ -67,8 +76,9 @@ memory:
 
 mcp:
     # MCP 服务器连接（stdio 传输）
-    # 每个 server 暴露的工具以 mcp_<server>_<tool> 注册给 agent
-    # 注意：MCP 工具在外部进程运行，不受本地 sandbox 管控，只连接可信 server
+    # 每个 server 暴露的工具以 mcp_<server>_<tool> 注册给 agent。
+    # MCP 工具默认声明 unclassified + requires_permission=true，normal/auto 会进入 HITL，
+    # strict/readonly 拒绝；只连接可信 server 仍是必要的纵深防御。
     servers:
       # - name: filesystem
       #   command: npx

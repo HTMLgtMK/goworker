@@ -68,20 +68,20 @@ func PatternDesc(pattern string) string {
 
 // riskPatternLevel 是默认风险模式对应的风险等级，供 Assess 结构化推导（而非矩阵硬编码）。
 var riskPatternLevel = map[string]RiskLevel{
-	`rm\s+`:    RiskR3,
-	`mv\s+`:    RiskR3,
-	`dd\s+`:    RiskR3,
-	`>\s+\S`:   RiskR2,
-	`>>\s+\S`:  RiskR2,
-	`\|`:       RiskR2,
-	`sudo\s+`:  RiskR4,
-	`chmod\s+`: RiskR4,
-	`chown\s+`: RiskR4,
-	`kill\s+`:  RiskR4,
-	`shutdown`: RiskR4,
-	`reboot`:   RiskR4,
-	`init\s+0`: RiskR4,
-	`init\s+6`: RiskR4,
+	`rm\s+`:    RiskElevated,
+	`mv\s+`:    RiskElevated,
+	`dd\s+`:    RiskElevated,
+	`>\s+\S`:   RiskMedium,
+	`>>\s+\S`:  RiskMedium,
+	`\|`:       RiskMedium,
+	`sudo\s+`:  RiskHigh,
+	`chmod\s+`: RiskHigh,
+	`chown\s+`: RiskHigh,
+	`kill\s+`:  RiskHigh,
+	`shutdown`: RiskHigh,
+	`reboot`:   RiskHigh,
+	`init\s+0`: RiskHigh,
+	`init\s+6`: RiskHigh,
 }
 
 // riskPatternEffects 是默认风险模式对应的副作用（审计/floor 用）。0 = 无独立副作用。

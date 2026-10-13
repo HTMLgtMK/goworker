@@ -4,6 +4,13 @@ import (
 	"testing"
 )
 
+func TestNewFromConfig_InvalidAutoMaxRiskDefaultsToConservativeThreshold(t *testing.T) {
+	cfg := NewFromConfig(&SandboxConfig{Mode: "auto", AutoMaxRisk: "unknown-level"})
+	if cfg.AutoMaxRisk != RiskLow {
+		t.Fatalf("AutoMaxRisk = %s, want %s", cfg.AutoMaxRisk, RiskLow)
+	}
+}
+
 // 决策矩阵：level × mode → Decision。
 func TestPolicy_DecisionMatrix(t *testing.T) {
 	mkCfg := func(mode string) *Config { return NewFromConfig(&SandboxConfig{Mode: mode}) }
@@ -13,33 +20,35 @@ func TestPolicy_DecisionMatrix(t *testing.T) {
 		mode  string
 		want  Decision
 	}{
-		// normal：R0/R1 allow，R2-R4/R6/R7 hitl，R5 deny
-		{RiskR0, "normal", DecisionAllow},
-		{RiskR1, "normal", DecisionAllow},
-		{RiskR2, "normal", DecisionHitl},
-		{RiskR3, "normal", DecisionHitl},
-		{RiskR4, "normal", DecisionHitl},
-		{RiskR5, "normal", DecisionDeny}, // denylist 恒硬拒
-		{RiskR6, "normal", DecisionHitl}, // unknown → HITL（核心行为）
-		{RiskR7, "normal", DecisionHitl},
-		// auto：保留 deny，其余原本 HITL 的风险自动放行
-		{RiskR2, "auto", DecisionAllow},
-		{RiskR4, "auto", DecisionAllow},
-		{RiskR5, "auto", DecisionDeny},
-		{RiskR6, "auto", DecisionAllow},
-		// strict：只放 R0/R1，其余硬拒
-		{RiskR0, "strict", DecisionAllow},
-		{RiskR1, "strict", DecisionAllow},
-		{RiskR2, "strict", DecisionDeny},
-		{RiskR5, "strict", DecisionDeny},
-		{RiskR6, "strict", DecisionDeny},
-		// readonly：只放 R0/R1，其余硬拒
-		{RiskR1, "readonly", DecisionAllow},
-		{RiskR2, "readonly", DecisionDeny},
-		{RiskR4, "readonly", DecisionDeny},
+		// normal：benign/low allow，medium-reserved hitl，critical 也允许 HITL
+		{RiskBenign, "normal", DecisionAllow},
+		{RiskLow, "normal", DecisionAllow},
+		{RiskMedium, "normal", DecisionHitl},
+		{RiskElevated, "normal", DecisionHitl},
+		{RiskHigh, "normal", DecisionHitl},
+		{RiskCritical, "normal", DecisionHitl},     // critical 进入 HITL，hard deny 另测
+		{RiskUnclassified, "normal", DecisionHitl}, // unknown → HITL（核心行为）
+		{RiskReserved, "normal", DecisionHitl},
+		// auto：只有不超过阈值的风险自动放行，其余进入 HITL
+		{RiskBenign, "auto", DecisionAllow},
+		{RiskLow, "auto", DecisionAllow},
+		{RiskMedium, "auto", DecisionHitl},
+		{RiskHigh, "auto", DecisionHitl},
+		{RiskCritical, "auto", DecisionHitl},
+		{RiskUnclassified, "auto", DecisionHitl},
+		// strict：只放 benign/low，其余硬拒
+		{RiskBenign, "strict", DecisionAllow},
+		{RiskLow, "strict", DecisionAllow},
+		{RiskMedium, "strict", DecisionDeny},
+		{RiskCritical, "strict", DecisionDeny},
+		{RiskUnclassified, "strict", DecisionDeny},
+		// readonly：只放 benign/low，其余硬拒
+		{RiskLow, "readonly", DecisionAllow},
+		{RiskMedium, "readonly", DecisionDeny},
+		{RiskHigh, "readonly", DecisionDeny},
 		// off：全部放行
-		{RiskR5, "off", DecisionAllow},
-		{RiskR6, "off", DecisionAllow},
+		{RiskCritical, "off", DecisionAllow},
+		{RiskUnclassified, "off", DecisionAllow},
 	}
 	for _, tc := range cases {
 		t.Run(tc.mode+"/"+tc.level.String(), func(t *testing.T) {
@@ -50,6 +59,33 @@ func TestPolicy_DecisionMatrix(t *testing.T) {
 				t.Errorf("Decide(level=%s, mode=%s) = %v, want %v", tc.level, tc.mode, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestPolicy_HardDenyIsIndependentOfRiskLevel(t *testing.T) {
+	cfg := newTestConfig("normal")
+	p := NewPolicy(cfg)
+
+	critical := p.Decide(CommandRequest{Command: "critical"}, cfg, RiskAssessment{Level: RiskCritical})
+	if critical.Decision != DecisionHitl {
+		t.Fatalf("ordinary critical decision = %v, want hitl", critical.Decision)
+	}
+
+	blocked := p.Decide(CommandRequest{Command: "blocked"}, cfg, RiskAssessment{Level: RiskCritical, HardDeny: true})
+	if blocked.Decision != DecisionDeny {
+		t.Fatalf("hard-deny critical decision = %v, want deny", blocked.Decision)
+	}
+}
+
+func TestPolicy_AutoMaxRisk(t *testing.T) {
+	cfg := NewFromConfig(&SandboxConfig{Mode: "auto", AutoMaxRisk: "high"})
+	policy := NewPolicy(cfg)
+
+	if got := policy.Decide(CommandRequest{}, cfg, RiskAssessment{Level: RiskHigh}).Decision; got != DecisionAllow {
+		t.Errorf("high with auto_max_risk=high = %v, want allow", got)
+	}
+	if got := policy.Decide(CommandRequest{}, cfg, RiskAssessment{Level: RiskCritical}).Decision; got != DecisionHitl {
+		t.Errorf("critical with auto_max_risk=high = %v, want hitl", got)
 	}
 }
 
@@ -64,13 +100,13 @@ func TestPolicy_EffectFloors(t *testing.T) {
 		effs   []Effect
 		wantLv RiskLevel
 	}{
-		{"code exec floor", RiskR1, []Effect{EffectCodeExecution}, RiskR4},
-		{"privileged floor", RiskR1, []Effect{EffectPrivileged}, RiskR4},
-		{"secret floor", RiskR1, []Effect{EffectSecretAccess}, RiskR4},
-		{"destructive floor", RiskR1, []Effect{EffectDestructive}, RiskR3},
-		{"file write floor", RiskR1, []Effect{EffectFileWrite}, RiskR2},
-		{"network no floor", RiskR1, []Effect{EffectNetwork}, RiskR1}, // 网络访问不升级
-		{"read no floor", RiskR1, []Effect{EffectFileRead}, RiskR1},
+		{"code exec floor", RiskLow, []Effect{EffectCodeExecution}, RiskHigh},
+		{"privileged floor", RiskLow, []Effect{EffectPrivileged}, RiskHigh},
+		{"secret floor", RiskLow, []Effect{EffectSecretAccess}, RiskHigh},
+		{"destructive floor", RiskLow, []Effect{EffectDestructive}, RiskElevated},
+		{"file write floor", RiskLow, []Effect{EffectFileWrite}, RiskMedium},
+		{"network no floor", RiskLow, []Effect{EffectNetwork}, RiskLow}, // 网络访问不升级
+		{"read no floor", RiskLow, []Effect{EffectFileRead}, RiskLow},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -123,7 +159,7 @@ func TestPolicy_AllowRuleOverride(t *testing.T) {
 		return NewFromConfig(&SandboxConfig{
 			Mode: mode,
 			AllowRules: []AllowRuleConfig{
-				{Match: "git push", MaxRisk: "R4", Effects: []string{"network", "file_write"}, Desc: "trusted push"},
+				{Match: "git push", MaxRisk: "high", Effects: []string{"network", "file_write"}, Desc: "trusted push"},
 			},
 		})
 	}
@@ -171,10 +207,10 @@ func TestPolicy_AllowRuleOverride(t *testing.T) {
 	})
 
 	t.Run("rule below risk floor not applied", func(t *testing.T) {
-		// pip install → R6；规则 max_risk R2 太低 → 不降级
+		// pip install → unclassified；规则 max_risk medium 太低 → 不降级
 		cfg := NewFromConfig(&SandboxConfig{
 			Mode:       "normal",
-			AllowRules: []AllowRuleConfig{{Match: "pip install", MaxRisk: "R2"}},
+			AllowRules: []AllowRuleConfig{{Match: "pip install", MaxRisk: "medium"}},
 		})
 		if out := Evaluate(CommandRequest{Command: "pip install foo"}, cfg); out.Decision != DecisionHitl {
 			t.Errorf("pip install with low max_risk = %v, want hitl", out.Decision)
@@ -183,7 +219,7 @@ func TestPolicy_AllowRuleOverride(t *testing.T) {
 }
 
 func TestAllowRuleForCommand_NormalizesMainTokens(t *testing.T) {
-	rule, ok := AllowRuleForCommand("env FOO=bar git push origin main", RiskR4, []string{"network"})
+	rule, ok := AllowRuleForCommand("env FOO=bar git push origin main", RiskHigh, []string{"network"})
 	if !ok {
 		t.Fatal("AllowRuleForCommand returned ok=false")
 	}
@@ -196,8 +232,8 @@ func TestAllowRuleForCommand_NormalizesMainTokens(t *testing.T) {
 			t.Errorf("MatchTokens[%d] = %q, want %q", i, rule.MatchTokens[i], want[i])
 		}
 	}
-	if rule.MaxRisk != RiskR4 || !rule.Effects.Has(EffectNetwork) {
-		t.Errorf("rule = %+v, want R4 with network effect", rule)
+	if rule.MaxRisk != RiskHigh || !rule.Effects.Has(EffectNetwork) {
+		t.Errorf("rule = %+v, want high with network effect", rule)
 	}
 }
 

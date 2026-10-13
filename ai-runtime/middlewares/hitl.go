@@ -13,19 +13,21 @@ import (
 )
 
 // HITLMiddleware 通过 DecisionProvider 对接沙箱检查，拦截风险工具调用。
-// 覆盖两类工具：
-//   - bash：走 sandbox 正则规则（deny 直接拒绝 / risky 需要确认）
-//   - mcp_*：外部进程，sandbox 约束不到 —— strict/readonly 直接拒绝，normal 走 HITL 确认
+// bash 使用命令决策引擎；带 requires_permission=true 的外部工具使用统一的
+// metadata 风险策略。未标记的内部工具保持原有直通行为。
 type HITLMiddleware struct {
 	sandboxCfg       sandbox.Config
 	decisionProvider hitl.DecisionProvider
 	audit            *sandbox.AuditLogger // nil = 不审计
 	allowAlways      AllowAlwaysHandler
+	toolAllowAlways  ToolAllowAlwaysHandler
 }
 
 type HITLOption func(*HITLMiddleware)
 
 type AllowAlwaysHandler func(sandbox.AllowRule) error
+
+type ToolAllowAlwaysHandler func(sandbox.ToolAllowRule) error
 
 func allowRuleForRequest(req *hitl.InterruptRequest) (sandbox.AllowRule, error) {
 	if req == nil || req.ToolName != "bash" {
@@ -42,9 +44,25 @@ func allowRuleForRequest(req *hitl.InterruptRequest) (sandbox.AllowRule, error) 
 	return rule, nil
 }
 
+func toolAllowRuleForRequest(req *hitl.InterruptRequest) (sandbox.ToolAllowRule, error) {
+	if req == nil || strings.TrimSpace(req.AllowAlwaysKey) == "" {
+		return sandbox.ToolAllowRule{}, fmt.Errorf("allow_always is unavailable for this tool")
+	}
+	maxRisk, err := sandbox.ParseRiskLevel(req.RiskLevel)
+	if err != nil {
+		return sandbox.ToolAllowRule{}, fmt.Errorf("parse risk level: %w", err)
+	}
+	return sandbox.ToolAllowRule{Key: req.AllowAlwaysKey, MaxRisk: maxRisk}, nil
+}
+
 // WithAllowAlways injects the persistence boundary for command allow rules.
 func WithAllowAlways(handler AllowAlwaysHandler) HITLOption {
 	return func(mw *HITLMiddleware) { mw.allowAlways = handler }
+}
+
+// WithToolAllowAlways injects the persistence boundary for external tool rules.
+func WithToolAllowAlways(handler ToolAllowAlwaysHandler) HITLOption {
+	return func(mw *HITLMiddleware) { mw.toolAllowAlways = handler }
 }
 
 var reqID atomic.Int64
@@ -72,15 +90,101 @@ func (mw *HITLMiddleware) OnBeforeTool(ev *core.BeforeToolEvent) *core.Middlewar
 	if ev.Tool == nil {
 		return &core.MiddlewareResponse{}
 	}
-	switch name := ev.Tool.Function.Name; {
-	case name == "bash":
+	name := ev.Tool.Function.Name
+	if name == "bash" {
 		return mw.checkBash(ev)
+	}
+	if policy, ok := resolveToolPolicy(ev); ok {
+		return mw.checkPolicyTool(ev, policy)
+	}
+	// Compatibility fallback for callers that have not populated ToolDef yet.
+	// Registered MCP/sys bridges always carry metadata and use the generic path above.
+	switch {
 	case strings.HasPrefix(name, "mcp_"):
 		return mw.checkMCP(ev)
 	case strings.HasPrefix(name, "sys_"):
 		return mw.checkSys(ev)
+	default:
+		return &core.MiddlewareResponse{}
 	}
-	return &core.MiddlewareResponse{}
+}
+
+// resolveToolPolicy returns only explicit permission-gated tool declarations.
+func resolveToolPolicy(ev *core.BeforeToolEvent) (sandbox.ToolPolicyMetadata, bool) {
+	if ev == nil || ev.ToolDef == nil {
+		return sandbox.ToolPolicyMetadata{}, false
+	}
+	metadata := ev.ToolDef.Metadata
+	if !strings.EqualFold(metadata[sandbox.ToolMetadataRequiresPermission], "true") {
+		return sandbox.ToolPolicyMetadata{}, false
+	}
+	return sandbox.NormalizeToolMetadata(metadata), true
+}
+
+func (mw *HITLMiddleware) checkPolicyTool(ev *core.BeforeToolEvent, policy sandbox.ToolPolicyMetadata) *core.MiddlewareResponse {
+	decision := mw.toolDecision(policy)
+	argsJSON, _ := json.Marshal(ev.Args)
+	now := time.Now()
+	req := &hitl.InterruptRequest{
+		ID:             fmt.Sprintf("req-%d", reqID.Add(1)),
+		ToolName:       ev.Tool.Function.Name,
+		Command:        string(argsJSON),
+		RiskReason:     fmt.Sprintf("declared risk_level=%s (tool metadata)", policy.RiskLevel),
+		Description:    fmt.Sprintf("tool %s with args %s", ev.Tool.Function.Name, string(argsJSON)),
+		RiskLevel:      policy.RiskLevel.String(),
+		AllowAlwaysKey: policy.AllowAlwaysKey,
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(hitl.DefaultTimeout),
+	}
+	switch decision {
+	case "allow":
+		return &core.MiddlewareResponse{}
+	case "deny":
+		return mw.block(ev, fmt.Sprintf("⛔ tool %s denied in %s mode (risk_level=%s)", ev.Tool.Function.Name, mw.sandboxCfg.Mode, policy.RiskLevel))
+	default:
+		return mw.confirm(ev, req, nil)
+	}
+}
+
+func (mw *HITLMiddleware) toolDecision(policy sandbox.ToolPolicyMetadata) string {
+	level := policy.RiskLevel
+	switch mw.sandboxCfg.Mode {
+	case sandbox.ModeStrict, sandbox.ModeReadOnly:
+		if level <= sandbox.RiskLow {
+			return "allow"
+		}
+		return "deny"
+	case sandbox.ModeAuto:
+		if !policy.ForceHITL && level <= mw.sandboxCfg.AutoMaxRisk {
+			return "allow"
+		}
+		return "hitl"
+	case sandbox.ModeOff:
+		if !policy.ForceHITL {
+			return "allow"
+		}
+		return "hitl"
+	default:
+		if !policy.ForceHITL && level <= sandbox.RiskLow {
+			return "allow"
+		}
+		if !policy.ForceHITL && toolAllowRuleMatches(mw.sandboxCfg.ToolAllowRules, policy) {
+			return "allow"
+		}
+		return "hitl"
+	}
+}
+
+func toolAllowRuleMatches(rules []sandbox.ToolAllowRule, policy sandbox.ToolPolicyMetadata) bool {
+	if policy.AllowAlwaysKey == "" {
+		return false
+	}
+	for _, rule := range rules {
+		if rule.Key == policy.AllowAlwaysKey && policy.RiskLevel <= rule.MaxRisk {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- sys_*：client-ward 设备能力，按声明的 risk_level × 沙箱模式裁决 ----
@@ -165,14 +269,15 @@ func (mw *HITLMiddleware) checkBash(ev *core.BeforeToolEvent) *core.MiddlewareRe
 	default: // DecisionHitl
 		now := time.Now()
 		req := &hitl.InterruptRequest{
-			ID:         fmt.Sprintf("req-%d", reqID.Add(1)),
-			ToolName:   "bash",
-			Command:    cmdStr,
-			RiskReason: riskReason(out),
-			RiskLevel:  out.Level.String(),
-			Effects:    out.Effects.Names(),
-			CreatedAt:  now,
-			ExpiresAt:  now.Add(hitl.DefaultTimeout),
+			ID:          fmt.Sprintf("req-%d", reqID.Add(1)),
+			ToolName:    "bash",
+			Command:     cmdStr,
+			AllowAlways: true,
+			RiskReason:  riskReason(out),
+			RiskLevel:   out.Level.String(),
+			Effects:     out.Effects.Names(),
+			CreatedAt:   now,
+			ExpiresAt:   now.Add(hitl.DefaultTimeout),
 		}
 		return mw.confirm(ev, req, func(d hitl.Decision, outcome string) {
 			mw.recordAudit(out, string(d.Type), outcome)
@@ -241,6 +346,18 @@ func (mw *HITLMiddleware) checkMCP(ev *core.BeforeToolEvent) *core.MiddlewareRes
 	}
 }
 
+func appendToolAllowRule(rules []sandbox.ToolAllowRule, next sandbox.ToolAllowRule) []sandbox.ToolAllowRule {
+	for i, rule := range rules {
+		if rule.Key != next.Key {
+			continue
+		}
+		updated := append([]sandbox.ToolAllowRule(nil), rules...)
+		updated[i] = next
+		return updated
+	}
+	return append(append([]sandbox.ToolAllowRule(nil), rules...), next)
+}
+
 // ---- 公共 HITL 流程 ----
 
 // confirm 走完整 HITL 决策流程：发 interrupt token → 等用户决策 → 处理。
@@ -261,6 +378,9 @@ func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *hitl.InterruptR
 		})
 	}
 
+	if mw.decisionProvider == nil {
+		return mw.reject(ev, "⛔ no decision provider available")
+	}
 	d := mw.decisionProvider.GetDecision(ev.Ctx, req)
 	audit := func(outcome string) {
 		if onDecide != nil {
@@ -272,20 +392,38 @@ func (mw *HITLMiddleware) confirm(ev *core.BeforeToolEvent, req *hitl.InterruptR
 	case hitl.DecisionApprove:
 		audit("executed")
 	case hitl.DecisionApproveAlways:
-		if mw.allowAlways == nil {
+		if req.AllowAlwaysKey == "" {
+			if mw.allowAlways == nil {
+				audit("blocked")
+				return mw.reject(ev, "⛔ allow_always is unavailable")
+			}
+			rule, err := allowRuleForRequest(req)
+			if err != nil {
+				audit("blocked")
+				return mw.reject(ev, "⛔ "+err.Error())
+			}
+			if err := mw.allowAlways(rule); err != nil {
+				audit("blocked")
+				return mw.reject(ev, "⛔ failed to persist allow_always")
+			}
+			mw.sandboxCfg.AllowRules = append(mw.sandboxCfg.AllowRules, rule)
+			audit("executed")
+			break
+		}
+		if mw.toolAllowAlways == nil {
 			audit("blocked")
 			return mw.reject(ev, "⛔ allow_always is unavailable")
 		}
-		rule, err := allowRuleForRequest(req)
+		rule, err := toolAllowRuleForRequest(req)
 		if err != nil {
 			audit("blocked")
 			return mw.reject(ev, "⛔ "+err.Error())
 		}
-		if err := mw.allowAlways(rule); err != nil {
+		if err := mw.toolAllowAlways(rule); err != nil {
 			audit("blocked")
 			return mw.reject(ev, "⛔ failed to persist allow_always")
 		}
-		mw.sandboxCfg.AllowRules = append(mw.sandboxCfg.AllowRules, rule)
+		mw.sandboxCfg.ToolAllowRules = appendToolAllowRule(mw.sandboxCfg.ToolAllowRules, rule)
 		audit("executed")
 	case hitl.DecisionEdit:
 		// 仅 bash 支持命令编辑；MCP 工具没有 command 字段，编辑视为批准

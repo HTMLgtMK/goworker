@@ -8,6 +8,7 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
+	"github.com/tinguo/goworker/ai-runtime/middlewares"
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
@@ -26,6 +27,55 @@ func testSession(pv core.Provider) (*Session, *runtimeconfig.Config) {
 		},
 	})
 	return s, cfg
+}
+
+func TestSessionToolAllowRulesSnapshotAndRefresh(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	persisted := 0
+	s := NewSession(SessionDeps{
+		Config: cfg,
+		PersistToolAllowRule: func(sandbox.ToolAllowRule) error {
+			persisted++
+			return nil
+		},
+	})
+	if got := s.toolAllowRulesSnapshot(); len(got) != 0 {
+		t.Fatalf("initial tool rule snapshot = %+v, want empty", got)
+	}
+	cfg.Sandbox.ToolAllowRules = append(cfg.Sandbox.ToolAllowRules, sandbox.ToolAllowRuleConfig{Key: "config-only", MaxRisk: "reserved"})
+	if got := s.toolAllowRulesSnapshot(); len(got) != 0 {
+		t.Fatalf("session snapshot changed through config mutation: %+v", got)
+	}
+
+	provider := &captureProvider{}
+	sandboxCfg := sandbox.NewFromConfig(&cfg.Sandbox)
+	decisions := make(chan hitl.Decision, 1)
+	mws := s.buildMiddlewareChain(RunCallbacks{}, provider, sandboxCfg, cfg, decisions)
+	mw := mws[0].(*middlewares.HITLMiddleware)
+	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
+	ev := &core.BeforeToolEvent{
+		Ctx:  context.Background(),
+		Tool: &core.ToolCall{ID: "call-1", Function: core.ToolCallFunction{Name: "custom_write"}},
+		ToolDef: &core.Tool{
+			Name: "custom_write",
+			Metadata: map[string]string{
+				sandbox.ToolMetadataRiskLevel:          "elevated",
+				sandbox.ToolMetadataRequiresPermission: "true",
+				sandbox.ToolMetadataAllowAlwaysKey:     "custom-write",
+			},
+		},
+	}
+	mw.OnBeforeTool(ev)
+	if ev.Abort != nil {
+		t.Fatalf("allow_always aborted: %+v", ev.Abort)
+	}
+	if persisted != 1 {
+		t.Fatalf("persist calls = %d, want 1", persisted)
+	}
+	got := s.toolAllowRulesSnapshot()
+	if len(got) != 1 || got[0].Key != "custom-write" || got[0].MaxRisk != sandbox.RiskElevated {
+		t.Fatalf("refreshed session snapshot = %+v", got)
+	}
 }
 
 func testRunCallbacks(buf *strings.Builder) RunCallbacks {

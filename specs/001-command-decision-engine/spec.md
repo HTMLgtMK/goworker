@@ -6,7 +6,7 @@
 
 **Status**: Draft
 
-**Input**: User description: "把 goworker 现有的正则三态命令安全层升级为结构化风险分级 + 策略决策引擎。核心：RiskLevel R0-R7 + Effects 维度 + Assess/Decide 分离 + Unknown→HITL + Normalize 强化 + AllowRules 配置 + 审计 jsonl。不含 tiny model / confidence calibration / gVisor 隔离。"
+**Input**: User description: "把 goworker 现有的正则三态命令安全层升级为结构化风险分级 + 策略决策引擎。核心：RiskLevel benign-reserved + Effects 维度 + Assess/Decide 分离 + Unknown→HITL + Normalize 强化 + AllowRules 配置 + 审计 jsonl。不含 tiny model / confidence calibration / gVisor 隔离。"
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -56,7 +56,7 @@
 
 **Acceptance Scenarios**:
 
-1. **Given** 配置了 `git push` 的预批准规则（风险上限 R4），**When** 代理执行 `git push origin main`，**Then** 命令免确认放行
+1. **Given** 配置了 `git push` 的预批准规则（风险上限 high），**When** 代理执行 `git push origin main`，**Then** 命令免确认放行
 2. **Given** 上一条规则，**When** 代理执行 `git fetch`，**Then** 规则不命中，按常规评估
 3. **Given** 一条预批准规则的允许副作用不包含破坏性操作，**When** 代理执行带破坏性副作用的命令，**Then** 仍进入确认而非被规则放行
 4. **Given** 沙箱处于 strict/readonly 模式，**When** 代理执行被预批准规则覆盖但本应拒绝的命令，**Then** 规则不覆盖模式硬拒，命令仍被拒绝
@@ -93,7 +93,7 @@
 
 ### Functional Requirements
 
-- **FR-001**: 系统 MUST 对每条待执行命令输出结构化风险等级（R0-R7，R6 表示无法分类）
+- **FR-001**: 系统 MUST 对每条待执行命令输出结构化风险等级（benign-reserved，unclassified 表示无法分类）
 - **FR-002**: 系统 MUST 识别命令的副作用维度：文件读/写、网络、提权、破坏性、密钥访问、进程生成、代码执行
 - **FR-003**: 系统 MUST 根据风险等级与运行模式（normal/strict/readonly/off）的矩阵决定放行/确认/拒绝，分类与决策 MUST 相互独立
 - **FR-004**: 无法分类的命令（unknown）MUST 进入用户确认，禁止静默放行

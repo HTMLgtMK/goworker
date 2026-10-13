@@ -6,25 +6,36 @@ import (
 )
 
 func TestRiskLevel_StringParseRoundTrip(t *testing.T) {
-	for i := 0; i <= 7; i++ {
-		lv := RiskLevel(i)
-		want := "R" + string(rune('0'+i))
-		if got := lv.String(); got != want {
-			t.Errorf("RiskLevel(%d).String() = %q, want %q", i, got, want)
+	cases := []struct {
+		level RiskLevel
+		name  string
+	}{
+		{RiskBenign, "benign"},
+		{RiskLow, "low"},
+		{RiskMedium, "medium"},
+		{RiskElevated, "elevated"},
+		{RiskHigh, "high"},
+		{RiskCritical, "critical"},
+		{RiskUnclassified, "unclassified"},
+		{RiskReserved, "reserved"},
+	}
+	for _, tc := range cases {
+		if got := tc.level.String(); got != tc.name {
+			t.Errorf("%v.String() = %q, want %q", tc.level, got, tc.name)
 		}
-		parsed, err := ParseRiskLevel(want)
+		parsed, err := ParseRiskLevel(tc.name)
 		if err != nil {
-			t.Errorf("ParseRiskLevel(%q) err = %v", want, err)
+			t.Errorf("ParseRiskLevel(%q) err = %v", tc.name, err)
 			continue
 		}
-		if parsed != lv {
-			t.Errorf("ParseRiskLevel(%q) = %v, want %v", want, parsed, lv)
+		if parsed != tc.level {
+			t.Errorf("ParseRiskLevel(%q) = %v, want %v", tc.name, parsed, tc.level)
 		}
 	}
 }
 
 func TestRiskLevel_ParseInvalid(t *testing.T) {
-	bad := []string{"", "R", "R8", "r1", "R10", "4", "RiskR4"}
+	bad := []string{"", "unknown", "risky", "4", "RiskHigh", "LOW"}
 	for _, s := range bad {
 		if _, err := ParseRiskLevel(s); err == nil {
 			t.Errorf("ParseRiskLevel(%q) = nil, want error", s)
@@ -33,15 +44,15 @@ func TestRiskLevel_ParseInvalid(t *testing.T) {
 }
 
 func TestRiskLevel_MarshalText(t *testing.T) {
-	if b, err := RiskR4.MarshalText(); err != nil || string(b) != "R4" {
-		t.Errorf("MarshalText(R4) = %q, %v", b, err)
+	if b, err := RiskHigh.MarshalText(); err != nil || string(b) != "high" {
+		t.Errorf("MarshalText(high) = %q, %v", b, err)
 	}
 	var lv RiskLevel
-	if err := lv.UnmarshalText([]byte("R6")); err != nil {
+	if err := lv.UnmarshalText([]byte("unclassified")); err != nil {
 		t.Fatalf("UnmarshalText err = %v", err)
 	}
-	if lv != RiskR6 {
-		t.Errorf("UnmarshalText(R6) = %v", lv)
+	if lv != RiskUnclassified {
+		t.Errorf("UnmarshalText(unclassified) = %v", lv)
 	}
 }
 
