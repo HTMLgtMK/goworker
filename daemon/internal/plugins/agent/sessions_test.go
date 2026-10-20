@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/session"
@@ -62,16 +62,38 @@ func archiveIDs(t *testing.T, dir string) []string {
 	return ids
 }
 
+// archiveSessionIDs 返回归档文件 metadata 中的 logical sessionId，按文件名排序。
+func archiveSessionIDs(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, "archive"))
+	if err != nil {
+		t.Fatalf("read archive dir: %v", err)
+	}
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		view, err := session.OpenArchiveView(filepath.Join(dir, "archive", entry.Name()))
+		if err != nil {
+			t.Fatalf("open archive view: %v", err)
+		}
+		ids = append(ids, view.SessionID())
+	}
+	return ids
+}
+
 func TestAgentPlugin_ListSessionsPinsCurrentAndOrdersArchivesByUpdatedAt(t *testing.T) {
 	p, st, dir := sessionFixture(t, 2)
+	logicalID := st.SessionID()
 	headBefore := st.Head()
 
 	got := p.ListSessions()
 	if len(got) != 3 {
 		t.Fatalf("ListSessions = %+v, want current + 2 archived", got)
 	}
-	if got[0].SessionID != headBefore {
-		t.Errorf("sessions[0].sessionId = %q, want current head %q", got[0].SessionID, headBefore)
+	if got[0].SessionID != logicalID {
+		t.Errorf("sessions[0].sessionId = %q, want current logical id %q", got[0].SessionID, logicalID)
 	}
 	if got[0].Title != "当前会话" {
 		t.Errorf("sessions[0].title = %q, want 当前会话", got[0].Title)
@@ -80,7 +102,7 @@ func TestAgentPlugin_ListSessionsPinsCurrentAndOrdersArchivesByUpdatedAt(t *test
 		t.Errorf("sessions[1].title = %q, want newline-collapsed 历史会话标题 第二行", got[1].Title)
 	}
 	// 归档按 mtime 倒序：后归档的文件名（UnixNano）更大，应排在前面
-	ids := archiveIDs(t, dir)
+	ids := archiveSessionIDs(t, dir)
 	if len(ids) != 2 {
 		t.Fatalf("archive ids = %v, want 2", ids)
 	}
@@ -119,8 +141,8 @@ func TestAgentPlugin_ListSessionsKeepsCurrentFirstEvenWhenArchiveIsNewer(t *test
 	if len(got) != 2 {
 		t.Fatalf("ListSessions = %+v, want current + 1 archived", got)
 	}
-	if got[0].SessionID != st.Head() {
-		t.Errorf("sessions[0].sessionId = %q, want current head %q pinned first", got[0].SessionID, st.Head())
+	if got[0].SessionID != st.SessionID() {
+		t.Errorf("sessions[0].sessionId = %q, want current logical id %q pinned first", got[0].SessionID, st.SessionID())
 	}
 }
 
@@ -136,8 +158,8 @@ func TestAgentPlugin_ListSessionsWithoutCurrentOrPersistence(t *testing.T) {
 	if got := p.ListSessions(); got == nil || len(got) != 0 {
 		t.Errorf("ListSessions = %#v, want non-nil empty", got)
 	}
-	if got := p.CurrentSessionID(); got != "" {
-		t.Errorf("CurrentSessionID = %q, want empty for headless session", got)
+	if got := p.CurrentSessionID(); got != st.SessionID() {
+		t.Errorf("CurrentSessionID = %q, want logical session id %q for headless session", got, st.SessionID())
 	}
 
 	// store 未启用（nil）：清单为空、当前会话 id 为空
@@ -246,7 +268,7 @@ func historyFixture(t *testing.T) (*AgentPlugin, *session.Store) {
 }
 
 // rawBodyFields 解码 Raw 透传体为字段表，便于逐字段断言 wire 形状。
-func rawBodyFields(t *testing.T, body protocol.SessionUpdateBody) map[string]any {
+func rawBodyFields(t *testing.T, body model.SessionUpdate) map[string]any {
 	t.Helper()
 	if len(body.Raw) == 0 {
 		t.Fatalf("body.Raw 为空，期望透传载荷：%+v", body)
@@ -288,12 +310,12 @@ func TestAgentPlugin_CurrentSessionHistoryReplaysRoundsWithToolPairing(t *testin
 		protocol.UpdateToolCallUpdate,    // 孤立 call_orphan 降级
 	}
 	// Raw 透传体的判别值在载荷内部（同 availableCommandsUpdateBody），typed 字段为空
-	bodyKind := func(body protocol.SessionUpdateBody) string {
+	bodyKind := func(body model.SessionUpdate) string {
 		if len(body.Raw) > 0 {
 			kind, _ := rawBodyFields(t, body)["sessionUpdate"].(string)
 			return kind
 		}
-		return body.SessionUpdate
+		return body.Kind
 	}
 	for i, kind := range wantKinds {
 		if gotKind := bodyKind(got[i]); gotKind != kind {
@@ -568,12 +590,12 @@ func TestAgentPlugin_ArchivedSessionHistoryReplaysArchive(t *testing.T) {
 		protocol.UpdateToolCallUpdate,
 		protocol.UpdateAgentMessageChunk,
 	}
-	bodyKind := func(body protocol.SessionUpdateBody) string {
+	bodyKind := func(body model.SessionUpdate) string {
 		if len(body.Raw) > 0 {
 			fields := rawBodyFields(t, body)
 			return fields["sessionUpdate"].(string)
 		}
-		return body.SessionUpdate
+		return body.Kind
 	}
 	if len(got) != len(wantKinds) {
 		t.Fatalf("ArchivedSessionHistory = %d bodies, want %d: %+v", len(got), len(wantKinds), got)
@@ -645,22 +667,21 @@ func TestAgentPlugin_ArchivedSessionHistoryErrors(t *testing.T) {
 	}
 }
 
-// TestAgentPlugin_ListSessionsMarksCurrentAndCwd 验证 IsCurrent 标记与当前会话
-// cwd 回显：当前条目 isCurrent=true（TS 侧据此禁用归档输入框），SetSession 声明
-// 的 cwd 规范化为绝对路径后回显；归档条目两项皆空。
+// TestAgentPlugin_ListSessionsMarksCurrentAndCwd 验证 domain Active 标记与当前会话
+// cwd 回显：当前条目 Active=true，归档条目 Active=false。
 func TestAgentPlugin_ListSessionsMarksCurrentAndCwd(t *testing.T) {
 	p, st, dir := sessionFixture(t, 2)
-	head := st.Head()
+	logicalID := st.SessionID()
 
 	got := p.ListSessions()
 	if len(got) != 3 {
 		t.Fatalf("ListSessions = %+v, want 3 entries", got)
 	}
-	if !got[0].IsCurrent || got[1].IsCurrent || got[2].IsCurrent {
-		t.Errorf("isCurrent flags = [%v %v %v], want [true false false]", got[0].IsCurrent, got[1].IsCurrent, got[2].IsCurrent)
+	if !got[0].Active || got[1].Active || got[2].Active {
+		t.Errorf("active flags = [%v %v %v], want [true false false]", got[0].Active, got[1].Active, got[2].Active)
 	}
-	if got[0].SessionID != head {
-		t.Errorf("sessions[0].sessionId = %q, want head %q", got[0].SessionID, head)
+	if got[0].SessionID != logicalID {
+		t.Errorf("sessions[0].sessionId = %q, want logical id %q", got[0].SessionID, logicalID)
 	}
 	if got[0].Cwd != "" {
 		t.Errorf("sessions[0].cwd = %q before SetSession, want empty", got[0].Cwd)

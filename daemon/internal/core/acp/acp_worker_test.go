@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	sandbox "github.com/tinguo/goworker/ai-sandbox"

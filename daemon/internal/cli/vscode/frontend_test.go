@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
 	dispatch "github.com/tinguo/goworker/ai-dispatch"
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -522,13 +522,30 @@ type fakeSessionSource struct {
 	archiveReqs []string
 }
 
-func (s *fakeSessionSource) ListSessions() []protocol.SessionInfo { return s.list }
-func (s *fakeSessionSource) CurrentSessionID() string             { return s.current }
+func (s *fakeSessionSource) ListSessions() []model.SessionSummary {
+	infos := make([]model.SessionSummary, 0, len(s.list))
+	for _, info := range s.list {
+		infos = append(infos, model.SessionSummary{
+			SessionID: info.SessionID,
+			Cwd:       info.Cwd,
+			Title:     info.Title,
+			UpdatedAt: info.UpdatedAt,
+		})
+	}
+	return infos
+}
+func (s *fakeSessionSource) CurrentSessionID() string { return s.current }
 func (s *fakeSessionSource) ReloadCurrentSession() error {
 	s.reloaded++
 	return s.reloadErr
 }
-func (s *fakeSessionSource) CurrentSessionHistory() []protocol.SessionUpdateBody { return s.history }
+func (s *fakeSessionSource) CurrentSessionHistory() []model.SessionUpdate {
+	updates := make([]model.SessionUpdate, 0, len(s.history))
+	for _, body := range s.history {
+		updates = append(updates, sessionBodyToModel(body))
+	}
+	return updates
+}
 
 func (s *fakeSessionSource) SetSession(sessionID, cwd string) {
 	s.mu.Lock()
@@ -536,21 +553,40 @@ func (s *fakeSessionSource) SetSession(sessionID, cwd string) {
 	s.setSessions = append(s.setSessions, [2]string{sessionID, cwd})
 }
 
-func (s *fakeSessionSource) ArchivedSessionHistory(sessionID string) ([]protocol.SessionUpdateBody, error) {
+func (s *fakeSessionSource) ArchivedSessionHistory(sessionID string) ([]model.SessionUpdate, error) {
 	s.mu.Lock()
 	s.archiveReqs = append(s.archiveReqs, sessionID)
 	s.mu.Unlock()
-	if bodies, ok := s.archives[sessionID]; ok {
-		return bodies, nil
+	bodies, ok := s.archives[sessionID]
+	if !ok {
+		return []model.SessionUpdate{}, nil
 	}
-	return []protocol.SessionUpdateBody{}, nil
+	updates := make([]model.SessionUpdate, 0, len(bodies))
+	for _, body := range bodies {
+		updates = append(updates, sessionBodyToModel(body))
+	}
+	return updates, nil
 }
 
-func (s *fakeSessionSource) SessionModes() *protocol.SessionModeState {
-	return &protocol.SessionModeState{
+func (s *fakeSessionSource) SessionModes() *model.SessionModeState {
+	return &model.SessionModeState{
 		CurrentModeID:  "deepseek",
-		AvailableModes: []protocol.SessionMode{{ID: "deepseek", Name: "deepseek (deepseek-chat)"}},
+		AvailableModes: []model.SessionMode{{ID: "deepseek", Name: "deepseek (deepseek-chat)"}},
 	}
+}
+
+func sessionBodyToModel(body protocol.SessionUpdateBody) model.SessionUpdate {
+	update := model.SessionUpdate{
+		Kind:       body.SessionUpdate,
+		ToolCallID: body.ToolCallID,
+		Title:      body.Title,
+		Status:     body.Status,
+		Raw:        append(json.RawMessage(nil), body.Raw...),
+	}
+	if body.Content != nil {
+		update.Content = &model.SessionContent{Type: body.Content.Type, Text: body.Content.Text}
+	}
+	return update
 }
 
 // setSessionCalls 返回 SetSession 调用序列快照。
@@ -640,7 +676,7 @@ func TestFrontend_ServesSessionListAndAdvertisesLoadCapability(t *testing.T) {
 		protocol.InitializeRequest{ProtocolVersion: protocol.Version}, &init); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	if !init.AgentCapabilities.LoadSession {
+	if !init.AgentCapabilities.Has("loadSession") {
 		t.Errorf("LoadSession capability = false, want true (ingress 实现 SessionLoader)")
 	}
 
@@ -901,7 +937,7 @@ func TestIngress_LoadSessionArchivedReplaysReadOnly(t *testing.T) {
 	source := &fakeSessionSource{
 		current: "sess_live",
 		list: []protocol.SessionInfo{
-			{SessionID: "sess_live", IsCurrent: true},
+			{SessionID: "sess_live"},
 			{SessionID: "1735689600000000000"},
 		},
 		archives: map[string][]protocol.SessionUpdateBody{

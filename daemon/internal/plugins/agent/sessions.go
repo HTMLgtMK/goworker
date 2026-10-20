@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	"github.com/tinguo/goworker/ai-runtime/session"
+	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
 const (
@@ -32,23 +32,24 @@ const (
 // 归档会话按 updatedAt 倒序随后，最多 maxListSessions 条。
 //
 // 取值规则（store 的记录模型不落 cwd）：
-//   - sessionId：当前会话 = store 当前 head id（与 session/load 的「当前会话」
-//     判定同源，保证列表给出的 id 可直接 load）；归档会话 = 归档文件名去
-//     .jsonl（归档时的 UnixNano 时间戳，稳定且唯一）。
+//   - sessionId：当前会话 = store 的稳定 logical SessionID（与 session/load 的「当前会话」
+//     判定同源，保证列表给出的 id 可直接 load）；Store.Head 只用于判断当前文件是否有
+//     消息，绝不作为 ACP sessionId；归档会话 = 归档 metadata 中的 logical SessionID。
 //   - cwd：当前会话填最近一次有效声明的会话 cwd（未声明为空）；归档会话为空。
-//   - isCurrent：当前会话条目置 true，前端据此区分可续接条目与只读归档条目。
+//   - active：daemon domain summary 标记当前会话；ACP SessionInfo 映射时不会写入该字段。
 //   - title：文件内首条 user 消息内容，空白折叠为单行后截断到 titleMaxRunes。
 //   - updatedAt：文件 mtime（RFC3339）。
-func (p *AgentPlugin) ListSessions() []protocol.SessionInfo {
-	out := make([]protocol.SessionInfo, 0, 4)
-	if p.store.Load() == nil || p.cfg.Session.Dir == "" {
+func (p *AgentPlugin) ListSessions() []model.SessionSummary {
+	out := make([]model.SessionSummary, 0, 4)
+	store := p.store.Load()
+	if store == nil || p.cfg.Session.Dir == "" {
 		return out
 	}
 	dir := p.cfg.Session.Dir
 
-	if head := p.store.Load().Head(); head != "" {
-		if m := describeSessionFile(filepath.Join(dir, "current.jsonl"), head); m != nil {
-			m.info.IsCurrent = true
+	if head := store.Head(); head != "" {
+		if m := describeSessionFile(filepath.Join(dir, "current.jsonl"), store.SessionID()); m != nil {
+			m.info.Active = true
 			m.info.Cwd = p.currentSessionCwd()
 			out = append(out, m.info)
 		}
@@ -66,7 +67,7 @@ func (p *AgentPlugin) ListSessions() []protocol.SessionInfo {
 // 数据源 cfg.LLM，只显示不切换 —— currentModeId = default_provider，
 // availableModes = providers 按名字排序（id = provider 名，name = "名 (model)"，
 // description 留空）。无 providers 或无配置返回 nil（响应省略 modes）。
-func (p *AgentPlugin) SessionModes() *protocol.SessionModeState {
+func (p *AgentPlugin) SessionModes() *model.SessionModeState {
 	if p.cfg == nil || len(p.cfg.LLM.Providers) == 0 {
 		return nil
 	}
@@ -75,14 +76,14 @@ func (p *AgentPlugin) SessionModes() *protocol.SessionModeState {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	modes := make([]protocol.SessionMode, 0, len(names))
+	modes := make([]model.SessionMode, 0, len(names))
 	for _, name := range names {
-		modes = append(modes, protocol.SessionMode{
+		modes = append(modes, model.SessionMode{
 			ID:   name,
 			Name: fmt.Sprintf("%s (%s)", name, p.cfg.LLM.Providers[name].Model),
 		})
 	}
-	return &protocol.SessionModeState{
+	return &model.SessionModeState{
 		CurrentModeID:  p.cfg.LLM.DefaultProvider,
 		AvailableModes: modes,
 	}
@@ -95,13 +96,12 @@ func (p *AgentPlugin) currentSessionCwd() string {
 	return p.sessionCwd
 }
 
-// CurrentSessionID 返回当前活动会话的 head id（空 = 无活动会话/持久化未启用）。
-// vscode 前端用它判定 session/load 的目标是否为当前会话。
+// CurrentSessionID returns the stable logical identity, not the mutable head.
 func (p *AgentPlugin) CurrentSessionID() string {
-	if p.store.Load() == nil {
-		return ""
+	if store := p.store.Load(); store != nil {
+		return store.SessionID()
 	}
-	return p.store.Load().Head()
+	return ""
 }
 
 // ReloadCurrentSession 确保内存会话视图与 store 最新状态一致。session/load
@@ -125,13 +125,13 @@ func (p *AgentPlugin) ReloadCurrentSession() error {
 // 并入最后一段。checkpoint 只作边界，不进重放流。
 //
 // 全量重放，不设轮次/条数上限。无持久化（store 为 nil）或空会话返回非 nil 空切片。
-func (p *AgentPlugin) CurrentSessionHistory() []protocol.SessionUpdateBody {
+func (p *AgentPlugin) CurrentSessionHistory() []model.SessionUpdate {
 	if p.store.Load() == nil {
-		return []protocol.SessionUpdateBody{}
+		return []model.SessionUpdate{}
 	}
 	view := p.store.Load().ActiveView()
 	if len(view) == 0 {
-		return []protocol.SessionUpdateBody{}
+		return []model.SessionUpdate{}
 	}
 	return replayUpdates(view, checkpointAnchors(p.store.Load()))
 }
@@ -141,11 +141,11 @@ func (p *AgentPlugin) CurrentSessionHistory() []protocol.SessionUpdateBody {
 // id 校验防 traversal），OpenArchiveView 构建 ActiveView 与 checkpoint 锚点，
 // 经与 CurrentSessionHistory 相同的 segmentByCheckpoints + roundUpdates 管线输出。
 // 不持写句柄、不 rename、不触碰 current 与 store。
-func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]protocol.SessionUpdateBody, error) {
+func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]model.SessionUpdate, error) {
 	if p.cfg == nil || p.cfg.Session.Dir == "" {
 		return nil, fmt.Errorf("agent: session persistence disabled")
 	}
-	path, ok := archiveFilePath(p.cfg.Session.Dir, sessionID)
+	path, ok := archivePathForSession(p.cfg.Session.Dir, sessionID)
 	if !ok {
 		return nil, fmt.Errorf("agent: invalid archive session id %q", sessionID)
 	}
@@ -168,11 +168,41 @@ func archiveFilePath(sessionDir, archiveID string) (string, bool) {
 	return filepath.Join(sessionDir, "archive", archiveID+".jsonl"), true
 }
 
-// replayUpdates 是重放映射管线：活跃视图 + checkpoint 锚点 → session/update 序列。
+func archivePathForSession(sessionDir, sessionID string) (string, bool) {
+	direct, valid := archiveFilePath(sessionDir, sessionID)
+	if !valid {
+		return "", false
+	}
+
+	// Keep accepting pre-metadata callers that used the timestamp filename as
+	// an archive ID. New listings always expose the logical metadata ID.
+	if view, err := session.OpenArchiveView(direct); err == nil {
+		if view.SessionID() == sessionID || strings.TrimSuffix(filepath.Base(direct), ".jsonl") == sessionID {
+			return direct, true
+		}
+	}
+
+	entries, err := os.ReadDir(filepath.Join(sessionDir, "archive"))
+	if err != nil {
+		return direct, true
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		path := filepath.Join(sessionDir, "archive", entry.Name())
+		view, viewErr := session.OpenArchiveView(path)
+		if viewErr == nil && view.SessionID() == sessionID {
+			return path, true
+		}
+	}
+	return direct, true
+}
+
 // 当前会话导出（CurrentSessionHistory）与归档只读查看（ArchivedSessionHistory）共用。
 // 无命中锚点时整个视图一段（checkpoint 漏打的结尾消息并入最后一段）。
-func replayUpdates(view []core.Message, anchors map[string]bool) []protocol.SessionUpdateBody {
-	out := []protocol.SessionUpdateBody{}
+func replayUpdates(view []core.Message, anchors map[string]bool) []model.SessionUpdate {
+	out := []model.SessionUpdate{}
 	for _, round := range segmentByCheckpoints(view, anchors) {
 		out = append(out, roundUpdates(round)...)
 	}
@@ -228,22 +258,22 @@ func segmentByCheckpoints(view []core.Message, anchors map[string]bool) [][]core
 //   - assistant 有正文无 tool_calls → agent_message_chunk（全文一条）；空正文且
 //     无 tool_calls 跳过；
 //   - system（compact 摘要）与其余角色跳过。
-func roundUpdates(round []core.Message) []protocol.SessionUpdateBody {
-	out := make([]protocol.SessionUpdateBody, 0, len(round))
+func roundUpdates(round []core.Message) []model.SessionUpdate {
+	out := make([]model.SessionUpdate, 0, len(round))
 	for _, msg := range round {
 		switch msg.Role {
 		case "user":
-			out = append(out, protocol.SessionUpdateBody{
-				SessionUpdate: protocol.UpdateUserMessageChunk,
-				Content:       &protocol.ContentBlock{Type: "text", Text: msg.Content},
+			out = append(out, model.SessionUpdate{
+				Kind:    model.SessionUpdateUserMessageChunk,
+				Content: &model.SessionContent{Type: "text", Text: msg.Content},
 			})
 		case "assistant":
 			// thinking 先于 tools/正文：对应实时流里思考块的位置，重放后
 			// AgentThoughtBlock 以收起态渲染（streaming=false）。
 			if msg.Thinking.Text != "" {
-				out = append(out, protocol.SessionUpdateBody{
-					SessionUpdate: protocol.UpdateAgentThoughtChunk,
-					Content:       &protocol.ContentBlock{Type: "text", Text: msg.Thinking.Text},
+				out = append(out, model.SessionUpdate{
+					Kind:    model.SessionUpdateAgentThoughtChunk,
+					Content: &model.SessionContent{Type: "text", Text: msg.Thinking.Text},
 				})
 			}
 			if len(msg.ToolCalls) > 0 {
@@ -254,9 +284,9 @@ func roundUpdates(round []core.Message) []protocol.SessionUpdateBody {
 				}
 			}
 			if msg.Content != "" {
-				out = append(out, protocol.SessionUpdateBody{
-					SessionUpdate: protocol.UpdateAgentMessageChunk,
-					Content:       &protocol.ContentBlock{Type: "text", Text: msg.Content},
+				out = append(out, model.SessionUpdate{
+					Kind:    model.SessionUpdateAgentMessageChunk,
+					Content: &model.SessionContent{Type: "text", Text: msg.Content},
 				})
 			}
 		case "tool":
@@ -295,9 +325,9 @@ type acpToolCallUpdate struct {
 // toolCallBody 构造一条 tool_call 透传体；空 call id 无法与 tool 结果配对，跳过。
 // 这些字段 json.Marshal 不会失败（失败即跳过该条，与 availableCommandsUpdateBody
 // 同策略）。
-func toolCallBody(tc core.ToolCall) (protocol.SessionUpdateBody, bool) {
+func toolCallBody(tc core.ToolCall) (model.SessionUpdate, bool) {
 	if tc.ID == "" {
-		return protocol.SessionUpdateBody{}, false
+		return model.SessionUpdate{}, false
 	}
 	// title 与 live 路径同构（name(args)）：webview 的 generic 分支渲染
 	// "tool · <name>"，args 收进折叠区；不报 kind（枚举是语义描述，不为
@@ -307,34 +337,34 @@ func toolCallBody(tc core.ToolCall) (protocol.SessionUpdateBody, bool) {
 		title = fmt.Sprintf("%s(%s)", title, args)
 	}
 	data, err := json.Marshal(acpToolCall{
-		SessionUpdate: protocol.UpdateToolCall,
+		SessionUpdate: model.SessionUpdateToolCall,
 		ToolCallID:    tc.ID,
 		Title:         title,
 		Status:        "in_progress",
 		RawInput:      rawInputValue(tc.Function.Arguments),
 	})
 	if err != nil {
-		return protocol.SessionUpdateBody{}, false
+		return model.SessionUpdate{}, false
 	}
-	return protocol.SessionUpdateBody{Raw: data}, true
+	return model.SessionUpdate{Raw: data}, true
 }
 
 // toolCallUpdateBody 构造一条 tool_call_update 透传体（status=completed，输出文本
 // 走 rawOutput）；id 为空（tool 消息没有 ToolCallID）无法配对，跳过。
-func toolCallUpdateBody(id, output string) (protocol.SessionUpdateBody, bool) {
+func toolCallUpdateBody(id, output string) (model.SessionUpdate, bool) {
 	if id == "" {
-		return protocol.SessionUpdateBody{}, false
+		return model.SessionUpdate{}, false
 	}
 	data, err := json.Marshal(acpToolCallUpdate{
-		SessionUpdate: protocol.UpdateToolCallUpdate,
+		SessionUpdate: model.SessionUpdateToolCallUpdate,
 		ToolCallID:    id,
 		Status:        "completed",
 		RawOutput:     output,
 	})
 	if err != nil {
-		return protocol.SessionUpdateBody{}, false
+		return model.SessionUpdate{}, false
 	}
-	return protocol.SessionUpdateBody{Raw: data}, true
+	return model.SessionUpdate{Raw: data}, true
 }
 
 // rawInputValue 把调用参数包装成 SDK 友好的形状：合法 JSON 内嵌为对象，其余退化
@@ -352,7 +382,7 @@ func rawInputValue(args string) any {
 
 // sessionMeta 是扫描单个 jsonl 的内部摘要；at 保留 time.Time 供排序。
 type sessionMeta struct {
-	info protocol.SessionInfo
+	info model.SessionSummary
 	at   time.Time
 }
 
@@ -369,8 +399,12 @@ func listArchivedSessions(archiveDir string) []sessionMeta {
 		if entry.IsDir() || !strings.HasSuffix(name, ".jsonl") {
 			continue
 		}
-		// sessionId = 归档文件名去扩展名（Archive 以 UnixNano 命名，稳定唯一）
-		m := describeSessionFile(filepath.Join(archiveDir, name), strings.TrimSuffix(name, ".jsonl"))
+		path := filepath.Join(archiveDir, name)
+		sessionID := strings.TrimSuffix(name, ".jsonl")
+		if view, viewErr := session.OpenArchiveView(path); viewErr == nil && view.SessionID() != "" {
+			sessionID = view.SessionID()
+		}
+		m := describeSessionFile(path, sessionID)
 		if m == nil {
 			continue
 		}
@@ -388,7 +422,7 @@ func describeSessionFile(path, sessionID string) *sessionMeta {
 		return nil
 	}
 	return &sessionMeta{
-		info: protocol.SessionInfo{
+		info: model.SessionSummary{
 			SessionID: sessionID,
 			Title:     firstUserTitle(path),
 			UpdatedAt: fi.ModTime().Format(time.RFC3339),

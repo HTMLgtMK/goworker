@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-dispatch"
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	"github.com/tinguo/goworker/ai-dispatch/task"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/daemon/internal/core/model"

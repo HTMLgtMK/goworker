@@ -1,6 +1,11 @@
 package protocol
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+)
 
 // ACP 协议版本（REV_1）。
 const Version = 1
@@ -39,25 +44,36 @@ type InitializeResponse struct {
 	AuthMethods       []AuthMethod      `json:"authMethods,omitempty"`
 }
 
-type ClientCapabilities struct {
-	Fs *FsCapabilities `json:"fs,omitempty"`
+type ClientCapabilities = Capabilities
+
+type AgentCapabilities = Capabilities
+
+// Capability 是 ACP capability advertisement 的最小契约。
+// capability 的 wire value 由具体实现编码，集合负责 key 唯一性和对象聚合。
+type Capability interface {
+	Key() string
+	json.Marshaler
 }
 
-type FsCapabilities struct {
+// Capabilities 是不暴露动态 map 的 capability 集合。
+// capability 是否被支持由它是否存在于集合中表达。
+type Capabilities struct {
+	items []Capability
+}
+
+type FileSystemCapability struct {
 	ReadTextFile  bool `json:"readTextFile"`
 	WriteTextFile bool `json:"writeTextFile"`
 }
 
-type AgentCapabilities struct {
-	LoadSession bool `json:"loadSession,omitempty"`
-}
+type LoadSessionCapability struct{}
 
 type AuthMethod struct {
 	ID          string `json:"id"`
 	Description string `json:"description,omitempty"`
 }
 
-// ---- session/load（可选，能力协商 AgentCapabilities.LoadSession）----
+// ---- session/load（可选，能力由 AgentCapabilities 中的 LoadSessionCapability 声明）----
 
 type LoadSessionRequest struct {
 	SessionID  string           `json:"sessionId"`
@@ -81,9 +97,8 @@ type SessionMode struct {
 	Description string `json:"description,omitempty"`
 }
 
-// SessionModeState 是 session/new 与 session/load 响应携带的 modes 状态。
-// daemon 只显示不切换：session/set_mode 未实现，客户端切换请求以
-// method-not-found 诚实失败。
+// SessionModeState 是 session/new 与 session/load 响应携带的 ACP mode 状态。
+// 是否支持 session/set_mode 由 server handler 决定。
 type SessionModeState struct {
 	CurrentModeID  string        `json:"currentModeId"`
 	AvailableModes []SessionMode `json:"availableModes"`
@@ -98,19 +113,11 @@ type ListSessionsRequest struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
-// SessionInfo 是清单里的一条会话摘要（字段名对齐 @agentclientprotocol/sdk）。
-// IsCurrent 标记当前活动会话（单活动会话模型下清单里至多一条为 true），前端据此
-// 区分可续接条目与只读归档条目。
 type SessionInfo struct {
 	SessionID string `json:"sessionId"`
 	Cwd       string `json:"cwd"`
 	Title     string `json:"title,omitempty"`
 	UpdatedAt string `json:"updatedAt,omitempty"` // RFC3339
-	// IsCurrent 标记当前活动会话。**不带 omitempty**：false 必须显式出现在 wire 上，
-	// 否则「这条是归档（false）」与「这份 wire 压根不表达该字段（旧版）」在单条上
-	// 无法区分，客户端只能靠位置猜，/new 之后（清单全是归档）就会把最新的一条归档
-	// 误判成当前会话。
-	IsCurrent bool `json:"isCurrent"`
 }
 
 type ListSessionsResponse struct {
@@ -137,7 +144,7 @@ type PromptRequest struct {
 	Prompt    []ContentBlock `json:"prompt"`
 }
 
-// ContentBlock 是任务输入块；dispatcher 只产出 text。
+// ContentBlock 是当前 ACP text content 子集；其他 content kind 可在协议扩展时增加具体类型。
 type ContentBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
@@ -177,6 +184,57 @@ type SessionUpdateBody struct {
 	Kind          string          `json:"kind,omitempty"`
 	Status        string          `json:"status,omitempty"`
 	Raw           json.RawMessage `json:"-"`
+
+	rawKnown map[string]json.RawMessage
+}
+
+var sessionUpdateKnownFields = [...]string{
+	"sessionUpdate",
+	"content",
+	"toolCallId",
+	"title",
+	"kind",
+	"status",
+}
+
+// MarshalJSON 保留 ACP 扩展字段，同时让调用方对已知字段的修改生效。
+func (b SessionUpdateBody) MarshalJSON() ([]byte, error) {
+	type alias SessionUpdateBody
+	if len(b.Raw) == 0 {
+		return json.Marshal(alias(b))
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b.Raw, &raw); err != nil || raw == nil {
+		if err == nil {
+			err = errors.New("session update body must be a JSON object")
+		}
+		return nil, fmt.Errorf("marshal session update body: %w", err)
+	}
+	encoded, err := json.Marshal(alias(b))
+	if err != nil {
+		return nil, err
+	}
+	var current map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &current); err != nil {
+		return nil, err
+	}
+	if b.rawKnown == nil {
+		return append([]byte(nil), b.Raw...), nil
+	}
+	for _, field := range sessionUpdateKnownFields {
+		original, wasKnown := b.rawKnown[field]
+		value, isPresent := current[field]
+		if wasKnown && bytes.Equal(original, value) {
+			continue
+		}
+		if isPresent {
+			raw[field] = value
+		} else {
+			delete(raw, field)
+		}
+	}
+	return json.Marshal(raw)
 }
 
 // UnmarshalJSON 解码已知字段并保留完整原始报文（供逐字转发）。
@@ -188,6 +246,16 @@ func (b *SessionUpdateBody) UnmarshalJSON(data []byte) error {
 	}
 	*b = SessionUpdateBody(a)
 	b.Raw = append(b.Raw[:0], data...)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	b.rawKnown = make(map[string]json.RawMessage)
+	for _, field := range sessionUpdateKnownFields {
+		if value, ok := fields[field]; ok {
+			b.rawKnown[field] = append(json.RawMessage(nil), value...)
+		}
+	}
 	return nil
 }
 

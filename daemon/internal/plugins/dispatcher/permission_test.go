@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	dispatch "github.com/tinguo/goworker/ai-dispatch"
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 )
 

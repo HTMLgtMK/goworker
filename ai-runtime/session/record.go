@@ -17,6 +17,7 @@ const (
 	kindHead       = "head"
 	kindCheckpoint = "checkpoint"
 	kindCursor     = "cursor"
+	kindMetadata   = "metadata"
 )
 
 // msgFields 真实消息（含 compact 时的保留段副本）。
@@ -63,6 +64,13 @@ type cursorFields struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// metadataFields identifies the logical session independently from its current head.
+// It is written once at the beginning of a session JSONL file and survives archive/compact.
+type metadataFields struct {
+	SessionID string    `json:"session_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // Record 是 jsonl 记录的统一视图：kind 判别 + 对应类型的字段组。
 // 磁盘格式保持扁平单行，序列化/反序列化见 MarshalJSON/UnmarshalJSON。
 type Record struct {
@@ -73,6 +81,7 @@ type Record struct {
 	Head *headFields       // kind == kindHead
 	CK   *checkpointFields // kind == kindCheckpoint
 	Cur  *cursorFields     // kind == kindCursor
+	Meta *metadataFields   // kind == kindMetadata
 }
 
 // NodeID 返回节点 id（msg/compact/checkpoint 有，head/cursor 无则空串）。
@@ -132,6 +141,10 @@ func (r Record) Created() time.Time {
 		if r.Cur != nil {
 			return r.Cur.CreatedAt
 		}
+	case kindMetadata:
+		if r.Meta != nil {
+			return r.Meta.CreatedAt
+		}
 	}
 	return time.Time{}
 }
@@ -161,6 +174,7 @@ func (r Record) MarshalJSON() ([]byte, error) {
 		At          string                     `json:"at,omitempty"`
 		Preview     string                     `json:"preview,omitempty"`
 		MsgID       string                     `json:"msg_id,omitempty"`
+		SessionID   string                     `json:"session_id,omitempty"`
 		CreatedAt   time.Time                  `json:"created_at"`
 	}
 
@@ -189,6 +203,10 @@ func (r Record) MarshalJSON() ([]byte, error) {
 	case kindCursor:
 		if r.Cur != nil {
 			f.MsgID = r.Cur.MsgID
+		}
+	case kindMetadata:
+		if r.Meta != nil {
+			f.SessionID = r.Meta.SessionID
 		}
 	}
 	return json.Marshal(f)
@@ -236,6 +254,12 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		r.Cur = &f
+	case kindMetadata:
+		var f metadataFields
+		if err := json.Unmarshal(data, &f); err != nil {
+			return err
+		}
+		r.Meta = &f
 	}
 	return nil
 }
@@ -274,6 +298,11 @@ func newCheckpointRecord(id, at, preview string, created time.Time) Record {
 // newCursorRecord 构造游标记录。
 func newCursorRecord(msgID string, created time.Time) Record {
 	return Record{Kind: kindCursor, Cur: &cursorFields{MsgID: msgID, CreatedAt: created}}
+}
+
+// newMetadataRecord constructs the immutable logical session identity record.
+func newMetadataRecord(sessionID string, created time.Time) Record {
+	return Record{Kind: kindMetadata, Meta: &metadataFields{SessionID: sessionID, CreatedAt: created}}
 }
 
 // ── 记录与消息互转 ──────────────────────────────────────────────────────

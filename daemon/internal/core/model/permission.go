@@ -16,7 +16,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 )
 

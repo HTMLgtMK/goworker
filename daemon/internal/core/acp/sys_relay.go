@@ -2,7 +2,7 @@ package acp
 
 // x-device 扩展：client-ward 设备能力中继。
 //
-// 分层边界：方法名与工具描述符都属应用层扩展（x- 前缀），不进 ai-dispatch/protocol
+// 分层边界：方法名与工具描述符都属应用层扩展（x- 前缀），不进 ai-acp/protocol。
 // 标准面。worker 只做声明透传与调用转发，不感知具体能力语义 —— 新增设备能力
 // 只改客户端（工具注册表），Go 侧零改动。风险档位（risk_level）由描述符声明、
 // HITL 中间件按元数据裁决（见 ai-runtime/middlewares/hitl.go checkSys）。

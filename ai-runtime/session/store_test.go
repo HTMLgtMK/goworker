@@ -729,10 +729,14 @@ func TestArchive(t *testing.T) {
 		t.Fatalf("Archive: %v", err)
 	}
 
-	// current.jsonl 应该为空（新文件）
+	// current.jsonl 保留新会话的 metadata 行，不能再把物理空文件当成空会话。
 	newLines := readJSONLFile(t, currentPath)
-	if len(newLines) != 0 {
-		t.Errorf("current.jsonl should be empty after archive, got %d lines", len(newLines))
+	if len(newLines) != 1 {
+		t.Errorf("current.jsonl should contain one metadata line after archive, got %d", len(newLines))
+	}
+	var currentMetadata Record
+	if len(newLines) == 1 && json.Unmarshal([]byte(newLines[0]), &currentMetadata) == nil && currentMetadata.Kind != kindMetadata {
+		t.Errorf("current.jsonl first record kind = %q, want metadata", currentMetadata.Kind)
 	}
 
 	// archive 目录应该有刚才归档的文件
@@ -1669,5 +1673,124 @@ func TestSortCheckpoints(t *testing.T) {
 		return times[i] > times[j]
 	}) {
 		t.Errorf("checkpoints not in reverse chronological order: %v", times)
+	}
+}
+
+func TestStoreSessionIdentityIsStableAcrossReopenAndCompact(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	id := store.SessionID()
+	if id == "" {
+		t.Fatal("SessionID is empty")
+	}
+	if store.Head() != "" {
+		t.Fatalf("new store Head = %q, want empty", store.Head())
+	}
+	if _, err := store.Commit([]core.Message{
+		commMsg("m0", "user", "hello"),
+		commMsg("m1", "assistant", "answer"),
+	}); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	head := store.Head()
+	if err := store.Compact("m0", "m0", "summary"); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if store.SessionID() != id {
+		t.Errorf("SessionID after compact = %q, want %q", store.SessionID(), id)
+	}
+	if store.Head() == head {
+		t.Errorf("Head after compact = %q, want a new head", store.Head())
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	if reopened.SessionID() != id {
+		t.Errorf("SessionID after reopen = %q, want %q", reopened.SessionID(), id)
+	}
+}
+
+func TestStoreArchiveKeepsArchivedIdentityAndCreatesNewCurrentIdentity(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	oldID := store.SessionID()
+	if _, err := store.Commit([]core.Message{commMsg("m0", "user", "archive me")}); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := store.Archive(); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	newID := store.SessionID()
+	if newID == "" || newID == oldID {
+		t.Fatalf("new current SessionID = %q, want a distinct non-empty ID", newID)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "archive"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("archive entries = %v, err=%v", entries, err)
+	}
+	view, err := OpenArchiveView(filepath.Join(dir, "archive", entries[0].Name()))
+	if err != nil {
+		t.Fatalf("OpenArchiveView: %v", err)
+	}
+	if view.SessionID() != oldID {
+		t.Errorf("archived SessionID = %q, want %q", view.SessionID(), oldID)
+	}
+}
+
+func TestStoreMigratesLegacyJSONLWithStableIdentity(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "current.jsonl")
+	legacy := `{"kind":"msg","id":"legacy-message","role":"user","content":"old","created_at":"2024-01-01T00:00:00Z"}` + "\n" +
+		`{"kind":"head","tail":"legacy-message","created_at":"2024-01-01T00:00:00Z"}` + "\n"
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open legacy: %v", err)
+	}
+	id := store.SessionID()
+	if id == "" {
+		t.Fatal("migrated SessionID is empty")
+	}
+	if !strings.HasPrefix(id, "legacy_") {
+		t.Errorf("migrated SessionID = %q, want legacy_ prefix", id)
+	}
+	if id == store.Head() {
+		t.Fatalf("migrated SessionID unexpectedly equals Head %q", id)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen legacy: %v", err)
+	}
+	defer reopened.Close()
+	if reopened.SessionID() != id {
+		t.Errorf("migrated SessionID changed after reopen: %q -> %q", id, reopened.SessionID())
+	}
+	lines := readJSONLFile(t, path)
+	foundMetadata := false
+	for _, line := range lines {
+		var record Record
+		if err := json.Unmarshal([]byte(line), &record); err == nil && record.Kind == kindMetadata {
+			foundMetadata = true
+		}
+	}
+	if !foundMetadata {
+		t.Fatal("legacy migration did not persist metadata record")
 	}
 }

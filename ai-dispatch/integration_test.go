@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
+	"github.com/tinguo/goworker/ai-acp/protocol"
 )
 
 // ---- fake agent：模拟一个 ACP worker ----

@@ -10,9 +10,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
 	dispatch "github.com/tinguo/goworker/ai-dispatch"
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -215,6 +215,50 @@ func (f *Frontend) awaitServer(server *dispatch.Server) {
 	f.mu.Lock()
 	delete(f.servers, server)
 	f.mu.Unlock()
+}
+
+func sessionInfoToProtocol(info model.SessionSummary) protocol.SessionInfo {
+	return protocol.SessionInfo{
+		SessionID: info.SessionID,
+		Cwd:       info.Cwd,
+		Title:     info.Title,
+		UpdatedAt: info.UpdatedAt,
+	}
+}
+
+func sessionModeStateToProtocol(state *model.SessionModeState) *protocol.SessionModeState {
+	if state == nil {
+		return nil
+	}
+	modes := make([]protocol.SessionMode, 0, len(state.AvailableModes))
+	for _, mode := range state.AvailableModes {
+		modes = append(modes, protocol.SessionMode{
+			ID:          mode.ID,
+			Name:        mode.Name,
+			Description: mode.Description,
+		})
+	}
+	return &protocol.SessionModeState{
+		CurrentModeID:  state.CurrentModeID,
+		AvailableModes: modes,
+	}
+}
+
+func sessionUpdateToProtocol(update model.SessionUpdate) protocol.SessionUpdateBody {
+	body := protocol.SessionUpdateBody{
+		SessionUpdate: update.Kind,
+		ToolCallID:    update.ToolCallID,
+		Title:         update.Title,
+		Status:        update.Status,
+		Raw:           append(json.RawMessage(nil), update.Raw...),
+	}
+	if update.Content != nil {
+		body.Content = &protocol.ContentBlock{
+			Type: update.Content.Type,
+			Text: update.Content.Text,
+		}
+	}
+	return body
 }
 
 func tokenToUpdate(token core.Token) protocol.SessionUpdateBody {
@@ -424,7 +468,7 @@ func (h *ingress) SessionModes() *protocol.SessionModeState {
 	if h.sessionSource == nil {
 		return nil
 	}
-	return h.sessionSource.SessionModes()
+	return sessionModeStateToProtocol(h.sessionSource.SessionModes())
 }
 
 // ListSessions 实现 dispatch.SessionLister：转发给会话数据源；无数据源时返回
@@ -433,12 +477,17 @@ func (h *ingress) ListSessions() []protocol.SessionInfo {
 	if h.sessionSource == nil {
 		return []protocol.SessionInfo{}
 	}
-	return h.sessionSource.ListSessions()
+	summaries := h.sessionSource.ListSessions()
+	infos := make([]protocol.SessionInfo, 0, len(summaries))
+	for _, summary := range summaries {
+		infos = append(infos, sessionInfoToProtocol(summary))
+	}
+	return infos
 }
 
 // LoadSession 实现 dispatch.SessionLoader。daemon 的 agent 插件是单活动会话模型
 // （store 是唯一真相，当前会话始终处于已加载状态），load 的语义是「确认会话上下文已在」：
-//   - sessionId == 当前会话 head → 刷新会话视图后成功，并在响应前推送重放通知：
+//   - sessionId == 当前会话的 stable logical ID → 刷新会话视图后成功，并在响应前推送重放通知：
 //     先把声明的 cwd 落到 daemon（SetSession），再记住该 id（load 不走 session/new，
 //     不记住则后续 session/prompt 被本连接的 known-session 检查拒掉）；然后下发
 //     available_commands_update（load 路径没有 SetSessionServer，斜杠补全只能在
@@ -467,7 +516,7 @@ func (h *ingress) LoadSession(sessionID, cwd string, rep dispatch.Reporter) erro
 			}
 		}
 		for _, body := range h.sessionSource.CurrentSessionHistory() {
-			rep.Update(sessionID, body)
+			rep.Update(sessionID, sessionUpdateToProtocol(body))
 		}
 		return nil
 	}
@@ -487,7 +536,7 @@ func (h *ingress) LoadSession(sessionID, cwd string, rep dispatch.Reporter) erro
 			}
 		}
 		for _, body := range history {
-			rep.Update(sessionID, body)
+			rep.Update(sessionID, sessionUpdateToProtocol(body))
 		}
 		return nil
 	}

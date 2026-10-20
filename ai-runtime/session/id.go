@@ -2,6 +2,7 @@ package session
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"time"
@@ -17,4 +18,29 @@ func NewMsgID() string {
 		return fmt.Sprintf("m_%016x", time.Now().UnixNano())
 	}
 	return "m_" + hex.EncodeToString(b)
+}
+
+// NewSessionID returns a random logical session identity. It is deliberately
+// independent from message/head IDs: compact and rewind are allowed to replace
+// the latter without changing the session resource.
+func NewSessionID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("session_%016x", time.Now().UnixNano())
+	}
+	return "session_" + hex.EncodeToString(b)
+}
+
+// legacySessionID creates a deterministic identity for a JSONL file written by
+// versions that predate metadata. A stable first node ID is preferred because
+// it remains unchanged when current.jsonl is archived; callers use the content
+// digest only when the legacy file has no node records.
+func legacySessionID(firstNodeID string, content []byte) string {
+	seed := firstNodeID
+	if seed == "" {
+		digest := sha256.Sum256(content)
+		seed = hex.EncodeToString(digest[:])
+	}
+	digest := sha256.Sum256([]byte(seed))
+	return "legacy_" + hex.EncodeToString(digest[:8])
 }

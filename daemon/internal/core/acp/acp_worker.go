@@ -15,9 +15,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
 	dispatch "github.com/tinguo/goworker/ai-dispatch"
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-sandbox"

@@ -9,7 +9,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-dispatch/task"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
