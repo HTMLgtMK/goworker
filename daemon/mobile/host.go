@@ -1,10 +1,10 @@
-// Package mobile 是 Android（gobind）入口壳：进程内嵌入 ACP worker 的管道桥。
+// Package mobile 是 Android（gobind）入口壳：进程内嵌入 app.Application 后端的管道桥。
 //
 // 架构：Kotlin 侧实现 ACP Client（JSON-RPC over 换行分隔帧），经本包与 Go 侧
-// acpworker.ServeACPWorker 通信 —— 与 VS Code/ZCode 前端共享同一套协议语义
-// （session/prompt 流式输出、session/request_permission HITL、session/load 回放）。
-// 本包只桥接字节流，不解释协议：JSON-RPC 编解码、session 生命周期、HITL 对话框
-// 交互全部在 Kotlin ACP 客户端完成。协议细节见 PROTOCOL.md。
+// app.Application 通信 —— ACP 经 WithACPConnection 走进程内管道，后端是完整
+// 的 Engine + 插件 + services 装配（内置命令、会话持久化与 VS Code 端的
+// app-service 路径同源）。本包只桥接字节流，不解释协议：JSON-RPC 编解码、
+// session 生命周期、HITL 对话框交互全部在 Kotlin ACP 客户端完成。协议细节见 PROTOCOL.md。
 //
 // gobind 边界约束：仅 string/[]byte/error/可绑定接口（无 map/func 字段/变参）；
 // 一切导出方法带 recover 壳 —— Go panic 会 abort 整个 App 进程。
@@ -16,14 +16,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"sync"
 
-	dispatch "github.com/tinguo/goworker/ai-dispatch"
-	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
-	"github.com/tinguo/goworker/ai-runtime/logger"
-	"github.com/tinguo/goworker/daemon/internal/app/config"
-	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
+	"github.com/tinguo/goworker/daemon/internal/app"
 )
 
 // Callbacks 是 worker → Kotlin 的上行回调（Kotlin 实现，gobind 生成 proxy）。
@@ -37,8 +32,8 @@ type Callbacks interface {
 	OnClose(message string)
 }
 
-// pipeConn 把一对 io.Pipe 拼成 worker 侧的 io.ReadWriteCloser：
-// 读 = client→worker 管道（Kotlin Write 的一端），写 = worker→client 管道。
+// pipeConn 把一对 io.Pipe 拼成 app 侧的 io.ReadWriteCloser：
+// 读 = client→app 管道（Kotlin Write 的一端），写 = app→client 管道。
 type pipeConn struct {
 	r *io.PipeReader
 	w *io.PipeWriter
@@ -52,19 +47,17 @@ func (c *pipeConn) Close() error {
 	return nil
 }
 
-// Host 是 Android 侧持有的 ACP worker 容器：Start 后 worker 在后台 goroutine
-// 服务 ACP 协议，Kotlin 经 Write/OnData 与之全双工通信。非并发安全：
+// Host 是 Android 侧持有的 agent 后端容器：Start 后 app.Application 在
+// 进程内服务 ACP 协议，Kotlin 经 Write/OnData 与之全双工通信。非并发安全：
 // Close 之后 Host 不可再用；Write 需在 Start 之后。
 type Host struct {
 	mu sync.Mutex
 	cb Callbacks
 
-	runtimeCfg *runtimeconfig.Config
-	log        *logger.Logger
+	appl *app.Application
 
-	clientW *io.PipeWriter // Kotlin Write → worker 读端
-	pumpR   *io.PipeReader // worker 写端 → pump → OnData
-	server  *dispatch.Server
+	clientW *io.PipeWriter // Kotlin Write → ACP server 读端
+	pumpR   *io.PipeReader // ACP server 写端 → pump → OnData
 
 	started     bool
 	closed      bool
@@ -72,10 +65,11 @@ type Host struct {
 	closeReport sync.Once
 }
 
-// NewHost 装载 worker 运行时。与 app.RunACPWorker 共享同一套装配点：
-// 配置/日志装载、GOWORKER_SANDBOX_MODE 门禁覆盖；分叉的只有传输层 ——
-// 管道而非 stdio。configDir 经 GOWORKER_CONFIG_DIR 注入
-// （App 传 getFilesDir() 派生路径；空串走默认 ~/.config/goworker）。
+// NewHost 准备 Android agent 后端容器。装配（配置/日志装载、沙箱门禁覆盖、
+// Engine/插件/服务生命周期）统一由 app.New 在 Start 时完成 —— NewHost 只存
+// configDir 与回调，配置校验推迟到 Start，错误经 error 而非 panic 交给壳层。
+// configDir 经 GOWORKER_CONFIG_DIR 注入（App 传 getFilesDir() 派生路径；
+// 空串走默认 ~/.config/goworker）。
 func NewHost(configDir string, cb Callbacks) (h *Host, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -88,33 +82,13 @@ func NewHost(configDir string, cb Callbacks) (h *Host, err error) {
 	if configDir != "" {
 		os.Setenv("GOWORKER_CONFIG_DIR", configDir)
 	}
-	cfgPath := config.DefaultPath()
-	cfg := config.Load(cfgPath)
-	if cfg == nil {
-		return nil, fmt.Errorf("配置无效: %s，详见日志；修好后重试，或删掉该文件用默认配置", cfgPath)
-	}
-	// 与 app.RunACPWorker 一致：无人值守 worker 的沙箱门禁可经环境收紧，
-	// 非法值拒绝启动（App 侧如需 strict 可在启动前设置该 env）。
-	runtimeCfg := cfg.ToRuntime()
-	if mode := os.Getenv("GOWORKER_SANDBOX_MODE"); mode != "" {
-		switch mode {
-		case "normal", "strict", "readonly", "off":
-			runtimeCfg.Sandbox.Mode = mode
-		default:
-			return nil, fmt.Errorf("invalid GOWORKER_SANDBOX_MODE %q (normal|strict|readonly|off)", mode)
-		}
-		slog.Info("mobile worker: sandbox mode overridden", "mode", mode)
-	}
-	log, err := logger.Setup(cfg.Log)
-	if err != nil {
-		return nil, fmt.Errorf("init logger: %w", err)
-	}
-	slog.SetDefault(log.Logger)
-	return &Host{cb: cb, runtimeCfg: runtimeCfg, log: log}, nil
+	return &Host{cb: cb}, nil
 }
 
-// Start 启动 worker：io.Pipe 桥接 + ServeACPWorker 后台服务。
-// 之后 Kotlin 即可经 Write 发送 ACP 请求（首条约定为 initialize）。
+// Start 装配并启动后端：io.Pipe 桥 + app.New(WithACPConnection) 同步装配
+// （配置 → Engine → 插件 → StartAll → services.Start），之后 Kotlin 即可经
+// Write 发送 ACP 请求（首条约定为 initialize）。app.New 阻塞装配是预期行为；
+// acp service 的 Start 只调 listener factory 后台 accept，不会卡在协议握手。
 func (h *Host) Start() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -130,21 +104,27 @@ func (h *Host) Start() (err error) {
 		return errors.New("host closed")
 	}
 
-	toWorkerR, toWorkerW := io.Pipe()     // client→worker
-	fromWorkerR, fromWorkerW := io.Pipe() // worker→client
+	toWorkerR, toWorkerW := io.Pipe()     // client→app
+	fromWorkerR, fromWorkerW := io.Pipe() // app→client
 	h.clientW = toWorkerW
 	h.pumpR = fromWorkerR
-	h.server = acpworker.ServeACPWorker(&pipeConn{r: toWorkerR, w: fromWorkerW}, acpworker.ACPWorkerDeps{
-		Config:   h.runtimeCfg,
-		AuditDir: filepath.Join(config.DefaultDir(), "audit"),
-	})
+	appl, err := app.New(app.WithACPConnection(&pipeConn{r: toWorkerR, w: fromWorkerW}))
+	if err != nil {
+		// Host 自己的管道自己收：关掉四个端点防泄漏；app.New 内部失败已自行 cleanup
+		//（services/engine/log），管道留给它只会悬空。
+		_ = toWorkerR.Close()
+		_ = toWorkerW.Close()
+		_ = fromWorkerR.Close()
+		_ = fromWorkerW.Close()
+		return err
+	}
+	h.appl = appl
 	h.started = true
 	go h.pump()
-	go h.watchDone()
 	return nil
 }
 
-// Write 发送一条 client→worker 的 JSON-RPC 消息。Host 负责帧定界：
+// Write 发送一条 client→app 的 JSON-RPC 消息。Host 负责帧定界：
 // 每次 Write 追加 '\n' —— 一次 Write 一条完整消息，chunk 无需自带换行。
 func (h *Host) Write(chunk []byte) (err error) {
 	defer func() {
@@ -166,34 +146,38 @@ func (h *Host) Write(chunk []byte) (err error) {
 	return nil
 }
 
-// Close 停止 worker 并释放资源。幂等；Close 后 OnClose 恰好回调一次。
+// Close 停止后端并释放资源。幂等；Close 后 OnClose 恰好回调一次。
+// 顺序：先关 Kotlin 写端（EOF → ACP server 读循环退出），再 appl.Stop()
+// （services → engine → log）—— Stop 会等活跃 prompt 取消完成，可能阻塞，
+// 这是有意的收口语义；期间 acp service 收口会关闭管道对端，pump 读到 EOF
+// 退出并触发 OnClose。
 func (h *Host) Close() {
 	defer func() {
-		if r := recover(); r != nil && h.log != nil {
-			h.log.Error("mobile close panic", "panic", r)
+		if r := recover(); r != nil {
+			slog.Error("mobile close panic", "panic", r)
 		}
 	}()
 	h.closeOnce.Do(func() {
 		h.mu.Lock()
-		started := h.started
 		if h.clientW != nil {
-			_ = h.clientW.Close() // EOF → worker 读循环退出 → Done
-		}
-		if h.pumpR != nil {
-			_ = h.pumpR.Close() // pump 退出
+			_ = h.clientW.Close() // EOF → ACP server 读循环退出
 		}
 		h.closed = true
 		h.mu.Unlock()
-		if started && h.server != nil {
-			_ = h.server.Close()
+		if h.appl != nil {
+			h.appl.Stop()
+			return
 		}
-		if h.log != nil {
-			h.log.Close()
+		// Start 未跑或失败：没有后端替我们关对端，pump 只能手动收。
+		h.mu.Lock()
+		if h.pumpR != nil {
+			_ = h.pumpR.Close()
 		}
+		h.mu.Unlock()
 	})
 }
 
-// pump 把 worker 输出桥到 OnData（worker 写端 → Kotlin）。
+// pump 把后端输出桥到 OnData（app 写端 → Kotlin）。
 func (h *Host) pump() {
 	buf := make([]byte, 32*1024)
 	for {
@@ -220,14 +204,7 @@ func (h *Host) pump() {
 	}
 }
 
-// watchDone 等待 worker 读循环退出（对端断开/Close），收尾并上报。
-func (h *Host) watchDone() {
-	<-h.server.Done()
-	h.reportClose("worker stopped")
-	h.Close()
-}
-
-// reportClose 保证 OnClose 恰好递送一次（pump 与 watchDone 谁先到都行）。
+// reportClose 保证 OnClose 恰好递送一次。
 func (h *Host) reportClose(message string) {
 	h.closeReport.Do(func() {
 		h.safe(func() { h.cb.OnClose(message) })
@@ -235,11 +212,12 @@ func (h *Host) reportClose(message string) {
 }
 
 // safe 保护上行回调：Kotlin 侧抛出的异常经 gobind 变 Go panic，吞掉并记日志，
-// 不让它打断 worker。
+// 不让它打断后端。此时全局 slog 已被 app.New 接上配置的 handler；装配前阶段
+// 没有回调触发，用 slog.Default 兜底即可。
 func (h *Host) safe(fn func()) {
 	defer func() {
-		if r := recover(); r != nil && h.log != nil {
-			h.log.Error("mobile callback panic", "panic", r)
+		if r := recover(); r != nil {
+			slog.Error("mobile callback panic", "panic", r)
 		}
 	}()
 	fn()

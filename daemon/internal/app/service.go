@@ -36,7 +36,9 @@ func registerServices(a *Application, options applicationOptions) error {
 }
 
 func registerACPService(a *Application, options applicationOptions) error {
-	if !a.Config.Frontend.ACP.Enabled {
+	// 显式注入连接 = 装配层明确要求 ACP（mobile Host 的进程内管道形态），
+	// 配置开关只管默认的 Unix socket 形态 —— 连接都给了没 service 是装配 bug。
+	if !a.Config.Frontend.ACP.Enabled && options.acpConnection == nil {
 		return nil
 	}
 

@@ -113,6 +113,14 @@ func New(options ...Option) (*Application, error) {
 	// ai-runtime 聚合配置（各插件的目录路径注入见 RegisterPlugins 装配链）
 	runtimeCfg := cfg.ToRuntime()
 
+	// 沙箱门禁的环境覆盖（GOWORKER_SANDBOX_MODE）：非法值按启动失败处理，
+	// 装配到此只占用了配置/日志，回收日志即可 —— 插件还没起。
+	if err := applySandboxModeOverride(runtimeCfg); err != nil {
+		log.Error("invalid sandbox mode override", "error", err)
+		log.Close()
+		return nil, err
+	}
+
 	e := engine.NewEngine(cfg, runtimeCfg, log)
 
 	// 注册拦截器

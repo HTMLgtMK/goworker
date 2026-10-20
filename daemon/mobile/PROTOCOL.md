@@ -10,10 +10,12 @@ ZCode dispatcher 共享同一套协议语义（`ai-dispatch/protocol`），区�
 │  Kotlin ACP Client (JSON-RPC 编解码 / session 生命周期 / HITL UI)   │
 │        ▲ Write(chunk)                │ OnData(chunk) ▼            │
 │  ┌─────┴──────────── daemon/mobile (gobind bind 面) ────────────┐  │
-│  │      io.Pipe 桥 → acpworker.ServeACPWorker(rwc, deps)        │  │
+│  │      io.Pipe 桥 → app.Application(WithACPConnection)         │  │
+│  │      （Engine + 插件 + services）→ ACP service                │  │
+│  │      → ConnectionListener（进程内管道，无 Unix socket）        │  │
 │  └──────────────────────────┬───────────────────────────────────┘  │
 │                             ▼                                      │
-│        ACP worker（ai-runtime Session：LLM/工具/沙箱/HITL）          │
+│        app-service 后端（ai-runtime Session：LLM/工具/沙箱/HITL）    │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
@@ -27,13 +29,61 @@ ZCode dispatcher 共享同一套协议语义（`ai-dispatch/protocol`），区�
 
 | 方法 | 说明 |
 |---|---|
-| `initialize` | 能力协商，首条必发；响应含 agentCapabilities（loadSession 等） |
+| `initialize` | 能力协商，首条必发；params 带 `clientCapabilities`（见下节），响应含 `agentCapabilities`（loadSession 等） |
 | `session/new` | 建会话，params `{cwd, mcpServers}`；响应 `{sessionId, modes?}` |
-| `session/load` | 回放历史会话（checkpoint 锚定，update 先于响应到达） |
+| `session/load` | 回放历史会话（checkpoint 锚定，update 先于响应到达）；仅当 agentCapabilities 声明 `loadSession` 时可用 |
 | `session/list` | 会话清单（当前 + 归档，`isCurrent` 显式区分） |
 | `session/prompt` | 提交一轮对话，阻塞到回合结束返回 stop reason |
 | `session/cancel` | **通知**（无响应）：取消进行中的 prompt —— Android 停止按钮发这个 |
 | `session/set_mode` | 未注册（method-not-found 诚实失败） |
+
+## 能力协商（initialize）
+
+完整报文示例（客户端视角，逐字段可抄）：
+
+```json
+→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+     "protocolVersion":1,
+     "clientCapabilities":{"x-device":{"tools":true}}
+   }}
+← {"jsonrpc":"2.0","id":1,"result":{
+     "protocolVersion":1,
+     "agentCapabilities":{"loadSession":true}
+   }}
+```
+
+**clientCapabilities（client 声明）**
+
+- key 存在性即门控，value 当前不解析 —— `{"x-device":{"tools":true}}` 里的
+  `tools` 字段是给未来留的形状，写了不亏。
+- 声明 `x-device` = 本客户端实现 `x-device/tools` / `x-device/call`
+  （设备能力注册表见「系统能力工具」一节）。
+- **不声明的后果（app-service 路径）**：agent 不发探测请求，设备工具静默为零
+  —— 不报错、不降级提示，LLM 只是看不到任何 `sys_*` 工具。这是能力协商的
+  预期行为（VS Code 等标准客户端就是这条路），但实现了 DeviceTools 的客户端
+  忘了声明就是纯丢功能。
+- 旧 AAR（ServeACPWorker 路径）不检查此字段：声明了无害、被忽略。
+
+**agentCapabilities（agent 声明）**
+
+- 客户端**必须保存** initialize 响应并据此降级，不要对能力面做硬编码假设：
+  - `loadSession` 缺失 → 藏掉/禁用「恢复历史会话」入口，别发 `session/load`
+    吃 -32000。
+  - 两条 Go 路径的能力面不同（ServeACPWorker 无 load/list；app-service 全有），
+    客户端同一份代码要能对着任意一份 AAR 跑。（当前 mobile Host 已切 app-service
+    路径；ServeACPWorker 仅剩 stdio worker 形态在用 —— ZCode dispatcher spawn
+    的无人值守进程。）
+
+**客户端迁移清单（旧 AAR → capability 门控版 AAR）**
+
+1. initialize params 补 `clientCapabilities: {"x-device": {"tools": true}}`
+   —— 唯一必改点。
+2. 保存 initialize 响应的 `agentCapabilities`，UI 按能力降级。
+3. 其余不动：`x-device/tools` / `x-device/call` 的应答逻辑、-32601 兜底、
+   权限对话框语义全部照旧。
+4. 新 AAR（app-service 路径）要求客户端声明 `clientCapabilities`（见上节），
+   未声明时设备工具静默为零；Host 侧已强制启用 ACP service —— 显式注入连接时
+   `frontend.acp.enabled` 开关无效，装配层无视该开关注册 service。
 
 ## agent → client
 
@@ -55,15 +105,19 @@ ZCode dispatcher 共享同一套协议语义（`ai-dispatch/protocol`），区�
 ## 生命周期
 
 ```
-NewHost(configDir, callbacks)   装载配置/日志（GOWORKER_CONFIG_DIR 注入，
-                                GOWORKER_SANDBOX_MODE 可收紧沙箱门禁）
-  → Start()                     io.Pipe 桥 + worker 后台启动
+NewHost(configDir, callbacks)   只存 configDir 与回调，不校验配置
+                               （GOWORKER_CONFIG_DIR 注入；GOWORKER_SANDBOX_MODE
+                                可收紧沙箱门禁，Start 时经 app.New 校验）
+  → Start()                     io.Pipe 桥 + app.New 同步装配（配置/日志 →
+                                Engine → 插件 → services.Start）
   → initialize → session/new → (session/prompt ⇄ update/permission)* → …
   → Close()                     幂等；之后 OnClose 恰好回调一次
 ```
 
 配置文件落在 `configDir`（`config.yaml`），LLM endpoint 等可经 ACP 无关路径
-预置（app 首启引导生成），或后续经 agent 的命令通道设置。
+预置（app 首启引导生成），或后续经 agent 的命令通道设置。**会话持久化现在真的
+生效**：旧 worker 路径 Store=nil 纯内存，重启进程即丢；app-service 路径经
+session store 落 JSONL，同一 configDir 重建 Host 后 `session/load` 可恢复。
 
 ## 系统能力工具：x-device 扩展（已实现）
 
@@ -72,8 +126,8 @@ NewHost(configDir, callbacks)   装载配置/日志（GOWORKER_CONFIG_DIR 注入
 VS Code/ZCode 等标准客户端不认识 → 自动 method-not-found → 无设备工具，零兼容负担。
 
 ```
-session/new 后（旧 ServeACPWorker 路径）或每次 prompt 的工具收集时（app-service
-路径）：agent ── x-device/tools（探测请求）──→ client
+每次 prompt 的工具收集时（app-service 路径，mobile Host 属于该路径；旧
+ServeACPWorker 是 session/new 后一次性探测）：agent ── x-device/tools（探测请求）──→ client
                  ← {tools: [{name, description, schema, risk_level}]}
                  （method-not-found / 超时 / 非法条目 → 视为无能力，不注册工具）
 
@@ -83,12 +137,11 @@ LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下�
 ```
 
 - **工具名强制 `sys_` 前缀**（worker 添加）：与 bash/mcp 命名空间隔离。
-- **能力门控（app-service 路径）**：客户端必须在 initialize 声明
-  `clientCapabilities: {"x-device": ...}` 才会被探测（value 暂不解析，存在性即门控）。
-- **探测时机（两条路径差异）**：app-service 路径（FrontendHandler）probe 从
-  session/new 后移到每次 prompt 的工具收集时（Session.Run 合并按请求注入的
-  ToolSource）；mobile Host 走的 ServeACPWorker 旧路径本次不改，仍是 session/new
-  后一次性探测并注册。
+- **能力门控（app-service 路径）**：门控规则与报文见「能力协商（initialize）」一节
+  —— 客户端在 initialize 的 clientCapabilities 里声明 `x-device` 才会被探测。
+- **探测时机**：probe 在每次 prompt 的工具收集时进行（Session.Run 合并按请求
+  注入的 ToolSource），session/new 后不做一次性探测注册。旧 ServeACPWorker
+  路径（session/new 后一次性探测）仅剩 stdio worker（ZCode dispatcher）形态。
 - **metadata 声明**：客户端应发送 `risk_level: benign..reserved`；需要统一门控的工具还应发送 `requires_permission: true`。worker 为 gated 工具补充稳定的 `allow_always_key: sys_<name>`。
 - **兼容旧客户端**：`never → low`（直通）、`mode → unclassified`、`always → critical + permission_policy=always_hitl`；旧值只在 relay 边界转换，runtime 内部统一使用 benign-reserved。
 

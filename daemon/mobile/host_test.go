@@ -3,6 +3,8 @@ package mobile
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -151,5 +153,39 @@ func TestHostLifecycle(t *testing.T) {
 	}
 	if err := h.Start(); err == nil {
 		t.Fatal("double Start: want error")
+	}
+}
+
+// TestHostStartRejectsInvalidSandboxMode 校验 GOWORKER_SANDBOX_MODE 门禁已随装配
+// 移交 app.New：NewHost 不再提前校验（它根本不碰配置），Start 拒绝启动。
+func TestHostStartRejectsInvalidSandboxMode(t *testing.T) {
+	t.Setenv("GOWORKER_CONFIG_DIR", t.TempDir())
+	t.Setenv("GOWORKER_SANDBOX_MODE", "yolo")
+	cb := &collectCB{closed: make(chan string, 1)}
+	h, err := NewHost("", cb)
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+	if err := h.Start(); err == nil {
+		t.Fatal("Start with invalid GOWORKER_SANDBOX_MODE: want error")
+	}
+}
+
+// TestHostStartValidatesConfig 校验配置校验也已推迟到 Start（app.New 统一装载）：
+// NewHost 对损坏的 config.yaml 照常成功，Start 报配置错误。
+func TestHostStartValidatesConfig(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("llm: [unclosed"), 0o600); err != nil {
+		t.Fatalf("write broken config: %v", err)
+	}
+	cb := &collectCB{closed: make(chan string, 1)}
+	h, err := NewHost(dir, cb)
+	if err != nil {
+		t.Fatalf("NewHost with broken config: %v", err)
+	}
+	defer h.Close()
+	if err := h.Start(); err == nil {
+		t.Fatal("Start with broken config: want error")
 	}
 }
