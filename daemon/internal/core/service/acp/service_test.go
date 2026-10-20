@@ -3,6 +3,7 @@ package acp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -41,7 +42,9 @@ func (h *blockingHandler) Prompt(ctx context.Context, _ string, _ []protocol.Con
 func TestServiceStartStopIsIdempotent(t *testing.T) {
 	dir := shortTempDir(t)
 	sockPath := filepath.Join(dir, "nested", "acp.sock")
-	service := NewService(&recordingHandler{prompted: make(chan struct{})})
+	service := NewService(func() aiacp.SessionHandler {
+		return &recordingHandler{prompted: make(chan struct{})}
+	})
 
 	if err := service.Start(sockPath); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -73,8 +76,8 @@ func TestServiceStartStopIsIdempotent(t *testing.T) {
 
 func TestServiceAcceptsUnixACPClient(t *testing.T) {
 	sockPath := filepath.Join(shortTempDir(t), "acp.sock")
-	handler := &recordingHandler{prompted: make(chan struct{})}
-	service := NewService(handler)
+	handlers := newRecordingHandlerFactory(t)
+	service := NewService(handlers.factory)
 	if err := service.Start(sockPath); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -100,15 +103,119 @@ func TestServiceAcceptsUnixACPClient(t *testing.T) {
 		t.Fatalf("Prompt: %v", err)
 	}
 	select {
-	case <-handler.prompted:
+	case <-handlers.only().prompted:
 	case <-time.After(time.Second):
 		t.Fatal("session handler was not called")
 	}
 }
 
+// TestServiceHandlerFactoryIsPerConnection 验证每条连接都调用 factory 并拿到
+// 独立 handler 实例：多 frontend 同时连一个 socket 时 session 状态不串线。
+func TestServiceHandlerFactoryIsPerConnection(t *testing.T) {
+	sockPath := filepath.Join(shortTempDir(t), "acp.sock")
+	handlers := newRecordingHandlerFactory(t)
+	service := NewService(handlers.factory)
+	if err := service.Start(sockPath); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = service.Stop() }()
+
+	const clients = 3
+	for i := 0; i < clients; i++ {
+		go func() {
+			conn, err := net.Dial("unix", sockPath)
+			if err != nil {
+				t.Errorf("Dial: %v", err)
+				return
+			}
+			defer conn.Close()
+			client := aiacp.NewClient("test", conn, nil)
+			defer client.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if _, err := client.Initialize(ctx); err != nil {
+				t.Errorf("Initialize: %v", err)
+				return
+			}
+			sessionID, err := client.NewSession(ctx, "")
+			if err != nil {
+				t.Errorf("NewSession: %v", err)
+				return
+			}
+			if _, err := client.Prompt(ctx, sessionID, []protocol.ContentBlock{{Type: "text", Text: "hi"}}); err != nil {
+				t.Errorf("Prompt: %v", err)
+				return
+			}
+		}()
+	}
+
+	// factory 每条连接调用一次；每条连接的 handler 都应完成一次 prompt。
+	seen := make(map[*recordingHandler]struct{}, clients)
+	deadline := time.After(3 * time.Second)
+	for len(seen) < clients {
+		select {
+		case h := <-handlers.produced:
+			seen[h] = struct{}{}
+		case <-deadline:
+			t.Fatalf("only %d/%d connections produced a handler", len(seen), clients)
+		}
+	}
+	if got := handlers.count(); got != clients {
+		t.Fatalf("factory called %d times, want %d", got, clients)
+	}
+	for h := range seen {
+		select {
+		case <-h.prompted:
+		case <-time.After(time.Second):
+			t.Fatal("one connection's handler was never prompted")
+		}
+	}
+}
+
+// recordingHandlers 记录 factory 创建的每个 handler，供测试断言隔离语义。
+type recordingHandlers struct {
+	mu       sync.Mutex
+	created  []*recordingHandler
+	factory  HandlerFactory
+	produced chan *recordingHandler
+}
+
+func newRecordingHandlerFactory(t *testing.T) *recordingHandlers {
+	t.Helper()
+	rh := &recordingHandlers{produced: make(chan *recordingHandler, 16)}
+	rh.factory = func() aiacp.SessionHandler {
+		h := &recordingHandler{prompted: make(chan struct{})}
+		rh.mu.Lock()
+		rh.created = append(rh.created, h)
+		rh.mu.Unlock()
+		rh.produced <- h
+		return h
+	}
+	return rh
+}
+
+func (r *recordingHandlers) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.created)
+}
+
+// only 断言 factory 恰好创建过一个 handler 并返回它。
+func (r *recordingHandlers) only() *recordingHandler {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.created) != 1 {
+		panic(fmt.Sprintf("factory created %d handlers, want 1", len(r.created)))
+	}
+	return r.created[0]
+}
+
 func TestServiceClientDisconnectReleasesPeer(t *testing.T) {
 	sockPath := filepath.Join(shortTempDir(t), "acp.sock")
-	service := NewService(&recordingHandler{prompted: make(chan struct{})})
+	service := NewService(func() aiacp.SessionHandler {
+		return &recordingHandler{prompted: make(chan struct{})}
+	})
 	if err := service.Start(sockPath); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -145,7 +252,9 @@ func TestServiceStopCancelsActiveHandlerAndReleasesSocket(t *testing.T) {
 		started:   make(chan struct{}),
 		cancelled: make(chan struct{}),
 	}
-	service := NewService(handler)
+	service := NewService(func() aiacp.SessionHandler {
+		return handler
+	})
 	if err := service.Start(sockPath); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

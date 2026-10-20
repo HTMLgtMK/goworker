@@ -10,10 +10,16 @@ import (
 	aiacp "github.com/tinguo/goworker/ai-acp"
 )
 
+// HandlerFactory creates the protocol-level handler for one accepted
+// connection. Each connection gets its own handler instance so per-connection
+// session state never leaks across peers.
+type HandlerFactory func() aiacp.SessionHandler
+
 // Service is a reusable ACP daemon adapter. It owns its Unix listener and all
-// connected peers; callers own only the injected protocol-level handler.
+// connected peers; callers supply a factory that builds one handler per
+// connection. Daemon task/session routing remains an application concern.
 type Service struct {
-	handler aiacp.SessionHandler
+	handlerFactory HandlerFactory
 
 	mu       sync.Mutex
 	listener *Listener
@@ -27,14 +33,14 @@ type Service struct {
 	acceptWG sync.WaitGroup
 }
 
-// NewService constructs a stopped service. The handler must implement only the
+// NewService constructs a stopped service. The factory must implement only the
 // ai-acp SessionHandler contract; daemon task/session routing remains an
 // application concern.
-func NewService(handler aiacp.SessionHandler) *Service {
+func NewService(factory HandlerFactory) *Service {
 	return &Service{
-		handler: handler,
-		peers:   make(map[*aiacp.Server]struct{}),
-		done:    make(chan struct{}),
+		handlerFactory: factory,
+		peers:          make(map[*aiacp.Server]struct{}),
+		done:           make(chan struct{}),
 	}
 }
 
@@ -58,8 +64,8 @@ func (s *Service) Start(sockPath string) error {
 	if s.stopping {
 		return errors.New("acp: service has been stopped")
 	}
-	if s.handler == nil {
-		return errors.New("acp: session handler is required")
+	if s.handlerFactory == nil {
+		return errors.New("acp: handler factory is required")
 	}
 
 	listener, err := NewUnixListener(sockPath)
@@ -76,8 +82,8 @@ func (s *Service) Start(sockPath string) error {
 
 // Start is also available as a convenience for one-shot composition roots.
 // The returned service remains the owner of the socket and must be stopped.
-func Start(sockPath string, handler aiacp.SessionHandler) (*Service, error) {
-	service := NewService(handler)
+func Start(sockPath string, factory HandlerFactory) (*Service, error) {
+	service := NewService(factory)
 	if err := service.Start(sockPath); err != nil {
 		return nil, err
 	}
@@ -159,7 +165,14 @@ func (s *Service) acceptLoop(listener *Listener) {
 }
 
 func (s *Service) accept(conn io.ReadWriteCloser) {
-	server, err := aiacp.NewServer(conn, s.handler)
+	// factory 在连接粒度调用：每条连接一份 handler，session 状态不跨连接串线。
+	handler := s.handlerFactory()
+	if handler == nil {
+		_ = conn.Close()
+		slog.Error("acp: handler factory returned nil")
+		return
+	}
+	server, err := aiacp.NewServer(conn, handler)
 	if err != nil {
 		_ = conn.Close()
 		slog.Error("failed to create ACP server", "error", err)
