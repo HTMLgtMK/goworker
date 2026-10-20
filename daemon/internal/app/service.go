@@ -35,7 +35,7 @@ func startACPService(a *Application) error {
 		sessions = nil
 	}
 
-	service := acpservice.NewService(acpservice.NewFrontendHandlerFactory(a.Engine.Eval, sessions))
+	service := acpservice.NewService(acpservice.NewFrontendHandlerFactory(a.Engine.Eval, a.Engine.Commands, sessions))
 	if err := service.Start(a.Config.Frontend.ACP.Socket); err != nil {
 		return fmt.Errorf("start acp service: %w", err)
 	}

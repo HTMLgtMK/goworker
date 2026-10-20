@@ -2,6 +2,7 @@ package acp
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +35,61 @@ func (r *recordingReporter) RequestPermission(context.Context, string, protocol.
 	return "", aiacp.ErrPermissionUnsupported
 }
 
+// fakeSessionSource 是脚本化的 model.SessionSource，供 adapter 测试注入。
+type fakeSessionSource struct {
+	mu              sync.Mutex
+	currentID       string
+	setSessionCalls []string
+	reloadErr       error
+	currentHistory  []model.SessionUpdate
+	archived        map[string][]model.SessionUpdate
+	list            []model.SessionSummary
+	modes           *model.SessionModeState
+}
+
+func (f *fakeSessionSource) ListSessions() []model.SessionSummary {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.list
+}
+
+func (f *fakeSessionSource) CurrentSessionID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.currentID
+}
+
+func (f *fakeSessionSource) SetSession(sessionID, cwd string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setSessionCalls = append(f.setSessionCalls, sessionID+"|"+cwd)
+}
+
+func (f *fakeSessionSource) ReloadCurrentSession() error {
+	return f.reloadErr
+}
+
+func (f *fakeSessionSource) CurrentSessionHistory() []model.SessionUpdate {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.currentHistory
+}
+
+func (f *fakeSessionSource) ArchivedSessionHistory(sessionID string) ([]model.SessionUpdate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if history, ok := f.archived[sessionID]; ok {
+		return history, nil
+	}
+	return nil, fmt.Errorf("no archive for %q", sessionID)
+}
+
+func (f *fakeSessionSource) SessionModes() *model.SessionModeState {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.modes
+}
+
 func TestFrontendHandlerRejectsUnknownSession(t *testing.T) {
 	handler := &FrontendHandler{
 		evaluate: func(ctx *model.Context, input string) error {
@@ -59,11 +115,12 @@ func TestFrontendHandlerRoutesPromptThroughEvaluator(t *testing.T) {
 			gotInput = input
 			mu.Unlock()
 			ctx.Writer("hello ")
+			ctx.Writer("\n") // 纯空白在围栏开启前必须被吞，不能造出空代码块
 			ctx.Writer("world")
 			return nil
 		},
 	}
-	if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp"}, nil); err != nil {
+	if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp"}, reporter); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 
@@ -83,14 +140,18 @@ func TestFrontendHandlerRoutesPromptThroughEvaluator(t *testing.T) {
 	if gotInput != "hello\nworld" {
 		t.Fatalf("evaluate input = %q, want %q", gotInput, "hello\nworld")
 	}
-	if joined := strings.Join(reporter.chunks, ""); joined != "hello world" {
-		t.Fatalf("chunks joined = %q, want %q", joined, "hello world")
+	joined := strings.Join(reporter.chunks, "")
+	// 围栏开启前吞掉纯空白（首个 "hello " 即开栏）；开启后一律透传，
+	// 输出应是「开栏 + hello + 换行 + world + 补换行 + 闭栏」。
+	want := commandFence + "\nhello \nworld\n" + commandFence + "\n"
+	if joined != want {
+		t.Fatalf("chunks joined = %q, want %q", joined, want)
 	}
 }
 
 func TestNewFrontendHandlerFactoryPerConnection(t *testing.T) {
 	evaluate := func(ctx *model.Context, input string) error { return nil }
-	factory := NewFrontendHandlerFactory(evaluate, nil)
+	factory := NewFrontendHandlerFactory(evaluate, nil, nil)
 
 	first, second := factory(), factory()
 	if first == second {
@@ -98,5 +159,118 @@ func TestNewFrontendHandlerFactoryPerConnection(t *testing.T) {
 	}
 	if _, ok := first.(aiacp.SessionHandler); !ok {
 		t.Fatal("factory product does not implement aiacp.SessionHandler")
+	}
+}
+
+func TestCreateSessionPushesCommands(t *testing.T) {
+	reporter := &recordingReporter{}
+	handler := &FrontendHandler{
+		commands: func() []model.Command {
+			return []model.Command{{Name: "/agent", Description: "agent", Aliases: []string{"/a"}}}
+		},
+	}
+	if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if len(reporter.updates) != 1 {
+		t.Fatalf("updates = %d, want 1", len(reporter.updates))
+	}
+	body := reporter.updates[0]
+	// 载荷整体经 Raw 透传，sessionUpdate 判别字段在 JSON 内部而非 Go 字段。
+	if !strings.Contains(string(body.Raw), `"sessionUpdate":"available_commands_update"`) {
+		t.Fatalf("raw payload missing discriminator: %s", body.Raw)
+	}
+	if !strings.Contains(string(body.Raw), `"name":"agent"`) || !strings.Contains(string(body.Raw), `"name":"a"`) {
+		t.Fatalf("raw payload missing command/alias entries: %s", body.Raw)
+	}
+}
+
+func TestLoadSessionCurrentReplaysHistory(t *testing.T) {
+	sessions := &fakeSessionSource{
+		currentID:      "s1",
+		currentHistory: []model.SessionUpdate{{Kind: model.SessionUpdateAgentMessageChunk, Content: &model.SessionContent{Type: "text", Text: "hi"}}},
+	}
+	reporter := &recordingReporter{}
+	handler := &FrontendHandler{
+		evaluate: func(ctx *model.Context, input string) error { return nil },
+		sessions: sessions,
+	}
+
+	if err := handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "s1", Cwd: "/tmp"}, reporter); err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	// 重放的历史先于 load 响应写出；随后该 id 应可直接 prompt。
+	stop, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("go on")}, reporter)
+	if err != nil {
+		t.Fatalf("Prompt after load: %v", err)
+	}
+	if stop != protocol.StopEndTurn {
+		t.Fatalf("stop reason = %q, want %q", stop, protocol.StopEndTurn)
+	}
+	sessions.mu.Lock()
+	defer sessions.mu.Unlock()
+	if len(sessions.setSessionCalls) != 1 || sessions.setSessionCalls[0] != "s1|/tmp" {
+		t.Fatalf("SetSession calls = %v, want [s1|/tmp]", sessions.setSessionCalls)
+	}
+}
+
+func TestLoadSessionArchivedIsReadOnly(t *testing.T) {
+	sessions := &fakeSessionSource{
+		list: []model.SessionSummary{{SessionID: "old"}},
+		archived: map[string][]model.SessionUpdate{
+			"old": {{Kind: model.SessionUpdateUserMessageChunk, Content: &model.SessionContent{Type: "text", Text: "past"}}},
+		},
+	}
+	reporter := &recordingReporter{}
+	handler := &FrontendHandler{
+		evaluate: func(ctx *model.Context, input string) error {
+			t.Error("archived sessions are read-only; evaluate must not run")
+			return nil
+		},
+		sessions: sessions,
+	}
+
+	if err := handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "old"}, reporter); err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if len(reporter.updates) != 1 {
+		t.Fatalf("updates = %d, want 1 replayed", len(reporter.updates))
+	}
+	// 归档会话 prompt 必须诚实报 read-only，而不是 unknown session。
+	_, err := handler.Prompt(context.Background(), "old", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter)
+	if err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("Prompt archived = %v, want read-only error", err)
+	}
+}
+
+func TestLoadSessionUnknownSession(t *testing.T) {
+	handler := &FrontendHandler{sessions: &fakeSessionSource{currentID: "s1"}}
+	err := handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "ghost"}, &recordingReporter{})
+	if err == nil || !strings.Contains(err.Error(), "unknown session") {
+		t.Fatalf("LoadSession ghost = %v, want unknown session error", err)
+	}
+}
+
+func TestListSessionsAndModesMapDomain(t *testing.T) {
+	sessions := &fakeSessionSource{
+		list: []model.SessionSummary{{SessionID: "s1", Title: "t", UpdatedAt: "2026-01-01T00:00:00Z", Active: true}},
+		modes: &model.SessionModeState{
+			CurrentModeID:  "m1",
+			AvailableModes: []model.SessionMode{{ID: "m1", Name: "mode one"}},
+		},
+	}
+	handler := &FrontendHandler{sessions: sessions}
+
+	infos, err := handler.ListSessions(context.Background(), protocol.ListSessionsRequest{})
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(infos) != 1 || infos[0].SessionID != "s1" || infos[0].Title != "t" {
+		t.Fatalf("infos = %+v, want s1 mapped", infos)
+	}
+
+	modes := handler.SessionModes()
+	if modes == nil || modes.CurrentModeID != "m1" || len(modes.AvailableModes) != 1 {
+		t.Fatalf("modes = %+v, want m1 mapped", modes)
 	}
 }
