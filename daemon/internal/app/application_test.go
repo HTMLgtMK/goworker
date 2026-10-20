@@ -27,7 +27,8 @@ func TestNew_InvalidConfig(t *testing.T) {
 // TestNew_DefaultConfig 校验成功路径：空配置目录走 Default()，
 // 装配出完整 Application 且 Stop 幂等退出。
 func TestNew_DefaultConfig(t *testing.T) {
-	t.Setenv("GOWORKER_CONFIG_DIR", t.TempDir())
+	dir := t.TempDir()
+	t.Setenv("GOWORKER_CONFIG_DIR", dir)
 	appl, err := New()
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -52,5 +53,16 @@ func TestNew_DefaultConfig(t *testing.T) {
 		}
 	} else if sourceErr == nil || source != nil {
 		t.Fatalf("SessionSource() = (%#v, %v), want unavailable", source, sourceErr)
+	}
+	if appl.ACP == nil {
+		t.Fatal("ACP service is nil")
+	}
+	socket := filepath.Join(dir, "frontend", "acp.sock")
+	info, err := os.Stat(socket)
+	if err != nil {
+		t.Fatalf("stat acp socket: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("acp socket mode = %04o, want 0600", info.Mode().Perm())
 	}
 }

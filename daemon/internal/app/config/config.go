@@ -37,6 +37,7 @@ type Config struct {
 type FrontendConfig struct {
 	Stdin  StdinConfig          `yaml:"stdin"`
 	Vscode VscodeFrontendConfig `yaml:"vscode"`
+	ACP    ACPFrontendConfig    `yaml:"acp"`
 }
 
 type StdinConfig struct {
@@ -47,6 +48,12 @@ type StdinConfig struct {
 type VscodeFrontendConfig struct {
 	Enabled bool   `yaml:"enabled"`          // false = 不启动 vscode ACP 前端（默认 true）
 	Socket  string `yaml:"socket,omitempty"` // 完整 Unix socket 路径；空 = main 按 DefaultDir 派生
+}
+
+// ACPFrontendConfig 是 daemon 主会话 ACP service 的解析层配置。
+type ACPFrontendConfig struct {
+	Enabled bool   `yaml:"enabled"`          // false = 不启动 ACP service（默认 true）
+	Socket  string `yaml:"socket,omitempty"` // 完整 Unix socket 路径；空 = app 按 DefaultDir 派生
 }
 
 // ---- sandbox 解析层（保留双格式兼容，运行时转 ai-sandbox）----
@@ -190,6 +197,8 @@ func Default() *Config {
 			Stdin: StdinConfig{Theme: "default"},
 			// vscode ACP 前端默认开启；socket 路径留空，由 main 按 DefaultDir 派生
 			Vscode: VscodeFrontendConfig{Enabled: true},
+			// daemon 主会话 ACP service 默认开启；socket 路径留空，由 app 按 DefaultDir 派生
+			ACP: ACPFrontendConfig{Enabled: true},
 		},
 		LLM:    runtimeconfig.DefaultLLM(),
 		Memory: mem,

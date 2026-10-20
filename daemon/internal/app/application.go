@@ -18,15 +18,17 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/engine"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
+	acpservice "github.com/tinguo/goworker/daemon/internal/core/service/acp"
 )
 
-// Application 是装配完成的 agent 后端：Engine + 插件 + 配置 + 日志。
+// Application 是装配完成的 agent 后端：Engine + 插件 + ACP service + 配置 + 日志。
 // 字段供壳层取用（CLI 读 Config.Frontend.Stdin，mobile 读 Engine.Eval 等）。
 type Application struct {
 	Config  *config.Config
 	Runtime *runtimeconfig.Config
 	Engine  *engine.Engine
 	Log     *logger.Logger
+	ACP     *acpservice.Service
 }
 
 var ErrCapabilityUnavailable = errors.New("capability unavailable")
@@ -115,11 +117,27 @@ func New() (*Application, error) {
 	// 发送启动事件
 	e.Notify(model.Event{Type: model.EventPluginStarted, Payload: "system"})
 
+	// ACP service：daemon 主会话的默认 ACP 入口，在 StartAll 后启动 ——
+	// SessionSource 能力要等 agent 插件启动后才可用。启动失败与插件同级：
+	// 回收已启动资源后交壳层退出。
+	if cfg.Frontend.ACP.Enabled {
+		if err := startACPService(a); err != nil {
+			log.Error("start acp service failed", "error", err)
+			e.StopAll()
+			log.Close()
+			return nil, fmt.Errorf("start acp service failed: %w", err)
+		}
+	}
+
 	return a, nil
 }
 
-// Stop 释放资源：插件停止 + 日志关闭。对应原 main 的 defer 链，壳层在所有退出路径调用。
+// Stop 释放资源：先停 ACP service（收口新连接与活跃 prompt），再停插件、关日志。
+// 对应原 main 的 defer 链，壳层在所有退出路径调用。
 func (a *Application) Stop() {
+	if a.ACP != nil {
+		_ = a.ACP.Stop()
+	}
 	a.Engine.StopAll()
 	a.Log.Close()
 }
