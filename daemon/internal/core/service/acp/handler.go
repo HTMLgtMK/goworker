@@ -48,7 +48,8 @@ var (
 
 // NewFrontendHandlerFactory 返回每连接创建一个 FrontendHandler 的工厂。sessions
 // 可为 nil（会话能力不可用时降级：list/load/modes 诚实报错或不支持，prompt 仍可路由）。
-// commands 可为 nil（不下发命令补全）。
+// commands 可为 nil（不下发命令补全）。evaluate 不可为 nil（Prompt 直接调用），
+// 装配层须保证（如注入 Engine.Eval）。
 func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Command, sessions model.SessionSource) HandlerFactory {
 	return func() aiacp.SessionHandler {
 		return &FrontendHandler{
@@ -67,6 +68,9 @@ func (h *FrontendHandler) remember(sessionID string) {
 		h.promptable = map[string]struct{}{}
 	}
 	h.promptable[sessionID] = struct{}{}
+	// 同一会话只能归属一个集合：若先以归档身份 load 进只读集合、后又被恢复为
+	// 当前会话再 load，不清掉旧标记会让 Prompt 永远误判 read-only（评审 MEDIUM-2）。
+	delete(h.readOnly, sessionID)
 	h.mu.Unlock()
 }
 
@@ -250,6 +254,9 @@ const commandFence = "````"
 // 为什么能流式：CommonMark 规定未闭合的围栏代码块延伸到文档末尾，所以中途每次
 // 增量渲染看到的都是一段合法的（尚未闭合的）代码块 —— 长命令的进度实时可见，
 // 收尾补上闭合围栏定稿。不必先攒完再发。
+//
+// 并发约束：Writer/Close 只能在单 goroutine 上调用（engine 命令执行串行写）；
+// EmitToken 走 reporter.Update，与 Writer 各走各的通道，不共享本结构状态。
 //
 // 围栏惰性开启：命令没有任何输出时不留空块。开启前只认「有实质内容」的写入，
 // 开启后一律原样透传 —— 围栏内的空行是表格排版的一部分，不能吞。

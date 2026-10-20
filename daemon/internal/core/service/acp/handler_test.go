@@ -9,6 +9,7 @@ import (
 
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
+	"github.com/tinguo/goworker/ai-core/core"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -272,5 +273,68 @@ func TestListSessionsAndModesMapDomain(t *testing.T) {
 	modes := handler.SessionModes()
 	if modes == nil || modes.CurrentModeID != "m1" || len(modes.AvailableModes) != 1 {
 		t.Fatalf("modes = %+v, want m1 mapped", modes)
+	}
+}
+
+func TestTokenToUpdateMapping(t *testing.T) {
+	cases := []struct {
+		name  string
+		token core.Token
+		want  protocol.SessionUpdateBody
+	}{
+		{
+			name:  "thinking",
+			token: core.Token{Type: core.TokenTypeThinking, Content: "hmm"},
+			want: protocol.SessionUpdateBody{SessionUpdate: protocol.UpdateAgentThoughtChunk,
+				Content: &protocol.ContentBlock{Type: "text", Text: "hmm"}},
+		},
+		{
+			name:  "tool_call",
+			token: core.Token{Type: core.TokenTypeToolCall, Content: "bash(ls)", ToolCall: core.ToolCall{ID: "t1"}},
+			want: protocol.SessionUpdateBody{SessionUpdate: protocol.UpdateToolCall,
+				ToolCallID: "t1", Title: "bash(ls)", Status: "pending"},
+		},
+		{
+			name:  "tool_result",
+			token: core.Token{Type: core.TokenTypeToolResult, Content: "ok", ToolCallID: "t1"},
+			want: protocol.SessionUpdateBody{SessionUpdate: protocol.UpdateToolCallUpdate,
+				ToolCallID: "t1", Title: "ok", Status: "completed"},
+		},
+		{
+			name:  "text",
+			token: core.Token{Type: core.TokenTypeText, Content: "hi"},
+			want: protocol.SessionUpdateBody{SessionUpdate: protocol.UpdateAgentMessageChunk,
+				Content: &protocol.ContentBlock{Type: "text", Text: "hi"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := TokenToUpdate(tc.token)
+			if got.SessionUpdate != tc.want.SessionUpdate || got.ToolCallID != tc.want.ToolCallID ||
+				got.Title != tc.want.Title || got.Status != tc.want.Status {
+				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+			if (got.Content == nil) != (tc.want.Content == nil) ||
+				(got.Content != nil && *got.Content != *tc.want.Content) {
+				t.Fatalf("content = %+v, want %+v", got.Content, tc.want.Content)
+			}
+		})
+	}
+}
+
+// TestRememberClearsStaleReadOnlyMark 回归 MEDIUM-2：先以归档身份进入只读集合、
+// 之后同一会话被恢复为当前会话再 load，旧的只读标记必须被清掉，prompt 不能被
+// 永久误拒。
+func TestRememberClearsStaleReadOnlyMark(t *testing.T) {
+	handler := &FrontendHandler{
+		evaluate: func(ctx *model.Context, input string) error { return nil },
+		sessions: &fakeSessionSource{currentID: "old"},
+	}
+	handler.rememberReadOnly("old")
+	if err := handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "old"}, &recordingReporter{}); err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if _, err := handler.Prompt(context.Background(), "old", []protocol.ContentBlock{protocol.TextBlock("hi")}, &recordingReporter{}); err != nil {
+		t.Fatalf("Prompt after restore: %v, want promptable", err)
 	}
 }
