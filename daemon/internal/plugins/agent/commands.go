@@ -62,7 +62,10 @@ func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
 	}
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		return p.session.Load().Run(runCtx, runtimeagent.RunRequest{Input: strings.Join(ctx.Args, " ")}, callbacksFromPlugin(runContext))
+		return p.session.Load().Run(runCtx, runtimeagent.RunRequest{
+			Input:      strings.Join(ctx.Args, " "),
+			ToolSource: ctx.ToolSource,
+		}, callbacksFromPlugin(runContext))
 	})
 }
 

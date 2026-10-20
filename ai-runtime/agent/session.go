@@ -102,6 +102,11 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 		sandboxCfg.AllowedWorkDir = cwd
 	}
 	tools := s.deps.CollectTools(&sandboxCfg)
+	// 连接级工具源惰性合并：probe 只在本轮确实收集工具时发生一次，probe 失败
+	// 返回空切片，不影响 bash/mcp 工具。
+	if req.ToolSource != nil {
+		tools = append(tools, req.ToolSource(ctx)...)
+	}
 	cfg := s.deps.Config
 
 	// 命令决策审计：配置开启时首次 Run 惰性打开，复用文件句柄（不每轮重开）。

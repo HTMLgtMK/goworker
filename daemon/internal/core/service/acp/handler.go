@@ -9,6 +9,7 @@ import (
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
+	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -107,6 +108,30 @@ func (h *FrontendHandler) CreateSession(_ context.Context, sessionID string, req
 	return nil
 }
 
+// deviceToolSource 按 initialize 协商的 clientCapabilities 门控：
+// 对端声明 x-device 且 reporter 提供反向 Call 通道时，返回惰性工具源；
+// 否则 nil（无设备工具，零往返）。
+func deviceToolSource(reporter aiacp.Reporter) func(ctx context.Context) []core.Tool {
+	capable, ok := reporter.(interface {
+		ClientCapabilities() protocol.ClientCapabilities
+	})
+	if !ok {
+		return nil
+	}
+	caller, ok := reporter.(acpworker.DeviceCaller)
+	if !ok {
+		return nil
+	}
+	if !capable.ClientCapabilities().Has(acpworker.CapabilityDeviceTools) {
+		return nil
+	}
+	return func(ctx context.Context) []core.Tool {
+		pctx, cancel := context.WithTimeout(ctx, acpworker.ProbeTimeout)
+		defer cancel()
+		return acpworker.RelayDeviceTools(caller, acpworker.ProbeDeviceTools(pctx, caller))
+	}
+}
+
 // Prompt 实现 aiacp.SessionHandler。流程对齐 vscode ingress.Run：归档只读守卫
 // → 未知会话守卫 → 命令输出围栏 + token 映射 + HITL 授权 → evaluate → 闭合围栏。
 func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt []protocol.ContentBlock, reporter aiacp.Reporter) (string, error) {
@@ -149,6 +174,10 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 			// Decide 接上 ACP 授权请求：沙箱中间件的 HITL 决策经
 			// Reporter.RequestPermission 到客户端，nil 的静默拒绝不再吞掉危险命令提示。
 			Decide: model.DecideViaACP(ctx, reporter, sessionID),
+			// Device tool source is gated on the initialize-time clientCapabilities
+			// of this connection. Assigning nil directly is safe: Session.Run and
+			// the plugin both treat a nil ToolSource as "no device tools".
+			ToolSource: deviceToolSource(reporter),
 		},
 		Values: make(map[string]any),
 	}

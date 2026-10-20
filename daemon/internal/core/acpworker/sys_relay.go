@@ -29,8 +29,13 @@ const (
 
 	// maxDeviceTools 兜底限制客户端声明的工具数，防止撑爆 system prompt。
 	maxDeviceTools = 32
-	// probeTimeout 探测往返的上限；超时按无能力处理。
-	probeTimeout = 2 * time.Second
+	// ProbeTimeout 探测往返的上限；超时按无能力处理。
+	ProbeTimeout = 2 * time.Second
+
+	// CapabilityDeviceTools 是 client 在 initialize 的 clientCapabilities 里
+	// 声明的设备工具能力 key。声明此 key = 支持设备工具探测；value 目前不解析，
+	// 存在性即门控。
+	CapabilityDeviceTools = "x-device"
 )
 
 // DeviceCaller 是 client-ward 调用通道（由 dispatch.Server 实现）。
@@ -155,7 +160,7 @@ func RelayDeviceTools(caller DeviceCaller, descriptors []DeviceToolDescriptor) [
 
 // probeDeviceTools 带默认超时的探测（SetSessionServer 用，无现成 ctx）。
 func probeDeviceTools(caller DeviceCaller) []DeviceToolDescriptor {
-	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), ProbeTimeout)
 	defer cancel()
 	return ProbeDeviceTools(ctx, caller)
 }

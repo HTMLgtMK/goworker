@@ -112,6 +112,11 @@ type Server struct {
 	doneOnce  sync.Once
 	done      chan struct{}
 	started   bool
+
+	// initMu guards clientCaps: handleInitialize writes it from the read
+	// loop while applications read it from prompt goroutines.
+	initMu     sync.Mutex
+	clientCaps protocol.ClientCapabilities
 }
 
 // NewServer constructs a server but does not start its read loop. Use Start
@@ -223,10 +228,22 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 			return nil, fmt.Errorf("acp: advertise loadSession: %w", err)
 		}
 	}
+	s.initMu.Lock()
+	s.clientCaps = req.ClientCapabilities
+	s.initMu.Unlock()
 	return protocol.InitializeResponse{
 		ProtocolVersion:   protocol.Version,
 		AgentCapabilities: caps,
 	}, nil
+}
+
+// ClientCapabilities returns the capabilities the peer declared during
+// initialize. Before initialize it returns the zero value, whose Has reports
+// false for every key.
+func (s *Server) ClientCapabilities() protocol.ClientCapabilities {
+	s.initMu.Lock()
+	defer s.initMu.Unlock()
+	return s.clientCaps
 }
 
 func (s *Server) handleSessionNew(ctx context.Context, params json.RawMessage) (any, error) {

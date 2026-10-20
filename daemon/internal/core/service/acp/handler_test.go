@@ -2,6 +2,7 @@ package acp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
+	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -336,5 +338,114 @@ func TestRememberClearsStaleReadOnlyMark(t *testing.T) {
 	}
 	if _, err := handler.Prompt(context.Background(), "old", []protocol.ContentBlock{protocol.TextBlock("hi")}, &recordingReporter{}); err != nil {
 		t.Fatalf("Prompt after restore: %v, want promptable", err)
+	}
+}
+
+// capsReporter 在 recordingReporter 之上补齐 FrontendHandler 注入设备工具源
+// 所需的两个通道：initialize 协商的 clientCapabilities 与 client-ward Call。
+type capsReporter struct {
+	recordingReporter
+	caps protocol.ClientCapabilities
+}
+
+func (r *capsReporter) ClientCapabilities() protocol.ClientCapabilities { return r.caps }
+
+// Call 模拟客户端应答 x-device/tools 探测：result 是 relay 层的未导出应答结构，
+// 统一以 JSON 解码填充，不感知具体类型。
+func (r *capsReporter) Call(_ context.Context, method string, _ any, result any) error {
+	if method != acpworker.MethodDeviceTools {
+		return fmt.Errorf("unexpected client-ward method %q", method)
+	}
+	const payload = `{"tools":[{"name":"vibrate","description":"buzz the device","schema":"{\"type\":\"object\"}","risk_level":"benign"}]}`
+	return json.Unmarshal([]byte(payload), result)
+}
+
+// decodeCaps 从 JSON 构造 clientCapabilities（rawCapability 保留任意 key，
+// 包括 x-device 这类不进标准面的扩展）。
+func decodeCaps(t *testing.T, raw string) protocol.ClientCapabilities {
+	t.Helper()
+	var caps protocol.ClientCapabilities
+	if err := json.Unmarshal([]byte(raw), &caps); err != nil {
+		t.Fatalf("decode capabilities: %v", err)
+	}
+	return caps
+}
+
+// TestPromptInjectsDeviceToolSourceWhenCapable：对端声明 x-device 且提供 Call
+// 通道时，Prompt 注入惰性工具源；调用即 probe，工具带 sys_ 前缀。
+func TestPromptInjectsDeviceToolSourceWhenCapable(t *testing.T) {
+	reporter := &capsReporter{caps: decodeCaps(t, `{"x-device": {"tools": true}}`)}
+	var (
+		mu      sync.Mutex
+		toolSrc func(context.Context) []core.Tool
+	)
+	handler := &FrontendHandler{
+		evaluate: func(ctx *model.Context, _ string) error {
+			mu.Lock()
+			toolSrc = ctx.ToolSource
+			mu.Unlock()
+			return nil
+		},
+	}
+	if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+
+	mu.Lock()
+	ts := toolSrc
+	mu.Unlock()
+	if ts == nil {
+		t.Fatal("Prompt did not inject ToolSource for x-device capable reporter")
+	}
+	tools := ts(context.Background())
+	if len(tools) != 1 {
+		t.Fatalf("tool source returned %d tools, want 1", len(tools))
+	}
+	if tools[0].Name != "sys_vibrate" {
+		t.Fatalf("tool name = %q, want sys_vibrate", tools[0].Name)
+	}
+}
+
+// TestPromptOmitsDeviceToolSourceWithoutCapability：能力门控的两个否定分支 ——
+// caps 不含 x-device，或 reporter 没有反向 Call 通道，都必须零注入、零往返。
+func TestPromptOmitsDeviceToolSourceWithoutCapability(t *testing.T) {
+	tests := []struct {
+		name     string
+		reporter aiacp.Reporter
+	}{
+		{name: "caps without x-device", reporter: &capsReporter{caps: decodeCaps(t, `{"fs": {"readTextFile": true}}`)}},
+		{name: "reporter without Call channel", reporter: &recordingReporter{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu      sync.Mutex
+				toolSrc func(context.Context) []core.Tool
+			)
+			handler := &FrontendHandler{
+				evaluate: func(ctx *model.Context, _ string) error {
+					mu.Lock()
+					toolSrc = ctx.ToolSource
+					mu.Unlock()
+					return nil
+				},
+			}
+			if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, tc.reporter); err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+			if _, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, tc.reporter); err != nil {
+				t.Fatalf("Prompt: %v", err)
+			}
+
+			mu.Lock()
+			ts := toolSrc
+			mu.Unlock()
+			if ts != nil {
+				t.Fatal("ToolSource must be nil without x-device capability")
+			}
+		})
 	}
 }

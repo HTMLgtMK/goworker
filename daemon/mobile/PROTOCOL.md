@@ -72,7 +72,8 @@ NewHost(configDir, callbacks)   装载配置/日志（GOWORKER_CONFIG_DIR 注入
 VS Code/ZCode 等标准客户端不认识 → 自动 method-not-found → 无设备工具，零兼容负担。
 
 ```
-session/new 后：agent ── x-device/tools（探测请求）──→ client
+session/new 后（旧 ServeACPWorker 路径）或每次 prompt 的工具收集时（app-service
+路径）：agent ── x-device/tools（探测请求）──→ client
                  ← {tools: [{name, description, schema, risk_level}]}
                  （method-not-found / 超时 / 非法条目 → 视为无能力，不注册工具）
 
@@ -82,6 +83,12 @@ LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下�
 ```
 
 - **工具名强制 `sys_` 前缀**（worker 添加）：与 bash/mcp 命名空间隔离。
+- **能力门控（app-service 路径）**：客户端必须在 initialize 声明
+  `clientCapabilities: {"x-device": ...}` 才会被探测（value 暂不解析，存在性即门控）。
+- **探测时机（两条路径差异）**：app-service 路径（FrontendHandler）probe 从
+  session/new 后移到每次 prompt 的工具收集时（Session.Run 合并按请求注入的
+  ToolSource）；mobile Host 走的 ServeACPWorker 旧路径本次不改，仍是 session/new
+  后一次性探测并注册。
 - **metadata 声明**：客户端应发送 `risk_level: benign..reserved`；需要统一门控的工具还应发送 `requires_permission: true`。worker 为 gated 工具补充稳定的 `allow_always_key: sys_<name>`。
 - **兼容旧客户端**：`never → low`（直通）、`mode → unclassified`、`always → critical + permission_policy=always_hitl`；旧值只在 relay 边界转换，runtime 内部统一使用 benign-reserved。
 
@@ -96,7 +103,7 @@ LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下�
 - **每加一个能力的成本 = Kotlin 一处**（注册描述符 + handler），Go/协议零改动、无需重绑 AAR 之外的任何东西
 
 **客户端义务**：对不认识的带 id 请求必须自动回 -32601（JSON-RPC 标准行为）——
-worker 的探测靠这个快速失败；沉默客户端会把 session/new 拖到探测超时（2s）。
+worker 的探测靠这个快速失败；沉默客户端会把探测拖到超时（2s）。
 
 ## Android 构建与 Host 适配
 

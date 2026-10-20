@@ -95,6 +95,7 @@ type Event struct {
 
 type FrontendContext struct {
 	Decide     func(*hitl.InterruptRequest) hitl.Decision       // 前端注入：执行一次 HITL 决策会话（nil 表示不支持交互式确认）
+	ToolSource func(ctx context.Context) []core.Tool            // 前端注入：本轮请求的连接级工具源（nil = 无），与 Decide 同模式，惰性调用，probe 发生在会话收集工具的时机
 	Writer     func(string)                                     // 输出回调，由前端注入
 	WriteToken func(kind RenderKind, content string, done bool) // 前端注入：terminal renderer 兼容回调
 	EmitToken  func(core.Token)                                 // 前端注入：保留结构化语义的用户可见 token 流

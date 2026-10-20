@@ -149,6 +149,48 @@ func TestSessionRun_ShowsThinkingByDefault(t *testing.T) {
 	}
 }
 
+func TestSessionRun_MergesToolSourceTools(t *testing.T) {
+	provider := &captureProvider{}
+	s, _ := testSession(provider)
+
+	var probes int
+	err := s.Run(context.Background(), RunRequest{
+		Input: "hello",
+		ToolSource: func(context.Context) []core.Tool {
+			probes++
+			return []core.Tool{{
+				Name:        "sys_device_ping",
+				Description: "connection-level device tool",
+				Parameters:  map[string]any{"type": "object"},
+				Execute: func(context.Context, map[string]any) (string, error) {
+					return "pong", nil
+				},
+			}}
+		},
+	}, testRunCallbacks(&strings.Builder{}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if probes != 1 {
+		t.Errorf("ToolSource probe count = %d, want 1 (lazy, once per Run)", probes)
+	}
+
+	req := provider.lastReq
+	if req == nil {
+		t.Fatal("provider received no chat request")
+	}
+	found := false
+	for _, tool := range req.Tools {
+		if tool.Name == "sys_device_ping" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("tools = %+v, want sys_device_ping among them", req.Tools)
+	}
+}
+
 func TestSessionRun_WritesBackConversation(t *testing.T) {
 	s, _ := testSession(&captureProvider{})
 
