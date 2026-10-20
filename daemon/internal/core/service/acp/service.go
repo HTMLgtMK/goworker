@@ -34,6 +34,9 @@ type Service struct {
 	acceptWG sync.WaitGroup
 }
 
+// Name identifies the ACP service to the application service registry.
+func (s *Service) Name() string { return "acp" }
+
 // NewService constructs a stopped service. The factories must implement only
 // the transport and ai-acp SessionHandler contracts; daemon task/session routing
 // remains an application concern.

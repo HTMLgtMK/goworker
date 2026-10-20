@@ -1,8 +1,5 @@
-// Service 装配：Application 启动的后台 service（ACP 主会话入口）。
-//
-// 业务逻辑不在这里：handler 在 daemon/internal/core/service/acp（FrontendHandler），
-// 本文件只做 composition —— 解析 socket 路径、解析 SessionSource、把 Engine 的
-// evaluate 接进 handler factory。壳层（cmd/goworker、mobile）经 app.New 间接使用。
+// Service composition belongs to app: it selects and wires concrete services,
+// while lifecycle orchestration lives in daemon/internal/core/service.
 package app
 
 import (
@@ -13,65 +10,133 @@ import (
 	"path/filepath"
 
 	"github.com/tinguo/goworker/daemon/internal/app/config"
+	"github.com/tinguo/goworker/daemon/internal/core/model"
 	acpservice "github.com/tinguo/goworker/daemon/internal/core/service/acp"
 )
 
-// startACPService 启动 daemon 主会话 ACP service。socket 未配置时按 DefaultDir
-// 派生 <DefaultDir>/frontend/acp.sock —— 与 vscode.sock、dispatcher 的
-// <DispatchDir>/acp.sock 完全分离，三路 socket 各服务各的语义。
-func startACPService(a *Application, options applicationOptions) error {
-	if a.Config.Frontend.ACP.Socket == "" {
-		a.Config.Frontend.ACP.Socket = filepath.Join(config.DefaultDir(), "frontend", "acp.sock")
-	}
+type serviceRegistration struct {
+	name     string
+	register func(*Application, applicationOptions) error
+}
 
-	// SessionSource 在 StartAll 后已定型：可用则声明 cwd/清单，不可用只降级
-	// （FrontendHandler 的 CreateSession/Prompt 均可独立工作），与 vscode
-	// frontend 的处理一致。
-	sessions, err := a.SessionSource()
-	if err != nil {
-		if !errors.Is(err, ErrCapabilityUnavailable) {
-			return fmt.Errorf("resolve session source: %w", err)
+var serviceRegistrations = []serviceRegistration{
+	{name: "acp", register: registerACPService},
+}
+
+// registerServices wires every application-owned service into the generic core
+// registry. Adding a service belongs here rather than in Application.New so the
+// application lifecycle stays independent of concrete service types.
+func registerServices(a *Application, options applicationOptions) error {
+	for _, registration := range serviceRegistrations {
+		if err := registration.register(a, options); err != nil {
+			return fmt.Errorf("register service %q: %w", registration.name, err)
 		}
-		slog.Warn("acp service: session capability unavailable, sessions will not be declared to the daemon")
-		sessions = nil
-	}
-
-	listenerFactory := newACPUnixListenerFactory(a.Config.Frontend.ACP.Socket)
-	if options.acpConnection != nil {
-		listenerFactory = newACPConnectionListenerFactory(options.acpConnection)
-	}
-
-	service := acpservice.NewService(
-		acpservice.NewFrontendHandlerFactory(a.Engine.Eval, a.Engine.Commands, sessions),
-		listenerFactory,
-	)
-	if err := service.Start(); err != nil {
-		return fmt.Errorf("start acp service: %w", err)
-	}
-	a.ACP = service
-	if options.acpConnection != nil {
-		a.Log.Info("acp service attached to connection")
-	} else {
-		a.Log.Info("acp service listening", "socket", a.Config.Frontend.ACP.Socket)
 	}
 	return nil
 }
 
-func newACPUnixListenerFactory(socketPath string) acpservice.ListenerFactory {
+func registerACPService(a *Application, options applicationOptions) error {
+	if !a.Config.Frontend.ACP.Enabled {
+		return nil
+	}
+
+	sessions, err := resolveACPSessions(a)
+	if err != nil {
+		return err
+	}
+
+	var logger *slog.Logger
+	if a.Log != nil {
+		logger = a.Log.Logger
+	}
+	acp, err := newACPService(acpServiceOptions{
+		socketPath: a.Config.Frontend.ACP.Socket,
+		connection: options.acpConnection,
+		evaluate:   a.Engine.Eval,
+		commands:   a.Engine.Commands,
+		sessions:   sessions,
+		logger:     logger,
+	})
+	if err != nil {
+		return fmt.Errorf("construct ACP service: %w", err)
+	}
+	if err := a.Services.Register(acp); err != nil {
+		return fmt.Errorf("register ACP service: %w", err)
+	}
+	return nil
+}
+
+func resolveACPSessions(a *Application) (model.SessionSource, error) {
+	sessions, err := a.SessionSource()
+	if err == nil {
+		return sessions, nil
+	}
+	if errors.Is(err, ErrCapabilityUnavailable) {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("resolve session source: %w", err)
+}
+
+type acpServiceOptions struct {
+	socketPath string
+	connection io.ReadWriteCloser
+	evaluate   acpservice.Evaluator
+	commands   func() []model.Command
+	sessions   model.SessionSource
+	logger     *slog.Logger
+}
+
+// newACPService constructs the daemon's main ACP endpoint without starting it.
+// Application registers the returned concrete service with the core registry so
+// all application services share one lifecycle.
+func newACPService(options acpServiceOptions) (*acpservice.Service, error) {
+	if options.evaluate == nil {
+		return nil, errors.New("app: ACP evaluator is required")
+	}
+	if options.socketPath == "" {
+		options.socketPath = filepath.Join(config.DefaultDir(), "frontend", "acp.sock")
+	}
+	if options.logger == nil {
+		options.logger = slog.Default()
+	}
+	if options.sessions == nil {
+		options.logger.Warn("acp service: session capability unavailable, sessions will not be declared to the daemon")
+	}
+
+	var listenerFactory acpservice.ListenerFactory
+	if options.connection != nil {
+		listenerFactory = newACPConnectionListenerFactory(options.connection, options.logger)
+	} else {
+		listenerFactory = newACPUnixListenerFactory(options.socketPath, options.logger)
+	}
+
+	return acpservice.NewService(
+		acpservice.NewFrontendHandlerFactory(options.evaluate, options.commands, options.sessions),
+		listenerFactory,
+	), nil
+}
+
+func newACPUnixListenerFactory(socketPath string, logger *slog.Logger) acpservice.ListenerFactory {
 	return func() (acpservice.Listener, error) {
 		listener, err := acpservice.NewUnixListener(socketPath)
 		if err != nil {
 			return nil, fmt.Errorf("create Unix listener: %w", err)
 		}
+		if logger != nil {
+			logger.Info("acp service listening", "socket", socketPath)
+		}
 		return listener, nil
 	}
 }
 
-func newACPConnectionListenerFactory(conn io.ReadWriteCloser) acpservice.ListenerFactory {
+func newACPConnectionListenerFactory(conn io.ReadWriteCloser, logger *slog.Logger) acpservice.ListenerFactory {
 	return func() (acpservice.Listener, error) {
 		listener, err := acpservice.NewConnectionListener(conn)
 		if err != nil {
 			return nil, fmt.Errorf("create connection listener: %w", err)
+		}
+		if logger != nil {
+			logger.Info("acp service attached to connection")
 		}
 		return listener, nil
 	}
