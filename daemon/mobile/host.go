@@ -1,7 +1,7 @@
 // Package mobile 是 Android（gobind）入口壳：进程内嵌入 ACP worker 的管道桥。
 //
 // 架构：Kotlin 侧实现 ACP Client（JSON-RPC over 换行分隔帧），经本包与 Go 侧
-// acp.ServeACPWorker 通信 —— 与 VS Code/ZCode 前端共享同一套协议语义
+// acpworker.ServeACPWorker 通信 —— 与 VS Code/ZCode 前端共享同一套协议语义
 // （session/prompt 流式输出、session/request_permission HITL、session/load 回放）。
 // 本包只桥接字节流，不解释协议：JSON-RPC 编解码、session 生命周期、HITL 对话框
 // 交互全部在 Kotlin ACP 客户端完成。协议细节见 PROTOCOL.md。
@@ -23,7 +23,7 @@ import (
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/logger"
 	"github.com/tinguo/goworker/daemon/internal/app/config"
-	"github.com/tinguo/goworker/daemon/internal/core/acp"
+	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 )
 
 // Callbacks 是 worker → Kotlin 的上行回调（Kotlin 实现，gobind 生成 proxy）。
@@ -134,7 +134,7 @@ func (h *Host) Start() (err error) {
 	fromWorkerR, fromWorkerW := io.Pipe() // worker→client
 	h.clientW = toWorkerW
 	h.pumpR = fromWorkerR
-	h.server = acp.ServeACPWorker(&pipeConn{r: toWorkerR, w: fromWorkerW}, acp.ACPWorkerDeps{
+	h.server = acpworker.ServeACPWorker(&pipeConn{r: toWorkerR, w: fromWorkerW}, acpworker.ACPWorkerDeps{
 		Config:   h.runtimeCfg,
 		AuditDir: filepath.Join(config.DefaultDir(), "audit"),
 	})

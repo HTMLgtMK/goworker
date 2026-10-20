@@ -25,7 +25,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/ai-sandbox"
-	"github.com/tinguo/goworker/daemon/internal/core/acp"
+	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -321,7 +321,7 @@ func (p *AgentPlugin) startSession() {
 
 	// 会话层组装：资源就绪后构造 deps 与首会话。
 
-	modelProvider := acp.ProviderFactory(client)
+	modelProvider := acpworker.ProviderFactory(client)
 
 	p.deps = runtimeagent.SessionDeps{
 		Config:               p.cfg,

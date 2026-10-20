@@ -2,7 +2,7 @@
 // `goworker acp` 启动后，任意 ACP Client（包括本项目的 dispatcher，或 Zed 等
 // 编辑器）都能把 ZCode 当作 worker 驱动：session/prompt 的文本即 agent 输入，
 // token 流经 session/update 回传。
-package acp
+package acpworker
 
 import (
 	"context"

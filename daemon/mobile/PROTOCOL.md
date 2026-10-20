@@ -10,7 +10,7 @@ ZCode dispatcher 共享同一套协议语义（`ai-dispatch/protocol`），区�
 │  Kotlin ACP Client (JSON-RPC 编解码 / session 生命周期 / HITL UI)   │
 │        ▲ Write(chunk)                │ OnData(chunk) ▼            │
 │  ┌─────┴──────────── daemon/mobile (gobind bind 面) ────────────┐  │
-│  │      io.Pipe 桥 → acp.ServeACPWorker(rwc, deps)                 │  │
+│  │      io.Pipe 桥 → acpworker.ServeACPWorker(rwc, deps)        │  │
 │  └──────────────────────────┬───────────────────────────────────┘  │
 │                             ▼                                      │
 │        ACP worker（ai-runtime Session：LLM/工具/沙箱/HITL）          │
@@ -92,7 +92,7 @@ LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下�
   | strict / readonly | 放行 | 拒绝 |
   | off | 放行（`always_hitl` 仍询问） | 放行（`always_hitl` 仍询问） |
 
-- **实现位置**：worker 中继 `daemon/internal/core/acp/sys_relay.go`；统一裁决 `ai-runtime/middlewares/hitl.go`；执行器在 Kotlin `DeviceTools` 注册表
+- **实现位置**：worker 中继 `daemon/internal/core/acpworker/sys_relay.go`；统一裁决 `ai-runtime/middlewares/hitl.go`；执行器在 Kotlin `DeviceTools` 注册表
 - **每加一个能力的成本 = Kotlin 一处**（注册描述符 + handler），Go/协议零改动、无需重绑 AAR 之外的任何东西
 
 **客户端义务**：对不认识的带 id 请求必须自动回 -32601（JSON-RPC 标准行为）——

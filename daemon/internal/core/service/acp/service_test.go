@@ -106,23 +106,36 @@ func TestServiceAcceptsUnixACPClient(t *testing.T) {
 	}
 }
 
-func TestPeerDoneAfterTransportClose(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	handler := &recordingHandler{prompted: make(chan struct{})}
-	peer, err := NewPeer(serverConn, handler)
-	if err != nil {
-		t.Fatalf("NewPeer: %v", err)
+func TestServiceClientDisconnectReleasesPeer(t *testing.T) {
+	sockPath := filepath.Join(shortTempDir(t), "acp.sock")
+	service := NewService(&recordingHandler{prompted: make(chan struct{})})
+	if err := service.Start(sockPath); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
-	peer.Start()
-	client := aiacp.NewClient("test", clientConn, nil)
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	client := aiacp.NewClient("test", conn, nil)
 	if err := client.Close(); err != nil {
 		t.Fatalf("client Close: %v", err)
 	}
 
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- service.Stop() }()
 	select {
-	case <-peer.Done():
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("peer Done did not close after transport close")
+		t.Fatal("Stop did not finish after client disconnect")
+	}
+	select {
+	case <-service.Done():
+	default:
+		t.Fatal("Done is not closed after Stop")
 	}
 }
 

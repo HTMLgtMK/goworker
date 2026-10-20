@@ -18,7 +18,7 @@ type Service struct {
 	mu       sync.Mutex
 	listener *Listener
 	sockPath string
-	peers    map[*Peer]struct{}
+	peers    map[*aiacp.Server]struct{}
 
 	started  bool
 	stopping bool
@@ -33,7 +33,7 @@ type Service struct {
 func NewService(handler aiacp.SessionHandler) *Service {
 	return &Service{
 		handler: handler,
-		peers:   make(map[*Peer]struct{}),
+		peers:   make(map[*aiacp.Server]struct{}),
 		done:    make(chan struct{}),
 	}
 }
@@ -100,7 +100,7 @@ func (s *Service) Stop() error {
 	}
 	s.stopping = true
 	listener := s.listener
-	peers := make([]*Peer, 0, len(s.peers))
+	peers := make([]*aiacp.Server, 0, len(s.peers))
 	for peer := range s.peers {
 		peers = append(peers, peer)
 	}
@@ -141,7 +141,7 @@ func (s *Service) acceptLoop(listener *Listener) {
 	if !stopping {
 		s.stopping = true
 	}
-	peers := make([]*Peer, 0, len(s.peers))
+	peers := make([]*aiacp.Server, 0, len(s.peers))
 	if !stopping {
 		for peer := range s.peers {
 			peers = append(peers, peer)
@@ -159,36 +159,36 @@ func (s *Service) acceptLoop(listener *Listener) {
 }
 
 func (s *Service) accept(conn io.ReadWriteCloser) {
-	peer, err := NewPeer(conn, s.handler)
+	server, err := aiacp.NewServer(conn, s.handler)
 	if err != nil {
 		_ = conn.Close()
-		slog.Error("failed to create ACP peer", "error", err)
+		slog.Error("failed to create ACP server", "error", err)
 		return
 	}
-	if !s.addPeer(peer) {
-		_ = peer.Close()
+	if !s.addPeer(server) {
+		_ = server.Close()
 		return
 	}
-	defer s.removePeer(peer)
-	defer peer.Close()
+	defer s.removePeer(server)
+	defer server.Close()
 
-	peer.Start()
-	<-peer.Done()
+	server.Start()
+	<-server.Done()
 }
 
-func (s *Service) addPeer(peer *Peer) bool {
+func (s *Service) addPeer(server *aiacp.Server) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopping {
 		return false
 	}
-	s.peers[peer] = struct{}{}
+	s.peers[server] = struct{}{}
 	return true
 }
 
-func (s *Service) removePeer(peer *Peer) {
+func (s *Service) removePeer(server *aiacp.Server) {
 	s.mu.Lock()
-	delete(s.peers, peer)
+	delete(s.peers, server)
 	s.mu.Unlock()
 }
 
