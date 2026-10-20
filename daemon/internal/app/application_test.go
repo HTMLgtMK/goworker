@@ -1,6 +1,8 @@
 package app
 
 import (
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,5 +66,27 @@ func TestNew_DefaultConfig(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("acp socket mode = %04o, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestNew_WithACPConnectionUsesConnectionTransport(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GOWORKER_CONFIG_DIR", dir)
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	appl, err := New(WithACPConnection(serverConn))
+	if err != nil {
+		serverConn.Close()
+		t.Fatalf("New with ACP connection: %v", err)
+	}
+	defer appl.Stop()
+
+	if appl.ACP == nil {
+		t.Fatal("ACP service is nil")
+	}
+	socket := filepath.Join(dir, "frontend", "acp.sock")
+	if _, err := os.Stat(socket); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("default ACP socket stat error = %v, want not exist", err)
 	}
 }

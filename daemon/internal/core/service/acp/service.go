@@ -15,15 +15,16 @@ import (
 // session state never leaks across peers.
 type HandlerFactory func() aiacp.SessionHandler
 
-// Service is a reusable ACP daemon adapter. It owns its Unix listener and all
-// connected peers; callers supply a factory that builds one handler per
-// connection. Daemon task/session routing remains an application concern.
+// Service is a reusable ACP daemon adapter. It owns the listener returned by
+// listenerFactory and all connected peers; callers supply factories for both the
+// transport and the per-connection protocol handler. Daemon task/session routing
+// remains an application concern.
 type Service struct {
-	handlerFactory HandlerFactory
+	handlerFactory  HandlerFactory
+	listenerFactory ListenerFactory
 
 	mu       sync.Mutex
-	listener *Listener
-	sockPath string
+	listener Listener
 	peers    map[*aiacp.Server]struct{}
 
 	started  bool
@@ -33,21 +34,22 @@ type Service struct {
 	acceptWG sync.WaitGroup
 }
 
-// NewService constructs a stopped service. The factory must implement only the
-// ai-acp SessionHandler contract; daemon task/session routing remains an
-// application concern.
-func NewService(factory HandlerFactory) *Service {
+// NewService constructs a stopped service. The factories must implement only
+// the transport and ai-acp SessionHandler contracts; daemon task/session routing
+// remains an application concern.
+func NewService(handlerFactory HandlerFactory, listenerFactory ListenerFactory) *Service {
 	return &Service{
-		handlerFactory: factory,
-		peers:          make(map[*aiacp.Server]struct{}),
-		done:           make(chan struct{}),
+		handlerFactory:  handlerFactory,
+		listenerFactory: listenerFactory,
+		peers:           make(map[*aiacp.Server]struct{}),
+		done:            make(chan struct{}),
 	}
 }
 
-// Start creates the Unix listener and begins accepting ACP peers. A successful
-// Start is idempotent for the same socket path. A failed Start leaves the
-// service stopped so the caller can correct the path and retry.
-func (s *Service) Start(sockPath string) error {
+// Start creates the listener once and begins accepting ACP peers. A successful
+// Start is idempotent. A failed listener factory leaves the service stopped so
+// the caller can correct the factory and retry only with a new service.
+func (s *Service) Start() error {
 	if s == nil {
 		return errors.New("acp: nil service")
 	}
@@ -56,10 +58,7 @@ func (s *Service) Start(sockPath string) error {
 	defer s.mu.Unlock()
 
 	if s.started {
-		if s.sockPath == sockPath {
-			return nil
-		}
-		return fmt.Errorf("acp: service already started on %s", s.sockPath)
+		return nil
 	}
 	if s.stopping {
 		return errors.New("acp: service has been stopped")
@@ -67,13 +66,19 @@ func (s *Service) Start(sockPath string) error {
 	if s.handlerFactory == nil {
 		return errors.New("acp: handler factory is required")
 	}
-
-	listener, err := NewUnixListener(sockPath)
-	if err != nil {
-		return err
+	if s.listenerFactory == nil {
+		return errors.New("acp: listener factory is required")
 	}
+
+	listener, err := s.listenerFactory()
+	if err != nil {
+		return fmt.Errorf("acp: create listener: %w", err)
+	}
+	if listener == nil {
+		return errors.New("acp: listener factory returned nil listener")
+	}
+
 	s.listener = listener
-	s.sockPath = sockPath
 	s.started = true
 	s.acceptWG.Add(1)
 	go s.acceptLoop(listener)
@@ -81,10 +86,10 @@ func (s *Service) Start(sockPath string) error {
 }
 
 // Start is also available as a convenience for one-shot composition roots.
-// The returned service remains the owner of the socket and must be stopped.
-func Start(sockPath string, factory HandlerFactory) (*Service, error) {
-	service := NewService(factory)
-	if err := service.Start(sockPath); err != nil {
+// The returned service owns the listener and must be stopped.
+func Start(handlerFactory HandlerFactory, listenerFactory ListenerFactory) (*Service, error) {
+	service := NewService(handlerFactory, listenerFactory)
+	if err := service.Start(); err != nil {
 		return nil, err
 	}
 	return service, nil
@@ -135,7 +140,7 @@ func (s *Service) Done() <-chan struct{} {
 	return s.done
 }
 
-func (s *Service) acceptLoop(listener *Listener) {
+func (s *Service) acceptLoop(listener Listener) {
 	defer s.acceptWG.Done()
 	err := listener.Serve(s.accept)
 	if err != nil {

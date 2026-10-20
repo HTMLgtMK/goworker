@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -39,21 +41,111 @@ func (h *blockingHandler) Prompt(ctx context.Context, _ string, _ []protocol.Con
 	return "", ctx.Err()
 }
 
+type fakeListener struct {
+	closed    chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+	doneOnce  sync.Once
+}
+
+func newFakeListener() *fakeListener {
+	return &fakeListener{
+		closed: make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+}
+
+func (l *fakeListener) Serve(_ func(io.ReadWriteCloser)) error {
+	<-l.closed
+	l.doneOnce.Do(func() { close(l.done) })
+	return nil
+}
+
+func (l *fakeListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *fakeListener) Done() <-chan struct{} { return l.done }
+
+func unixListenerFactory(sockPath string) ListenerFactory {
+	return func() (Listener, error) {
+		return NewUnixListener(sockPath)
+	}
+}
+
+func TestServiceUsesListenerFactory(t *testing.T) {
+	listener := newFakeListener()
+	calls := 0
+	service := NewService(func() aiacp.SessionHandler {
+		return &recordingHandler{prompted: make(chan struct{})}
+	}, func() (Listener, error) {
+		calls++
+		return listener, nil
+	})
+
+	if err := service.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("listener factory called %d times, want 1", calls)
+	}
+	if err := service.Start(); err != nil {
+		t.Fatalf("second Start: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("listener factory called %d times after second Start, want 1", calls)
+	}
+	if err := service.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case <-listener.Done():
+	default:
+		t.Fatal("listener Done is not closed after service Stop")
+	}
+}
+
+func TestServiceListenerFactoryErrorLeavesServiceStopped(t *testing.T) {
+	wantErr := errors.New("listener unavailable")
+	service := NewService(func() aiacp.SessionHandler {
+		return &recordingHandler{prompted: make(chan struct{})}
+	}, func() (Listener, error) {
+		return nil, wantErr
+	})
+
+	err := service.Start()
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Start error = %v, want wrapped %v", err, wantErr)
+	}
+	if !strings.Contains(err.Error(), "create listener") {
+		t.Fatalf("Start error = %q, want listener context", err)
+	}
+	if service.started {
+		t.Fatal("service marked started after listener factory failure")
+	}
+	select {
+	case <-service.Done():
+		t.Fatal("Done closed after failed Start")
+	default:
+	}
+	if err := service.Stop(); err != nil {
+		t.Fatalf("Stop after failed Start: %v", err)
+	}
+}
+
 func TestServiceStartStopIsIdempotent(t *testing.T) {
 	dir := shortTempDir(t)
 	sockPath := filepath.Join(dir, "nested", "acp.sock")
 	service := NewService(func() aiacp.SessionHandler {
 		return &recordingHandler{prompted: make(chan struct{})}
-	})
+	}, unixListenerFactory(sockPath))
 
-	if err := service.Start(sockPath); err != nil {
+	if err := service.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := service.Start(sockPath); err != nil {
+	if err := service.Start(); err != nil {
 		t.Fatalf("second Start: %v", err)
-	}
-	if err := service.Start(filepath.Join(dir, "other.sock")); err == nil {
-		t.Fatal("Start with a different path succeeded")
 	}
 
 	assertMode(t, filepath.Dir(sockPath), 0o700)
@@ -77,8 +169,8 @@ func TestServiceStartStopIsIdempotent(t *testing.T) {
 func TestServiceAcceptsUnixACPClient(t *testing.T) {
 	sockPath := filepath.Join(shortTempDir(t), "acp.sock")
 	handlers := newRecordingHandlerFactory(t)
-	service := NewService(handlers.factory)
-	if err := service.Start(sockPath); err != nil {
+	service := NewService(handlers.factory, unixListenerFactory(sockPath))
+	if err := service.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	defer func() { _ = service.Stop() }()
@@ -114,8 +206,8 @@ func TestServiceAcceptsUnixACPClient(t *testing.T) {
 func TestServiceHandlerFactoryIsPerConnection(t *testing.T) {
 	sockPath := filepath.Join(shortTempDir(t), "acp.sock")
 	handlers := newRecordingHandlerFactory(t)
-	service := NewService(handlers.factory)
-	if err := service.Start(sockPath); err != nil {
+	service := NewService(handlers.factory, unixListenerFactory(sockPath))
+	if err := service.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	defer func() { _ = service.Stop() }()
@@ -215,8 +307,8 @@ func TestServiceClientDisconnectReleasesPeer(t *testing.T) {
 	sockPath := filepath.Join(shortTempDir(t), "acp.sock")
 	service := NewService(func() aiacp.SessionHandler {
 		return &recordingHandler{prompted: make(chan struct{})}
-	})
-	if err := service.Start(sockPath); err != nil {
+	}, unixListenerFactory(sockPath))
+	if err := service.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -254,8 +346,8 @@ func TestServiceStopCancelsActiveHandlerAndReleasesSocket(t *testing.T) {
 	}
 	service := NewService(func() aiacp.SessionHandler {
 		return handler
-	})
-	if err := service.Start(sockPath); err != nil {
+	}, unixListenerFactory(sockPath))
+	if err := service.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 

@@ -14,17 +14,62 @@ import (
 
 const staleSocketProbeTimeout = 100 * time.Millisecond
 
-// Listener owns the Unix socket used by an ACP service. It removes only the
-// socket it created, so a failed or replaced path cannot be clobbered on close.
-type Listener struct {
+// Listener owns one ACP transport. Serve invokes onAccept for each connection,
+// Close stops the transport, and Done signals that its transport lifecycle has
+// completed.
+type Listener interface {
+	Serve(func(conn io.ReadWriteCloser)) error
+	Close() error
+	Done() <-chan struct{}
+}
+
+// ListenerFactory constructs an ACP transport listener.
+type ListenerFactory func() (Listener, error)
+
+// AbsListener contains the shared lifecycle state for all ACP transports.
+// Concrete listeners compose it and provide transport-specific behavior through
+// the injected functions.
+type AbsListener struct {
+	acceptFn  func() (io.ReadWriteCloser, error)
+	closeFn   func() error
+	cleanupFn func() error
+
 	mu        sync.Mutex
-	listener  net.Listener
-	path      string
-	ownedPath os.FileInfo
 	closed    bool
 	serveOnce bool
 	done      chan struct{}
 	doneOnce  sync.Once
+}
+
+// UnixListener owns the Unix socket transport and composes AbsListener for its
+// lifecycle behavior.
+type UnixListener struct {
+	*AbsListener
+}
+
+// ConnectionListener adapts one already-established connection and composes
+// AbsListener for its lifecycle behavior.
+type ConnectionListener struct {
+	*AbsListener
+}
+
+func newAbsListener(
+	acceptFn func() (io.ReadWriteCloser, error),
+	closeFn func() error,
+	cleanupFn func() error,
+) (*AbsListener, error) {
+	if acceptFn == nil {
+		return nil, errors.New("acp: accept function is required")
+	}
+	if closeFn == nil {
+		return nil, errors.New("acp: close function is required")
+	}
+	return &AbsListener{
+		acceptFn:  acceptFn,
+		closeFn:   closeFn,
+		cleanupFn: cleanupFn,
+		done:      make(chan struct{}),
+	}, nil
 }
 
 // NewUnixListener creates a private Unix-domain listener at sockPath.
@@ -32,7 +77,7 @@ type Listener struct {
 // A stale socket is removed after checking that no server is accepting it.
 // Non-socket paths are never removed. The socket itself is chmoded to 0600;
 // a newly-created parent directory is 0700.
-func NewUnixListener(sockPath string) (*Listener, error) {
+func NewUnixListener(sockPath string) (*UnixListener, error) {
 	if sockPath == "" {
 		return nil, errors.New("acp: socket path is required")
 	}
@@ -48,14 +93,14 @@ func NewUnixListener(sockPath string) (*Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("acp: listen on %s: %w", sockPath, err)
 	}
-	unixListener, ok := raw.(*net.UnixListener)
+	unixSocket, ok := raw.(*net.UnixListener)
 	if !ok {
 		_ = raw.Close()
 		return nil, fmt.Errorf("acp: unexpected Unix listener type %T", raw)
 	}
-	// Let Listener own cleanup. The standard library otherwise unlinks the
-	// path during Close before we can verify that it is still ours.
-	unixListener.SetUnlinkOnClose(false)
+	// Let the shared listener own cleanup. The standard library otherwise unlinks
+	// the path during Close before ownership can be verified.
+	unixSocket.SetUnlinkOnClose(false)
 
 	ownedPath, err := os.Lstat(sockPath)
 	if err != nil {
@@ -77,18 +122,59 @@ func NewUnixListener(sockPath string) (*Listener, error) {
 		return nil, fmt.Errorf("acp: socket path changed while starting")
 	}
 
-	return &Listener{
-		listener:  raw,
-		path:      sockPath,
-		ownedPath: ownedPath,
-		done:      make(chan struct{}),
-	}, nil
+	base, err := newAbsListener(
+		func() (io.ReadWriteCloser, error) {
+			conn, err := raw.Accept()
+			if err != nil {
+				return nil, err
+			}
+			return conn, nil
+		},
+		raw.Close,
+		func() error { return removeSocket(sockPath, ownedPath) },
+	)
+	if err != nil {
+		_ = raw.Close()
+		_ = removeSocket(sockPath, ownedPath)
+		return nil, err
+	}
+	return &UnixListener{AbsListener: base}, nil
+}
+
+// NewConnectionListener creates a listener for one already-established,
+// full-duplex connection. Serve invokes its callback exactly once and waits for
+// that callback to finish.
+func NewConnectionListener(conn io.ReadWriteCloser) (*ConnectionListener, error) {
+	if conn == nil {
+		return nil, errors.New("acp: connection is required")
+	}
+
+	accepted := false
+	base, err := newAbsListener(
+		func() (io.ReadWriteCloser, error) {
+			if accepted {
+				return nil, io.EOF
+			}
+			accepted = true
+			return conn, nil
+		},
+		conn.Close,
+		nil,
+	)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return &ConnectionListener{AbsListener: base}, nil
 }
 
 // Serve accepts connections until Close is called. The callback is run in a
 // goroutine for each connection, and Serve waits for those callbacks before it
 // returns so its caller has a complete lifecycle barrier.
-func (l *Listener) Serve(onAccept func(conn io.ReadWriteCloser)) error {
+func (l *AbsListener) Serve(onAccept func(conn io.ReadWriteCloser)) error {
+	if l == nil {
+		return errors.New("acp: nil listener")
+	}
 	if onAccept == nil {
 		return errors.New("acp: nil accept callback")
 	}
@@ -100,7 +186,6 @@ func (l *Listener) Serve(onAccept func(conn io.ReadWriteCloser)) error {
 	}
 	l.serveOnce = true
 	closed := l.closed
-	listener := l.listener
 	l.mu.Unlock()
 	defer l.doneOnce.Do(func() { close(l.done) })
 
@@ -110,13 +195,17 @@ func (l *Listener) Serve(onAccept func(conn io.ReadWriteCloser)) error {
 
 	var callbacks sync.WaitGroup
 	for {
-		conn, err := listener.Accept()
+		conn, err := l.acceptFn()
 		if err != nil {
 			callbacks.Wait()
-			if l.isClosed() || errors.Is(err, net.ErrClosed) {
+			if l.isClosed() || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
 				return nil
 			}
 			return fmt.Errorf("acp: accept connection: %w", err)
+		}
+		if conn == nil {
+			callbacks.Wait()
+			return errors.New("acp: accept function returned nil connection")
 		}
 
 		callbacks.Add(1)
@@ -127,8 +216,8 @@ func (l *Listener) Serve(onAccept func(conn io.ReadWriteCloser)) error {
 	}
 }
 
-// Close stops accepting and removes this listener's socket. It is idempotent.
-func (l *Listener) Close() error {
+// Close stops the transport and runs its cleanup function. It is idempotent.
+func (l *AbsListener) Close() error {
 	if l == nil {
 		return nil
 	}
@@ -139,29 +228,33 @@ func (l *Listener) Close() error {
 		return nil
 	}
 	l.closed = true
-	listener := l.listener
-	path := l.path
-	ownedPath := l.ownedPath
+	closeFn := l.closeFn
+	cleanupFn := l.cleanupFn
+	serveStarted := l.serveOnce
 	l.mu.Unlock()
 
-	var closeErr error
-	if listener != nil {
-		closeErr = listener.Close()
+	closeErr := closeFn()
+	var cleanupErr error
+	if cleanupFn != nil {
+		cleanupErr = cleanupFn()
 	}
-	removeErr := removeSocket(path, ownedPath)
-	l.doneOnce.Do(func() { close(l.done) })
-	return errors.Join(closeErr, removeErr)
+	if !serveStarted {
+		l.doneOnce.Do(func() { close(l.done) })
+	}
+	return errors.Join(closeErr, cleanupErr)
 }
 
-// Done is closed when the listener has been closed or Serve has returned.
-func (l *Listener) Done() <-chan struct{} {
+// Done closes when Serve has returned and all callbacks have completed. If the
+// listener is closed before Serve starts, it closes because there is no Serve to
+// wait for.
+func (l *AbsListener) Done() <-chan struct{} {
 	if l == nil {
 		return nil
 	}
 	return l.done
 }
 
-func (l *Listener) isClosed() bool {
+func (l *AbsListener) isClosed() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.closed

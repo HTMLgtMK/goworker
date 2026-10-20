@@ -8,6 +8,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 
@@ -18,7 +19,7 @@ import (
 // startACPService 启动 daemon 主会话 ACP service。socket 未配置时按 DefaultDir
 // 派生 <DefaultDir>/frontend/acp.sock —— 与 vscode.sock、dispatcher 的
 // <DispatchDir>/acp.sock 完全分离，三路 socket 各服务各的语义。
-func startACPService(a *Application) error {
+func startACPService(a *Application, options applicationOptions) error {
 	if a.Config.Frontend.ACP.Socket == "" {
 		a.Config.Frontend.ACP.Socket = filepath.Join(config.DefaultDir(), "frontend", "acp.sock")
 	}
@@ -35,11 +36,43 @@ func startACPService(a *Application) error {
 		sessions = nil
 	}
 
-	service := acpservice.NewService(acpservice.NewFrontendHandlerFactory(a.Engine.Eval, a.Engine.Commands, sessions))
-	if err := service.Start(a.Config.Frontend.ACP.Socket); err != nil {
+	listenerFactory := newACPUnixListenerFactory(a.Config.Frontend.ACP.Socket)
+	if options.acpConnection != nil {
+		listenerFactory = newACPConnectionListenerFactory(options.acpConnection)
+	}
+
+	service := acpservice.NewService(
+		acpservice.NewFrontendHandlerFactory(a.Engine.Eval, a.Engine.Commands, sessions),
+		listenerFactory,
+	)
+	if err := service.Start(); err != nil {
 		return fmt.Errorf("start acp service: %w", err)
 	}
 	a.ACP = service
-	a.Log.Info("acp service listening", "socket", a.Config.Frontend.ACP.Socket)
+	if options.acpConnection != nil {
+		a.Log.Info("acp service attached to connection")
+	} else {
+		a.Log.Info("acp service listening", "socket", a.Config.Frontend.ACP.Socket)
+	}
 	return nil
+}
+
+func newACPUnixListenerFactory(socketPath string) acpservice.ListenerFactory {
+	return func() (acpservice.Listener, error) {
+		listener, err := acpservice.NewUnixListener(socketPath)
+		if err != nil {
+			return nil, fmt.Errorf("create Unix listener: %w", err)
+		}
+		return listener, nil
+	}
+}
+
+func newACPConnectionListenerFactory(conn io.ReadWriteCloser) acpservice.ListenerFactory {
+	return func() (acpservice.Listener, error) {
+		listener, err := acpservice.NewConnectionListener(conn)
+		if err != nil {
+			return nil, fmt.Errorf("create connection listener: %w", err)
+		}
+		return listener, nil
+	}
 }

@@ -11,6 +11,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
@@ -32,6 +33,25 @@ type Application struct {
 }
 
 var ErrCapabilityUnavailable = errors.New("capability unavailable")
+
+type applicationOptions struct {
+	acpConnection io.ReadWriteCloser
+}
+
+// Option customizes Application assembly without exposing ACP transport
+// factories. Connections are adapted to listeners by the app composition root.
+type Option func(*applicationOptions)
+
+// WithACPConnection serves ACP over an already-established full-duplex
+// connection, such as a mobile pipe. A nil connection leaves the default Unix
+// socket transport in place.
+func WithACPConnection(conn io.ReadWriteCloser) Option {
+	return func(options *applicationOptions) {
+		if conn != nil {
+			options.acpConnection = conn
+		}
+	}
+}
 
 func (a *Application) SessionSource() (model.SessionSource, error) {
 	capability, ok := a.Engine.Capability(model.SessionSourceCapability)
@@ -77,7 +97,14 @@ func loadConfigAndLogger() (*config.Config, *logger.Logger, error) {
 
 // New 完成全部装配：配置 → 日志 → Engine → AgentPlugin → 内置命令 → StartAll。
 // 出错返回 error，不 panic、不 os.Exit —— 退出策略归壳层（CLI 打印后 exit，mobile 转 Java 异常）。
-func New() (*Application, error) {
+func New(options ...Option) (*Application, error) {
+	appOptions := applicationOptions{}
+	for _, option := range options {
+		if option != nil {
+			option(&appOptions)
+		}
+	}
+
 	cfg, log, err := loadConfigAndLogger()
 	if err != nil {
 		return nil, err
@@ -121,7 +148,7 @@ func New() (*Application, error) {
 	// SessionSource 能力要等 agent 插件启动后才可用。启动失败与插件同级：
 	// 回收已启动资源后交壳层退出。
 	if cfg.Frontend.ACP.Enabled {
-		if err := startACPService(a); err != nil {
+		if err := startACPService(a, appOptions); err != nil {
 			log.Error("start acp service failed", "error", err)
 			e.StopAll()
 			log.Close()
