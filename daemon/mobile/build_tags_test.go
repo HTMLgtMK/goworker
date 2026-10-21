@@ -1,4 +1,4 @@
-//go:build goworker_no_dispatcher
+//go:build goworker_no_dispatcher && !goworker_no_agent
 
 package mobile
 
