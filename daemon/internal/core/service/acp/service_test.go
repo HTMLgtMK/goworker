@@ -216,8 +216,11 @@ func TestServiceHandlerFactoryIsPerConnection(t *testing.T) {
 	defer func() { _ = service.Stop() }()
 
 	const clients = 3
+	var clientsWG sync.WaitGroup
+	clientsWG.Add(clients)
 	for i := 0; i < clients; i++ {
 		go func() {
+			defer clientsWG.Done()
 			conn, err := net.Dial("unix", sockPath)
 			if err != nil {
 				t.Errorf("Dial: %v", err)
@@ -269,6 +272,20 @@ func TestServiceHandlerFactoryIsPerConnection(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("one connection's handler was never prompted")
 		}
+	}
+
+	// prompted 只代表 handler 已被调用；response 可能还没写回客户端。必须等所有
+	// client goroutine 收到 Prompt 响应并完成 Close，测试返回后的 service.Stop
+	// 才不会抢先关 peer，制造偶发的 "acp: connection closed" 假失败。
+	clientsDone := make(chan struct{})
+	go func() {
+		clientsWG.Wait()
+		close(clientsDone)
+	}()
+	select {
+	case <-clientsDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("clients did not finish after prompt responses")
 	}
 }
 
