@@ -41,7 +41,10 @@ ZCode dispatcher 共享同一套协议语义（`ai-dispatch/protocol`），区�
 当前会话 `session/load`）会把连接 A 的会话顶成 superseded，此后 A 再发
 `session/prompt` 返回 -32000 错误（消息含 "no longer active"）——prompt 不会静默
 串到 B 的工作区里执行。客户端收到该错误后应重新 `session/new` 或 `session/load`
-当前会话。
+当前会话。反方向同理：prompt 在飞期间，B 的 `session/new` 与对当前会话的
+`session/load` 返回 -32000 "session busy"（归档 load 只读不受限），等 prompt 结束
+或取消后重试即可；各连接的 prompt 在 daemon 侧串行执行，连接断开时排队中的
+prompt 以错误退出。
 
 ## 能力协商（initialize）
 

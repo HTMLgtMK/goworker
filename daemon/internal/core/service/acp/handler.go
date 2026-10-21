@@ -21,18 +21,20 @@ type Evaluator = func(ctx *model.Context, input string) error
 // daemon 语义：
 //
 //   - CreateSession：登记本连接可 prompt 的 session，声明 cwd，下发命令补全；
-//   - Prompt：known/read-only/superseded 守卫 → 命令输出围栏 + token→update 映射、
-//     HITL 授权经 Reporter.RequestPermission（model.DecideViaACP）；
+//   - Prompt：known/read-only 守卫 → 会话门禁（跨连接互斥）→ superseded 守卫
+//     → 命令输出围栏 + token→update 映射、HITL 授权经 Reporter.RequestPermission
+//     （model.DecideViaACP）；
 //   - LoadSession：当前会话 reload+重放（进可 prompt 集合），归档只读重放
 //     （进只读集合，prompt 诚实报错），未知会话报错；
 //   - ListSessions/SessionModes：domain → wire 映射转发。
 //
 // 它放在本包而非装配层：session 语义是 daemon domain 逻辑，所有壳层共用；
-// 装配层只接线。
+// 装配层只接线。gate 由装配层创建、全 daemon 一份（见 coordinator.go）。
 type FrontendHandler struct {
 	evaluate Evaluator
 	commands func() []model.Command
 	sessions model.SessionSource
+	gate     *SessionGate
 
 	mu         sync.Mutex
 	promptable map[string]struct{} // 可 prompt 集合：session/new 与当前会话 load 记入
@@ -50,13 +52,16 @@ var (
 // NewFrontendHandlerFactory 返回每连接创建一个 FrontendHandler 的工厂。sessions
 // 可为 nil（会话能力不可用时降级：list/load/modes 诚实报错或不支持，prompt 仍可路由）。
 // commands 可为 nil（不下发命令补全）。evaluate 不可为 nil（Prompt 直接调用），
-// 装配层须保证（如注入 Engine.Eval）。
-func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Command, sessions model.SessionSource) HandlerFactory {
+// 装配层须保证（如注入 Engine.Eval）。gate 不可为 nil：单活动会话模型的执行门禁，
+// 由装配层创建一次、被本工厂闭包捕获，跨所有连接共享——每连接一份的话 TOCTOU
+// 守卫等于没装。
+func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Command, sessions model.SessionSource, gate *SessionGate) HandlerFactory {
 	return func() aiacp.SessionHandler {
 		return &FrontendHandler{
 			evaluate: evaluate,
 			commands: commands,
 			sessions: sessions,
+			gate:     gate,
 		}
 	}
 }
@@ -93,13 +98,32 @@ func (h *FrontendHandler) membership(sessionID string) (promptable, readOnly boo
 	return promptable, readOnly
 }
 
+// sessionBusyError 是 prompt 在飞时会话切换请求（session/new、load-current）收到的
+// 诚实拒绝：busy 是瞬态错误，客户端取消在飞 prompt 或稍后重试即可。
+func sessionBusyError() *protocol.RPCError {
+	return &protocol.RPCError{
+		Code:    -32000,
+		Message: "acp frontend: session busy: a prompt is in flight on the active session; cancel it or retry",
+	}
+}
+
 // CreateSession 实现 aiacp.SessionCreator：登记本连接的 session、向 daemon 声明
 // cwd，并在响应返回前把命令清单作为 available_commands_update 下发（/ 补全）。
 func (h *FrontendHandler) CreateSession(_ context.Context, sessionID string, req protocol.NewSessionRequest, reporter aiacp.Reporter) error {
+	// SetSession 会把新 cwd 应用到当前会话（单活动会话模型里的共享状态突变），
+	// prompt 在飞时诚实报 busy 而非排队：客户端取消在飞 prompt 或稍后重试即可。
+	if !h.gate.tryAcquire() {
+		return sessionBusyError()
+	}
 	h.remember(sessionID)
 	if h.sessions != nil {
 		h.sessions.SetSession(sessionID, req.Cwd)
 	}
+	// 临界区只包共享状态突变，手动释放（不能用 defer：release 双还会偷走下一个
+	// 持有者的 token）。Update 是连接 I/O，客户端停摆时管道写会无限阻塞——
+	// 门禁绝不能被一个卡死的客户端攥住，否则全 daemon 的 prompt 都堵在这。
+	h.gate.release()
+
 	if h.commands != nil {
 		if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
 			reporter.Update(sessionID, body)
@@ -132,10 +156,13 @@ func deviceToolSource(reporter aiacp.Reporter) func(ctx context.Context) []core.
 	}
 }
 
-// Prompt 实现 aiacp.SessionHandler。流程：归档只读守卫
-// → 未知会话守卫 → superseded 守卫（单活动会话模型：已被其他连接的 session/new|load
+// Prompt 实现 aiacp.SessionHandler。流程：归档只读守卫 → 未知会话守卫
+// → 会话门禁（跨连接互斥 prompt 与 session/new|load-current；ctx 取消即失败，
+// 连接断开不悬挂）→ superseded 守卫（单活动会话模型：已被其他连接的 session/new|load
 // 顶掉的会话诚实报错，而非让 prompt 静默串到新活动会话的工作区里执行）
-// → 命令输出围栏 + token 映射 + HITL 授权 → evaluate → 闭合围栏。
+// → 命令输出围栏 + token 映射 + HITL 授权 → evaluate → 闭合围栏。门禁在 superseded
+// 检查之前获取并持有到 evaluate 返回：检查与执行之间不再有 session/new 可钻的
+// 空档（TOCTOU，评审 P1）。
 func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt []protocol.ContentBlock, reporter aiacp.Reporter) (string, error) {
 	promptable, readOnly := h.membership(sessionID)
 	if readOnly {
@@ -151,6 +178,17 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 			Message: fmt.Sprintf("acp frontend: unknown session %q", sessionID),
 		}
 	}
+
+	// 会话门禁：与 session/new、load-current 互斥，封闭 superseded 检查到 evaluate
+	// 之间的 TOCTOU 空档。ctx 取消（连接断开）时排队失败，绝不悬挂。
+	if err := h.gate.acquire(ctx); err != nil {
+		return "", &protocol.RPCError{
+			Code:    -32000,
+			Message: fmt.Sprintf("acp frontend: prompt canceled while waiting for the session gate: %v", err),
+		}
+	}
+	defer h.gate.release()
+
 	if h.sessions != nil {
 		if active := h.sessions.ActiveSessionID(); active != "" && active != sessionID {
 			return "", &protocol.RPCError{
@@ -215,17 +253,28 @@ func (h *FrontendHandler) LoadSession(_ context.Context, req protocol.LoadSessio
 		return &protocol.RPCError{Code: -32000, Message: "acp frontend: session load not supported"}
 	}
 	if req.SessionID == h.sessions.CurrentSessionID() {
+		// 与 prompt 互斥：load-current 同样改写共享会话状态（SetSession + reload）。
+		// prompt 在飞时诚实报 busy，归档分支只读、不碰共享状态，不需要门禁。
+		// 临界区手动收窄到状态突变+历史快照：重放 Update 是连接 I/O，停摆客户端
+		// 的阻塞写不能攥住门禁（同 CreateSession；release 不得双还）。
+		if !h.gate.tryAcquire() {
+			return sessionBusyError()
+		}
 		h.sessions.SetSession(req.SessionID, req.Cwd)
 		if err := h.sessions.ReloadCurrentSession(); err != nil {
+			h.gate.release()
 			return fmt.Errorf("acp frontend: reload current session: %w", err)
 		}
+		history := h.sessions.CurrentSessionHistory()
+		h.gate.release()
+
 		h.remember(req.SessionID)
 		if h.commands != nil {
 			if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
 				reporter.Update(req.SessionID, body)
 			}
 		}
-		for _, body := range h.sessions.CurrentSessionHistory() {
+		for _, body := range history {
 			reporter.Update(req.SessionID, SessionUpdateFromDomain(body))
 		}
 		return nil

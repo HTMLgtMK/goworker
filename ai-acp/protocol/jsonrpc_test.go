@@ -86,6 +86,58 @@ func TestConn_CallRoundtrip(t *testing.T) {
 	}
 }
 
+func TestConn_RequestHandlerPanicReturnsInternalError(t *testing.T) {
+	server, client := pipeConns(t)
+	server.Handle("boom", func(context.Context, json.RawMessage) (any, error) {
+		panic("handler exploded")
+	})
+	server.Handle("ping", func(context.Context, json.RawMessage) (any, error) {
+		return "pong", nil
+	})
+
+	var rpcErr *RPCError
+	if err := client.Call(context.Background(), "boom", nil, nil); !errors.As(err, &rpcErr) || rpcErr.Code != CodeInternalError {
+		t.Fatalf("err = %v, want internal-error RPCError", err)
+	}
+	var result string
+	if err := client.Call(context.Background(), "ping", nil, &result); err != nil || result != "pong" {
+		t.Fatalf("post-panic Call = %q, %v; connection should stay usable", result, err)
+	}
+}
+
+func TestConn_NotificationHandlerPanicDoesNotStallFIFO(t *testing.T) {
+	server, client := pipeConns(t)
+	got := make(chan int, 2)
+	server.HandleNotification("event", func(params json.RawMessage) {
+		var payload struct {
+			N int `json:"n"`
+		}
+		if err := json.Unmarshal(params, &payload); err != nil {
+			t.Errorf("notification payload: %v", err)
+			return
+		}
+		if payload.N == 1 {
+			panic("first notification exploded")
+		}
+		got <- payload.N
+	})
+
+	if err := client.Notify("event", map[string]int{"n": 1}); err != nil {
+		t.Fatalf("first Notify: %v", err)
+	}
+	if err := client.Notify("event", map[string]int{"n": 2}); err != nil {
+		t.Fatalf("second Notify: %v", err)
+	}
+	select {
+	case n := <-got:
+		if n != 2 {
+			t.Fatalf("delivered notification = %d, want 2", n)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("notification after a panicking one was not delivered; FIFO chain stalled")
+	}
+}
+
 func TestConn_CallErrorPropagates(t *testing.T) {
 	server, client := pipeConns(t)
 	server.Handle("boom", func(context.Context, json.RawMessage) (any, error) {

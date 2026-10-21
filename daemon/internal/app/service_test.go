@@ -45,7 +45,10 @@ func TestNewACPServiceAdvertisesSessionCapabilities(t *testing.T) {
 			}
 			defer func() { _ = svc.Stop() }()
 
-			client := aiacp.NewClient("gating-test", clientConn, nil)
+			client, err := aiacp.NewClient("gating-test", clientConn, nil)
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
 			defer client.Close()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

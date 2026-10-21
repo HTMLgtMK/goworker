@@ -15,7 +15,10 @@ func TestServerStoresClientCapabilities(t *testing.T) {
 	serverEnd, clientEnd := net.Pipe()
 	server := ServeConn(serverEnd, &lifecycleHandler{})
 	t.Cleanup(func() { _ = server.Close() })
-	client := NewClient("test-agent", clientEnd, nil)
+	client, err := NewClient("test-agent", clientEnd, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
 	t.Cleanup(func() { _ = client.Close() })
 
 	if server.ClientCapabilities().Has("x-device") {

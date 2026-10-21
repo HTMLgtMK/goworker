@@ -179,7 +179,10 @@ func TestServiceAcceptsUnixACPClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	client := aiacp.NewClient("test", conn, nil)
+	client, err := aiacp.NewClient("test", conn, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
 	defer client.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -221,7 +224,11 @@ func TestServiceHandlerFactoryIsPerConnection(t *testing.T) {
 				return
 			}
 			defer conn.Close()
-			client := aiacp.NewClient("test", conn, nil)
+			client, err := aiacp.NewClient("test", conn, nil)
+			if err != nil {
+				t.Errorf("NewClient: %v", err)
+				return
+			}
 			defer client.Close()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -316,7 +323,10 @@ func TestServiceClientDisconnectReleasesPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	client := aiacp.NewClient("test", conn, nil)
+	client, err := aiacp.NewClient("test", conn, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
 	if err := client.Close(); err != nil {
 		t.Fatalf("client Close: %v", err)
 	}
@@ -355,7 +365,10 @@ func TestServiceStopCancelsActiveHandlerAndReleasesSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	client := aiacp.NewClient("test", conn, nil)
+	client, err := aiacp.NewClient("test", conn, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
 	defer client.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

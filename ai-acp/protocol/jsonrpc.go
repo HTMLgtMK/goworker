@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"runtime/debug"
 	"strconv"
 	"sync"
 )
@@ -81,7 +83,9 @@ type ConnOptions struct {
 //     不得阻塞读循环，否则并发的 session/cancel 通知永远到不了；
 //   - 请求 handler 会在连接关闭或读循环终止时收到取消；
 //   - 通知也是异步分发（handler 阻塞不得卡死读循环），但串成 FIFO 链：
-//     线上顺序即送达顺序，session/update 的流式渲染依赖这一点。
+//     线上顺序即送达顺序，session/update 的流式渲染依赖这一点；
+//   - handler 的 panic 被就地兜住：请求回 -32603，通知丢弃并记日志，
+//     连接保持存活 —— handler 代码烂了不该拖垮整个进程。
 type Conn struct {
 	rwc             io.ReadWriteCloser
 	maxMessageBytes int
@@ -150,8 +154,9 @@ func (c *Conn) HandleNotification(method string, h Notifier) {
 }
 
 // dispatchNotif 把一条 notification 挂上 FIFO 链：goroutine 先等前一条完成，
-// 再跑自己的 handler —— 送达顺序与线上顺序一致。
-func (c *Conn) dispatchNotif(h Notifier, params json.RawMessage) {
+// 再跑自己的 handler —— 送达顺序与线上顺序一致。handler panic 在此就地兜住
+// （丢弃该通知并记日志），FIFO 链照常推进，连接不中断。
+func (c *Conn) dispatchNotif(method string, h Notifier, params json.RawMessage) {
 	c.notifMu.Lock()
 	wait := c.notifLast
 	done := make(chan struct{})
@@ -163,6 +168,11 @@ func (c *Conn) dispatchNotif(h Notifier, params json.RawMessage) {
 			<-wait
 		}
 		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("acp: notification handler panic", "method", method, "panic", r, "stack", string(debug.Stack()))
+			}
+		}()
 		h(params)
 	}()
 }
@@ -277,6 +287,16 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 	go func() {
 		defer cancel()
 		defer c.unregisterRequest(requestID)
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("acp: request handler panic", "method", method, "panic", r, "stack", string(debug.Stack()))
+				_ = c.write(Response{
+					JSONRPC: JSONRPCVersion,
+					ID:      id,
+					Error:   &RPCError{Code: CodeInternalError, Message: "internal error: handler panic"},
+				})
+			}
+		}()
 
 		c.mu.Lock()
 		h := c.methods[method]
@@ -318,7 +338,7 @@ func (c *Conn) dispatchNotification(method string, params json.RawMessage) {
 	h := c.notif[method]
 	c.mu.Unlock()
 	if h != nil {
-		c.dispatchNotif(h, params)
+		c.dispatchNotif(method, h, params)
 	}
 }
 

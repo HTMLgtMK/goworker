@@ -124,8 +124,10 @@ func newACPService(options acpServiceOptions) (*acpservice.Service, error) {
 		)
 	}
 
+	// gate 全 daemon 一份：prompt 执行与会话切换（session/new、load-current）跨
+	// 所有连接互斥。放在工厂闭包里被捕获，每连接 handler 共享同一把门禁。
 	return acpservice.NewService(
-		acpservice.NewFrontendHandlerFactory(options.evaluate, options.commands, options.sessions),
+		acpservice.NewFrontendHandlerFactory(options.evaluate, options.commands, options.sessions, acpservice.NewSessionGate()),
 		listenerFactory,
 		serverOptions...,
 	), nil

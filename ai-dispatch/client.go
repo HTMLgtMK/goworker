@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -80,7 +81,7 @@ type ClientCallbacks = aiacp.ClientCallbacks
 
 // NewClient constructs the generic ACP client through the dispatch package's
 // compatibility boundary.
-func NewClient(name string, rwc io.ReadWriteCloser, closeFn func() error) *Client {
+func NewClient(name string, rwc io.ReadWriteCloser, closeFn func() error) (*Client, error) {
 	return aiacp.NewClient(name, rwc, closeFn)
 }
 
@@ -98,7 +99,10 @@ func StartWorkerWithOpener(ctx context.Context, spec WorkerSpec, opener Opener) 
 	if closer != nil {
 		rwc = &managedConn{ReadWriteCloser: rwc, closer: closer}
 	}
-	client := aiacp.NewClient(spec.Name, rwc, nil)
+	client, err := aiacp.NewClient(spec.Name, rwc, nil)
+	if err != nil {
+		return nil, fmt.Errorf("start acp client for worker %q: %w", spec.Name, err)
+	}
 	return client, nil
 }
 

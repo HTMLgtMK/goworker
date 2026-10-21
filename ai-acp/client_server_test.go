@@ -90,7 +90,10 @@ func newTestClientServer(t *testing.T, handler *lifecycleHandler) *Client {
 	serverEnd, clientEnd := net.Pipe()
 	server := ServeConn(serverEnd, handler)
 	t.Cleanup(func() { _ = server.Close() })
-	client := NewClient("test-agent", clientEnd, nil)
+	client, err := NewClient("test-agent", clientEnd, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
 	t.Cleanup(func() { _ = client.Close() })
 	return client
 }

@@ -31,16 +31,17 @@ type Client struct {
 
 // NewClient constructs and starts a client on an existing transport. closeFn
 // runs once after the peer transport is closed and can reap an owning process.
-func NewClient(name string, rwc io.ReadWriteCloser, closeFn func() error) *Client {
+// It returns an error instead of panicking when the transport is unusable.
+func NewClient(name string, rwc io.ReadWriteCloser, closeFn func() error) (*Client, error) {
 	peer, err := newPeer(rwc, closeFn)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	client := &Client{Peer: peer, name: name}
 	client.HandleNotification(protocol.MethodSessionUpdate, client.handleUpdate)
 	client.Handle(protocol.MethodSessionRequestPermission, client.handlePermission)
 	client.Start()
-	return client
+	return client, nil
 }
 
 // SetCallbacks replaces the update and permission callbacks atomically.

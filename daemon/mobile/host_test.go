@@ -191,6 +191,34 @@ func TestHostStartValidatesConfig(t *testing.T) {
 	}
 }
 
+// TestHostStartRollbackClearsState 钉住启动失败与 panic 共用的 rollback：
+// Host 必须离开 starting，且不再暴露已经关闭的管道端点。
+func TestHostStartRollbackClearsState(t *testing.T) {
+	cb := &collectCB{closed: make(chan string, 1)}
+	h, err := NewHost("", cb)
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+
+	toWorkerR, toWorkerW := io.Pipe()
+	fromWorkerR, fromWorkerW := io.Pipe()
+	h.mu.Lock()
+	h.starting = true
+	h.clientW = toWorkerW
+	h.pumpR = fromWorkerR
+	h.mu.Unlock()
+
+	h.rollbackStart(toWorkerR, toWorkerW, fromWorkerR, fromWorkerW)
+
+	h.mu.Lock()
+	starting, clientW, pumpR := h.starting, h.clientW, h.pumpR
+	h.mu.Unlock()
+	if starting || clientW != nil || pumpR != nil {
+		t.Fatalf("start rollback: starting=%v clientW=%v pumpR=%v, want false/nil/nil", starting, clientW, pumpR)
+	}
+}
+
 // TestHostWriteBlockedCloseStillCloses 白盒复现 P1：app 侧读循环停摆时管道写
 // 无限阻塞，旧实现持 mu 写管道会让 Close 永远拿不到锁（Android 上就是 ANR）。
 // 不绕 app.New，直接手工摆一个无人读的管道对制造确定性阻塞。
@@ -247,6 +275,108 @@ func TestHostWriteBlockedCloseStillCloses(t *testing.T) {
 	// Close 之后的常规 Write 也要报错（生命周期守卫保留）。
 	if err := h.Write([]byte(`{}`)); err == nil {
 		t.Fatal("Write after Close: want error")
+	}
+}
+
+// TestHostCloseWithoutStartIsImmediate Close 在 Start 之前调用必须立刻返回
+// （状态机下无锁外装配可等），且不上报 OnClose —— 历史契约：后端从未跑起来
+// 就没有可关的流。收口后再 Start 必须拒绝。
+func TestHostCloseWithoutStartIsImmediate(t *testing.T) {
+	t.Setenv("GOWORKER_CONFIG_DIR", t.TempDir())
+	cb := &collectCB{closed: make(chan string, 1)}
+	h, err := NewHost("", cb)
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+
+	done := make(chan struct{})
+	go func() { h.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close before Start did not return immediately")
+	}
+	select {
+	case msg := <-cb.closed:
+		t.Fatalf("unexpected OnClose before any Start: %q", msg)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := h.Start(); err == nil {
+		t.Fatal("Start after Close: want error")
+	}
+}
+
+// TestHostStartCloseRace 压测 Start∥Close 全交织：Close 可能在 Start 登记
+// starting 之前、锁外装配中、装配完成之后落地。任何交织下 Start/Close 都要
+// 收敛（装配不持状态锁是本次修复的核心，看门狗兜底）；OnClose 至多一次，
+// Start 成功后 Close 必须给出恰一次。顺带覆盖：装配中重入 Start 快速拒绝、
+// 收口后 Start 拒绝。
+func TestHostStartCloseRace(t *testing.T) {
+	const iterations = 10
+	for i := 0; i < iterations; i++ {
+		dir := t.TempDir()
+		cb := &collectCB{closed: make(chan string, 2)} // 容量 2：多送一次能当场数出来
+		h, err := NewHost(dir, cb)
+		if err != nil {
+			t.Fatalf("iteration %d: NewHost: %v", i, err)
+		}
+
+		startDone := make(chan error, 1)
+		go func() { startDone <- h.Start() }()
+
+		// 等第一发 Start 登记好状态，之后的第二发 Start 必吃快速拒绝 ——
+		// 同时证明装配中的重入 Start 不排队等装配完成。
+		regDeadline := time.Now().Add(2 * time.Second)
+		for {
+			h.mu.Lock()
+			registered := h.starting || h.closed || h.started
+			h.mu.Unlock()
+			if registered {
+				break
+			}
+			if time.Now().After(regDeadline) {
+				t.Fatalf("iteration %d: Start never reached a registered state", i)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if err := h.Start(); err == nil {
+			t.Fatalf("iteration %d: Start while starting/started: want error", i)
+		}
+
+		// 抖动让 Close 落进生命周期不同阶段（登记前/装配中/装配后）。
+		time.Sleep(time.Duration(i%4) * time.Millisecond)
+		closeDone := make(chan struct{})
+		go func() { h.Close(); close(closeDone) }()
+
+		var startErr error
+		select {
+		case startErr = <-startDone:
+		case <-time.After(15 * time.Second):
+			t.Fatalf("iteration %d: Start did not converge under Close race", i)
+		}
+		select {
+		case <-closeDone:
+		case <-time.After(15 * time.Second):
+			t.Fatalf("iteration %d: Close did not converge during assembly", i)
+		}
+
+		if startErr == nil {
+			// Start 成功 → Close 走 appl.Stop → pump EOF → OnClose 恰一次。
+			select {
+			case <-cb.closed:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("iteration %d: Start succeeded but OnClose missing after Close", i)
+			}
+		}
+		if n := len(cb.closed); n > 1 {
+			t.Fatalf("iteration %d: OnClose delivered %d times, want at most 1", i, n)
+		}
+
+		// 收口后的 Host 彻底作废：再 Start 必须拒绝。
+		if err := h.Start(); err == nil {
+			t.Fatalf("iteration %d: Start after Close: want error", i)
+		}
 	}
 }
 
