@@ -6,9 +6,9 @@
 // allow_always，声明 allow_always_key 的外部工具也提供相同能力。永久授权
 // 分别落到 bash 命令规则或独立的外部工具规则，不把 MCP 参数粗暴伪装成命令。
 //
-// 放在 model 包是因为两个 ACP 前端都要用它：agent chat（cli/vscode 的
-// ingress）与 task worker（service 的 acpWorker）。model 是两者共同依赖的层
-// （且已持有 hitl.Decision 的装配点 FrontendContext.Decide）；放进任一个前端
+// 放在 model 包是因为两个 ACP 入口都要用它：主会话前端（core/service/acp 的
+// FrontendHandler）与 task worker（service 的 acpWorker）。model 是两者共同依赖的层
+// （且已持有 hitl.Decision 的装配点 FrontendContext.Decide）；放进任一个入口
 // 都会让另一个反向依赖它。
 package model
 
@@ -16,7 +16,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 )
 

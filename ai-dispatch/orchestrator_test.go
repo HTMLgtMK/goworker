@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-dispatch/task"
 )
 
@@ -267,9 +267,17 @@ type loadableWorker struct {
 func newLoadableWorker(rwc io.ReadWriteCloser, loadCaps bool) *loadableWorker {
 	w := &loadableWorker{conn: protocol.NewConn(rwc), loadCaps: loadCaps}
 	w.conn.Handle(protocol.MethodInitialize, func(context.Context, json.RawMessage) (any, error) {
+		caps := protocol.AgentCapabilities{}
+		if loadCaps {
+			var err error
+			caps, err = caps.With(protocol.LoadSessionCapability{})
+			if err != nil {
+				return nil, err
+			}
+		}
 		return protocol.InitializeResponse{
 			ProtocolVersion:   protocol.Version,
-			AgentCapabilities: protocol.AgentCapabilities{LoadSession: loadCaps},
+			AgentCapabilities: caps,
 		}, nil
 	})
 	w.conn.Handle(protocol.MethodSessionNew, func(context.Context, json.RawMessage) (any, error) {

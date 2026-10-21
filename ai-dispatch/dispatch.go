@@ -2,7 +2,12 @@
 // Client 驱动 worker agent 子进程执行任务，Server 对外暴露任务入口。
 package dispatch
 
-import "crypto/rand"
+import (
+	"crypto/rand"
+	"encoding/hex"
+)
+
+func hexEncode(b []byte) string { return hex.EncodeToString(b) }
 
 // newHexID 生成 <prefix>_<16hex> 形式的短 ID。
 func newHexID(prefix string) string {

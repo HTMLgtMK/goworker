@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
+	"github.com/tinguo/goworker/ai-acp/protocol"
 )
 
 // ---- fake agent：模拟一个 ACP worker ----
@@ -124,7 +124,10 @@ func clientToAgent(t *testing.T, agent *fakeAgent) *Client {
 	agent.conn.Handle(protocol.MethodSessionPrompt, agent.handlePrompt)
 	go func() { _ = agent.conn.Serve() }()
 
-	c := NewClient("fake", clientEnd, clientEnd.Close)
+	c, err := NewClient("fake", clientEnd, clientEnd.Close)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
 	t.Cleanup(func() { _ = c.Close() })
 	return c
 }

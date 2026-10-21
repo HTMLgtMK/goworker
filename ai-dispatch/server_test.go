@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
+	"github.com/tinguo/goworker/ai-acp/protocol"
 )
 
 // listingHandler 实现 TaskHandler + SessionLoader + SessionLister：具备 load/list 能力。
@@ -87,10 +87,10 @@ func initialize(t *testing.T, conn *protocol.Conn) protocol.InitializeResponse {
 }
 
 func TestServer_AdvertisesLoadSessionOnlyWhenHandlerImplementsLoader(t *testing.T) {
-	if resp := initialize(t, serveWith(t, listingHandler{})); !resp.AgentCapabilities.LoadSession {
+	if resp := initialize(t, serveWith(t, listingHandler{})); !resp.AgentCapabilities.Has("loadSession") {
 		t.Errorf("LoadSession capability = false with SessionLoader handler, want true")
 	}
-	if resp := initialize(t, serveWith(t, plainHandler{})); resp.AgentCapabilities.LoadSession {
+	if resp := initialize(t, serveWith(t, plainHandler{})); resp.AgentCapabilities.Has("loadSession") {
 		t.Errorf("LoadSession capability = true without SessionLoader handler, want false")
 	}
 }

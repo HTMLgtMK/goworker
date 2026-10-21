@@ -24,10 +24,15 @@ type Engine struct {
 	runtimeCfg      *runtimeconfig.Config
 	log             *logger.Logger
 	plugins         map[string]model.Plugin
+	pluginOrder     []string
+	started         map[string]bool
+	stopped         map[string]bool
+	stopRequested   bool
 	commands        map[string]model.Command
 	tools           map[string]model.Tool
 	interceptors    []model.PluginInterceptor
 	listeners       []func(model.Event)
+	capabilities    map[string]any
 	fallbackHandler func(ctx *model.Context) error // 未匹配命令的兜底处理器
 }
 
@@ -45,10 +50,14 @@ func NewEngine(cfg *config.Config, runtimeCfg *runtimeconfig.Config, l *logger.L
 		runtimeCfg:   runtimeCfg,
 		log:          l,
 		plugins:      make(map[string]model.Plugin),
+		pluginOrder:  make([]string, 0),
+		started:      make(map[string]bool),
+		stopped:      make(map[string]bool),
 		commands:     make(map[string]model.Command),
 		tools:        make(map[string]model.Tool),
 		interceptors: make([]model.PluginInterceptor, 0),
 		listeners:    make([]func(model.Event), 0),
+		capabilities: make(map[string]any),
 	}
 }
 
@@ -79,7 +88,7 @@ func (e *Engine) saveConfig(cfg any, save func(*config.Config, string) error) er
 	}
 	// TODO(竞态): 这里对共享的 *runtimeconfig.Config 做整体结构体拷贝，
 	// LLM.Providers 的 map 头不是原子写的 —— /model use 与 dispatcher 的
-	// worker 解析 / vscode 的 SessionModes 并发时可能读到撕裂的 map 头
+	// worker 解析 / ACP service 的 SessionModes 并发时可能读到撕裂的 map 头
 	// （评审 I5）。根治需要把运行时配置改成不可变快照 + atomic.Pointer 发布，
 	// 并让插件经 holder 读取；在那之前避免在任务运行中并发执行 /model use。
 	*e.runtimeCfg = candidateRuntime
@@ -91,6 +100,29 @@ func (e *Engine) saveConfig(cfg any, save func(*config.Config, string) error) er
 // 当用户输入不是任何已注册命令时，引擎会调用此 handler 而非返回错误。
 func (e *Engine) SetFallbackHandler(fn func(ctx *model.Context) error) {
 	e.fallbackHandler = fn
+}
+
+func (e *Engine) RegisterCapability(name string, capability any) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("capability name is required")
+	}
+	if capability == nil {
+		return fmt.Errorf("capability %q is nil", name)
+	}
+	if _, exists := e.capabilities[name]; exists {
+		return fmt.Errorf("capability %q already registered", name)
+	}
+	e.capabilities[name] = capability
+	return nil
+}
+
+func (e *Engine) Capability(name string) (any, bool) {
+	capability, ok := e.capabilities[name]
+	return capability, ok
+}
+
+func (e *Engine) UnregisterCapability(name string) {
+	delete(e.capabilities, name)
 }
 
 // ---- Middleware ----
@@ -127,6 +159,7 @@ func (e *Engine) Register(p model.Plugin) error {
 	}
 
 	e.plugins[name] = p
+	e.pluginOrder = append(e.pluginOrder, name)
 	e.log.Info("plugin registered", "name", name)
 	return nil
 }
@@ -147,11 +180,7 @@ func (e *Engine) pluginHub() *model.Hub {
 			return e.plugins[name]
 		},
 		Plugins: func() []string {
-			names := make([]string, 0, len(e.plugins))
-			for n := range e.plugins {
-				names = append(names, n)
-			}
-			return names
+			return e.Plugins()
 		},
 		Tools: func() []model.Tool {
 			return e.Tools()
@@ -167,6 +196,9 @@ func (e *Engine) pluginHub() *model.Hub {
 		SetFallbackHandler: func(fn func(ctx *model.Context) error) {
 			e.SetFallbackHandler(fn)
 		},
+		RegisterCapability:   e.RegisterCapability,
+		Capability:           e.Capability,
+		UnregisterCapability: e.UnregisterCapability,
 	}
 }
 
@@ -279,10 +311,19 @@ func (e *Engine) Eval(ctx *model.Context, input string) error {
 // ---- 生命周期 ----
 
 func (e *Engine) StartAll() error {
-	for name, p := range e.plugins {
-		if err := p.Start(); err != nil {
+	if e.stopRequested {
+		return fmt.Errorf("engine lifecycle already stopped")
+	}
+	for _, name := range e.pluginOrder {
+		if e.started[name] {
+			continue
+		}
+		plugin := e.plugins[name]
+		if err := plugin.Start(); err != nil {
+			e.StopAll()
 			return fmt.Errorf("plugin %q start: %w", name, err)
 		}
+		e.started[name] = true
 		e.Notify(model.Event{Type: model.EventPluginStarted, Payload: name})
 		e.log.Info("plugin started", "name", name)
 	}
@@ -290,17 +331,21 @@ func (e *Engine) StartAll() error {
 }
 
 func (e *Engine) StopAll() {
-	// 逆序关闭
-	order := make([]string, 0, len(e.plugins))
-	for name := range e.plugins {
-		order = append(order, name)
-	}
-	for i := len(order) - 1; i >= 0; i-- {
-		name := order[i]
+	e.stopRequested = true
+	for i := len(e.pluginOrder) - 1; i >= 0; i-- {
+		name := e.pluginOrder[i]
+		if e.stopped[name] {
+			continue
+		}
+		wasStarted := e.started[name]
 		if err := e.plugins[name].Stop(); err != nil {
 			e.log.Error("plugin stop error", "name", name, "error", err)
+			continue
 		}
-		e.Notify(model.Event{Type: model.EventPluginStopped, Payload: name})
+		e.stopped[name] = true
+		if wasStarted {
+			e.Notify(model.Event{Type: model.EventPluginStopped, Payload: name})
+		}
 		e.log.Info("plugin stopped", "name", name)
 	}
 }
@@ -312,7 +357,8 @@ func (e *Engine) AddEventListener(fn func(model.Event)) {
 
 // Notify 向所有 EventAwarePlugin 和外部监听者广播事件。
 func (e *Engine) Notify(event model.Event) {
-	for name, p := range e.plugins {
+	for _, name := range e.pluginOrder {
+		p := e.plugins[name]
 		if ep, ok := p.(model.EventAwarePlugin); ok {
 			if err := ep.OnEvent(event); err != nil {
 				e.log.Error("plugin OnEvent error", "name", name, "event", event.Type, "error", err)
@@ -331,11 +377,7 @@ func (e *Engine) Plugin(name string) model.Plugin {
 }
 
 func (e *Engine) Plugins() []string {
-	names := make([]string, 0, len(e.plugins))
-	for n := range e.plugins {
-		names = append(names, n)
-	}
-	return names
+	return append([]string(nil), e.pluginOrder...)
 }
 
 func (e *Engine) HasPlugin(name string) bool {

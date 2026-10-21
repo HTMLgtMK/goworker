@@ -25,6 +25,13 @@ type Checkpoint struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// Metadata identifies one logical conversation. The identity is immutable for
+// the lifetime of a JSONL file and is independent from its mutable head.
+type Metadata struct {
+	SessionID string    `json:"session_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // Store 管理会话的 jsonl 持久化存储。
 type Store struct {
 	mu sync.Mutex
@@ -34,9 +41,10 @@ type Store struct {
 
 	file *os.File // 追加写入句柄，Open 后保持打开
 
-	recs   []Record // 全部记录（仅加载时填充，后续追加写文件不维护内存全量——但为了回溯便捷保留）
-	head   string   // 当前 head 节点 id
-	cursor string   // 固化游标指向的消息 id
+	recs     []Record // 全部记录（仅加载时填充，后续追加写文件不维护内存全量——但为了回溯便捷保留）
+	metadata Metadata
+	head     string // 当前 head 节点 id
+	cursor   string // 固化游标指向的消息 id
 }
 
 // Open 打开或创建 dir 下的会话存储。目录不存在则创建，jsonl 文件不存在则新建。
@@ -69,16 +77,45 @@ func Open(dir string) (*Store, error) {
 		return nil, fmt.Errorf("session: restrict file %s: %w", path, err)
 	}
 
+	metadata, hasMetadata := metadataFromRecords(recs)
+	needsMetadata := !hasMetadata || metadata.SessionID == ""
+	if needsMetadata {
+		var content []byte
+		if data, readErr := os.ReadFile(path); readErr == nil {
+			content = data
+		}
+		firstID := firstNodeID(recs)
+		metadata = Metadata{
+			SessionID: legacySessionID(firstID, content),
+			CreatedAt: time.Now(),
+		}
+		if firstID == "" && len(content) == 0 {
+			metadata.SessionID = NewSessionID()
+		}
+	}
+
 	s := &Store{
-		path: path,
-		dir:  dir,
-		file: f,
-		recs: recs,
+		path:     path,
+		dir:      dir,
+		file:     f,
+		recs:     recs,
+		metadata: metadata,
+	}
+	if needsMetadata {
+		// Metadata is append-only and written exactly once. Old files are
+		// migrated in place so subsequent archive/reopen operations retain the
+		// same logical identity.
+		metadataRec := newMetadataRecord(metadata.SessionID, metadata.CreatedAt)
+		if err := s.appendRecord(metadataRec); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("session: persist metadata: %w", err)
+		}
+		s.recs = append(s.recs, metadataRec)
 	}
 
 	// 扫描最后出现的 head / cursor
-	for i := len(recs) - 1; i >= 0; i-- {
-		r := recs[i]
+	for i := len(s.recs) - 1; i >= 0; i-- {
+		r := s.recs[i]
 		if s.head == "" && r.Kind == kindHead && r.Head != nil {
 			s.head = r.Head.Tail
 		}
@@ -116,6 +153,22 @@ func (s *Store) Head() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.head
+}
+
+// SessionID returns the immutable logical identity of this session. It must
+// not be inferred from Head: compact, rewind, and message appends replace the
+// head while the session resource remains the same.
+func (s *Store) SessionID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.metadata.SessionID
+}
+
+// Metadata returns a copy of the immutable session metadata.
+func (s *Store) Metadata() Metadata {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.metadata
 }
 
 // ActiveView 从 head 沿 parent 回溯，构建当前活跃视图。
@@ -393,7 +446,7 @@ func (s *Store) AdvanceCursor(id string) error {
 	return nil
 }
 
-// Archive 将 current.jsonl 重命名为 archive/<timestamp>.jsonl，然后打开新的空文件。
+// Archive 将 current.jsonl 重命名为 archive/<timestamp>.jsonl，然后打开带有新 metadata 的 current 文件。
 func (s *Store) Archive() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -438,6 +491,14 @@ func (s *Store) Archive() error {
 	s.recs = nil
 	s.head = ""
 	s.cursor = ""
+	s.metadata = Metadata{SessionID: NewSessionID(), CreatedAt: time.Now()}
+	metadataRec := newMetadataRecord(s.metadata.SessionID, s.metadata.CreatedAt)
+	if err := s.appendRecord(metadataRec); err != nil {
+		_ = f.Close()
+		s.file = nil
+		return fmt.Errorf("session: persist metadata after archive: %w", err)
+	}
+	s.recs = []Record{metadataRec}
 
 	return nil
 }
@@ -499,6 +560,35 @@ func checkpointsFromRecords(recs []Record, limit int) []Checkpoint {
 		}
 	}
 	return cks
+}
+
+// metadataFromRecords returns the first valid metadata record. Metadata is
+// immutable, so later records are ignored rather than silently changing identity.
+func metadataFromRecords(recs []Record) (Metadata, bool) {
+	for _, r := range recs {
+		if r.Kind == kindMetadata && r.Meta != nil && r.Meta.SessionID != "" {
+			return Metadata{SessionID: r.Meta.SessionID, CreatedAt: r.Meta.CreatedAt}, true
+		}
+	}
+	return Metadata{}, false
+}
+
+func firstNodeID(recs []Record) string {
+	for _, r := range recs {
+		if (r.Kind == kindMsg || r.Kind == kindCompact) && r.NodeID() != "" {
+			return r.NodeID()
+		}
+	}
+	return ""
+}
+
+func timeFromRecords(recs []Record) time.Time {
+	for _, r := range recs {
+		if created := r.Created(); !created.IsZero() {
+			return created
+		}
+	}
+	return time.Time{}
 }
 
 func restrictArchivePermissions(dir string) error {

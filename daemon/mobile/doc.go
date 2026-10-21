@@ -1,8 +1,9 @@
-// Package mobile 是 Android（gobind）入口壳的占位：gomobile bind 的目标包，
-// 与 cmd/goworker（CLI 壳）共享 internal/app 的同一套 Application 装配。
+// Package mobile 是 Android（gobind）入口壳：进程内嵌入 app.Application 后端。
 //
-// 位置约束：不能放 cmd/ 下（gobind 绑不出 package main），也不能放
-// internal/ 下（gobind 生成的胶水在外部 module 里，导入不了 internal 包），
-// 只能是 module 根部的普通包。骨架（Callbacks/MobileTool/Host）随 Android
-// 集成工作填充。
+// Host 经 daemon/internal/app 的 Application 服务 ACP（完整 Engine + 插件 +
+// services 装配，含内置命令与会话持久化），ACP 经 WithACPConnection 走进程内
+// 管道。builtin side-effect import 确保 Agent Factory 与内置命令被静态编入 AAR；
+// gomobile 构建默认使用 goworker_no_dispatcher，不会把 Dispatcher 插件带进
+// 移动端产物。Android 侧通过 ACP 协议提供文件、权限、MCP/Tool 与生命周期适配，
+// 不直接暴露 Go 的 context、channel 或函数类型。
 package mobile

@@ -79,6 +79,39 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: daemon plugin variant matrix
+        run: |
+          set -euo pipefail
+          variants=(
+            "full|"
+            "agent|goworker_no_dispatcher"
+            "dispatcher|goworker_no_agent"
+            "minimal|goworker_no_agent,goworker_no_dispatcher"
+          )
+          for entry in "${variants[@]}"; do
+            IFS='|' read -r variant tags <<< "$entry"
+            echo "::group::daemon $variant"
+            tag_args=()
+            if [ -n "$tags" ]; then
+              tag_args=(-tags "$tags")
+            fi
+
+            (cd daemon && go test -race "${tag_args[@]}" ./...)
+            (cd daemon && go build "${tag_args[@]}" -o "/tmp/goworker-${variant}" ./cmd/goworker)
+
+            if [ "$variant" = "dispatcher" ] || [ "$variant" = "minimal" ]; then
+              deps=$(cd daemon && go list -deps "${tag_args[@]}" ./cmd/goworker)
+              # 只禁 Agent 实现包。core/service 是所有变体共用的 ACP 服务装配层，
+              # 轻量壳也会合法引用它，不能进黑名单。
+              if grep -Eq 'daemon/internal/plugins/agent' <<< "$deps"; then
+                echo "::error::$variant 仍依赖 Agent 实现包"
+                exit 1
+              fi
+            fi
+            echo "${variant} build/test/race/dependency check passed"
+            echo "::endgroup::"
+          done
+
       # next-version.sh 自称"抽出来是为了能测"——那就真的测。
       # 版本号算错会推一个错误 tag 出去，删起来很烦。
       - name: next-version.sh 用例

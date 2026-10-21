@@ -14,8 +14,9 @@ import (
 // ArchiveView 是归档 jsonl 的只读视图。recs/head 在打开时解析定案，之后只读：
 // 归档文件不可变（Archive 已切换到新 current），无需锁与刷新。
 type ArchiveView struct {
-	recs []Record
-	head string
+	recs     []Record
+	head     string
+	metadata Metadata
 }
 
 // OpenArchiveView 只读打开归档 jsonl 并构建视图。文件不存在或不可读返回错误
@@ -30,7 +31,16 @@ func OpenArchiveView(path string) (*ArchiveView, error) {
 	if err != nil {
 		return nil, fmt.Errorf("session: open archive view %s: %w", path, err)
 	}
-	v := &ArchiveView{recs: recs}
+	metadata, ok := metadataFromRecords(recs)
+	if !ok || metadata.SessionID == "" {
+		content, _ := os.ReadFile(path)
+		firstID := firstNodeID(recs)
+		metadata = Metadata{
+			SessionID: legacySessionID(firstID, content),
+			CreatedAt: timeFromRecords(recs),
+		}
+	}
+	v := &ArchiveView{recs: recs, metadata: metadata}
 	// head 取最后一条 head 记录（与 Store.Open 同策略：文件行序即追加序）
 	for i := len(recs) - 1; i >= 0; i-- {
 		if r := recs[i]; r.Kind == kindHead && r.Head != nil {
@@ -43,6 +53,13 @@ func OpenArchiveView(path string) (*ArchiveView, error) {
 
 // Head 返回归档会话的 head 节点 id（空文件/无 head 记录返回空串）。
 func (v *ArchiveView) Head() string { return v.head }
+
+// SessionID returns the logical identity stored in the archive metadata. Legacy
+// archives use the same deterministic migration identity as Store.Open.
+func (v *ArchiveView) SessionID() string { return v.metadata.SessionID }
+
+// Metadata returns a copy of the archive's logical session metadata.
+func (v *ArchiveView) Metadata() Metadata { return v.metadata }
 
 // ActiveView 从 head 沿 parent 回溯构建归档会话的活跃视图，与 Store.ActiveView
 // 共用 buildActiveView（compact 转 system 摘要、穿过 compact 回溯的语义一致）。

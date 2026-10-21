@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/tinguo/goworker/ai-dispatch/protocol"
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-dispatch/task"
 )
 
@@ -167,7 +167,7 @@ func (o *Orchestrator) establishSession(
 	ctx context.Context, client *Client, init protocol.InitializeResponse,
 	t *task.Task, cwd string, resuming bool,
 ) (string, error) {
-	if resuming && t.WorkerSession != "" && init.AgentCapabilities.LoadSession {
+	if resuming && t.WorkerSession != "" && init.AgentCapabilities.Has("loadSession") {
 		sessionID, err := client.SessionLoad(ctx, t.WorkerSession, cwd)
 		if err != nil {
 			// load 失败不致命：降级为全新会话重跑任务

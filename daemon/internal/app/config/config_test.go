@@ -596,3 +596,32 @@ func TestDefault_SandboxAuditLogOff(t *testing.T) {
 		t.Errorf("AllowRules should default empty, got %v", cfg.Sandbox.AllowRules)
 	}
 }
+
+// vscode ACP 前端已下线（统一走 app-service 的 frontend/acp.sock）。
+// 存量 config.yaml 里的 frontend.vscode 段必须被静默忽略：Load 用非严格
+// yaml.Unmarshal，未知字段不报错，且不能影响其余段的解析。
+func TestLoad_IgnoresLegacyVscodeFrontendSection(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+frontend:
+  vscode:
+    enabled: true
+    socket: /tmp/x.sock
+  acp:
+    enabled: false
+    socket: /tmp/legacy-acp.sock
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Load(path)
+	if cfg == nil {
+		t.Fatal("Load returned nil for config containing legacy frontend.vscode section")
+	}
+	if cfg.Frontend.ACP.Enabled {
+		t.Error("Frontend.ACP.Enabled = true, want false from yaml")
+	}
+	if cfg.Frontend.ACP.Socket != "/tmp/legacy-acp.sock" {
+		t.Errorf("Frontend.ACP.Socket = %q, want /tmp/legacy-acp.sock", cfg.Frontend.ACP.Socket)
+	}
+}

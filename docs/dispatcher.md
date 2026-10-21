@@ -43,7 +43,7 @@ ai-dispatch/                      ← 新独立 module（stdlib only，零 gowor
   client.go                       ← ACP Client 角色：spawn 子进程、驱动一个任务到终点
   server.go                       ← ACP Agent 角色：对外任务入口（stdio / unix socket）
 
-daemon/internal/dispatcher/       ← dispatcher 插件（daemon 侧适配）
+daemon/internal/plugins/dispatcher/  ← dispatcher 插件（daemon 侧适配）
   plugin.go                       ← plugin.Plugin 生命周期 + 命令注册 + 事件广播
   workers.go                      ← worker 注册表（config → launch 描述）
   worktree.go                     ← git worktree 隔离与清理
@@ -51,7 +51,7 @@ daemon/internal/dispatcher/       ← dispatcher 插件（daemon 侧适配）
   commands.go                     ← /dispatch /workers 命令实现
 ```
 
-依赖方向：`daemon/internal/dispatcher → ai-dispatch → (stdlib)`；`ai-runtime` 不感知 dispatcher。
+依赖方向：`daemon/internal/plugins/dispatcher → ai-dispatch → (stdlib)`；`ai-runtime` 不感知 dispatcher。
 
 ## 4. 任务模型与状态机
 
@@ -263,7 +263,7 @@ type ProgressEvent struct {
 }
 ```
 
-### 2. 发布点（daemon/internal/dispatcher）
+### 2. 发布点（daemon/internal/plugins/dispatcher）
 
 - **task_status**：不改 orchestrator。插件 `save()` 是全部落盘的汇聚点，
   在此对比 store 旧快照与新任务的 Status，不同即 `hub.Notify` 一次

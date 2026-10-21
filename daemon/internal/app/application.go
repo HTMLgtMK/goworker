@@ -9,7 +9,9 @@
 package app
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
@@ -17,19 +19,50 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/engine"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
-	"github.com/tinguo/goworker/daemon/internal/core/service"
+	coreservice "github.com/tinguo/goworker/daemon/internal/core/service"
 )
 
-// Application 是装配完成的 agent 后端：Engine + 插件 + 配置 + 日志。
+// Application 是装配完成的 agent 后端：Engine + 插件 + services + 配置 + 日志。
 // 字段供壳层取用（CLI 读 Config.Frontend.Stdin，mobile 读 Engine.Eval 等）。
 type Application struct {
-	Config  *config.Config
-	Runtime *runtimeconfig.Config
-	Engine  *engine.Engine
-	Log     *logger.Logger
-	// Agent 是 agent 插件实例（GOWORKER_NO_PLUGINS 剔除 agent 时为 nil）。
-	// vscode 前端经它做会话清单/load；最小壳下 CLI 壳跳过 vscode 前端启动。
-	Agent *service.AgentPlugin
+	Config   *config.Config
+	Runtime  *runtimeconfig.Config
+	Engine   *engine.Engine
+	Log      *logger.Logger
+	Services *coreservice.Registry
+}
+
+var ErrCapabilityUnavailable = errors.New("capability unavailable")
+
+type applicationOptions struct {
+	acpConnection io.ReadWriteCloser
+}
+
+// Option customizes Application assembly without exposing ACP transport
+// factories. Connections are adapted to listeners by the app composition root.
+type Option func(*applicationOptions)
+
+// WithACPConnection serves ACP over an already-established full-duplex
+// connection, such as a mobile pipe. A nil connection leaves the default Unix
+// socket transport in place.
+func WithACPConnection(conn io.ReadWriteCloser) Option {
+	return func(options *applicationOptions) {
+		if conn != nil {
+			options.acpConnection = conn
+		}
+	}
+}
+
+func (a *Application) SessionSource() (model.SessionSource, error) {
+	capability, ok := a.Engine.Capability(model.SessionSourceCapability)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrCapabilityUnavailable, model.SessionSourceCapability)
+	}
+	source, ok := capability.(model.SessionSource)
+	if !ok {
+		return nil, fmt.Errorf("capability %q has type %T, want model.SessionSource", model.SessionSourceCapability, capability)
+	}
+	return source, nil
 }
 
 // loadConfigAndLogger 装配前置两步：配置装载 + 日志初始化。New 与 RunACPWorker 共用。
@@ -62,9 +95,16 @@ func loadConfigAndLogger() (*config.Config, *logger.Logger, error) {
 	return cfg, log, nil
 }
 
-// New 完成全部装配：配置 → 日志 → Engine → AgentPlugin → 内置命令 → StartAll。
+// New 完成全部装配：配置 → 日志 → Engine → AgentPlugin → 内置命令 → StartAll → services.Start。
 // 出错返回 error，不 panic、不 os.Exit —— 退出策略归壳层（CLI 打印后 exit，mobile 转 Java 异常）。
-func New() (*Application, error) {
+func New(options ...Option) (*Application, error) {
+	appOptions := applicationOptions{}
+	for _, option := range options {
+		if option != nil {
+			option(&appOptions)
+		}
+	}
+
 	cfg, log, err := loadConfigAndLogger()
 	if err != nil {
 		return nil, err
@@ -73,14 +113,28 @@ func New() (*Application, error) {
 	// ai-runtime 聚合配置（各插件的目录路径注入见 RegisterPlugins 装配链）
 	runtimeCfg := cfg.ToRuntime()
 
+	// 沙箱门禁的环境覆盖（GOWORKER_SANDBOX_MODE）：非法值按启动失败处理，
+	// 装配到此只占用了配置/日志，回收日志即可 —— 插件还没起。
+	if err := applySandboxModeOverride(runtimeCfg); err != nil {
+		log.Error("invalid sandbox mode override", "error", err)
+		log.Close()
+		return nil, err
+	}
+
 	e := engine.NewEngine(cfg, runtimeCfg, log)
 
 	// 注册拦截器
 	e.Use(engine.LoggingInterceptor(log))
 
-	a := &Application{Config: cfg, Runtime: runtimeCfg, Engine: e, Log: log}
+	a := &Application{
+		Config:   cfg,
+		Runtime:  runtimeCfg,
+		Engine:   e,
+		Log:      log,
+		Services: coreservice.NewRegistry(),
+	}
 
-	// 注册插件：按构建标签装配（CMake GOWORKER_NO_PLUGINS → goworker_no_<name> off-tag）
+	// 注册插件：builtin 的条件导入决定编译集合，registry factory 负责统一装配。
 	if err := RegisterPlugins(a); err != nil {
 		// 失败路径与原 main 的 defer 语义对齐：先 StopAll（已启动的插件回收）再关日志，
 		// 最后经 error 交壳层决定退出方式（CLI exit 1 / mobile 转 Java 异常）。
@@ -104,11 +158,40 @@ func New() (*Application, error) {
 	// 发送启动事件
 	e.Notify(model.Event{Type: model.EventPluginStarted, Payload: "system"})
 
+	cleanup := func() {
+		if stopErr := a.Services.Stop(); stopErr != nil {
+			log.Error("stop services after startup failure", "error", stopErr)
+		}
+		e.StopAll()
+		_ = log.Close()
+	}
+
+	if err := registerServices(a, appOptions); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("register services: %w", err)
+	}
+	if err := a.Services.Start(); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("start services: %w", err)
+	}
 	return a, nil
 }
 
-// Stop 释放资源：插件停止 + 日志关闭。对应原 main 的 defer 链，壳层在所有退出路径调用。
+// Stop 释放资源：先停 services（收口新连接与活跃 prompt），再停插件、关日志。
+// 对应原 main 的 defer 链，壳层在所有退出路径调用。
 func (a *Application) Stop() {
-	a.Engine.StopAll()
-	a.Log.Close()
+	if a == nil {
+		return
+	}
+	if a.Services != nil {
+		if err := a.Services.Stop(); err != nil && a.Log != nil {
+			a.Log.Error("stop services failed", "error", err)
+		}
+	}
+	if a.Engine != nil {
+		a.Engine.StopAll()
+	}
+	if a.Log != nil {
+		_ = a.Log.Close()
+	}
 }

@@ -1,11 +1,7 @@
 package app
 
 import (
-	"fmt"
-	"log/slog"
-	"os"
-
-	"github.com/tinguo/goworker/daemon/internal/core/service"
+	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 )
 
 // RunACPWorker 以 stdio ACP Agent 模式服务 ZCode 会话：配置解析、HTTP 客户端、
@@ -25,17 +21,11 @@ func RunACPWorker() error {
 	// 沙箱下发：dispatcher 侧可经 worker 的 env 配置收紧无人值守 worker 的命令门禁，
 	// 如 env: ["GOWORKER_SANDBOX_MODE=strict"]。取值与 sandbox 模式一致，非法值拒绝启动。
 	runtimeCfg := cfg.ToRuntime()
-	if mode := os.Getenv("GOWORKER_SANDBOX_MODE"); mode != "" {
-		switch mode {
-		case "normal", "auto", "strict", "readonly", "off":
-			runtimeCfg.Sandbox.Mode = mode
-		default:
-			return fmt.Errorf("invalid GOWORKER_SANDBOX_MODE %q (normal|auto|strict|readonly|off)", mode)
-		}
-		slog.Info("acp worker: sandbox mode overridden", "mode", mode)
+	if err := applySandboxModeOverride(runtimeCfg); err != nil {
+		return err
 	}
 
-	server := service.ServeACPWorker(service.Stdio(), service.ACPWorkerDeps{
+	server := acpworker.ServeACPWorker(acpworker.Stdio(), acpworker.ACPWorkerDeps{
 		Config:   runtimeCfg,
 		AuditDir: defaultPaths().AuditDir,
 	})

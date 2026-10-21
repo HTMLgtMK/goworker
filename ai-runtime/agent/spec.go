@@ -5,6 +5,7 @@
 package agent
 
 import (
+	"context"
 	"sync"
 
 	"github.com/tinguo/goworker/ai-core/core"
@@ -17,6 +18,9 @@ import (
 
 type RunRequest struct {
 	Input string
+	// ToolSource 是本轮请求的连接级工具源（nil = 无）。
+	// 惰性调用：probe 发生在 Session.Run 收集工具的时机。
+	ToolSource func(ctx context.Context) []core.Tool
 }
 
 type RenderKind string

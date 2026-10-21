@@ -75,6 +75,111 @@ func TestRegisterPluginInitializesAndRejectsInvalidRegistrations(t *testing.T) {
 	}
 }
 
+func TestCapabilityRegistrationAndLookup(t *testing.T) {
+	e := newTestEngine()
+	plugin := &testPlugin{name: "provider"}
+	if err := e.Register(plugin); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	capability := &struct{ ready bool }{ready: true}
+	if err := plugin.hub.RegisterCapability("session.source", capability); err != nil {
+		t.Fatalf("RegisterCapability: %v", err)
+	}
+	if err := plugin.hub.RegisterCapability("session.source", capability); err == nil {
+		t.Fatal("duplicate capability should fail")
+	}
+	got, ok := plugin.hub.Capability("session.source")
+	if !ok || got != capability {
+		t.Fatalf("Capability() = (%#v, %v), want (%#v, true)", got, ok, capability)
+	}
+	plugin.hub.UnregisterCapability("session.source")
+	if _, ok := e.Capability("session.source"); ok {
+		t.Fatal("unregistered capability is still available")
+	}
+}
+
+func TestLifecycleUsesRegistrationOrderAndRollsBack(t *testing.T) {
+	e := newTestEngine()
+	var starts, stops []string
+	base := &lifecyclePlugin{name: "base", starts: &starts, stops: &stops}
+	child := &lifecyclePlugin{name: "child", starts: &starts, stops: &stops}
+	if err := e.Register(base); err != nil {
+		t.Fatalf("Register base: %v", err)
+	}
+	if err := e.Register(child); err != nil {
+		t.Fatalf("Register child: %v", err)
+	}
+	if err := e.StartAll(); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+	if !reflect.DeepEqual(starts, []string{"base", "child"}) {
+		t.Fatalf("start order = %#v, want [base child]", starts)
+	}
+	e.StopAll()
+	if !reflect.DeepEqual(stops, []string{"child", "base"}) {
+		t.Fatalf("stop order = %#v, want [child base]", stops)
+	}
+	e.StopAll()
+	if !reflect.DeepEqual(stops, []string{"child", "base"}) {
+		t.Fatalf("StopAll is not idempotent: %#v", stops)
+	}
+	if err := e.StartAll(); err == nil {
+		t.Fatal("StartAll after StopAll should fail")
+	}
+
+	e = newTestEngine()
+	starts = nil
+	stops = nil
+	good := &lifecyclePlugin{name: "good", starts: &starts, stops: &stops}
+	failed := &lifecyclePlugin{name: "failed", failStart: true, starts: &starts, stops: &stops}
+	var stoppedEvents []string
+	e.AddEventListener(func(event model.Event) {
+		if event.Type == model.EventPluginStopped {
+			stoppedEvents = append(stoppedEvents, event.Payload.(string))
+		}
+	})
+	if err := e.Register(good); err != nil {
+		t.Fatalf("Register good: %v", err)
+	}
+	if err := e.Register(failed); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+	if err := e.StartAll(); err == nil {
+		t.Fatal("StartAll should return start failure")
+	}
+	if !reflect.DeepEqual(stops, []string{"failed", "good"}) {
+		t.Fatalf("rollback stop order = %#v, want [failed good]", stops)
+	}
+	if !reflect.DeepEqual(stoppedEvents, []string{"good"}) {
+		t.Fatalf("rollback stopped events = %#v, want [good]", stoppedEvents)
+	}
+	if err := e.StartAll(); err == nil {
+		t.Fatal("StartAll after rollback should fail")
+	}
+
+	e = newTestEngine()
+	starts = nil
+	stops = nil
+	retry := &lifecyclePlugin{name: "retry", failStop: true, starts: &starts, stops: &stops}
+	if err := e.Register(retry); err != nil {
+		t.Fatalf("Register retry: %v", err)
+	}
+	if err := e.StartAll(); err != nil {
+		t.Fatalf("StartAll retry: %v", err)
+	}
+	e.StopAll()
+	e.StopAll()
+	if !reflect.DeepEqual(stops, []string{"retry", "retry"}) {
+		t.Fatalf("failed stop should retry: %#v", stops)
+	}
+	retry.failStop = false
+	e.StopAll()
+	if !reflect.DeepEqual(stops, []string{"retry", "retry", "retry"}) {
+		t.Fatalf("successful stop should be retained: %#v", stops)
+	}
+}
+
 func TestRegisterCommandAliasFallbackAndInterceptors(t *testing.T) {
 	e := newTestEngine()
 	calls := make([]string, 0)
@@ -204,6 +309,34 @@ func TestLifecycleEventsAndToolSorting(t *testing.T) {
 func newTestEngine() *Engine {
 	cfg := config.Default()
 	return NewEngine(cfg, cfg.ToRuntime(), nil)
+}
+
+type lifecyclePlugin struct {
+	name      string
+	failStart bool
+	failStop  bool
+	starts    *[]string
+	stops     *[]string
+}
+
+func (p *lifecyclePlugin) Name() string { return p.name }
+
+func (p *lifecyclePlugin) Init(*model.Hub) error { return nil }
+
+func (p *lifecyclePlugin) Start() error {
+	*p.starts = append(*p.starts, p.name)
+	if p.failStart {
+		return errors.New("start failed")
+	}
+	return nil
+}
+
+func (p *lifecyclePlugin) Stop() error {
+	*p.stops = append(*p.stops, p.name)
+	if p.failStop {
+		return errors.New("stop failed")
+	}
+	return nil
 }
 
 type testPlugin struct {
