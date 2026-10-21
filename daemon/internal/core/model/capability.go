@@ -61,6 +61,13 @@ const (
 type SessionSource interface {
 	ListSessions() []SessionSummary
 	CurrentSessionID() string
+	// ActiveSessionID 返回 transport 层的活动会话 id：最近一次经 session/new 或
+	// session/load（当前会话）有效声明的 transport UUID。它与 CurrentSessionID
+	// 返回的 store 稳定 id 不同源——前者是连接方自造的会话句柄，后者是持久化
+	// store 的逻辑身份。空 = 尚无 ACP 连接声明过会话（守卫不参与）。
+	// daemon 是单活动会话模型：prompt 一个已被其他连接声明顶掉的 transport 会话
+	// 会在 FrontendHandler.Prompt 被 superseded 守卫拒绝，而非静默串线执行。
+	ActiveSessionID() string
 	SetSession(sessionID, cwd string)
 	ReloadCurrentSession() error
 	CurrentSessionHistory() []SessionUpdate

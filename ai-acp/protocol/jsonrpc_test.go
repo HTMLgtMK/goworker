@@ -32,13 +32,35 @@ func TestNewConnWithOptions(t *testing.T) {
 	if _, err := NewConnWithOptions(nil, ConnOptions{MaxMessageBytes: -1}); err == nil {
 		t.Fatal("negative message limit should fail")
 	}
-	conn, err := NewConnWithOptions(nil, ConnOptions{MaxMessageBytes: 42})
+	if _, err := NewConnWithOptions(nil, ConnOptions{MaxMessageBytes: 42}); err == nil {
+		t.Fatal("nil transport should fail")
+	}
+	rawServer, rawClient := net.Pipe()
+	t.Cleanup(func() { _ = rawClient.Close() })
+	conn, err := NewConnWithOptions(rawServer, ConnOptions{MaxMessageBytes: 42})
 	if err != nil {
 		t.Fatalf("NewConnWithOptions: %v", err)
 	}
 	if conn.maxMessageBytes != 42 {
 		t.Fatalf("max message bytes = %d, want 42", conn.maxMessageBytes)
 	}
+}
+
+func TestNewConnNilTransportPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("NewConn(nil) should panic")
+		}
+		err, ok := r.(error)
+		if !ok {
+			t.Fatalf("panic value = %v, want error", r)
+		}
+		if err.Error() != "acp: nil transport" {
+			t.Fatalf("panic error = %v, want acp: nil transport", err)
+		}
+	}()
+	NewConn(nil)
 }
 
 func TestConn_CallRoundtrip(t *testing.T) {

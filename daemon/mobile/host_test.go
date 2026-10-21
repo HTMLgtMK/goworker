@@ -3,6 +3,7 @@ package mobile
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -187,5 +188,113 @@ func TestHostStartValidatesConfig(t *testing.T) {
 	defer h.Close()
 	if err := h.Start(); err == nil {
 		t.Fatal("Start with broken config: want error")
+	}
+}
+
+// TestHostWriteBlockedCloseStillCloses 白盒复现 P1：app 侧读循环停摆时管道写
+// 无限阻塞，旧实现持 mu 写管道会让 Close 永远拿不到锁（Android 上就是 ANR）。
+// 不绕 app.New，直接手工摆一个无人读的管道对制造确定性阻塞。
+func TestHostWriteBlockedCloseStillCloses(t *testing.T) {
+	cb := &collectCB{closed: make(chan string, 1)}
+	h, err := NewHost("", cb)
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+
+	// 白盒布置：started=true + 无读者的管道 —— 任何 Write 都必然阻塞在管道上。
+	toR, toW := io.Pipe()
+	defer func() { _ = toR.Close() }()
+	h.mu.Lock()
+	h.started = true
+	h.clientW = toW
+	h.mu.Unlock()
+
+	// 卡死的 writer：持有 writeMu 后阻塞在管道写上。
+	errCh := make(chan error, 1)
+	go func() { errCh <- h.Write([]byte(`{"jsonrpc":"2.0","id":1}`)) }()
+
+	// 等 Write 真正占住 writeMu（TryLock 成功说明它还没拿到，重试到拿不到为止）。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.writeMu.TryLock() {
+			h.writeMu.Unlock()
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		break
+	}
+
+	// 核心断言：卡死的 Write 拦不住 Close。旧实现这里必死锁，5 秒看门狗兜底。
+	closeDone := make(chan struct{})
+	go func() { h.Close(); close(closeDone) }()
+	select {
+	case <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close blocked by stuck Write: state lock still starved by pipe I/O")
+	}
+
+	// Close 关了 clientW，卡死的 Write 应以错误返回而非永远悬着。
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("stuck Write after Close: want error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stuck Write not unblocked after Close")
+	}
+
+	// Close 之后的常规 Write 也要报错（生命周期守卫保留）。
+	if err := h.Write([]byte(`{}`)); err == nil {
+		t.Fatal("Write after Close: want error")
+	}
+}
+
+// TestHostWriteCloseRace 真实 Start 下的并发压测：多 goroutine 狂发 Write，
+// 主 goroutine 同时 Close —— 全程 -race，Close 必须能及时收口、无死锁。
+func TestHostWriteCloseRace(t *testing.T) {
+	t.Setenv("GOWORKER_CONFIG_DIR", t.TempDir())
+	cb := &collectCB{closed: make(chan string, 1)}
+	h, err := NewHost("", cb)
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	const writers = 4
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; ; j++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				// 大块 payload 提高管道写阻塞概率，让 Write∥Close 真正撞上。
+				_ = h.Write([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"ping","params":{"pad":"%s"}}`, j, strings.Repeat("x", 4096))))
+			}
+		}()
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	closeDone := make(chan struct{})
+	go func() { h.Close(); close(closeDone) }()
+	select {
+	case <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not finish while writers were active")
+	}
+	close(stop)
+	wg.Wait()
+
+	if err := h.Write([]byte(`{}`)); err == nil {
+		t.Fatal("Write after Close: want error")
 	}
 }

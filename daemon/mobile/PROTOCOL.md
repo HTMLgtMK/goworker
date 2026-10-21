@@ -37,6 +37,12 @@ ZCode dispatcher 共享同一套协议语义（`ai-dispatch/protocol`），区�
 | `session/cancel` | **通知**（无响应）：取消进行中的 prompt —— Android 停止按钮发这个 |
 | `session/set_mode` | 未注册（method-not-found 诚实失败） |
 
+**单活动会话**：daemon 同一时刻只有一个活动会话。连接 B 发 `session/new`（或对
+当前会话 `session/load`）会把连接 A 的会话顶成 superseded，此后 A 再发
+`session/prompt` 返回 -32000 错误（消息含 "no longer active"）——prompt 不会静默
+串到 B 的工作区里执行。客户端收到该错误后应重新 `session/new` 或 `session/load`
+当前会话。
+
 ## 能力协商（initialize）
 
 完整报文示例（客户端视角，逐字段可抄）：

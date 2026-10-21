@@ -67,6 +67,11 @@ type AgentPlugin struct {
 	allowRuleMu sync.Mutex
 	sessionCwd  string // 最近一次有效声明的会话 cwd（绝对路径；空 = 未声明）
 	cwdErr      error  // 最近一次声明的校验错误（nil = 无声明或已通过）
+	// activeTransportSession 是最近一次有效声明的 transport 会话 id（连接方自造
+	// 的 UUID，与 store 的稳定 id 不同源）。空 = 尚无 ACP 会话声明。单活动会话
+	// 模型下它是「谁拥有 daemon 当前活动状态」的记号：FrontendHandler.Prompt 据此
+	// 拒绝已被其他连接顶掉的旧会话，而不是让 prompt 静默串到新声明的工作区里跑。
+	activeTransportSession string
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
@@ -344,6 +349,8 @@ func (p *AgentPlugin) startSession() {
 	// 每个 prompt）；有效声明跨会话保留并应用到新会话 —— 工作区没变，/new 不该
 	// 让工具悄悄回退到别的目录。取舍：不追踪「声明了 cwd 的 transport 会话与
 	// store 会话的对应关系」，单活动会话模型下一律落当前会话。
+	// activeTransportSession 有意不清：/new 只是 REPL 内换掉运行时会话对象，
+	// transport 会话的声明（连同其活动身份）依旧成立，prompt 它不算 superseded。
 	p.mu.Lock()
 	p.cwdErr = nil
 	cwd := p.sessionCwd
@@ -375,10 +382,25 @@ func (p *AgentPlugin) SetSession(sessionID, cwd string) {
 	}
 	p.mu.Lock()
 	p.sessionCwd, p.cwdErr = cwd, nil
+	// 有效声明（含空 cwd 的「未声明」重置）才转移活动会话标记。取舍：无效声明
+	// 不能顶掉别连接的好会话——B 连接的坏 session/new 若同时转移 active，A 的
+	// 好会话会被顶成 superseded 而无法 prompt；保持不动则与 prompt 侧的 cwdErr
+	// 防线一致（B 的 prompt 本来就会被拒）。
+	p.activeTransportSession = sessionID
 	p.mu.Unlock()
 	if s := p.session.Load(); s != nil {
 		s.SetCWD(cwd)
 	}
+}
+
+// ActiveSessionID 实现 model.SessionSource 的 transport 活动会话语义：返回最近
+// 一次经 session/new|load 有效声明的 transport 会话 id（锁内快照，空 = 未声明）。
+// 注意与 CurrentSessionID 的区别：那边是 store 的稳定逻辑 id，这边是连接方
+// 自造的会话句柄；FrontendHandler.Prompt 用它做 superseded 守卫。
+func (p *AgentPlugin) ActiveSessionID() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.activeTransportSession
 }
 
 // validateSessionCWD 校验声明的 cwd 是否落在 sandbox 边界内。

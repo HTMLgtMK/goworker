@@ -118,6 +118,9 @@ func NewConn(rwc io.ReadWriteCloser) *Conn {
 
 // NewConnWithOptions 使用显式配置创建连接。
 func NewConnWithOptions(rwc io.ReadWriteCloser, options ConnOptions) (*Conn, error) {
+	if rwc == nil {
+		return nil, errors.New("acp: nil transport")
+	}
 	if options.MaxMessageBytes <= 0 {
 		return nil, fmt.Errorf("acp: max message bytes must be positive: %d", options.MaxMessageBytes)
 	}

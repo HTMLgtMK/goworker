@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"path/filepath"
 
+	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 	acpservice "github.com/tinguo/goworker/daemon/internal/core/service/acp"
@@ -112,9 +113,21 @@ func newACPService(options acpServiceOptions) (*acpservice.Service, error) {
 		listenerFactory = newACPUnixListenerFactory(options.socketPath, options.logger)
 	}
 
+	// 无会话数据源时显式关闭 loader/lister 自动发现：FrontendHandler 静态实现
+	// 了这两个接口，auto-discovery 会让 initialize 通告 loadSession，客户端随即
+	// 协商一个调用必然失败的能力。
+	var serverOptions []aiacp.ServerOption
+	if options.sessions == nil {
+		serverOptions = append(serverOptions,
+			aiacp.WithSessionLoader(nil),
+			aiacp.WithSessionLister(nil),
+		)
+	}
+
 	return acpservice.NewService(
 		acpservice.NewFrontendHandlerFactory(options.evaluate, options.commands, options.sessions),
 		listenerFactory,
+		serverOptions...,
 	), nil
 }
 

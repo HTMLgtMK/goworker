@@ -51,8 +51,14 @@ func (c *pipeConn) Close() error {
 // 进程内服务 ACP 协议，Kotlin 经 Write/OnData 与之全双工通信。非并发安全：
 // Close 之后 Host 不可再用；Write 需在 Start 之后。
 type Host struct {
+	// mu 只守生命周期状态（started/closed/clientW/pumpR/appl），绝不跨管道
+	// I/O 持有 —— 管道写可能因对端停摆而无限阻塞，锁里等它 = ANR。
 	mu sync.Mutex
 	cb Callbacks
+
+	// writeMu 专管上行 I/O：序列化 chunk+'\n' 两段写保证一帧不交错。
+	// Close 刻意不碰它 —— 关 clientW 就能解救卡在管道上的 Write。
+	writeMu sync.Mutex
 
 	appl *app.Application
 
@@ -126,6 +132,10 @@ func (h *Host) Start() (err error) {
 
 // Write 发送一条 client→app 的 JSON-RPC 消息。Host 负责帧定界：
 // 每次 Write 追加 '\n' —— 一次 Write 一条完整消息，chunk 无需自带换行。
+//
+// 两段式加锁：先在 mu 下校验状态并快照写端（绝不持 mu 等管道），再在 writeMu
+// 下真正落笔。Close 随时可以拿 mu 关 clientW —— 卡在管道上的 Write 会立刻
+// 以 ErrClosedPipe 醒来，而不是抱着状态锁把 Close 一起拖死。
 func (h *Host) Write(chunk []byte) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -133,14 +143,19 @@ func (h *Host) Write(chunk []byte) (err error) {
 		}
 	}()
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if !h.started || h.closed {
+		h.mu.Unlock()
 		return errors.New("host not running")
 	}
-	if _, err := h.clientW.Write(chunk); err != nil {
+	w := h.clientW
+	h.mu.Unlock()
+
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	if _, err := w.Write(chunk); err != nil {
 		return fmt.Errorf("write acp pipe: %w", err)
 	}
-	if _, err := h.clientW.Write([]byte{'\n'}); err != nil {
+	if _, err := w.Write([]byte{'\n'}); err != nil {
 		return fmt.Errorf("write acp frame: %w", err)
 	}
 	return nil
@@ -151,6 +166,8 @@ func (h *Host) Write(chunk []byte) (err error) {
 // （services → engine → log）—— Stop 会等活跃 prompt 取消完成，可能阻塞，
 // 这是有意的收口语义；期间 acp service 收口会关闭管道对端，pump 读到 EOF
 // 退出并触发 OnClose。
+// 锁纪律：Close 只拿 mu、刻意不碰 writeMu —— 因此无论 Write 卡在管道上
+// 还是排在 I/O 锁后，都拦不住 Close 关端点解救它们（这也是拆锁的意义）。
 func (h *Host) Close() {
 	defer func() {
 		if r := recover(); r != nil {

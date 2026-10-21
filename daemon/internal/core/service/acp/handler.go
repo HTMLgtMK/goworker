@@ -21,8 +21,8 @@ type Evaluator = func(ctx *model.Context, input string) error
 // daemon 语义：
 //
 //   - CreateSession：登记本连接可 prompt 的 session，声明 cwd，下发命令补全；
-//   - Prompt：known/read-only 守卫 → 命令输出围栏 + token→update 映射 + HITL
-//     授权经 Reporter.RequestPermission（model.DecideViaACP）；
+//   - Prompt：known/read-only/superseded 守卫 → 命令输出围栏 + token→update 映射、
+//     HITL 授权经 Reporter.RequestPermission（model.DecideViaACP）；
 //   - LoadSession：当前会话 reload+重放（进可 prompt 集合），归档只读重放
 //     （进只读集合，prompt 诚实报错），未知会话报错；
 //   - ListSessions/SessionModes：domain → wire 映射转发。
@@ -133,7 +133,9 @@ func deviceToolSource(reporter aiacp.Reporter) func(ctx context.Context) []core.
 }
 
 // Prompt 实现 aiacp.SessionHandler。流程：归档只读守卫
-// → 未知会话守卫 → 命令输出围栏 + token 映射 + HITL 授权 → evaluate → 闭合围栏。
+// → 未知会话守卫 → superseded 守卫（单活动会话模型：已被其他连接的 session/new|load
+// 顶掉的会话诚实报错，而非让 prompt 静默串到新活动会话的工作区里执行）
+// → 命令输出围栏 + token 映射 + HITL 授权 → evaluate → 闭合围栏。
 func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt []protocol.ContentBlock, reporter aiacp.Reporter) (string, error) {
 	promptable, readOnly := h.membership(sessionID)
 	if readOnly {
@@ -147,6 +149,14 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 		return "", &protocol.RPCError{
 			Code:    -32000,
 			Message: fmt.Sprintf("acp frontend: unknown session %q", sessionID),
+		}
+	}
+	if h.sessions != nil {
+		if active := h.sessions.ActiveSessionID(); active != "" && active != sessionID {
+			return "", &protocol.RPCError{
+				Code:    -32000,
+				Message: fmt.Sprintf("acp frontend: session %q is no longer active (current active session %q); single-session daemon — create a new session or load the current one", sessionID, active),
+			}
 		}
 	}
 

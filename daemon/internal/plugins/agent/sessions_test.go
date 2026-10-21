@@ -832,6 +832,78 @@ func TestAgentPlugin_SessionModesFromConfig(t *testing.T) {
 	}
 }
 
+// TestAgentPlugin_ActiveSessionIDSemantics 验证 transport 活动会话标记的三条规则：
+// 有效声明转移、无效声明不顶掉（B 连接的坏 session/new 不能把 A 的好会话顶成
+// superseded）、空 cwd 的有效声明同样算数，以及 /new（startSession 重建）不清空。
+func TestAgentPlugin_ActiveSessionIDSemantics(t *testing.T) {
+	boundary := t.TempDir()
+	inside := filepath.Join(boundary, "project")
+	if err := os.MkdirAll(inside, 0o700); err != nil {
+		t.Fatalf("mkdir inside: %v", err)
+	}
+	outside := t.TempDir()
+
+	dir := t.TempDir()
+	st, err := session.Open(dir)
+	if err != nil {
+		t.Fatalf("session open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	cfg := &runtimeconfig.Config{
+		Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir},
+		Sandbox: sandbox.SandboxConfig{AllowedWorkDir: boundary},
+	}
+	p := withStore(cfg, st)
+	p.session.Store(runtimeagent.NewSession(runtimeagent.SessionDeps{Config: cfg, Store: st}))
+
+	if got := p.ActiveSessionID(); got != "" {
+		t.Fatalf("ActiveSessionID before any declaration = %q, want empty", got)
+	}
+
+	// 有效声明转移活动标记
+	p.SetSession("t1", inside)
+	if got := p.ActiveSessionID(); got != "t1" {
+		t.Fatalf("ActiveSessionID after valid declaration = %q, want t1", got)
+	}
+	if err := p.sessionCWDError(); err != nil {
+		t.Fatalf("valid cwd rejected: %v", err)
+	}
+
+	// 无效声明不顶掉：active 保持 t1，cwdErr 记无效标记（prompt 侧防线）
+	p.SetSession("t2", outside)
+	if got := p.ActiveSessionID(); got != "t1" {
+		t.Fatalf("ActiveSessionID after invalid declaration = %q, want t1 (not displaced)", got)
+	}
+	if err := p.sessionCWDError(); err == nil || !strings.Contains(err.Error(), "invalid session cwd") {
+		t.Fatalf("invalid declaration cwdErr = %v, want invalid session cwd", err)
+	}
+
+	// 空 cwd 的有效声明同样算数（「未声明」重置语义，与 cwd 清空一致）
+	p.SetSession("t3", "")
+	if got := p.ActiveSessionID(); got != "t3" {
+		t.Fatalf("ActiveSessionID after empty-cwd declaration = %q, want t3", got)
+	}
+	if err := p.sessionCWDError(); err != nil {
+		t.Fatalf("empty-cwd declaration cwdErr = %v, want nil", err)
+	}
+
+	// /new（startSession 重建会话）：活动标记跨会话保留，cwd 声明沿用
+	p.SetSession("t4", inside)
+	p.startSession()
+	if got := p.ActiveSessionID(); got != "t4" {
+		t.Fatalf("ActiveSessionID after startSession = %q, want t4 (survives /new reset)", got)
+	}
+	if err := p.sessionCWDError(); err != nil {
+		t.Errorf("cwdErr after startSession = %v, want nil (invalid marker cleared)", err)
+	}
+	if got := p.currentSessionCwd(); got != inside {
+		t.Errorf("sessionCwd after startSession = %q, want %q (valid declaration carries over)", got, inside)
+	}
+}
+
 // withStore 测试构造辅助：atomic.Pointer 字段无法在 struct 字面量里直接赋值。
 func withStore(cfg *runtimeconfig.Config, st *session.Store) *AgentPlugin {
 	p := &AgentPlugin{cfg: cfg}

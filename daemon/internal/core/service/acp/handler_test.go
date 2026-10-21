@@ -3,6 +3,7 @@ package acp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -39,9 +40,12 @@ func (r *recordingReporter) RequestPermission(context.Context, string, protocol.
 }
 
 // fakeSessionSource 是脚本化的 model.SessionSource，供 adapter 测试注入。
+// SetSession 无条件转移 active（不建模 cwd 校验——校验与「无效声明不顶掉」
+// 语义归 AgentPlugin 侧测试）。
 type fakeSessionSource struct {
 	mu              sync.Mutex
 	currentID       string
+	activeID        string
 	setSessionCalls []string
 	reloadErr       error
 	currentHistory  []model.SessionUpdate
@@ -66,6 +70,13 @@ func (f *fakeSessionSource) SetSession(sessionID, cwd string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.setSessionCalls = append(f.setSessionCalls, sessionID+"|"+cwd)
+	f.activeID = sessionID
+}
+
+func (f *fakeSessionSource) ActiveSessionID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.activeID
 }
 
 func (f *fakeSessionSource) ReloadCurrentSession() error {
@@ -448,4 +459,83 @@ func TestPromptOmitsDeviceToolSourceWithoutCapability(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPromptSupersededSessionGuard 单活动会话模型的诚实守卫：两条连接共享同一
+// SessionSource（与装配层接线一致），后声明者顶掉先声明者。fake 的 SetSession
+// 无条件转移 active，cwd 校验与「无效声明不顶掉」语义归 AgentPlugin 侧测试。
+func TestPromptSupersededSessionGuard(t *testing.T) {
+	newHandler := func(sessions *fakeSessionSource) *FrontendHandler {
+		return &FrontendHandler{
+			evaluate: func(ctx *model.Context, input string) error { return nil },
+			sessions: sessions,
+		}
+	}
+	reporter := &recordingReporter{}
+
+	t.Run("same connection prompt passes", func(t *testing.T) {
+		handler := newHandler(&fakeSessionSource{})
+		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp"}, reporter); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		if _, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt active session = %v, want silent guard", err)
+		}
+	})
+
+	t.Run("second connection displaces first", func(t *testing.T) {
+		sessions := &fakeSessionSource{}
+		a, b := newHandler(sessions), newHandler(sessions)
+		if err := a.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp/a"}, reporter); err != nil {
+			t.Fatalf("CreateSession s1: %v", err)
+		}
+		if err := b.CreateSession(context.Background(), "s2", protocol.NewSessionRequest{Cwd: "/tmp/b"}, reporter); err != nil {
+			t.Fatalf("CreateSession s2: %v", err)
+		}
+
+		// A 的旧会话已被 B 的声明顶掉：prompt s1 诚实报 superseded，绝不静默串线执行
+		_, err := a.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter)
+		var rpcErr *protocol.RPCError
+		if !errors.As(err, &rpcErr) {
+			t.Fatalf("Prompt superseded = %v, want *protocol.RPCError", err)
+		}
+		if rpcErr.Code != -32000 {
+			t.Errorf("code = %d, want -32000", rpcErr.Code)
+		}
+		if !strings.Contains(rpcErr.Message, `"s2"`) {
+			t.Errorf("message = %q, want mention of current active session s2", rpcErr.Message)
+		}
+
+		// B 的活动会话照常 prompt
+		if _, err := b.Prompt(context.Background(), "s2", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt current active session = %v", err)
+		}
+	})
+
+	t.Run("load current displaces", func(t *testing.T) {
+		sessions := &fakeSessionSource{currentID: "s2"}
+		handler := newHandler(sessions)
+		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp/a"}, reporter); err != nil {
+			t.Fatalf("CreateSession s1: %v", err)
+		}
+		// 对 s2 的 load-current 同样经 SetSession 声明，顶掉 s1 的活动身份
+		if err := handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "s2", Cwd: "/tmp"}, reporter); err != nil {
+			t.Fatalf("LoadSession s2: %v", err)
+		}
+		_, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter)
+		var rpcErr *protocol.RPCError
+		if !errors.As(err, &rpcErr) || rpcErr.Code != -32000 || !strings.Contains(rpcErr.Message, `"s2"`) {
+			t.Fatalf("Prompt s1 after load-current s2 = %v, want -32000 superseded error mentioning s2", err)
+		}
+	})
+
+	t.Run("empty active skips guard", func(t *testing.T) {
+		sessions := &fakeSessionSource{} // activeID 空 = 从未有 ACP 会话声明
+		handler := newHandler(sessions)
+		// 不走 CreateSession（那会经 SetSession 声明活动会话），直接记入可 prompt 集合
+		handler.remember("s1")
+		if _, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt with empty active = %v, want guard skipped", err)
+		}
+	})
 }

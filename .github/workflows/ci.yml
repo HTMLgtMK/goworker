@@ -101,7 +101,9 @@ jobs:
 
             if [ "$variant" = "dispatcher" ] || [ "$variant" = "minimal" ]; then
               deps=$(cd daemon && go list -deps "${tag_args[@]}" ./cmd/goworker)
-              if grep -Eq 'daemon/internal/plugins/agent|daemon/internal/core/service' <<< "$deps"; then
+              # 只禁 Agent 实现包。core/service 是所有变体共用的 ACP 服务装配层，
+              # 轻量壳也会合法引用它，不能进黑名单。
+              if grep -Eq 'daemon/internal/plugins/agent' <<< "$deps"; then
                 echo "::error::$variant 仍依赖 Agent 实现包"
                 exit 1
               fi

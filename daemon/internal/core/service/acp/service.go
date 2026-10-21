@@ -22,6 +22,9 @@ type HandlerFactory func() aiacp.SessionHandler
 type Service struct {
 	handlerFactory  HandlerFactory
 	listenerFactory ListenerFactory
+	// serverOptions 逐连接透传给 aiacp.NewServer。装配层用它关闭 handler
+	// 静态接口的自动发现（如无 SessionSource 时禁用 loadSession 能力通告）。
+	serverOptions []aiacp.ServerOption
 
 	mu       sync.Mutex
 	listener Listener
@@ -39,11 +42,13 @@ func (s *Service) Name() string { return "acp" }
 
 // NewService constructs a stopped service. The factories must implement only
 // the transport and ai-acp SessionHandler contracts; daemon task/session routing
-// remains an application concern.
-func NewService(handlerFactory HandlerFactory, listenerFactory ListenerFactory) *Service {
+// remains an application concern. serverOptions are applied to every accepted
+// peer's aiacp.Server in addition to the default handler auto-discovery.
+func NewService(handlerFactory HandlerFactory, listenerFactory ListenerFactory, serverOptions ...aiacp.ServerOption) *Service {
 	return &Service{
 		handlerFactory:  handlerFactory,
 		listenerFactory: listenerFactory,
+		serverOptions:   serverOptions,
 		peers:           make(map[*aiacp.Server]struct{}),
 		done:            make(chan struct{}),
 	}
@@ -90,8 +95,8 @@ func (s *Service) Start() error {
 
 // Start is also available as a convenience for one-shot composition roots.
 // The returned service owns the listener and must be stopped.
-func Start(handlerFactory HandlerFactory, listenerFactory ListenerFactory) (*Service, error) {
-	service := NewService(handlerFactory, listenerFactory)
+func Start(handlerFactory HandlerFactory, listenerFactory ListenerFactory, serverOptions ...aiacp.ServerOption) (*Service, error) {
+	service := NewService(handlerFactory, listenerFactory, serverOptions...)
 	if err := service.Start(); err != nil {
 		return nil, err
 	}
@@ -180,7 +185,7 @@ func (s *Service) accept(conn io.ReadWriteCloser) {
 		slog.Error("acp: handler factory returned nil")
 		return
 	}
-	server, err := aiacp.NewServer(conn, handler)
+	server, err := aiacp.NewServer(conn, handler, s.serverOptions...)
 	if err != nil {
 		_ = conn.Close()
 		slog.Error("failed to create ACP server", "error", err)

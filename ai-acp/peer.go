@@ -46,8 +46,21 @@ type closingTransport struct {
 	closeErr  error
 }
 
+// Close closes the embedded transport first (unblocking the peer's read
+// loop), then runs the close hook (e.g. reaping a child process). Exactly
+// one caller performs both; the rest receive the combined error.
 func (t *closingTransport) Close() error {
-	t.closeOnce.Do(func() { t.closeErr = t.closeFn() })
+	t.closeOnce.Do(func() {
+		var transportErr error
+		if t.ReadWriteCloser != nil {
+			transportErr = t.ReadWriteCloser.Close()
+		}
+		var hookErr error
+		if t.closeFn != nil {
+			hookErr = t.closeFn()
+		}
+		t.closeErr = errors.Join(transportErr, hookErr)
+	})
 	return t.closeErr
 }
 
