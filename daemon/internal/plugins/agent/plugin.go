@@ -50,7 +50,7 @@ type AgentPlugin struct {
 	deps runtimeagent.SessionDeps
 	// session 是当前会话。NewSession 创建（Init 一次 + /new 一次）；/new 用新实例替换，
 	// 旧会话状态（conversation/usage）随对象回收。
-	// 两者用 atomic.Pointer：/new 在 REPL goroutine 上换指针，vscode ingress 的
+	// 两者用 atomic.Pointer：/new 在 REPL goroutine 上换指针，ACP service 的
 	// session/list|load 与各命令 handler 在别的 goroutine 上读（评审 I4），
 	// 裸指针读写是没有 happens-before 的数据竞争。
 	session    atomic.Pointer[runtimeagent.Session]

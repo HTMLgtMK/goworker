@@ -30,7 +30,7 @@ ai-runtime/                     [module github.com/tinguo/goworker/ai-runtime] �
   mcp/ skills/ logger/ fakeserver/
 
 daemon/                         [module github.com/tinguo/goworker/daemon] agent 后端 + 前端壳 + dispatcher 宿主
-  cmd/goworker/main.go          # CLI 壳：app.New 装配 + `acp` worker 模式 + stdin/vscode 前端 + OS 信号
+  cmd/goworker/main.go          # CLI 壳：app.New 装配 + `acp` worker 模式 + stdin 前端 + OS 信号
   mobile/                       # Android Agent-only 壳（gobind Host + ACP 管道桥）
   internal/app/                 # 装配层：Application（配置→日志→Engine→RegisterPlugins→StartAll→Stop）
   internal/app/config/          # 顶层平铺 config.yaml 解析 + ToRuntime/ApplyRuntime + SaveConfig
@@ -39,7 +39,7 @@ daemon/                         [module github.com/tinguo/goworker/daemon] agent
   internal/core/acpworker/      # 轻量 ACP worker 与设备 Tool relay（不实例化内置插件）
   internal/plugins/agent/       # /agent 插件：Session 装配、命令注册、生命周期
   internal/plugins/dispatcher/  # dispatcher 插件：/dispatch /workers、ACP ingress、HITL 审批
-  internal/cli/                 # stdin REPL + vscode ACP 前端 + statusbar（addon 订阅 ai-runtime 事件）
+  internal/cli/                 # stdin REPL + statusbar（addon 订阅 ai-runtime 事件）；外部编辑器经 internal/core/service/acp 的 frontend/acp.sock 接入
 ```
 
 依赖方向（禁止反向）：

@@ -14,7 +14,7 @@ import (
 //
 // 这些函数把 daemon domain 类型（model.SessionSummary / SessionUpdate /
 // SessionModeState / core.Token / model.Command）映射为 ACP wire DTO，是
-// FrontendHandler 的序列化层。VS Code ingress 迁移后复用同一套映射，不再自持。
+// FrontendHandler 的序列化层。
 
 // SessionInfoFromDomain 把 daemon 会话摘要映射为 wire SessionInfo。domain 的
 // Active 是业务标记，不进 wire DTO（ACP SessionInfo 保持纯协议语义）。

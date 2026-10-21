@@ -35,19 +35,12 @@ type Config struct {
 }
 
 type FrontendConfig struct {
-	Stdin  StdinConfig          `yaml:"stdin"`
-	Vscode VscodeFrontendConfig `yaml:"vscode"`
-	ACP    ACPFrontendConfig    `yaml:"acp"`
+	Stdin StdinConfig       `yaml:"stdin"`
+	ACP   ACPFrontendConfig `yaml:"acp"`
 }
 
 type StdinConfig struct {
 	Theme string `yaml:"theme"` // "default" 或主题 JSON 文件路径
-}
-
-// VscodeFrontendConfig 是 VS Code ACP socket 前端的解析层配置。
-type VscodeFrontendConfig struct {
-	Enabled bool   `yaml:"enabled"`          // false = 不启动 vscode ACP 前端（默认 true）
-	Socket  string `yaml:"socket,omitempty"` // 完整 Unix socket 路径；空 = main 按 DefaultDir 派生
 }
 
 // ACPFrontendConfig 是 daemon 主会话 ACP service 的解析层配置。
@@ -161,12 +154,6 @@ func (c *Config) ToRuntime() *runtimeconfig.Config {
 		Session:  c.Session,
 		MCP:      c.MCP,
 		Dispatch: c.Dispatch,
-		Frontend: runtimeconfig.FrontendConfig{
-			Vscode: runtimeconfig.VscodeFrontendConfig{
-				Enabled: c.Frontend.Vscode.Enabled,
-				Socket:  c.Frontend.Vscode.Socket,
-			},
-		},
 	}
 }
 
@@ -178,10 +165,6 @@ func (c *Config) ApplyRuntime(r *runtimeconfig.Config) {
 	c.MCP = r.MCP
 	c.Dispatch = r.Dispatch
 	c.Sandbox = fromSandbox(r.Sandbox)
-	c.Frontend.Vscode = VscodeFrontendConfig{
-		Enabled: r.Frontend.Vscode.Enabled,
-		Socket:  r.Frontend.Vscode.Socket,
-	}
 }
 
 // ---- 默认值 ----
@@ -195,8 +178,6 @@ func Default() *Config {
 	return &Config{
 		Frontend: FrontendConfig{
 			Stdin: StdinConfig{Theme: "default"},
-			// vscode ACP 前端默认开启；socket 路径留空，由 main 按 DefaultDir 派生
-			Vscode: VscodeFrontendConfig{Enabled: true},
 			// daemon 主会话 ACP service 默认开启；socket 路径留空，由 app 按 DefaultDir 派生
 			ACP: ACPFrontendConfig{Enabled: true},
 		},

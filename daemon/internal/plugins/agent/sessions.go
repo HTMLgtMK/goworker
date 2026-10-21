@@ -1,6 +1,6 @@
 // sessions.go 提供 agent 插件的会话清单与元数据能力：扫描 Session.Dir（current.jsonl +
 // archive/*.jsonl）产出 ACP session/list 的会话摘要、session/new|load 响应的 modes
-// 状态与归档只读重放，供 vscode ACP 前端做会话列表、load 判定与模型显示。
+// 状态与归档只读重放，供主会话 ACP service 做会话列表、load 判定与模型显示。
 // 只读扫描：不取 store.mu、不触发 Archive、归档文件只读打开
 // ——清单绝不干扰运行中的 store（追加中的半行按坏行跳过，与 store.loadRecords 同策略）。
 package service
@@ -63,7 +63,7 @@ func (p *AgentPlugin) ListSessions() []model.SessionSummary {
 	return out
 }
 
-// SessionModes 实现 modes 探测（经 vscode ingress 委托给 dispatch.Server）：
+// SessionModes 实现 modes 探测（经 ACP service 委托给 dispatch.Server）：
 // 数据源 cfg.LLM，只显示不切换 —— currentModeId = default_provider，
 // availableModes = providers 按名字排序（id = provider 名，name = "名 (model)"，
 // description 留空）。无 providers 或无配置返回 nil（响应省略 modes）。
@@ -115,7 +115,7 @@ func (p *AgentPlugin) ReloadCurrentSession() error {
 }
 
 // CurrentSessionHistory 导出当前会话的完整对话历史，映射为 ACP session/update
-// 通知序列，供 vscode 前端在 session/load 返回响应前向客户端重放。数据源
+// 通知序列，供 ACP service 在 session/load 返回响应前向客户端重放。数据源
 // store.ActiveView()（store 锁内取只读快照，单活动会话模型下即当前视图），
 // 经 replayUpdates 管线（与归档只读查看共用）输出。
 //

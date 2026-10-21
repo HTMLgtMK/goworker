@@ -132,7 +132,7 @@ func deviceToolSource(reporter aiacp.Reporter) func(ctx context.Context) []core.
 	}
 }
 
-// Prompt 实现 aiacp.SessionHandler。流程对齐 vscode ingress.Run：归档只读守卫
+// Prompt 实现 aiacp.SessionHandler。流程：归档只读守卫
 // → 未知会话守卫 → 命令输出围栏 + token 映射 + HITL 授权 → evaluate → 闭合围栏。
 func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt []protocol.ContentBlock, reporter aiacp.Reporter) (string, error) {
 	promptable, readOnly := h.membership(sessionID)

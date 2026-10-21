@@ -33,9 +33,11 @@ daemon/                        ← agent backend: engine + plugins + shell per f
 │  ├── internal/core/          ← engine + model（通用 Plugin/Capability 协议）
 │  ├── internal/plugins/agent/ ← Agent 内置插件（可由 Build Tag 裁剪）
 │  ├── internal/plugins/dispatcher/ ← Dispatcher 内置插件（可由 Build Tag 裁剪）
-│  └── internal/cli/           ← stdin REPL + vscode ACP frontend + statusbar (subscribes ai-runtime events)
+│  └── internal/cli/           ← stdin REPL + statusbar (subscribes ai-runtime events); external editors connect via the app ACP service (frontend/acp.sock)
 docs/architecture.md           ← detailed architecture doc
 docs/dispatcher.md             ← dispatcher design (ACP dual-role, worktree isolation, HITL merge)
+docs/vscode-acp-integration.md ← VS Code 扩展接入对接（frontend/acp.sock、能力协商）
+daemon/mobile/PROTOCOL.md      ← ACP 客户端协议契约（能力协商、session 面、x-device 设备能力扩展）
 ```
 
 ```
@@ -54,7 +56,7 @@ daemon ──→ ai-runtime ──→ ai-core ──→ (zero goworker deps)
 - **Command** — slash commands like `/help`, `/agent`, `/model`.
 - **ReAct Agent** — Think→Act→Observe loop with multi-provider LLM (OpenAI-compatible / Anthropic Messages) + tool calling; thinking tokens stream end-to-end.
 - **Dispatcher** — commit-dispatching center as a plugin: accepts tasks (REPL `/dispatch` or external ACP clients), drives worker agents (Claude Code / Codex / ZCode) over ACP in isolated git worktrees, gates every merge behind human review.
-- **ACP dual role** — goworker speaks the Agent Client Protocol on both sides: as Client it spawns worker agents; as Agent it accepts task submissions (`<config-dir>/dispatch/acp.sock`) and exposes itself as a worker via `goworker acp`.
+- **ACP dual role** — goworker speaks the Agent Client Protocol on both sides: as Client it spawns worker agents; as Agent it serves the main conversation to external editors over `<config-dir>/frontend/acp.sock` (same service Android connects to in-process), accepts task submissions (`<config-dir>/dispatch/acp.sock`), and exposes itself as a worker via `goworker acp`. Client-facing protocol contract: [`daemon/mobile/PROTOCOL.md`](daemon/mobile/PROTOCOL.md).
 
 ### Agent Plugin
 

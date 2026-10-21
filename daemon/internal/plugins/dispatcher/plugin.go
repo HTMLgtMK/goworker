@@ -43,7 +43,7 @@ type DispatcherPlugin struct {
 	running map[string]context.CancelFunc
 	wg      sync.WaitGroup
 	// transitionMu 串行化任务终态迁移（approve/reject/cancel/complete）：
-	// 这些操作都是 Get→检查→Transition→Update，无 CAS 时 REPL 与 vscode
+	// 这些操作都是 Get→检查→Transition→Update，无 CAS 时 REPL 与 ACP service
 	// 并发 approve+reject 会以最后写入者获胜，被拒任务可能变成 done（评审 I1）。
 	transitionMu sync.Mutex
 
@@ -992,7 +992,7 @@ func (p *DispatcherPlugin) updateTask(t *task.Task) error {
 // taskID 为空时 "ask" 退化为拒绝（ask 需要任务身份才能定位订阅者）。
 // runCtx 用于把任务取消传导进挂起的权限 fan-out：jsonrpc 的请求 ctx 不随
 // 任务取消（见 protocol.Conn.dispatch），不并上去的话 cancel 期间挂在
-// vscode 观察者上的提问会一直等用户答复（评审 I2）。
+// ACP 观察者上的提问会一直等用户答复（评审 I2）。
 func (p *DispatcherPlugin) runOptions(worker, taskID string, runCtx context.Context) []dispatch.RunOption {
 	w, ok := p.cfg.Dispatch.Worker(worker)
 	if !ok {
@@ -1290,7 +1290,7 @@ func (p *DispatcherPlugin) handleApprove(ctx *model.Context, id string) error {
 }
 
 func (p *DispatcherPlugin) doApprove(execCtx context.Context, id string, write func(string)) {
-	// 状态迁移串行化：REPL 与 vscode 可能并发 approve/reject，无锁时
+	// 状态迁移串行化：REPL 与 ACP service 可能并发 approve/reject，无锁时
 	// Get→检查→Transition→Update 各自基于过期快照，被拒任务可能被 approve
 	// 的后写覆盖成 done（评审 I1）。锁住整个迁移段，慢操作（ff 合并）也在此
 	// 段内 —— 并发审批是人工节奏，串行可接受。
