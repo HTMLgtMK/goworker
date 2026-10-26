@@ -40,22 +40,22 @@ type AgentPlugin struct {
 	cfg   *runtimeconfig.Config
 	paths runtimeconfig.Paths
 	hub   *model.Hub
-	// runSession 是当前会话的独占执行权持有者（SessionRuntime 的容量 1 gate；
-	// P0-4 起由 SessionManager 注册管理）。会话类命令 handler —— /agent /new
-	// /compact /usage /history /task /rewind 共 7 个 —— 全部经 withSession 在它
-	// 上面排队，同一时刻只有一个命令回合在跑。agent 运行期间 collectTools 嵌套
-	// hub.Eval 执行这些命令时，靠 sessionGateKey ctx 重入标记放行（见 withSession），
-	// 绝不在持有 gate 时重复排队（重复取锁即死锁）。
-	runSession *runtimeagent.SessionRuntime
+	// manager 是多会话执行内核的注册表（§1.1 路由规则的解析点之一）：每个会话
+	// 一个 SessionRuntime（独占执行权 gate + 运行记账），经 startSession 注册。
+	// P0-4 阶段 runtime id 固定 "current" 单例，/new 重建时同 id 注册冲突、旧
+	// runtime 保留在册（归档固化窗口内仍可 Get 触达）；P1-3 起 id 换 store 的
+	// 真实 SessionID，新旧 runtime 以不同 id 共存。互斥不直接经过 manager——
+	// 命令一律经 currentSession() 解析出 runtime 再在其 gate 上排队。
+	manager *runtimeagent.SessionManager
+	// current 是当前会话的 runtime。atomic.Pointer：/new 在 REPL goroutine 上换
+	// 指针，ACP service 的 session/list|load 与各命令 handler 在别的 goroutine 上
+	// 读（评审 I4），裸指针读写是没有 happens-before 的数据竞争。会话本体经
+	// currentSession().Session() 取，不再单独持有裸 Session 指针（P0-4 起退役）。
+	current atomic.Pointer[runtimeagent.SessionRuntime]
 	// deps 是 Session 的资源依赖，startSession 每次会话边界全量重建（含指令快照），
-	// /new 经同一路径刷新后以新 deps 创建新会话。
-	deps runtimeagent.SessionDeps
-	// session 是当前会话。NewSession 创建（Init 一次 + /new 一次）；/new 用新实例替换，
-	// 旧会话状态（conversation/usage）随对象回收。
-	// 两者用 atomic.Pointer：/new 在 REPL goroutine 上换指针，ACP service 的
-	// session/list|load 与各命令 handler 在别的 goroutine 上读（评审 I4），
-	// 裸指针读写是没有 happens-before 的数据竞争。
-	session    atomic.Pointer[runtimeagent.Session]
+	// /new 经同一路径刷新后以新 deps 创建新会话；per-session Store 的拆分属 P1-3，
+	// 本字段在 P0+P1 全程保持 startSession 全量重建语义。
+	deps       runtimeagent.SessionDeps
 	store      atomic.Pointer[session.Store] // nil = 持久化禁用
 	skills     []skills.Skill                // Init 时加载的 skill 清单，注册为 skill_* 工具
 	mcpClients map[string]mcp.Client         // server name → 连接，Stop 时统一关闭
@@ -78,8 +78,29 @@ type AgentPlugin struct {
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
 // 插件不再从 model.Hub.Config 读配置（Hub.Config 已 any 化）——配置与路径全部构造函数注入。
+// 会话 runtime 不在此创建：首个（及后续每个）SessionRuntime 由 startSession 在
+// 会话边界上构造并注册进 manager；此前 currentSession() 返回 nil，命令报
+// 「no active session」（命令本就要等 Init 完成后才可派发）。
 func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *AgentPlugin {
-	return &AgentPlugin{cfg: cfg, paths: paths, runSession: runtimeagent.NewSessionRuntime("current", nil)}
+	return &AgentPlugin{cfg: cfg, paths: paths, manager: runtimeagent.NewSessionManager()}
+}
+
+// currentSession 返回当前会话的 runtime——§1.1 路由规则（命令按 SessionID 路由的
+// 兼容适配器）的统一解析点：内部即 p.current.Load()，nil = 尚无活动会话（Init
+// 未完成或 Init 失败回滚），调用方按约定报「no active session」。P5 显式
+// SessionID 到来时，各 handler 只需把这里换成 p.manager.Get(sid)，命令签名与
+// 互斥结构不变。
+func (p *AgentPlugin) currentSession() *runtimeagent.SessionRuntime {
+	return p.current.Load()
+}
+
+// boundSession 返回当前会话本体（currentSession().Session() 的 nil 防护组合）：
+// 无活动 runtime 或 runtime 未绑定 Session 时返回 nil，取数点据此跳过会话操作。
+func (p *AgentPlugin) boundSession() *runtimeagent.Session {
+	if rt := p.currentSession(); rt != nil {
+		return rt.Session()
+	}
+	return nil
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }
@@ -207,9 +228,13 @@ func (p *AgentPlugin) Stop() error {
 		// 同步等一次 LLM（带超时），否则后台 goroutine 会被进程退出杀掉，固化直接丢。
 		// LLM 网关慢时 20s 容易超时丢历史，放宽到 120s 给足时间。
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		// Client.Checkpoint 内部已打 applied 日志，这里不重复
-		if _, err := p.session.Load().Consolidate(ctx); err != nil {
-			slog.Warn("memory: stop checkpoint failed", "err", err)
+		// Client.Checkpoint 内部已打 applied 日志，这里不重复。nil 判空：Init 失败
+		// 回滚路径下可能尚无会话（Engine.Register 在 Init 报错后不调用 Stop，但
+		// 进程收尾等路径仍可能走到这里），直接解引用会 panic。
+		if s := p.boundSession(); s != nil {
+			if _, err := s.Consolidate(ctx); err != nil {
+				slog.Warn("memory: stop checkpoint failed", "err", err)
+			}
 		}
 		cancel()
 		if err := p.memory.Close(); err != nil {
@@ -350,7 +375,17 @@ func (p *AgentPlugin) startSession() {
 	if p.cfg.Memory.Enabled {
 		p.deps.Instruction = p.loadInstructions()
 	}
-	p.session.Store(runtimeagent.NewSession(p.deps))
+	// 多会话内核接线（P0-4）：每会话一个 SessionRuntime，构造后注册进 manager 并
+	// 置为 current。id 本步固定 "current"（稳定单例）；/new 重建时同 id 注册冲突，
+	// 旧 runtime 保留在册——归档固化窗口内仍可经 manager.Get 触达（配套测试
+	// TestCurrentSessionSwapsOnNew 锁死），P1-3 换 store 的真实 SessionID 后新旧
+	// 以不同 id 共存。
+	s := runtimeagent.NewSession(p.deps)
+	rt := runtimeagent.NewSessionRuntime("current", s)
+	if err := p.manager.Register(rt); err != nil {
+		slog.Debug("session: keep previous runtime registered", "id", rt.ID, "err", err)
+	}
+	p.current.Store(rt)
 
 	// 会话重建 = 新的会话边界。无效 cwd 标记随旧会话作废（否则会毒化新会话的
 	// 每个 prompt）；有效声明跨会话保留并应用到新会话 —— 工作区没变，/new 不该
@@ -362,7 +397,8 @@ func (p *AgentPlugin) startSession() {
 	p.cwdErr = nil
 	cwd := p.sessionCwd
 	p.mu.Unlock()
-	p.session.Load().SetCWD(cwd)
+	// s 即刚注册进 current runtime 的会话本体（等价 p.currentSession().Session()）。
+	s.SetCWD(cwd)
 }
 
 // SetSession 记录 ACP 提交方声明的会话工作目录并应用到当前会话（单活动会话模型：
@@ -395,7 +431,9 @@ func (p *AgentPlugin) SetSession(sessionID, cwd string) {
 	// 防线一致（B 的 prompt 本来就会被拒）。
 	p.activeTransportSession = sessionID
 	p.mu.Unlock()
-	if s := p.session.Load(); s != nil {
+	// 无活动会话（Init 未跑完/失败回滚）时跳过应用：声明已落 sessionCwd，
+	// startSession 的 cwd 重放会在会话创建时补上。
+	if s := p.boundSession(); s != nil {
 		s.SetCWD(cwd)
 	}
 }

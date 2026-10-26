@@ -239,7 +239,12 @@ func (p *AgentPlugin) handleTaskLocked(ctx *model.Context) error {
 		ctx.Writer(fmt.Sprintf("✔ 已关闭 task %s\n", id))
 
 	case "checkpoint":
-		sum, err := p.session.Load().Consolidate(ctx.Ctx)
+		s := p.boundSession()
+		if s == nil {
+			ctx.Writer("✘ Consolidation failed: no active session\n")
+			return nil
+		}
+		sum, err := s.Consolidate(ctx.Ctx)
 		if err != nil {
 			ctx.Writer(fmt.Sprintf("✘ Consolidation failed: %v\n", err))
 			return nil

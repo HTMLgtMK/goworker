@@ -6,13 +6,20 @@ import (
 	"testing"
 	"time"
 
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 )
 
-// newGatedPlugin 构造仅用于 gate 测试的插件：NewPlugin 不触碰 cfg/paths、不创建会话，
-// 互斥只经过 p.runSession（SessionRuntime 的容量 1 gate），全程无 LLM 网络调用。
+// newGatedPlugin 构造仅用于 gate 测试的插件：NewPlugin 只建 manager，不跑 Init/
+// startSession；这里手工接线一个未绑定 Session 的 current runtime（与 startSession
+// 的 Register + current.Store 同构）。互斥只经过 currentSession() 解析出的
+// runtime gate，全程无 LLM 网络调用。
 func newGatedPlugin() *AgentPlugin {
-	return NewPlugin(&runtimeconfig.Config{}, runtimeconfig.Paths{})
+	p := NewPlugin(&runtimeconfig.Config{}, runtimeconfig.Paths{})
+	rt := runtimeagent.NewSessionRuntime("current", nil)
+	_ = p.manager.Register(rt) // 全新 manager 注册必成功；冲突只发生在 /new 重建
+	p.current.Store(rt)
+	return p
 }
 
 func TestWithSession_ReentrantContextDoesNotBlock(t *testing.T) {
@@ -78,20 +85,20 @@ func TestWithSession_WaitsForOtherOwnerAndRespectsCancellation(t *testing.T) {
 }
 
 // 第一个持有者未释放时，第二个 AcquireRun 必须阻塞；release 后阻塞者立即进入。
-// P0-2 起互斥点从 plugin 的 runGate 换成 p.runSession（SessionRuntime），
-// 对 plugin 持有的 runtime 实例做等价断言。
+// P0-4 起互斥点经 p.currentSession() 解析（current 指向的 runtime，与 withSession
+// 的取锁同源），对当前 runtime 实例做等价断言。
 func TestRunGate_SecondAcquireBlocksUntilRelease(t *testing.T) {
 	p := newGatedPlugin()
 	ctx := context.Background()
 
-	release, err := p.runSession.AcquireRun(ctx)
+	release, err := p.currentSession().AcquireRun(ctx)
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 
 	acquired := make(chan error, 1)
 	go func() {
-		r, err := p.runSession.AcquireRun(ctx)
+		r, err := p.currentSession().AcquireRun(ctx)
 		if err == nil {
 			defer r()
 		}
@@ -119,7 +126,7 @@ func TestRunGate_SecondAcquireBlocksUntilRelease(t *testing.T) {
 // gate 被持有且不释放时，排队者 ctx 取消后必须立即返回 ctx.Err()。
 func TestRunGate_AcquireReturnsContextErrorOnCancel(t *testing.T) {
 	p := newGatedPlugin()
-	release, err := p.runSession.AcquireRun(context.Background())
+	release, err := p.currentSession().AcquireRun(context.Background())
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
@@ -128,7 +135,7 @@ func TestRunGate_AcquireReturnsContextErrorOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	acquired := make(chan error, 1)
 	go func() {
-		_, err := p.runSession.AcquireRun(ctx)
+		_, err := p.currentSession().AcquireRun(ctx)
 		acquired <- err
 	}()
 	time.Sleep(20 * time.Millisecond) // 给排队者时间进入阻塞

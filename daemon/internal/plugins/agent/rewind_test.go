@@ -83,10 +83,10 @@ func TestHandleRewind_Numbering(t *testing.T) {
 		}
 	}
 
-	s := runtimeagent.NewSession(runtimeagent.SessionDeps{Store: st})
-	p := &AgentPlugin{runSession: runtimeagent.NewSessionRuntime("current", nil)}
+	p := &AgentPlugin{manager: runtimeagent.NewSessionManager()}
 	p.store.Store(st)
-	p.session.Store(s)
+	p.deps = runtimeagent.SessionDeps{Store: st}
+	p.refreshSession()
 
 	// 列表：#1 应是最新（round 2），#3 是最旧（round 0）
 	ctx, buf := newContext()

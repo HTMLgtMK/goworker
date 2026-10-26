@@ -27,15 +27,22 @@ import (
 // 流入嵌套 Eval。
 type sessionGateKey struct{}
 
-// withSession 在当前会话的独占执行权下运行 run：互斥点在 p.runSession 的
-// SessionRuntime gate（容量 1，AcquireRun 监听 ctx 取消），7 个会话命令
-// handler（/agent /new /compact /usage /history /task /rewind）全部经此排队。
-// ctx 已携带本插件的 sessionGateKey 标记视为重入，直接执行不再排队。
+// withSession 在当前会话的独占执行权下运行 run：互斥点经 p.currentSession()
+// 解析出的 SessionRuntime gate（容量 1，AcquireRun 监听 ctx 取消）——解析与互斥
+// 同源（都取自 current），杜绝「锁在 A 会话、写在 B 会话」。7 个会话命令
+// handler（/agent /new /compact /usage /history /task /rewind）全部经此排队，
+// 同一时刻只有一个命令回合在跑；agent 运行期间 collectTools 嵌套 hub.Eval 执行
+// 这些命令时，靠 sessionGateKey ctx 重入标记放行，绝不在持有 gate 时重复排队
+// （重复取锁即死锁）。current 为 nil（Init 未完成/失败回滚）时不排队，直接报错。
 func (p *AgentPlugin) withSession(ctx context.Context, run func(context.Context) error) error {
 	if owner, _ := ctx.Value(sessionGateKey{}).(*AgentPlugin); owner == p {
 		return run(ctx)
 	}
-	release, err := p.runSession.AcquireRun(ctx)
+	rt := p.currentSession()
+	if rt == nil {
+		return fmt.Errorf("agent: no active session")
+	}
+	release, err := rt.AcquireRun(ctx)
 	if err != nil {
 		return err
 	}
@@ -57,10 +64,15 @@ func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
 	}
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		// Run 生命周期记账：已在 withSession 临界区内持有 gate，RecordRun 只记账不再排队。
-		// RunResult 进 debug 日志；handleAgent 返回值仍为闭包返回的 error（现状 nil），
-		// CLI/ACP 错误面不变。
-		res := p.runSession.RecordRun(func(s *runtimeagent.Session) (runtimeagent.RunResult, error) {
+		// 解析与互斥同源：gate 在 withSession 已按 current 解析，这里取同一
+		// current runtime 做记账。Run 生命周期记账在 RecordRun（已持 gate，只记账
+		// 不再排队）；RunResult 进 debug 日志，handleAgent 返回值仍为闭包返回的
+		// error（现状 nil），CLI/ACP 错误面不变。
+		rt := p.currentSession()
+		if rt == nil {
+			return fmt.Errorf("agent: no active session")
+		}
+		res := rt.RecordRun(func(s *runtimeagent.Session) (runtimeagent.RunResult, error) {
 			return s.Run(runCtx, runtimeagent.RunRequest{
 				Input:      strings.Join(ctx.Args, " "),
 				ToolSource: ctx.ToolSource,
@@ -97,16 +109,16 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
 		// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
 		// 同步固化旧会话（阻塞，状态栏显示进度）；快照走只读，先取好再重建。
-		old := p.session.Load()
+		old := p.boundSession()
 
 		// pending 快照（store 生效时用游标后的增量，否则全量）
 		var pending []core.Message
 		if st := p.store.Load(); st != nil {
 			pending = st.PendingAfterCursor()
-			if len(pending) == 0 {
+			if len(pending) == 0 && old != nil {
 				pending = old.Conversation() // 兜底全量
 			}
-		} else {
+		} else if old != nil {
 			pending = old.Conversation()
 		}
 		consolidate := p.memory != nil && len(pending) > 0
@@ -322,7 +334,13 @@ func selectedContextWindow(cfg *runtimeconfig.Config) int {
 func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		calls, comps, total := p.session.Load().UsageSnapshot()
+		// /usage 不执行工具（无嵌套 Eval 可换 current），闭包内一次性解析当前会话。
+		s := p.boundSession()
+		if s == nil {
+			runContext.Writer("(no active session)\n")
+			return nil
+		}
+		calls, comps, total := s.UsageSnapshot()
 		if len(calls) == 0 && len(comps) == 0 {
 			runContext.Writer("(no agent calls yet — run /agent first)\n")
 			return nil
@@ -370,7 +388,7 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 		}
 
 		// 当前历史占用：压缩后的直观体现，不必等下一次模型调用。
-		conv := p.session.Load().Conversation()
+		conv := s.Conversation()
 		if convLen := len(conv); convLen > 0 {
 			convEst := core.EstimateTokens(conv)
 			line := fmt.Sprintf("  history: %s est (%d msgs)", runtimeagent.Humanize(convEst), convLen)
@@ -388,7 +406,12 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 func (p *AgentPlugin) handleCompact(ctx *model.Context) error {
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		return p.session.Load().Compact(runCtx, callbacksFromPlugin(runContext))
+		s := p.boundSession()
+		if s == nil {
+			runContext.Writer("(no active session)\n")
+			return nil
+		}
+		return s.Compact(runCtx, callbacksFromPlugin(runContext))
 	})
 }
 
@@ -411,7 +434,10 @@ func (p *AgentPlugin) handleSkills(ctx *model.Context) error {
 func (p *AgentPlugin) handleHistory(ctx *model.Context) error {
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		conv := p.session.Load().Conversation()
+		var conv []core.Message
+		if s := p.boundSession(); s != nil {
+			conv = s.Conversation()
+		}
 		if len(conv) == 0 {
 			runContext.Writer("(no conversation history yet — run /agent first)\n")
 			return nil

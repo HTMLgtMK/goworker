@@ -82,7 +82,10 @@ func (p *AgentPlugin) doRewind(ctx *model.Context, arg string) error {
 	ck := cks[n-1]
 
 	// 已在目标点（比较 conversation 末尾消息 id 是否与 checkpoint.at 一致）
-	conv := p.session.Load().Conversation()
+	var conv []core.Message
+	if s := p.boundSession(); s != nil {
+		conv = s.Conversation()
+	}
 	if len(conv) > 0 && conv[len(conv)-1].MsgID == ck.At {
 		ctx.Writer(fmt.Sprintf("已在检查点 #%d（%s）\n", n, ck.CreatedAt.Format("15:04:05")))
 		return nil
@@ -94,7 +97,12 @@ func (p *AgentPlugin) doRewind(ctx *model.Context, arg string) error {
 		return nil
 	}
 
-	if err := p.session.Load().ReloadFromStore(); err != nil {
+	s := p.boundSession()
+	if s == nil {
+		ctx.Writer("✘ 刷新会话失败: no active session\n")
+		return nil
+	}
+	if err := s.ReloadFromStore(); err != nil {
 		ctx.Writer(fmt.Sprintf("✘ 刷新会话失败: %v\n", err))
 		return nil
 	}
@@ -102,8 +110,9 @@ func (p *AgentPlugin) doRewind(ctx *model.Context, arg string) error {
 	preview := runtimeagent.Truncate(ck.Preview, 80)
 	msg := fmt.Sprintf("✔ 已回溯到 %s: %s\n", ck.CreatedAt.Format("15:04:05"), preview)
 
-	// 检测是否恢复到 compact 折叠前的原文（详情分支）
-	newConv := p.session.Load().Conversation()
+	// 检测是否恢复到 compact 折叠前的原文（详情分支）——重读同一会话对象，
+	// ReloadFromStore 已把 head 后的视图刷进 conversation
+	newConv := s.Conversation()
 	hasCompactNode := false
 	for _, m := range newConv {
 		if isCompactMsg(m) {

@@ -108,10 +108,11 @@ func (p *AgentPlugin) CurrentSessionID() string {
 // 命中当前会话时调用——单活动会话模型下当前会话始终处于已加载状态，这里只做
 // 视图刷新（ReloadFromStore），不重建会话。
 func (p *AgentPlugin) ReloadCurrentSession() error {
-	if p.session.Load() == nil {
+	s := p.boundSession()
+	if s == nil {
 		return fmt.Errorf("agent: no active session")
 	}
-	return p.session.Load().ReloadFromStore()
+	return s.ReloadFromStore()
 }
 
 // CurrentSessionHistory 导出当前会话的完整对话历史，映射为 ACP session/update

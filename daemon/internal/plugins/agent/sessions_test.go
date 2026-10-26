@@ -174,16 +174,17 @@ func TestAgentPlugin_ListSessionsWithoutCurrentOrPersistence(t *testing.T) {
 
 func TestAgentPlugin_ReloadCurrentSessionRefreshesView(t *testing.T) {
 	p, st, _ := sessionFixture(t, 0)
-	p.session.Store(runtimeagent.NewSession(runtimeagent.SessionDeps{Config: p.cfg, Store: st}))
+	p.deps = runtimeagent.SessionDeps{Config: p.cfg, Store: st}
+	p.refreshSession()
 
-	before := len(p.session.Load().Conversation())
+	before := len(p.boundSession().Conversation())
 	if _, err := st.Commit([]core.Message{{Role: "user", Content: "追加一条", MsgID: session.NewMsgID()}}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	if err := p.ReloadCurrentSession(); err != nil {
 		t.Fatalf("ReloadCurrentSession: %v", err)
 	}
-	if after := len(p.session.Load().Conversation()); after != before+1 {
+	if after := len(p.boundSession().Conversation()); after != before+1 {
 		t.Errorf("conversation length = %d after reload, want %d", after, before+1)
 	}
 
@@ -727,7 +728,8 @@ func TestAgentPlugin_SetSessionValidatesSandboxBoundary(t *testing.T) {
 		Sandbox: sandbox.SandboxConfig{AllowedWorkDir: boundary},
 	}
 	p := withStore(cfg, st)
-	p.session.Store(runtimeagent.NewSession(runtimeagent.SessionDeps{Config: cfg, Store: st}))
+	p.deps = runtimeagent.SessionDeps{Config: cfg, Store: st}
+	p.refreshSession()
 
 	// 界内：接受，cwd 落到插件与会话
 	p.SetSession("sess_a", inside)
@@ -857,7 +859,8 @@ func TestAgentPlugin_ActiveSessionIDSemantics(t *testing.T) {
 		Sandbox: sandbox.SandboxConfig{AllowedWorkDir: boundary},
 	}
 	p := withStore(cfg, st)
-	p.session.Store(runtimeagent.NewSession(runtimeagent.SessionDeps{Config: cfg, Store: st}))
+	p.deps = runtimeagent.SessionDeps{Config: cfg, Store: st}
+	p.refreshSession()
 
 	if got := p.ActiveSessionID(); got != "" {
 		t.Fatalf("ActiveSessionID before any declaration = %q, want empty", got)
@@ -904,9 +907,10 @@ func TestAgentPlugin_ActiveSessionIDSemantics(t *testing.T) {
 	}
 }
 
-// withStore 测试构造辅助：atomic.Pointer 字段无法在 struct 字面量里直接赋值。
+// withStore 测试构造辅助：atomic.Pointer 字段无法在 struct 字面量里直接赋值；
+// manager 一并建好（startSession/refreshSession 经它注册 runtime）。
 func withStore(cfg *runtimeconfig.Config, st *session.Store) *AgentPlugin {
-	p := &AgentPlugin{cfg: cfg}
+	p := &AgentPlugin{cfg: cfg, manager: runtimeagent.NewSessionManager()}
 	p.store.Store(st)
 	return p
 }
