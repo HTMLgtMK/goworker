@@ -12,19 +12,21 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
 // P0-4 接线测试：plugin 的会话持有从「裸 Session 指针」升级为「manager 注册的
-// SessionRuntime」，current 为唯一解析点。本文件锁死 P0-4 验收要求的两条语义：
-//   - /new（经 startSession）后 current 指向新 runtime，manager 内旧 runtime 仍可
-//     Get（归档固化窗口内 CheckpointSync 仍持有旧会话）；
-//   - current 切换后 withSession 的互斥落在新 runtime 上（解析与互斥同源）。
+// SessionRuntime」，current 为唯一解析点。锁死的语义（P5-5 起收口反转了旧的
+// 「旧 runtime 保留在册」）：/new（经 startSession）后 current 指向新 runtime，
+// 旧 runtime 在 handleNew 尾部（CheckpointSync 完成后）注销出 manager——归档
+// 固化窗口内它仍在册，窗口结束即收口（注册表不再随 /new 无界累积）；
+// current 切换后 withSession 的互斥落在新 runtime 上（解析与互斥同源）。
 
-// TestCurrentSessionSwapsOnNew 模拟 /new：current 换到新 runtime，旧 runtime 保留
-// 在 manager 里。走真实 startSession 装配首会话（memory/持久化/MCP 全关，零外部
-// 依赖）——这是唯一一次注册；随后真实 handleNew → startSession 重建，会话切换
-// 后的 current/manager 状态即生产接线形态。
+// TestCurrentSessionSwapsOnNew 模拟 /new：current 换到新 runtime，旧 runtime 在
+// 收口后不再可 Get。走真实 startSession 装配首会话（memory/持久化/MCP 全关，零
+// 外部依赖）——这是唯一一次注册；随后真实 handleNew → startSession 重建，会话
+// 切换后的 current/manager 状态即生产接线形态。
 func TestCurrentSessionSwapsOnNew(t *testing.T) {
 	p := NewPlugin(&runtimeconfig.Config{}, runtimeconfig.Paths{})
 	p.startSession()
@@ -59,10 +61,11 @@ func TestCurrentSessionSwapsOnNew(t *testing.T) {
 		t.Fatal("fresh runtime did not bind a new session object")
 	}
 
-	// manager 内旧 runtime 仍可 Get：同 id "current" 注册冲突时旧条目保留在册，
-	// 归档固化窗口（old.CheckpointSync）期间旧会话可经 manager 触达。
-	if got := p.manager.Get(old.ID); got != old {
-		t.Fatalf("manager.Get(%q) = %v, want the pre-/new runtime still registered", old.ID, got)
+	// P5-5 收口：旧 runtime 已注销出 manager。纯内存（无 store）下新旧 runtime
+	// 同 id "current"、startSession 的 Register 冲突旧条目保留，handleNew 尾部
+	// Remove("current") 移除的正是旧条目——新 runtime 本就不在册，Get 返回 nil。
+	if got := p.manager.Get(old.ID); got != nil {
+		t.Fatalf("manager.Get(%q) = %v, want nil after /new (P5-5 removed the old runtime)", old.ID, got)
 	}
 }
 
@@ -277,5 +280,79 @@ func TestStartRunCarriesGateReentryMarker(t *testing.T) {
 	}
 	if !strings.Contains(toolResult, "usage:") {
 		t.Fatalf("tool result = %q, want /usage rendering (usage: ...)", toolResult)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// P5-5:/new 收口 —— 旧 runtime 注销出 manager + 旧 store Close(遗留①)。
+// ---------------------------------------------------------------------------
+
+// TestNewRemovesOldRuntimeAndClosesStore(P5-5,持久化启用):真实 legacy 挂载 +
+// handleNew → ① manager.Get(旧 id) == nil(注册表不再随 /new 累积旧 runtime);
+// ② 旧 store 已 Close——判据用「写入必须失败」:handleNew 里 Archive 会重开旧
+// store 的句柄(store.go Archive),若收口漏了 Close,Commit 必然成功、断言即
+// 失败;已关闭实例 file/lock 均为 nil,Commit 走 appendRecord 对 nil file 的
+// Write → 错误返回。再补一条 Close 幂等断言(对已关闭实例再 Close 仍 nil)。
+// ③ 新会话照常:current 换轨、新 runtime 在册、新 store 独立可写。
+func TestNewRemovesOldRuntimeAndClosesStore(t *testing.T) {
+	root := t.TempDir()
+	oldID := seedLegacySession(t, root, "旧会话的问题")
+
+	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: root}}
+	p := NewPlugin(cfg, runtimeconfig.Paths{})
+	p.startSession() // 首周期:root 下有 legacy 槽 → 原地挂载(维持旧版启动行为)
+	t.Cleanup(func() { _ = p.Stop() })
+
+	oldRT := p.currentSession()
+	if oldRT == nil {
+		t.Fatal("no current runtime after startSession")
+	}
+	if oldRT.ID != oldID {
+		t.Fatalf("current runtime id = %q, want mounted legacy id %q", oldRT.ID, oldID)
+	}
+	oldStore := p.currentStore()
+	if oldStore == nil {
+		t.Fatal("no current store after startSession (legacy mount failed)")
+	}
+
+	ctx, buf := newContext()
+	if err := p.handleNew(ctx); err != nil {
+		t.Fatalf("handleNew: %v", err)
+	}
+	if !strings.Contains(buf.String(), "New session started") {
+		t.Errorf("handleNew output = %q, want success message", buf.String())
+	}
+
+	// ① 旧 runtime 注销出 manager:注册表不再累积(勘察 K:此前 daemon 对
+	// manager.Remove 零调用,旧 runtime 随 /new 无界累积)。
+	if got := p.manager.Get(oldID); got != nil {
+		t.Fatalf("manager.Get(%q) = %v, want nil after /new (P5-5 removed the old runtime)", oldID, got)
+	}
+
+	// ② 旧 store 已 Close:先验证「写入失败」(可靠判据),再验证 Close 幂等。
+	if _, err := oldStore.Commit([]core.Message{{Role: "user", Content: "post-close", MsgID: session.NewMsgID()}}); err == nil {
+		t.Fatal("Commit into old store succeeded — /new did not close the old store")
+	}
+	if err := oldStore.Close(); err != nil {
+		t.Fatalf("second Close on old store = %v, want nil (Close 幂等, store.go:177-199)", err)
+	}
+
+	// ③ 新会话照常:current 换轨到新 runtime(在册),新 store 独立可写。
+	fresh := p.currentSession()
+	if fresh == nil || fresh == oldRT {
+		t.Fatal("current did not move to a new runtime after /new")
+	}
+	if got := p.manager.Get(fresh.ID); got != fresh {
+		t.Fatalf("manager.Get(%q) = %v, want the fresh runtime registered", fresh.ID, got)
+	}
+	freshStore := p.currentStore()
+	if freshStore == nil || freshStore == oldStore {
+		t.Fatal("current store did not move to a new instance after /new")
+	}
+	if freshStore.SessionID() == oldID {
+		t.Fatalf("fresh store id %q equals old id", freshStore.SessionID())
+	}
+	if _, err := freshStore.Commit([]core.Message{{Role: "user", Content: "新会话的问题", MsgID: session.NewMsgID()}}); err != nil {
+		t.Fatalf("commit into fresh store: %v", err)
 	}
 }

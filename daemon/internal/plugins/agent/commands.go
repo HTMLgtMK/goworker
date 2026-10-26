@@ -109,6 +109,9 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
 		// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
 		// 同步固化旧会话（阻塞，状态栏显示进度）；快照走只读，先取好再重建。
+		// oldRT 与 old 同点捕获：闭包持 gate（withSession），current 在临界区内
+		// 稳定，startSession 换轨前取到的都是同一 runtime（P5-5 收口要用它的 id）。
+		oldRT := p.currentSession()
 		old := p.boundSession()
 		// 当前会话 store 经 current 解析（P1-3）：快照与归档都落在 startSession
 		// 换轨前的同一实例上（闭包持 gate，重建前 current 不变）。
@@ -152,6 +155,32 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 		// 结果/警告经 ctx.Writer 回显。主 goroutine 执行，可直接读共享配置。
 		if consolidate {
 			old.CheckpointSync(runCtx, pending, callbacksFromPlugin(runContext))
+		}
+
+		// P5-5 收口（遗留①）：旧 runtime 注销出 manager、旧 store 关闭。
+		//
+		// Remove（首用 manager.Remove，勘察 K——此前 daemon 对 Remove 零调用，
+		// manager 随 /new 无界累积）：拍板⑤「V1 仅 current 可路由」成立后，旧
+		// runtime 留册只剩误路由面（经 manager.Get(旧id) 触达的是已换轨的死会话），
+		// 注销后对旧 id 的 run/start|attach（P5-6/8）得 ErrSessionNotFound → 诚实
+		// 报错，客户端语义随 P5-10 写入 PROTOCOL.md。纯内存降级（无 store）下新旧
+		// runtime 同 id "current"、Register 冲突时旧条目保留（plugin.go startSession）：
+		// Remove 移除的正是旧条目（新 runtime 本就不在册），注册表随之归零。
+		//
+		// Close：旧 store 归档/快照后已无写者——在途 run 与本闭包被 gate 串行
+		// （handleNew 持 gate 期间旧 runtime 不可能有活动 run），Remove 后经 manager
+		// 也再触达不了旧 runtime。Close 幂等（store.go:177-199，对已关闭/未持锁
+		// store 为 no-op）。只 Close、不从 repo 缓存逐出：P1-3 的实例唯一不变量要求
+		// 缓存条目存活到 Stop 的 repo.Close 统一回收；repo.Open 命中缓存直接返回
+		// 实例、不触碰文件锁（repository.go:161-163），已关闭实例留缓存不会引发
+		// 二次 Open 的 ErrStoreLocked。
+		if oldRT != nil {
+			p.manager.Remove(oldRT.ID)
+		}
+		if oldStore != nil {
+			if err := oldStore.Close(); err != nil {
+				slog.Warn("session: old store close failed", "err", err)
+			}
 		}
 		return nil
 	})
