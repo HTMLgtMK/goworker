@@ -2,6 +2,7 @@ package aiacp
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"sync"
 	"testing"
@@ -287,5 +288,79 @@ func TestSessionHandleCancel(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("cancel did not stop prompt")
+	}
+}
+
+// TestNotificationsDeliveredInWireOrder 钉死 dispatchNotif 的注释契约「送达
+// 顺序与线上顺序一致」:服务端背靠背连发 N 条通知,客户端 handler 的启动顺序
+// 必须与线上顺序逐条一致。历史缺陷:通知走 dispatchRequest 的新 goroutine,
+// FIFO 链位在 goroutine 内部才获取,相邻通知的调度竞争使链位与线上顺序脱钩
+// (实测三条连发即可按 [1,3,2] 送达)——修复后链位在读循环内同步获取。
+func TestNotificationsDeliveredInWireOrder(t *testing.T) {
+	serverEnd, clientEnd := net.Pipe()
+	server := ServeConn(serverEnd, &lifecycleHandler{})
+	t.Cleanup(func() { _ = server.Close() })
+	client, err := NewClient("wire-order", clientEnd, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	var mu sync.Mutex
+	var got []int
+	client.HandleNotification("test/ordered", func(params json.RawMessage) {
+		var n int
+		_ = json.Unmarshal(params, &n)
+		time.Sleep(50 * time.Microsecond) // handler 耗时放大链位竞争窗口(对齐真实消费者)
+		mu.Lock()
+		got = append(got, n)
+		mu.Unlock()
+	})
+
+	// 与真实消费方同构的 c.mu 争用:客户端同时在飞请求(daemon 的 run/get
+	// 轮询与事件流同连接并发),响应分发与通知 goroutine 的 registerRequest
+	// 竞争同一把 c.mu,调度交错放大链位竞争窗口。
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, _ = client.ListSessions(context.Background(), protocol.ListSessionsRequest{})
+		}
+	}()
+
+	const total = 200
+	for i := 0; i < total; i++ {
+		if err := server.Notify("test/ordered", i); err != nil {
+			t.Fatalf("notify %d: %v", i, err)
+		}
+	}
+	close(stop)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n >= total {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delivered %d/%d notifications (无缺无重)", n, total)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != total {
+		t.Fatalf("delivered %d notifications, want exactly %d (无缺无重)", len(got), total)
+	}
+	for i, n := range got {
+		if n != i {
+			t.Fatalf("handler order at %d = %d, want wire order (dispatchNotif 契约:送达顺序与线上顺序一致)", i, n)
+		}
 	}
 }

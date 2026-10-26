@@ -46,6 +46,106 @@ ZCode dispatcher 共享同一套协议语义（`ai-dispatch/protocol`），区�
 或取消后重试即可；各连接的 prompt 在 daemon 侧串行执行，连接断开时排队中的
 prompt 以错误退出。
 
+## x-goworker 扩展协议（后台 Run 与事件流）
+
+标准 ACP 方法面向同步交互（`session/prompt` 阻塞到回合结束）。`x-goworker/*`
+是 daemon 侧的**增量扩展协议**（`x-` 前缀 = goworker 应用层扩展，与 x-device
+同款先例，不进 `ai-dispatch/protocol` 标准面）：把「提交一轮对话」变成后台
+Run（立即返回，不等 LLM 完成），并把会话事件流（工具调用/流式文本/审批/
+run 生命周期）以持久化游标暴露给任意连接——断线重连不丢事件。
+
+**标准方法语义逐字不变**：本节全部是增量能力，标准 6 方法与
+`session/update`、`session/request_permission` 的报文和行为与本文件其余章节
+完全一致；不调用 x- 方法的旧客户端零感知。
+
+### 方法面
+
+| 方法 | 方向 | 入参 | 响应 | control lease |
+|---|---|---|---|---|
+| `x-goworker/run/start` | 请求 | `{sessionId, input, requestId}` | `{runId, state}` | **必须持有** |
+| `x-goworker/run/get` | 请求 | `{sessionId, runId}` | `{state, result?, latestSeq}` | 不需要（只读观察面） |
+| `x-goworker/run/cancel` | 请求 | `{sessionId, runId}` | `{accepted}` | **必须持有** |
+| `x-goworker/session/attach` | 请求 | `{sessionId, afterSeq, mode?}` | `{currentRun, latestSeq, tookOver?}` | `mode:"control"` 获取/接管；observe 不动 lease |
+| `x-goworker/session/detach` | 请求 | `{sessionId, mode?}` | `{detached}` | `mode:"control"` 归还（仅持有者本人有效） |
+| `x-goworker/approval/respond` | 请求 | `{requestId, decision}` | `{accepted}` | **必须持有** |
+| `x-goworker/session/events` | **服务端通知** | `SessionEvent`（原样 JSON，蛇形键） | — | attach 建立订阅后下行；observe/control 均可收 |
+
+- **`state` 取值**：`queued` / `running` / `waiting_input`（HITL 等审批）/
+  `waiting_capability`（设备工具等重绑）/ `completed` / `failed` /
+  `cancelled`。
+- **`requestId` 是幂等键，与 JSON-RPC id 不同**：连接断开后客户端不知道
+  run/start 是否成功时，用**同一个 requestId** 重试——daemon 返回原 runId
+  与该 run 的当前状态快照，绝不创建第二个 Run。requestId 缺省/空串被 -32000
+  拒绝（放弃幂等键 = 放弃重试保护）。注意 `approval/respond` 里的
+  `requestId` 寻址的是**待决审批**（`permission.requested` 事件 payload 的
+  `id` 字段，`req-N` 命名空间），与 run/start 的 requestId 是两个命名空间。
+- **run/start 立即返回**：Run 被接受并持久化登记后即响应（提交时 state 恒
+  `queued`），不等 LLM 完成；后续进展经 `x-goworker/session/events` 或
+  run/get 观察。
+- **错误约定**：沿用 -32000 + 明确文案（不新增标准错误码）。无 control
+  lease → `"x-goworker: control lease held by another connection ..."`；
+  游标超前 → 文案含 `cursor expired`；未知 run → 文案含 `not found`。
+
+### Observe / Control（多客户端控制权限）
+
+同一会话可有多个观察者，至多一个 control 持有者（control lease）：
+
+- `attach` 不带 `mode` 或 `mode:"observe"` = **只读观察**：收事件流，不碰
+  lease；run/start|cancel 与 approval/respond 一律 -32000。
+- `attach` `mode:"control"` = **获取 control lease**：空闲时获取（响应不含
+  `tookOver`）；他人持有时**显式接管**（响应 `tookOver:true`，daemon 侧记
+  slog 审计日志）。
+- V1 采用本机信任的宿主授权（单用户 daemon，无账号体系）：不做 lease 过期
+  与授权协商；**断开连接即释放 lease**（审批不悬死在已死连接上）；
+  `detach` `mode:"control"` 主动归还。权限检查全部在 daemon 侧完成，不依赖
+  客户端 UI 自律。
+
+### attach：原子 Replay+Live 与 latestSeq 语义
+
+- `attach {sessionId, afterSeq}` **原子建立「回放 + 实时」订阅**：先重放
+  `(afterSeq, latest]` 的持久化事件，再无缝续上此后实时产生的事件——无缺、
+  无重、无乱序。`afterSeq` 是客户端已确认游标（0 = 从保留最早开始）。
+- **响应的 `latestSeq` 仅描述 attach 时刻事件流的位置，不是游标授权**：
+  客户端不得把本地游标直接跳到 latestSeq——只有真正应用了对应事件之后，
+  才能按逐事件 `seq` 推进本地 cursor。
+- 游标超前保留窗口 → -32000（文案含 `cursor expired`），订阅不建立；客户端
+  修正游标（或按 0 全量重放）后重新 attach。
+- **attach 仅限当前会话**：对非当前会话（归档/已被对端 `session/new` 顶掉）
+  的 run/start|attach 返回 -32000（文案含 `not the current session`）——
+  归档历史走 `session/load` 只读重放。分工：`session/load` = 历史对话重放，
+  `x-goworker/session/attach` = 事件游标（Replay+Live）。
+- 同连接重复 attach 同一会话 = **换代**：旧订阅收掉、按本次 afterSeq 重建，
+  每连接每会话至多一条事件流；`detach` 或断连收掉订阅。
+- **与标准方法的共存语义**：后台 Run 运行期间，任何连接的标准
+  `session/prompt` 会阻塞等待该 Run 结束（排队，不报 busy 错误）；反之标准
+  prompt 在飞时 run/start 返回 -32000（同会话单活动 Run）。同步入口与后台
+  入口靠同一把会话执行权互斥，不存在并发写会话。
+
+### 交互示例（对齐总方案 §7，键名为 daemon 实际 wire 形状）
+
+```json
+→ {"jsonrpc":"2.0","id":1,"method":"x-goworker/run/start","params":{"sessionId":"session-A","input":"分析当前项目架构","requestId":"client-req-001"}}
+← {"jsonrpc":"2.0","id":1,"result":{"runId":"run-001","state":"queued"}}
+← {"jsonrpc":"2.0","method":"x-goworker/session/events","params":{"session_id":"…","run_id":"run-001","seq":1,"type":"run.started","time":"…","payload":{"state":"running"}}}
+```
+
+断线重连（从 `permission.requested` 事件 payload 的 `id` 取审批 requestID）：
+
+```json
+→ {"jsonrpc":"2.0","id":2,"method":"x-goworker/session/attach","params":{"sessionId":"session-A","afterSeq":120,"mode":"control"}}
+← {"jsonrpc":"2.0","id":2,"result":{"currentRun":{"runId":"run-001","state":"waiting_input"},"latestSeq":145,"tookOver":true}}
+→ {"jsonrpc":"2.0","id":3,"method":"x-goworker/approval/respond","params":{"requestId":"req-7","decision":{"interrupt_id":"req-7","type":"approve"}}}
+← {"jsonrpc":"2.0","id":3,"result":{"accepted":true}}
+```
+
+### 能力通告与降级
+
+daemon **不经 agentCapabilities 通告 x-goworker 能力**（V1 决策，与 x-device
+的方法面同策略）：客户端按 JSON-RPC 标准行为降级——收到
+`-32601 method not found` 即视为对端无此扩展（老 daemon / stdio worker 形态）。
+实现 x-goworker 的客户端：先试 attach，吃 -32601 就回退纯标准面（prompt 阻塞
+语义 + session/update 流），不要假设方法一定存在。
+
 ## 能力协商（initialize）
 
 完整报文示例（客户端视角，逐字段可抄）：
@@ -109,6 +209,11 @@ prompt 以错误退出。
 - `session/request_permission` 阻塞 worker 侧直到应答：Kotlin 收到后必须
   **最终**回一个 response（超时由 worker 侧 `ExpiresAt` 兜底判拒），
   否则该轮工具调用永远挂起
+- `x-goworker/session/events` 是**异步服务端通知**，消费注意（与上一条同样
+  独立于 request/response 挂起请求表）：通知可能在任意时刻到达（不限于某个
+  请求在飞），Kotlin 读循环收到后分发订阅回调即可，不要在回调里反压读循环
+  ——daemon 侧对慢消费者直接背压断流（断线窗口内的事件由下次 attach 带已
+  确认游标补齐），事件处理应投递到独立队列/协程
 - Go 侧全部导出方法有 recover 壳；Kotlin 回调里抛异常同样不会崩 worker
 
 ## 生命周期
@@ -161,6 +266,20 @@ LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下�
   | strict / readonly | 放行 | 拒绝 |
   | off | 放行（`always_hitl` 仍询问） | 放行（`always_hitl` 仍询问） |
 
+- **断连等待（P5 行为变化，声明 x-device 的客户端必须知晓）**：设备工具调用
+  时发现执行通道已断（连接退出/`x-device/call` 失败）→ 不再「立即把错误交给
+  模型」，而是**等待重绑**（默认 45s）：
+  - 预算内同会话出现具备相同工具能力的新绑定（新连接 prompt 探测成功即重绑）
+    → 工具在新连接上执行完成；重绑后的调用照常走统一 HITL 门控（per-call
+    裁决，危险操作重绑后仍需确认）；
+  - 预算耗尽 → 返回**明确失败文本**（`device tool sys_<name> unavailable:
+    connection lost, waited Ns`）交给模型决定下一步，run 正常继续；
+  - **绝不把工具请求静默路由到其他连接**（含已断开的旧连接）；
+  - 等待期间 run 状态为 `waiting_capability`（x-goworker 的 run/get /
+    session/events 可观测）。
+- **`capability_wait_timeout` 配置**：上述等待预算，秒为单位，`config.yaml`
+  的 `session.capability_wait_timeout`，默认 45（硬约束：必须小于工具执行
+  60s 上限，否则等待被掐断呈现为普通超时）；<=0 回落 45s 兜底。
 - **实现位置**：worker 中继 `daemon/internal/core/acpworker/sys_relay.go`；统一裁决 `ai-runtime/middlewares/hitl.go`；执行器在 Kotlin `DeviceTools` 注册表
 - **每加一个能力的成本 = Kotlin 一处**（注册描述符 + handler），Go/协议零改动、无需重绑 AAR 之外的任何东西
 
@@ -192,9 +311,36 @@ Host 只负责进程内管道和 ACP 帧桥接，Android 侧负责能力适配�
 AAR 的 API 只暴露 `NewHost`、`Start`、`Write`、`Close` 和 `Callbacks`，不把 Go 的
 `context.Context`、channel 或 runtime 内部对象直接穿过 gobind 边界。
 
+## 仓库外依赖：Android App 跟进清单（goworker-android 仓库）
+
+本文件上述 P5 协议面落码后，Android App（独立仓库）需要跟进的改动清单；
+daemon 侧已全部实现并有协议级集成测试覆盖（`xgw_integration_test.go`）：
+
+1. **事件流消费（`x-goworker/session/events`）**：注册通知回调，按 `seq`
+   逐事件推进本地 cursor（`latestSeq` 只描述位置，不得跳游标，见
+   「x-goworker 扩展协议」节）；断线重连走 `session/attach {afterSeq: 已确认
+   游标, mode}` 原子续传，吃 `-32601` 回退纯标准面。
+2. **后台 Run 与审批应答（`run/start` / `approval/respond`）**：run/start 携带
+   客户端生成的 `requestId`（幂等键，重试复用同一值）；HITL 决策可从
+   `permission.requested` 事件取 `id` 经 `approval/respond` 应答（attach
+   `mode:"control"` 后），或继续走标准 `session/request_permission` 同步应答
+   ——两条路都在，按 UI 形态选。
+3. **断连等待文案**：设备工具断连后 run 会停在 `waiting_capability` 等待重绑
+   （默认 45s，见「系统能力工具」节），UI 需要新的等待/失败文案与状态展示；
+   失败文本形如 `device tool sys_<name> unavailable: connection lost, waited Ns`。
+4. **断连=宿主停机的边界不变**：Host.Close → 整个后端销毁，后台 Run 存活与
+   `waiting_capability` 等待期依赖 Android 侧 RuntimeService（进程内形态会被
+   进程死亡截断）——需要后台 Run 在断连后继续跑的话，属 Android 侧独立工程项。
+
 ## 演进规则
 
 - 协议语义以 `ai-dispatch/protocol` 为唯一事实源，本文档只做映射，不定义新语义
 - 新增 client-ward 能力方法：先在 `ai-dispatch/protocol` 落方法常量与类型
   （编辑器端可复用），再在 Kotlin 客户端实现
+- **x-goworker 归属**：`x-goworker/*` 是 daemon 侧 agent-ward 的应用层扩展
+  （agent 发起/承载的后台 Run 控制与事件流），**不进 `ai-dispatch/protocol`
+  标准面**——方法常量与 wire 类型在 daemon 侧自持
+  (`daemon/internal/core/service/acp/xproto.go`)，与 x-device（client-ward
+  扩展，不进标准面）同款先例；标准面回归由集成测试钉死
+  （`TestXGWStandardMethodsUnaffected` 等）
 - 破坏性变更：`protocolVersion` 递增，Kotlin 客户端按 initialize 协商降级
