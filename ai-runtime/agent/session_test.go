@@ -112,7 +112,7 @@ func TestSessionRun_HidesThinkingWithoutDroppingHistory(t *testing.T) {
 			output.WriteString(content)
 		},
 	}
-	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, callbacks); err != nil {
+	if _, err := s.Run(context.Background(), RunRequest{Input: "hello"}, callbacks); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	for _, kind := range kinds {
@@ -141,7 +141,7 @@ func TestSessionRun_ShowsThinkingByDefault(t *testing.T) {
 	callbacks := RunCallbacks{
 		WriteToken: func(kind RenderKind, _ string, _ bool) { kinds = append(kinds, kind) },
 	}
-	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, callbacks); err != nil {
+	if _, err := s.Run(context.Background(), RunRequest{Input: "hello"}, callbacks); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if len(kinds) < 2 || kinds[0] != KindThinking || kinds[1] != KindText {
@@ -154,7 +154,7 @@ func TestSessionRun_MergesToolSourceTools(t *testing.T) {
 	s, _ := testSession(provider)
 
 	var probes int
-	err := s.Run(context.Background(), RunRequest{
+	_, err := s.Run(context.Background(), RunRequest{
 		Input: "hello",
 		ToolSource: func(context.Context) []core.Tool {
 			probes++
@@ -195,7 +195,7 @@ func TestSessionRun_WritesBackConversation(t *testing.T) {
 	s, _ := testSession(&captureProvider{})
 
 	var buf strings.Builder
-	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
+	if _, err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -221,7 +221,7 @@ func TestSessionRun_AccumulatesUsageAcrossRuns(t *testing.T) {
 	}
 
 	var buf strings.Builder
-	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
+	if _, err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	// 本轮 captureProvider 记 1 次 → 累计 2 次
@@ -254,7 +254,7 @@ func TestSessionRun_EmptyInputShowsUsage(t *testing.T) {
 	s, _ := testSession(&captureProvider{})
 
 	var buf strings.Builder
-	if err := s.Run(context.Background(), RunRequest{}, testRunCallbacks(&buf)); err != nil {
+	if _, err := s.Run(context.Background(), RunRequest{}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if !strings.Contains(buf.String(), "用法: /agent") {

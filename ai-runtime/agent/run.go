@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -84,4 +86,22 @@ func (run *AgentRun) snapshot() RunResult {
 	res := run.result
 	res.State = run.state
 	return res
+}
+
+// finish 记录最终结果并推进到终态。result 必须先于 done 关闭写入(与 transition
+// 的契约一致):done 关闭后等待者观察到的 snapshot 即为完整终态结果。
+func (run *AgentRun) finish(res RunResult) {
+	run.mu.Lock()
+	run.result = res
+	run.mu.Unlock()
+	run.transition(res.State)
+}
+
+// runSeq 是 RunID 的进程内自增序列。RunID 只需进程内唯一(标识"本进程的第 N 次
+// 执行");跨进程归因/Trace 属 P2 RunSupervisor 与 Journal 的范围。
+var runSeq atomic.Uint64
+
+// newRunID 返回新的 run id(run-N,进程内自增)。
+func newRunID() string {
+	return fmt.Sprintf("run-%d", runSeq.Add(1))
 }

@@ -82,13 +82,23 @@ func (s *Session) updateToolAllowRule(next sandbox.ToolAllowRule) {
 }
 
 // Run 执行一轮 /agent 对话：组装 agent → 跑 ReAct 循环 → 流式输出 → 写回 conversation。
-func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) error {
+//
+// 第一返回值是 Run 生命周期记账（「模型成功 ≠ 持久化成功」）：
+//   - 空输入未进入 ReAct → RunCancelled（不创建 AgentRun 语义，由调用方记账）；
+//   - provider / agent.Run 失败 → RunFailed+Persisted=false（用户可见输出逐字不变，仍写 ✘）；
+//   - 持久化 Compact/Commit 失败 → RunFailed+Persisted=false，绝不记 RunCompleted；
+//     Checkpoint 失败维持 warn 不改 State；
+//   - 全部成功（含纯内存模式，内存 conversation 即事实源）→ RunCompleted+Persisted=true。
+//
+// 第二返回值 error 仅保留给调用层错误（现状恒 nil），CLI/ACP 错误面不变。
+func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (RunResult, error) {
 	input := strings.TrimSpace(req.Input)
 	if input == "" {
 		if cb.Write != nil {
 			cb.Write("用法: /agent <你的问题>\n")
 		}
-		return nil
+		// 未进入 ReAct，不创建 AgentRun：记取消态，成功/失败/持久化均无从谈起。
+		return RunResult{State: RunCancelled}, nil
 	}
 
 	// usage 是会话累计账本：跨多次 /agent 累计，直到 /new 用新对象替换当前会话才清零。
@@ -124,7 +134,7 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 		if cb.Write != nil {
 			cb.Write(fmt.Sprintf("✘ Provider 配置错误: %v\n", err))
 		}
-		return nil
+		return RunResult{State: RunFailed, Err: err, Persisted: false}, nil
 	}
 	decisions := make(chan hitl.Decision, 1)
 	mws := s.buildMiddlewareChain(cb, provider, &sandboxCfg, cfg, decisions)
@@ -149,7 +159,7 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 		if cb.Write != nil {
 			cb.Write(fmt.Sprintf("✘ %v\n", err))
 		}
-		return nil
+		return RunResult{State: RunFailed, Err: err, Persisted: false}, nil
 	}
 	s.streamTokens(cb, agentCtx, tokenCh, decisions)
 
@@ -160,25 +170,30 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 	if len(messages) > 1 {
 		conv2 := stripMemoryBlocks(messages[1:]) // messages[0] 是 system prompt
 		if s.deps.Store == nil {
-			// 纯内存模式：保持旧行为
+			// 纯内存模式：保持旧行为。内存 conversation 即事实源，RunCompleted 记 Persisted=true。
 			s.mu.Lock()
 			s.conversation = conv2
 			s.mu.Unlock()
 		} else {
-			// 持久化模式：检测压缩 → compact 或直接 commit
+			// 持久化模式：检测压缩 → compact 或直接 commit。
+			// 「模型成功 ≠ 持久化成功」：Compact/Commit 失败一律 RunFailed+Persisted=false，
+			// 绝不记 RunCompleted；Checkpoint 失败维持 warn 不改 State。
 			if from, to, summary, ok := session.DetectCompact(conv, conv2); ok {
 				// conv2[0] 是摘要（system），由 compact 节点承载，不落 msg
 				if err := s.deps.Store.Compact(from, to, summary); err != nil {
 					slog.Warn("session: compact failed", "err", err)
+					return RunResult{State: RunFailed, Err: fmt.Errorf("session: compact conversation: %w", err), Persisted: false}, nil
 				}
 				if len(conv2) > 1 {
 					if _, err := s.deps.Store.Commit(conv2[1:]); err != nil {
 						slog.Warn("session: commit after compact failed", "err", err)
+						return RunResult{State: RunFailed, Err: fmt.Errorf("session: commit conversation: %w", err), Persisted: false}, nil
 					}
 				}
 			} else {
 				if _, err := s.deps.Store.Commit(conv2); err != nil {
 					slog.Warn("session: commit failed", "err", err)
+					return RunResult{State: RunFailed, Err: fmt.Errorf("session: commit conversation: %w", err), Persisted: false}, nil
 				}
 			}
 			// 提交后自动打 checkpoint，作为 /rewind 回溯锚点（plan「核心模型」）
@@ -190,7 +205,7 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) erro
 			}
 		}
 	}
-	return nil
+	return RunResult{State: RunCompleted, Persisted: true}, nil
 }
 
 // streamTokens 消费 agent 的流式输出：渲染 token、转发 HITL 决策。

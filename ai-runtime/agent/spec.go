@@ -12,7 +12,6 @@ import (
 	memory "github.com/tinguo/goworker/ai-memory"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
-	"github.com/tinguo/goworker/ai-runtime/session"
 	sandbox "github.com/tinguo/goworker/ai-sandbox"
 )
 
@@ -55,6 +54,22 @@ type Session struct {
 	deps SessionDeps
 }
 
+// ConversationStore 是 Session.Run/Compact/Consolidate 所需的持久化最小面;
+// *session.Store 天然满足,宿主（daemon plugin）继续持有具体 *session.Store 传参零改动。
+// 接口成员取自本包实际调用点:session.go 的 ActiveView(383/468)、Commit(175/180)、
+// Compact(171/422)、Checkpoint(185),以及 checkpoint.go Consolidate 的
+// PendingAfterCursor(90)/AdvanceCursor(99)——plan 勘察称后两者「只被 plugin/rewind
+// 使用」,与实际代码不符,由编译器指路补进接口(遗漏在编译期暴露,见 plan 风险 2)。
+// Archive/SetHead/Checkpoints 只被 plugin/rewind 使用,不进接口。
+type ConversationStore interface {
+	ActiveView() []core.Message
+	Commit(msgs []core.Message) ([]core.Message, error)
+	Compact(coveredFrom, coveredTo, summary string) error
+	Checkpoint(preview string) error
+	PendingAfterCursor() []core.Message
+	AdvanceCursor(id string) error
+}
+
 // SessionDeps 是会话构造输入包：插件级资源 + 本会话参数，Init 组装后每次 NewSession 复用。
 // 其余字段跨会话不变。可变资源（instructions）的装载在 plugin 层，这里只收最终值。
 type SessionDeps struct {
@@ -65,7 +80,7 @@ type SessionDeps struct {
 	CollectTools         func(cfg *sandbox.Config) []core.Tool                  // 方法值捕获 p，按需收集工具
 	NewProvider          func(cfg *runtimeconfig.Config) (core.Provider, error) // 按当前 default_provider 构造协议适配器
 	Instruction          *memory.InstructionSet                                 // 会话边界刷新（Init / /new 经 startSession 重载）
-	Store                *session.Store                                         // nil = 持久化禁用
+	Store                ConversationStore                                      // nil = 持久化禁用（接口字段必须真 nil，typed-nil 会让禁用判断失效）
 	PersistAllowRule     func(sandbox.AllowRule) error                          // 持久化 bash allow_always 规则
 	PersistToolAllowRule func(sandbox.ToolAllowRule) error                      // 持久化外部工具 allow_always 规则
 }

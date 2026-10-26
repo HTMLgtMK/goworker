@@ -57,10 +57,17 @@ func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
 	}
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		return p.session.Load().Run(runCtx, runtimeagent.RunRequest{
-			Input:      strings.Join(ctx.Args, " "),
-			ToolSource: ctx.ToolSource,
-		}, callbacksFromPlugin(runContext))
+		// Run 生命周期记账：已在 withSession 临界区内持有 gate，RecordRun 只记账不再排队。
+		// RunResult 进 debug 日志；handleAgent 返回值仍为闭包返回的 error（现状 nil），
+		// CLI/ACP 错误面不变。
+		res := p.runSession.RecordRun(func(s *runtimeagent.Session) (runtimeagent.RunResult, error) {
+			return s.Run(runCtx, runtimeagent.RunRequest{
+				Input:      strings.Join(ctx.Args, " "),
+				ToolSource: ctx.ToolSource,
+			}, callbacksFromPlugin(runContext))
+		})
+		slog.Debug("agent: run finished", "state", res.State, "persisted", res.Persisted, "err", res.Err)
+		return nil
 	})
 }
 

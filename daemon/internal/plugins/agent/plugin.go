@@ -336,9 +336,14 @@ func (p *AgentPlugin) startSession() {
 		Memory:               p.memory,
 		CollectTools:         p.collectTools,
 		NewProvider:          modelProvider,
-		Store:                p.store.Load(),
 		PersistAllowRule:     p.persistAllowRule,
 		PersistToolAllowRule: p.persistToolAllowRule,
+	}
+	// P0-3 起 deps.Store 是 ConversationStore 接口：仅持久化启用且打开成功时注入。
+	// 不能写 Store: p.store.Load() —— *Store 为 nil 时会塞进 typed-nil（接口持 nil
+	// 指针），Session 的 `deps.Store == nil` 纯内存判断随之失效。
+	if st := p.store.Load(); st != nil {
+		p.deps.Store = st
 	}
 	// 指令快照与记忆组件同开关：memory disabled 时留 nil，buildSystemPrompt 跳过指令段。
 	// 会话边界（Init / /new）经 startSession 重载 —— system prompt 在会话创建前就绪。

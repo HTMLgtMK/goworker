@@ -227,7 +227,7 @@ func (p fixedProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan co
 func seedRuns(p *AgentPlugin, inputs ...string) {
 	var out strings.Builder
 	for _, in := range inputs {
-		_ = p.session.Load().Run(context.Background(), runtimeagent.RunRequest{Input: in}, runtimeagent.RunCallbacks{
+		_, _ = p.session.Load().Run(context.Background(), runtimeagent.RunRequest{Input: in}, runtimeagent.RunCallbacks{
 			Write: func(s string) { out.WriteString(s) },
 		})
 	}

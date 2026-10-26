@@ -44,7 +44,7 @@ func TestSessionIntegration_RunPersistsToFile(t *testing.T) {
 	s, _, _, dir := testSessionWithStore(t, &captureProvider{})
 
 	var buf strings.Builder
-	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
+	if _, err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -144,7 +144,7 @@ func TestSessionIntegration_StoreDisabledFallback(t *testing.T) {
 	s, _ := testSession(&captureProvider{})
 
 	var buf strings.Builder
-	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
+	if _, err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 

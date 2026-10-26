@@ -178,7 +178,10 @@ func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispa
 		// 策略决定是自动放行还是转给订阅者）。决策失败一律拒绝，见 DecideViaACP。
 		Decide: model.DecideViaACP(ctx, rep, sessionID),
 	}
-	if err := session.Run(ctx, runtimeagent.RunRequest{Input: prompt}, cb); err != nil {
+	// stdio worker 无 SessionRuntime，Run 不记账（会话生命周期归调用方管理，
+	// 勘察修正 C）；记账留 P2 RunSupervisor。第二返回值 RunResult 此处仅丢弃，
+	// error 面与改造前一致。
+	if _, err := session.Run(ctx, runtimeagent.RunRequest{Input: prompt}, cb); err != nil {
 		return "", err
 	}
 	return protocol.StopEndTurn, nil

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"sync"
 )
 
@@ -63,4 +64,42 @@ func (r *SessionRuntime) Active() *AgentRun {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.active
+}
+
+// RecordRun 在「调用方已持 gate」的前提下执行一轮会话并记账——withSession 的
+// 临界区是唯一预期调用点,这里绝不再 AcquireRun(二次排队即死锁)。流程:创建
+// AgentRun 存入 r.active → 执行 fn → 按 result/ctx 终态化 → 清 r.active → 返回结果。
+// 终态映射:fn 返回的 RunResult 已带终态则原样记账;调用层 error(fn 未归类的
+// 失败)按 ctx 语义分流——取消/超时记 RunCancelled,其余记 RunFailed。
+//
+// 这是 P0 阶段 daemon 同步调用形态的适配;「独占 + 记账 + 宿主 ctx」合一的完整
+// 形态(StartRun)由 P2 的 RunSupervisor 提供。
+func (r *SessionRuntime) RecordRun(fn func(*Session) (RunResult, error)) RunResult {
+	// SessionID 暂以 runtime id 充当("current");store 的稳定 SessionID 在 P1-3 接线。
+	run := newAgentRun(newRunID(), r.ID)
+	run.transition(RunRunning)
+	r.mu.Lock()
+	r.active = run
+	r.mu.Unlock()
+
+	res, err := fn(r.session)
+	switch {
+	case err != nil:
+		state := RunFailed
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			state = RunCancelled
+		}
+		res = RunResult{State: state, Err: err, Persisted: res.Persisted}
+	case res.State != RunCompleted && res.State != RunFailed && res.State != RunCancelled:
+		// 防御:fn 返回非终态且无错误时按完成记账,避免 active 永悬。
+		res.State = RunCompleted
+	}
+
+	run.finish(res)
+	r.mu.Lock()
+	if r.active == run { // 防御:不覆盖后续记账(当前 gate 独占下不会发生)
+		r.active = nil
+	}
+	r.mu.Unlock()
+	return res
 }
