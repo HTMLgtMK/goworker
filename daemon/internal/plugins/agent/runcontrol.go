@@ -295,6 +295,24 @@ func (p *AgentPlugin) Attach(sessionID string) (*runtimeagent.EventHub, uint64, 
 	return hub, hub.LatestSeq(), nil
 }
 
+// ActiveRun 实现 RunControlSource(P5-8):current 会话的 rt.Active() 快照直转,
+// 与 RunStatus 的 active 分支同源(同一观察点)。语义:非 current 会话/无
+// runtime/无活动 run → ok=false——attach 响应的 currentRun=null 不是错误
+// (Attach 才是会话路由的权威校验面,本访问器只做快照观察)。
+func (p *AgentPlugin) ActiveRun(sessionID string) (string, string, bool) {
+	if err := p.requireCurrentSession(sessionID); err != nil {
+		return "", "", false
+	}
+	rt := p.currentSession()
+	if rt == nil {
+		return "", "", false
+	}
+	if run := rt.Active(); run != nil {
+		return run.ID, string(run.State()), true
+	}
+	return "", "", false
+}
+
 // AcquireControl 实现 RunControlSource 的 control lease(P5-6,V1 宿主授权简化
 // 形,拍板②):空闲 → 占用并返回 false;他人持有 → 显式接管(置新 holder,
 // 返回 true 并 slog.Info 审计——「权限检查必须在 Daemon 侧完成」,总方案 §7.4

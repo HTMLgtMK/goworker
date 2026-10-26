@@ -45,6 +45,17 @@ type FrontendHandler struct {
 	// SessionSource 插件/测试桩):全部 x-goworker 方法诚实报错,与 loader/lister
 	// 降级同型。
 	runs model.RunControlSource
+	// events 是 x-goworker 订阅泵的下行通知面(P5-8):registerXGWMethods 注入本
+	// 连接的 *aiacp.Server(内嵌 *Peer,Notify 导出;注册先于 server.Start,无
+	// 并发面,happens-before 经 Start 的 goroutine 创建成立)。nil = 未注册
+	// (不经 wire 的直调形态):attach 诚实报错,泵无从建立。
+	events xgwEventSink
+
+	// subs 是本连接的会话订阅表(P5-8):sessionID → 订阅回收句柄,每连接每会话
+	// 至多一订阅(重复 attach 先 cancel 旧泵再建新);泵退出自清按句柄指针身份
+	// 判重,换代/断连(Close)统一回收。与 promptable/readOnly 共用 h.mu:各
+	// 临界区互不嵌套、均为叶锁,无锁环。
+	subs map[string]*xgwSubscription
 
 	mu         sync.Mutex
 	promptable map[string]struct{} // 可 prompt 集合：session/new 与当前会话 load 记入

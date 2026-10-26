@@ -103,6 +103,63 @@ type XApprovalRespondResult struct {
 	Accepted bool `json:"accepted"`
 }
 
+// attach/detach 的 mode 白名单(总方案 §7.4 的 AttachMode 二值枚举):control
+// 显式获取 control lease(后到连接接管,tookOver 回显),observe 只观察不动
+// lease。空串按 observe 处理(总方案 §7 交互示例的 attach 报文即不带 mode——
+// 无特权默认;特权必须显式 opt-in)。未知值 fail-closed 拒绝:把 "control"
+// 拼错的客户端绝不静默降级为 observe(拿不到 lease 的错误可见,好过以为
+// 持有控制权实则没有)。
+const (
+	XAttachModeObserve = "observe"
+	XAttachModeControl = "control"
+)
+
+// XSessionAttachParams 是 x-goworker/session/attach 的入参。afterSeq 是客户端
+// 已确认游标:Subscribe 回放 (afterSeq, 注册点 latest] 后无缝续 live(Replay+
+// Live 原子建立,总方案 §7);0 = 从保留最早开始。attach 仅 current 会话
+// (拍板⑤):归档会话 source 层诚实报错并指引 session/load。
+type XSessionAttachParams struct {
+	SessionID string `json:"sessionId"`
+	AfterSeq  uint64 `json:"afterSeq"`
+	Mode      string `json:"mode,omitempty"`
+}
+
+// XSessionAttachRun 是 attach 响应 currentRun 字段的子形状:attach 时刻该
+// 会话活动 Run 的快照(经 source 的 ActiveRun 访问器);无活动 Run 时
+// currentRun 为 null(指针 nil,不是错误)。
+type XSessionAttachRun struct {
+	RunID string `json:"runId"`
+	State string `json:"state"`
+}
+
+// XSessionAttachResult 是 x-goworker/session/attach 的响应。latestSeq 是
+// attach 时刻会话事件流的位置快照,**仅描述当前位置,客户端不得跳游标**——
+// 只有真正应用了对应事件才能推进本地 cursor(总方案 §7 :586-589);订阅注册
+// 水位可能高于本值(attach 与 Subscribe 之间发布的事件由 live 侧续传),客户端
+// 按逐事件 seq 记账,不据此批量前移。tookOver 仅 mode=control 且接管了他连接
+// 的 lease 时为 true(其余省略)。
+type XSessionAttachResult struct {
+	CurrentRun *XSessionAttachRun `json:"currentRun"`
+	LatestSeq  uint64             `json:"latestSeq"`
+	TookOver   bool               `json:"tookOver,omitempty"`
+}
+
+// XSessionDetachParams 是 x-goworker/session/detach 的入参。mode 与 attach 同
+// 白名单:mode=control 时本连接归还 control lease(仅持有者本人有效,他人
+// 调用为空操作,P5-6 契约);observe/省略只收订阅泵,lease 不动——lease 生命
+// 周期显式(attach(control) 获取,detach(control) 或断连归还)。
+type XSessionDetachParams struct {
+	SessionID string `json:"sessionId"`
+	Mode      string `json:"mode,omitempty"`
+}
+
+// XSessionDetachResult 是 x-goworker/session/detach 的响应:detached=true 表示
+// 本连接该会话的订阅(与 mode=control 时的 lease)已交还。对无订阅的会话
+// detach 同样返回 detached=true(幂等,总方案 §7 响应形状)。
+type XSessionDetachResult struct {
+	Detached bool `json:"detached"`
+}
+
 // xgwError 按本协议错误约定构造 -32000 RPC 错误。
 func xgwError(format string, args ...any) *protocol.RPCError {
 	return &protocol.RPCError{Code: xgwErrorCode, Message: fmt.Sprintf(format, args...)}
@@ -144,4 +201,14 @@ func xgwDecisionFromWire(d XApprovalDecision) (hitl.Decision, error) {
 	}
 	return hitl.Decision{}, xgwError(
 		"x-goworker: unknown decision type %q (want approve, approve_always, reject, edit or respond)", d.Type)
+}
+
+// xgwAttachMode 校验 attach/detach 的 mode 白名单(见常量注释):空串与
+// observe 同义(无特权默认),control 是显式 opt-in,未知值 fail-closed。
+func xgwAttachMode(mode string) (string, error) {
+	switch mode {
+	case "", XAttachModeObserve, XAttachModeControl:
+		return mode, nil
+	}
+	return "", xgwError("x-goworker: unknown attach mode %q (want %q or %q)", mode, XAttachModeObserve, XAttachModeControl)
 }

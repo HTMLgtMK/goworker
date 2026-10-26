@@ -122,6 +122,11 @@ type RunControlSource interface {
 	// Attach 返回会话事件枢纽与当前 latest seq（P5-8 的 attach 面消费；本步
 	// 落签名与实现——EnsureHub 使「重启后 attach 时 hub 未建」的缺口关闭）。
 	Attach(sessionID string) (hub *runtimeagent.EventHub, latest uint64, err error)
+	// ActiveRun 返回会话当前活动 Run 的 (runID, state) 快照（P5-8 attach 响应
+	// 的 currentRun 字段消费；RunControlSource 在 P5-6 未备该访问器，P5-8 按
+	// 响应契约最小补齐——RunStatus 需 runID 寻址，无法充当）。无活动 Run、无
+	// runtime 或非 current 会话 → ok=false（currentRun=null，非错误）。
+	ActiveRun(sessionID string) (runID, state string, ok bool)
 	// AcquireControl 获取 control lease：空闲→占用并返回 false；他人持有→
 	// 显式接管（返回 true，slog.Info 审计）；同持有者重复→false。
 	AcquireControl(connectionID string) (tookOver bool)
