@@ -61,9 +61,10 @@ func (h RunHandle) Wait(ctx context.Context) (RunResult, error) {
 // 契约(调用方必须遵守,plan §5 风险 1):
 //  1. cb 所有权自本方法返回起归 supervisor:execute goroutine 是 cb 的唯一后续
 //     使用者,调用方不得再读写 cb 的任何字段/捕获变量,否则数据竞争;
-//  2. execute 的 runCtx 以 manager 宿主 ctx(m.contextOf())为父——调用方 ctx
-//     不参与(API 形状即保证:连接断开不影响后台 Run,TestRunSurvivesDisconnect
-//     钉死),且 runCtx **不带 sessionGateKey 重入标记**:后台 Run 与前端同会话
+//  2. run 的 runCtx 由本方法同步段以 manager 宿主 ctx(m.contextOf())为父派生
+//     (StartRun ⑥,P2-6 修正)——调用方 ctx 不参与(API 形状即保证:连接断开
+//     不影响后台 Run,TestRunSurvivesDisconnect 钉死),且 runCtx **不带
+//     sessionGateKey 重入标记**:后台 Run 与前端同会话
 //     操作靠 gate 互斥,但 run 内经 hub.Eval 等路径嵌套发起同会话 prompt(需要
 //     重入标记放行 SessionGate,commands.go:28-50)会死锁——P5 接前端时必须在
 //     注入点补上该标记,本方法不做。
@@ -124,22 +125,29 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 		At:        time.Now(),
 	})
 
-	// ⑥ 执行转移给 supervisor goroutine(cb 所有权随之转移,契约①),立即返回。
-	go m.execute(rt, run, req, cb)
-	return RunHandle{SessionID: sessionID, RunID: run.ID, run: run}, nil
-}
-
-// execute 是后台 Run 的单 goroutine 执行体(cb 所有权自 StartRun 返回起归它,
-// 契约①):派生 runCtx → gate → runSlots → 出队 → running → Session.Run →
-// 终态化。每条出口路径上 pending/gate/runSlots/active 四项资源各恰好释放一次
-// (评审重点,plan §5.8 的释放矩阵)。
-func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, req RunRequest, cb RunCallbacks) {
-	// runCtx 以宿主 ctx 为父(契约②:调用方 ctx 不参与、无 sessionGateKey 重入
-	// 标记);cancel 写入 run 供 CancelRun(P2-6)经 cancelFunc() 调用。
+	// ⑥ 派生 runCtx 并写入 run.cancel——**同步段完成**(P2-6 修正):返回的
+	// 句柄立即可取消。若推迟到 execute 内写入(P2-5 原形态),StartRun 返回后
+	// 立即 CancelRun 会与 execute 的调度竞争,对排队中的 Run 误报
+	// ErrRunNotCancellable(plan P2-6 的 TestCancelIsolation 实测 20 次复跑 6 次
+	// 命中)。runCtx 以宿主 ctx 为父(契约②:调用方 ctx 不参与、无
+	// sessionGateKey 重入标记);同步 RecordRun 路径不经此处,run.cancel 恒 nil
+	// 的语义不变(ErrRunNotCancellable 的产生面仍只有同步路径)。
 	runCtx, cancel := context.WithCancel(m.contextOf())
 	run.mu.Lock()
 	run.cancel = cancel
 	run.mu.Unlock()
+
+	// ⑦ 执行转移给 supervisor goroutine(cb 所有权随之转移,契约①),立即返回。
+	go m.execute(rt, run, runCtx, cancel, req, cb)
+	return RunHandle{SessionID: sessionID, RunID: run.ID, run: run}, nil
+}
+
+// execute 是后台 Run 的单 goroutine 执行体(cb 所有权自 StartRun 返回起归它,
+// 契约①):gate → runSlots → 出队 → running → Session.Run → 终态化。runCtx/
+// cancel 由 StartRun 同步段派生并写入 run.cancel(P2-6 修正,见 StartRun ⑥),
+// execute 负责在出口释放 cancel。每条出口路径上 pending/gate/runSlots/active
+// 四项资源各恰好释放一次(评审重点,plan §5.8 的释放矩阵)。
+func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx context.Context, cancel context.CancelFunc, req RunRequest, cb RunCallbacks) {
 	defer cancel()
 
 	// ① 每会话 gate:与同步路径(withSession)天然互斥。失败(runCtx 取消,如

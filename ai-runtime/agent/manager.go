@@ -17,9 +17,8 @@ import (
 // 新 runtime(同步 Register 与 P2-5 的 StartRun 共用同一拒绝语义)。
 var ErrManagerClosed = errors.New("session: manager closed")
 
-// StartRun(P2-5)与其余 Run 记账面的拒绝语义 sentinel。ErrRunNotFound/
-// ErrRunNotCancellable 的产生方是 CancelRun(P2-6),随本步一并定义以保持
-// sentinel 面完整(未使用不报错,由 P2-6 接线)。
+// StartRun(P2-5)与其余 Run 记账面的拒绝语义 sentinel:ErrRunNotFound/
+// ErrRunNotCancellable 的产生方是 CancelRun(P2-6,本文件末尾)。
 var (
 	ErrSessionNotFound   = errors.New("session: session not found")
 	ErrRunActive         = errors.New("session: run already active")
@@ -186,4 +185,43 @@ func (m *SessionManager) Close() {
 	m.mu.Lock()
 	m.runtimes = make(map[string]*SessionRuntime)
 	m.mu.Unlock()
+}
+
+// CancelRun 取消一个后台 Run(P2-6,总方案 P2 第 4 条):运行中与排队中的
+// StartRun Run 均可取消。cancel 使 runCtx 就绪.Done,取消的落点全部在 execute
+// 既有分支(supervisor.go):
+//   - 排队中(等待在 ① gate / ② runSlots 的 select)→ 命中 runCtx.Done →
+//     释放已持有的 gate/pending → finalizeRun(RunCancelled)——总方案第四节
+//     「排队取消必须直接释放占用权」由该失败分支的释放满足;
+//   - 运行中 → ⑤ 返回后 runCtx.Err() 非 nil → execute 层归一覆盖 RunCancelled
+//     (P2-1 归一保证状态正确,取消绝不记 failed)。
+//
+// 拒绝语义:未知会话 / 无在途 Run / RunID 不匹配 → ErrRunNotFound;cancelFunc()
+// == nil → ErrRunNotCancellable——同步 RecordRun 路径的 Run 无 cancel,其取消
+// 入口是调用方请求 ctx(连接断开 / session cancel),P5 前不经 CancelRun。
+//
+// 并发论证:两把锁(m.mu / rt.mu)内都只做快照,cancel() 在任何锁之外调用
+// (锁内不调回调);快照后 run.ID/cancelFunc() 的读取只依赖 run 自身的 mu,
+// 与 rt.mu 无关。取消与完成竞争幂等:谁先到 finalizeRun 都成立(transition
+// 防重入 run.go:67-85、done 幂等关闭;cancel 落在终态之后只是关闭一个已无
+// 等待者的 ctx,无副作用)。
+func (m *SessionManager) CancelRun(sessionID, runID string) error {
+	rt := m.Get(sessionID)
+	if rt == nil {
+		return ErrRunNotFound
+	}
+
+	// rt.mu 内快照 Active()(Active 自身持 rt.mu)后立即释放:后续判定与
+	// cancel 均在锁外。
+	run := rt.Active()
+	if run == nil || run.ID != runID {
+		return ErrRunNotFound
+	}
+
+	cancel := run.cancelFunc()
+	if cancel == nil {
+		return ErrRunNotCancellable // 同步 RecordRun 路径无 cancel
+	}
+	cancel()
+	return nil
 }

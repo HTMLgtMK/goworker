@@ -288,3 +288,239 @@ func TestStartRunJournalsQueuedBeforeReturn(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// P2-6:CancelRun + 排队取消路径(总方案第十一节 TestCancelIsolation → 本步)。
+//
+// plan P2-6「取消相关 stub provider 必须 select ctx.Done 及时返回」:gatedProvider
+// 的挂起不感知 ctx,取消后仍要等 release 才返回,无法证明取消及时生效——取消
+// 测试专用 cancelAwareProvider(单轮使用,每测试独立实例)。
+// ---------------------------------------------------------------------------
+
+// cancelAwareProvider 是取消测试专用的单轮 stub provider:开工即宣告 started,
+// 随后 select 挂起在 release 与 ctx.Done 上——release 关闭则正常返回(内容为
+// reply,空则回落 "reply"),ctx 取消则立即返回 ctx.Err()。每个实例只服务一轮
+// Chat(关闭已关闭的 started 会 panic,单轮构造即契约)。
+type cancelAwareProvider struct {
+	started chan struct{}
+	release chan struct{}
+	reply   string
+}
+
+func (p *cancelAwareProvider) Name() string  { return "cancel-aware" }
+func (p *cancelAwareProvider) Model() string { return "m" }
+
+func (p *cancelAwareProvider) Chat(ctx context.Context, _ *core.ChatRequest) (*core.ChatResponse, error) {
+	close(p.started)
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	content := p.reply
+	if content == "" {
+		content = "reply"
+	}
+	return &core.ChatResponse{Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: content}}}}, nil
+}
+
+func (p *cancelAwareProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	return nil, errors.New("not implemented")
+}
+
+// newCancelRuntime 构造带 cancelAwareProvider 的 runtime 并注册进 manager:started
+// 在 provider 开工时关闭;release 关闭后 provider 正常返回,ctx 取消则立即返回。
+func newCancelRuntime(t *testing.T, m *SessionManager, id, reply string) (st *fakeConversationStore, started, release chan struct{}) {
+	t.Helper()
+	started = make(chan struct{})
+	release = make(chan struct{})
+	pv := &cancelAwareProvider{started: started, release: release, reply: reply}
+	st = &fakeConversationStore{}
+	rt := NewSessionRuntime(id, newFakeStoreSession(st, nil, pv))
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("register %s: %v", id, err)
+	}
+	return st, started, release
+}
+
+// waitCancelled 等待句柄到达终态并断言 RunCancelled(与 waitHandle 的完成断言
+// 对偶;Err/Persisted 由各测试按路径自行断言)。
+func waitCancelled(t *testing.T, h RunHandle) RunResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := h.Wait(ctx)
+	if err != nil {
+		t.Fatalf("Wait: %v (state=%s)", err, h.State())
+	}
+	if res.State != RunCancelled {
+		t.Fatalf("run result = %+v, want RunCancelled", res)
+	}
+	return res
+}
+
+// TestCancelIsolation(总方案第十一节 → 本步):WithRunLimits(1, 8)——A 挂起
+// 占住唯一全局槽,B StartRun 排队(queued)后取消 B:B.Wait = RunCancelled、B 的
+// provider 从未被调用(store 零提交、排队取消直接释放占用权);A release 后照常
+// RunCompleted+Persisted 且 store 提交完整——A 不受 B 取消影响。
+func TestCancelIsolation(t *testing.T) {
+	m := NewSessionManager(WithRunLimits(1, 8))
+	defer m.Close()
+	stA, startedA, releaseA := newCancelRuntime(t, m, "session-A", "reply-A")
+	stB, _, _ := newCancelRuntime(t, m, "session-B", "reply-B") // B 排队取消:provider 不会被调用
+
+	hA, err := m.StartRun("session-A", RunRequest{Input: "q-A"}, testRunCallbacks(&strings.Builder{}))
+	if err != nil {
+		t.Fatalf("StartRun A: %v", err)
+	}
+	waitStarted(t, startedA) // A 占住唯一 runSlots 槽
+
+	hB, err := m.StartRun("session-B", RunRequest{Input: "q-B"}, testRunCallbacks(&strings.Builder{}))
+	if err != nil {
+		t.Fatalf("StartRun B while slot held: %v", err)
+	}
+	if got := hB.State(); got != RunQueued {
+		t.Fatalf("B state right after StartRun = %q, want RunQueued", got)
+	}
+
+	if err := m.CancelRun("session-B", hB.RunID); err != nil {
+		t.Fatalf("CancelRun queued B: %v", err)
+	}
+	resB := waitCancelled(t, hB)
+	if resB.Persisted {
+		t.Fatalf("cancelled queued run B persisted = true, want false: %+v", resB)
+	}
+	// 排队取消,B 从未执行:store 零提交。
+	stB.mu.Lock()
+	bCommits := len(stB.commits)
+	stB.mu.Unlock()
+	if bCommits != 0 {
+		t.Fatalf("cancelled queued run B committed %d time(s), want 0 (B 未执行)", bCommits)
+	}
+
+	close(releaseA) // A 不受 B 取消影响,放行后照常完成
+	waitHandle(t, hA)
+	assertSingleCommit(t, stA, "q-A", "reply-A")
+}
+
+// TestCancelRunningRun:运行中(A 的 provider 挂起中)Cancel → RunCancelled;
+// journal 记录流为 queued → running → cancelled(终态记录 state=="cancelled",
+// 取消绝不记 failed/completed)。
+func TestCancelRunningRun(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	jr := &stubRunJournal{}
+	started := make(chan struct{})
+	release := make(chan struct{}) // 不关闭:取消是本测试唯一出口
+	pv := &cancelAwareProvider{started: started, release: release}
+	s := NewSession(SessionDeps{
+		Config:   runtimeconfig.Default(),
+		AuditDir: "",
+		CollectTools: func(*sandbox.Config) []core.Tool {
+			return nil
+		},
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			return pv, nil
+		},
+		Store:      &fakeConversationStore{},
+		RunJournal: jr,
+	})
+	rt := NewSessionRuntime("cancel-running", s)
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	h, err := m.StartRun("cancel-running", RunRequest{Input: "q"}, testRunCallbacks(&strings.Builder{}))
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	waitStarted(t, started) // provider 挂起中:run 正在运行
+
+	if err := m.CancelRun("cancel-running", h.RunID); err != nil {
+		t.Fatalf("CancelRun running: %v", err)
+	}
+	waitCancelled(t, h)
+
+	recs := jr.snapshot()
+	wantStates := []string{string(RunQueued), string(RunRunning), string(RunCancelled)}
+	if len(recs) != len(wantStates) {
+		t.Fatalf("journal records = %d, want %d (%s → %s → %s)", len(recs), len(wantStates), wantStates[0], wantStates[1], wantStates[2])
+	}
+	for i, rec := range recs {
+		if rec.RunID != h.RunID {
+			t.Fatalf("record %d RunID = %q, want %q", i, rec.RunID, h.RunID)
+		}
+		if rec.State != wantStates[i] {
+			t.Fatalf("record %d state = %q, want %q (终态必须是 cancelled)", i, rec.State, wantStates[i])
+		}
+	}
+}
+
+// TestCancelUnknownRun:ErrRunNotFound 的三个产生分支——未知会话、已知会话但
+// RunID 不匹配、无在途 Run(空闲会话)。
+func TestCancelUnknownRun(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+	_, started, release := newCancelRuntime(t, m, "known", "reply")
+	newCancelRuntime(t, m, "idle", "reply") // 从未运行:无在途 Run
+
+	h, err := m.StartRun("known", RunRequest{Input: "q"}, testRunCallbacks(&strings.Builder{}))
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	waitStarted(t, started)
+
+	if err := m.CancelRun("no-such-session", h.RunID); !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("CancelRun unknown session = %v, want ErrRunNotFound", err)
+	}
+	// 已知会话但在途 Run 的 RunID 不匹配。
+	if err := m.CancelRun("known", "run-bogus"); !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("CancelRun mismatched run id = %v, want ErrRunNotFound", err)
+	}
+	// 空闲会话(Active() 为 nil)。
+	if err := m.CancelRun("idle", "run-whatever"); !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("CancelRun idle session = %v, want ErrRunNotFound", err)
+	}
+
+	close(release)
+	waitHandle(t, h)
+}
+
+// TestCancelSyncRunRejected:同步路径(RecordRun)在途时 CancelRun 拒绝
+// (ErrRunNotCancellable)——同步 Run 无 cancel,取消入口是调用方请求 ctx,
+// CancelRun 不得误伤;随后同步 Run 照常完成。
+func TestCancelSyncRunRejected(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	pv := &gatedProvider{
+		replies: []string{"reply"},
+		starts:  []chan struct{}{started},
+		release: []chan struct{}{release},
+	}
+	rt := NewSessionRuntime("sync", newFakeStoreSession(&fakeConversationStore{}, nil, pv))
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	done := make(chan RunResult, 1)
+	go func() {
+		done <- rt.RecordRun(func(s *Session) (RunResult, error) {
+			return s.Run(context.Background(), RunRequest{Input: "q"}, testRunCallbacks(&strings.Builder{}))
+		})
+	}()
+	waitStarted(t, started)
+
+	run := rt.Active()
+	if run == nil {
+		t.Fatal("no active run while sync RecordRun in flight")
+	}
+	if err := m.CancelRun("sync", run.ID); !errors.Is(err, ErrRunNotCancellable) {
+		t.Fatalf("CancelRun sync run = %v, want ErrRunNotCancellable", err)
+	}
+
+	close(release) // 同步 Run 不受影响,照常完成
+	waitRunResult(t, done)
+}

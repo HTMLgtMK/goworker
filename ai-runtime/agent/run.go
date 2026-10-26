@@ -44,9 +44,10 @@ type AgentRun struct {
 	startedAt time.Time
 	done      chan struct{}
 	result    RunResult
-	// cancel 是后台 Run 的取消函数(mu 保护):P2-5 的 execute 在派生 runCtx
-	// 后写入,CancelRun(P2-6)经 cancelFunc() 读取并调用。RecordRun 同步路径
-	// 恒 nil——同步 Run 的取消入口是调用方请求 ctx,不经 run 记账。
+	// cancel 是后台 Run 的取消函数(mu 保护):StartRun 同步段在派生 runCtx 后
+	// 写入(P2-6 修正:先于 go execute,返回的句柄立即可取消),CancelRun(P2-6)
+	// 经 cancelFunc() 读取并调用。RecordRun 同步路径恒 nil——同步 Run 的取消
+	// 入口是调用方请求 ctx,不经 run 记账。
 	cancel context.CancelFunc
 }
 
