@@ -125,10 +125,10 @@ func (r *SessionRuntime) DeclareCWD(cwd string, err error) {
 //     二次确认写入(双重检查)。两把锁无嵌套:rt.mu 释放后才进 NewEventHub
 //     (hub.mu 由 hub 自持,不回触 rt.mu),无锁环;极端竞态下(前提被未来改动
 //     破坏)最坏结果是多造一个被丢弃的 hub——构造只读不写,丢弃无副作用;
-//   - 与 Manager.Close 的 closeEvents(P3-5)的交集(预留注释,P3-5 落码兑现):
-//     Close 的次序是「先等全部在途 run 终态,再逐 runtime closeEvents」,而
-//     bindEvents 只发生在 StartRun 同步段——Close 置 closed 后 StartRun 在 ①
-//     即被拒,二者无并发窗口;events 字段的全部读写都在 rt.mu 内。
+//   - 与 Manager.Close 的 closeEvents(P3-5)的交集:Close 的次序是「先等全部
+//     在途 run 终态,再逐 runtime closeEvents」,而 bindEvents 只发生在 StartRun
+//     同步段——Close 置 closed 后 StartRun 在 ① 即被拒,二者无并发窗口;events
+//     字段的全部读写都在 rt.mu 内。
 func (r *SessionRuntime) bindEvents(sessionID string, journal EventJournal) *EventHub {
 	if journal == nil {
 		return nil
@@ -158,6 +158,35 @@ func (r *SessionRuntime) eventHub() *EventHub {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.events
+}
+
+// closeEvents 收口本 runtime 的事件枢纽(P3-5 生命周期断线/关闭语义):events
+// 非 nil 时依次 EndRun(幂等:flush 残留合并缓冲 + 清 curRunID)与 Close(幂等:
+// 置 closed、断开全部订阅者、关 journal 桥接)——此后 hub 一律拒绝 Publish/
+// Subscribe(ErrHubClosed)。「关掉的事件流不能再产出事件」。
+//
+// 调用点只有 Manager.Close(P3-5):「等全部在途 run 终态」之后、「清表」之前,
+// 逐 runtime 调用。次序即论证:tee 的 Publish 只发生在 Session.Run 内(supervisor.go
+// 的 cb 调用面,先于 finalizeRun 关闭 run.done),Close 等到全部 done 关闭后才到
+// 这里 ⇒ 执行中的 Publish 不可能写已关闭的 journal;EndRun 先行兜底 flush(正常
+// 路径 execute ⑤.5 已收口,此处到达时缓冲已空,幂等空操作)。Close 之后
+// bindEvents 理论上仍可被极端竞态下的 StartRun 触发(见 bindEvents 注释),本方法
+// 不做重入防御——只保证「Close 返回时快照 runtime 的 hub 已收口」,与 P2-4 Close
+// 的「快照时在途 run 全部 done」语义对齐。
+//
+// 锁协调:events 经 eventHub() 在 rt.mu 内读取,EndRun/Close(hub.mu + journal
+// 文件 I/O)在 rt.mu 外执行——「锁内不做文件 I/O」纪律(P2-3 起);rt.mu 与
+// hub.mu 无嵌套(hub 不回触 runtime),无锁环。
+func (r *SessionRuntime) closeEvents() {
+	if hub := r.eventHub(); hub != nil {
+		hub.EndRun()
+		if err := hub.Close(); err != nil {
+			// 桥接 journal 的 Close 失败只 warn:与 journalRunState/teePublish 的
+			// 降级语义一致(journal.go:493-513,RunJournalStore 不实现 io.Closer,
+			// 此路仅自定义桥接可达),不阻断 manager 停机。
+			slog.Warn("agent: event hub close failed", "err", err, "session", r.ID)
+		}
+	}
 }
 
 // journalRunState 将一条 Run 状态记录写入会话绑定的 Run journal(s.deps.RunJournal,

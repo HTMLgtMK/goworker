@@ -11,7 +11,8 @@ import (
 // 本文件是多会话执行内核的注册表:SessionManager 按 SessionID 管理
 // SessionRuntime,并持有宿主生命周期 ctx(P2-4)与全局并发配额(P2-5 的
 // runSlots/pending)——StartRun(P2-5,supervisor.go)的 runCtx 以宿主 ctx 为父,
-// Close = 取消宿主 ctx + 等待在途 Run 终态 + 拒绝后续 Register。
+// Close = 取消宿主 ctx + 等待在途 Run 终态 + 逐 runtime 收口事件枢纽(P3-5)
+// + 拒绝后续 Register。
 
 // ErrManagerClosed 是 manager 停机后的注册拒绝 sentinel:Close 之后不再接受
 // 新 runtime(同步 Register 与 P2-5 的 StartRun 共用同一拒绝语义)。
@@ -148,7 +149,8 @@ func (m *SessionManager) contextOf() context.Context {
 }
 
 // Close 是总方案 P2 第 4 条的 Shutdown:取消宿主生命周期 ctx → 等待全部在途
-// Run 终态 → 拒绝后续 Register(ErrManagerClosed)→ 清空注册表。幂等。
+// Run 终态 → 逐 runtime 收口事件枢纽(P3-5 的 closeEvents)→ 拒绝后续 Register
+// (ErrManagerClosed)→ 清空注册表。幂等。
 //
 // 语义边界:
 //   - 同步路径(RecordRun)的 fn 用调用方 ctx,与 m.ctx 无父子关系,Close 的
@@ -156,6 +158,11 @@ func (m *SessionManager) contextOf() context.Context {
 //     session cancel)语义管理,不经 manager;
 //   - 等待只盯 run.done(由 transition 在 run.mu 内关闭):不持 m.mu 也不持
 //     rt.mu 等待,Get/Remove/List 与记账推进在等待期间照常工作,无锁环;
+//   - 事件面收口(P3-5)在「等全部在途 run 终态」之后、「清表」之前:次序即
+//     论证——tee 的 Publish 只发生在 Session.Run 内(supervisor.go 的 cb 调用
+//     面,先于 finalizeRun 关闭 run.done),等待完成后再关 hub ⇒ 执行中的
+//     Publish 不可能写已关闭的 journal;Close 后 hub 一律拒绝新 Subscribe
+//     (ErrHubClosed),事件流随 manager 生命周期终结;
 //   - P2-7 起 daemon 在 Stop 时**不**调用它:同步路径(daemon 现状唯一调用
 //     形态)没有 manager 持有的 run,等待在途 prompt 反而拖慢停机——Stop 的
 //     收尾仍是各 store/repo 各自 Close,P5 StartRun 接入前端后再接线。
@@ -180,6 +187,14 @@ func (m *SessionManager) Close() {
 		if run := rt.Active(); run != nil {
 			<-run.done
 		}
+	}
+
+	// 事件面收口(P3-5):逐 runtime EndRun+Close 其 EventHub(均幂等;events
+	// 为 nil 的 runtime——同步路径/未启用 RunEvents——是空操作)。必须落在
+	// 上面的等待之后:先等 run done 再关 hub,执行中的 Publish 不可能写已关闭
+	// 的 journal(见函数头语义边界);此后 hub 拒绝 Publish/Subscribe。
+	for _, rt := range runtimes {
+		rt.closeEvents()
 	}
 
 	m.mu.Lock()
