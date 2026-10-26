@@ -20,6 +20,7 @@ import (
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/mcp"
 	runtimeopenai "github.com/tinguo/goworker/ai-runtime/provider/openai"
+	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/ai-sandbox"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
@@ -244,11 +245,17 @@ func (p *AgentPlugin) setMemory(c *memory.Client) {
 
 // refreshSession 用当前 deps 重建会话并接线 current runtime，对齐 startSession
 // 的会话边界构造（Register 进 manager + 置为 current；测试不读真实文件 ——
-// deps 由测试直接注入）。重复调用（setMemory 等）即 /new 式重建：同 id 注册
-// 冲突时旧 runtime 保留在 manager，current 换新。
+// deps 由测试直接注入）。runtime id 与生产同规则（P1-3 ④）：deps 注入了
+// *session.Store 时取其 SessionID（currentStore() 经 repo 缓存解析取数的键），
+// 纯内存维持 "current" 稳定单例。重复调用（setMemory 等）即 /new 式重建：同 id
+// 注册冲突时旧 runtime 保留在 manager，current 换新。
 func (p *AgentPlugin) refreshSession() {
 	s := runtimeagent.NewSession(p.deps)
-	rt := runtimeagent.NewSessionRuntime("current", s)
+	id := "current"
+	if st, ok := p.deps.Store.(*session.Store); ok && st != nil {
+		id = st.SessionID()
+	}
+	rt := runtimeagent.NewSessionRuntime(id, s)
 	_ = p.manager.Register(rt)
 	p.current.Store(rt)
 }

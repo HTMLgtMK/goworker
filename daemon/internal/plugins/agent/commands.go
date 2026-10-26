@@ -110,11 +110,14 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 		// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
 		// 同步固化旧会话（阻塞，状态栏显示进度）；快照走只读，先取好再重建。
 		old := p.boundSession()
+		// 当前会话 store 经 current 解析（P1-3）：快照与归档都落在 startSession
+		// 换轨前的同一实例上（闭包持 gate，重建前 current 不变）。
+		oldStore := p.currentStore()
 
 		// pending 快照（store 生效时用游标后的增量，否则全量）
 		var pending []core.Message
-		if st := p.store.Load(); st != nil {
-			pending = st.PendingAfterCursor()
+		if oldStore != nil {
+			pending = oldStore.PendingAfterCursor()
 			if len(pending) == 0 && old != nil {
 				pending = old.Conversation() // 兜底全量
 			}
@@ -130,14 +133,17 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 		}
 
 		// 先归档旧 store，再开新会话（新 store 写新文件）
-		// pending 快照已在 Archive 前取出，不受归档影响
-		if st := p.store.Load(); st != nil {
-			if err := st.Archive(); err != nil {
+		// pending 快照已在 Archive 前取出，不受归档影响。legacy 槽内轮转
+		// （current.jsonl → root/archive/）；独立目录会话同样在其目录内轮转
+		// （Archive 以 store 自身 dir 为基准）。
+		if oldStore != nil {
+			if err := oldStore.Archive(); err != nil {
 				slog.Warn("session: archive failed", "err", err)
 			}
 		}
 
-		// 创建新会话（新对象 = 新会话，旧状态随对象回收）
+		// 创建新会话（新对象 = 新会话，旧状态随对象回收）。P1-3 起 startSession
+		// 经 Repository.Create 产出独立目录新会话（<Session.Dir>/<id>/）。
 		p.startSession()
 
 		runContext.Writer("✔ STM cleared, memory will be retrieved on every query\n")

@@ -6,21 +6,9 @@ import (
 	"testing"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/session"
 )
-
-// openTestStore 打开临时目录下的 store 并注册 cleanup。
-func openTestStore(t *testing.T) *session.Store {
-	t.Helper()
-	d := t.TempDir()
-	s, err := session.Open(d)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s
-}
 
 // commMsgs 快捷构造一批带 id 的消息。
 // id 必须唯一：Commit 对重复 id 幂等跳过，固定 id 会让多轮提交被静默丢弃。
@@ -67,26 +55,26 @@ func TestIsCompactMsg(t *testing.T) {
 
 // TestHandleRewind_Numbering 验证 /rewind 编号语义：#1 = 最新 checkpoint（倒序）。
 // 这是 handler 层回归测试，锁死编号映射不回归（历史上 #1 曾误指向最旧）。
+// P1-3 起取数经 currentStore()：按生产 repo 接线（legacy 根槽挂载）后断言不变。
 func TestHandleRewind_Numbering(t *testing.T) {
-	st := openTestStore(t)
-	// 提交三轮，每轮打 checkpoint
+	dir := t.TempDir()
+	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
 	var lastMsgID string
-	for round := 0; round < 3; round++ {
-		msgs := commMsgs([]string{"user", "assistant"})
-		committed, err := st.Commit(msgs)
-		if err != nil {
-			t.Fatalf("Commit round %d: %v", round, err)
+	mountID := seedLegacySlot(t, dir, func(st *session.Store) {
+		// 提交三轮，每轮打 checkpoint
+		for round := 0; round < 3; round++ {
+			msgs := commMsgs([]string{"user", "assistant"})
+			committed, err := st.Commit(msgs)
+			if err != nil {
+				t.Fatalf("Commit round %d: %v", round, err)
+			}
+			lastMsgID = committed[len(committed)-1].MsgID
+			if err := st.Checkpoint(fmt.Sprintf("round %d", round)); err != nil {
+				t.Fatalf("Checkpoint round %d: %v", round, err)
+			}
 		}
-		lastMsgID = committed[len(committed)-1].MsgID
-		if err := st.Checkpoint(fmt.Sprintf("round %d", round)); err != nil {
-			t.Fatalf("Checkpoint round %d: %v", round, err)
-		}
-	}
-
-	p := &AgentPlugin{manager: runtimeagent.NewSessionManager()}
-	p.store.Store(st)
-	p.deps = runtimeagent.SessionDeps{Store: st}
-	p.refreshSession()
+	})
+	p, st := wireLegacyStore(t, cfg, mountID)
 
 	// 列表：#1 应是最新（round 2），#3 是最旧（round 0）
 	ctx, buf := newContext()

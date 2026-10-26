@@ -52,15 +52,21 @@ type AgentPlugin struct {
 	// 读（评审 I4），裸指针读写是没有 happens-before 的数据竞争。会话本体经
 	// currentSession().Session() 取，不再单独持有裸 Session 指针（P0-4 起退役）。
 	current atomic.Pointer[runtimeagent.SessionRuntime]
-	// deps 是 Session 的资源依赖，startSession 每次会话边界全量重建（含指令快照），
-	// /new 经同一路径刷新后以新 deps 创建新会话；per-session Store 的拆分属 P1-3，
-	// 本字段在 P0+P1 全程保持 startSession 全量重建语义。
-	deps       runtimeagent.SessionDeps
-	store      atomic.Pointer[session.Store] // nil = 持久化禁用
-	skills     []skills.Skill                // Init 时加载的 skill 清单，注册为 skill_* 工具
-	mcpClients map[string]mcp.Client         // server name → 连接，Stop 时统一关闭
-	mcpTools   []core.Tool                   // 从已连接 server 拉取的工具（静态，collectTools 复用）
-	memory     *memory.Client                // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
+	// deps 是 Session 的资源依赖，startSession 每次会话边界全量重建（含指令快照
+	// 与当前 store 注入），/new 经同一路径刷新后以新 deps 创建新会话。
+	deps runtimeagent.SessionDeps
+	// repo 是会话持久化仓库（P1-3）：每会话独立目录 <Session.Dir>/<id>/ + legacy
+	// 根槽兼容挂载（<root>/current.jsonl 原地挂载，不移动用户数据）。进程内只开
+	// 一次（首个 startSession 即 Init），此后 /new 复用同一仓库——Repository 的
+	// 实例唯一缓存必须跨会话边界连续（重开缓存清空后对仍在使用的目录再次 Open
+	// 会被文件锁拒绝）；且只写一次（Init 完成前无并发读者），与 current 的原子
+	// 读并肩免去第二把锁。nil = 持久化禁用（cfg.Session.Enabled=false 或打开
+	// 失败，纯内存路径与旧版 store=nil 语义一致）。
+	repo       *session.Repository
+	skills     []skills.Skill        // Init 时加载的 skill 清单，注册为 skill_* 工具
+	mcpClients map[string]mcp.Client // server name → 连接，Stop 时统一关闭
+	mcpTools   []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
+	memory     *memory.Client        // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
 
 	// 会话工作目录状态（mu 保护）。ACP 提交方经 session/new|load 声明的 cwd 经
 	// sandbox 边界校验后落到这里并应用到当前会话；非法声明只记 cwdErr（无效标记），
@@ -101,6 +107,29 @@ func (p *AgentPlugin) boundSession() *runtimeagent.Session {
 		return rt.Session()
 	}
 	return nil
+}
+
+// currentStore 返回当前会话的持久化 store——P1-3 的统一取数解析点。Session 本体
+// 不持 store（deps.Store 仅构造时注入），解析链是：runtime id 在会话边界上绑定
+// store 的 SessionID（startSession ④），repo.Open 按 id 命中实例唯一缓存，返回的
+// 正是 startSession 打开/创建的那个 *Store——取数与互斥同源于 current 解析，不再
+// 单独持有 store 指针（旧 atomic.Pointer[session.Store] 字段随 P1-3 退役，/new
+// 换轨只剩 current 一个切换点）。legacy 槽被 Archive 轮转后 store 的 metadata id
+// 会更换，但缓存键仍是挂载时的 id，解析不受影响。nil = 持久化禁用/无活动会话，
+// 调用方按旧文案降级（/rewind 提示未启用、清单返回空、/new 兜底全量快照）。
+func (p *AgentPlugin) currentStore() *session.Store {
+	rt := p.currentSession()
+	if rt == nil || p.repo == nil {
+		return nil
+	}
+	st, err := p.repo.Open(rt.ID)
+	if err != nil {
+		// 正常路径是缓存命中（runtime id 即 store id）；未命中即纯内存降级
+		// （runtime id 非 store id）或仓库已收尾，按无持久化处理，与旧版
+		// store=nil 一致。
+		return nil
+	}
+	return st
 }
 
 func (p *AgentPlugin) Name() string { return "agent" }
@@ -241,10 +270,19 @@ func (p *AgentPlugin) Stop() error {
 			slog.Warn("memory close error", "err", err)
 		}
 	}
-	// store 生命周期收尾：consolidate 后关闭
-	if st := p.store.Load(); st != nil {
+	// store 生命周期收尾（P1-3）：consolidate 后关闭当前会话 store 与仓库缓存的
+	// 全部实例——/new 换轨后旧 store 实例滞留在 repo.open 缓存（实例唯一不变量
+	// 要求其存活），统一在此回收。两级都幂等：currentStore 与 repo 缓存常为同一
+	// 实例，Store.Close 对已关闭/未持锁 store 为 no-op（store.go Close 对 nil file
+	// 安全）；repo/current 为 nil（纯内存、Init 未完成或失败回滚）时整体跳过。
+	if st := p.currentStore(); st != nil {
 		if err := st.Close(); err != nil {
 			slog.Warn("session: store close failed", "err", err)
+		}
+	}
+	if p.repo != nil {
+		if err := p.repo.Close(); err != nil {
+			slog.Warn("session: repository close failed", "err", err)
 		}
 	}
 	return nil
@@ -324,15 +362,26 @@ func (p *AgentPlugin) persistToolAllowRule(rule sandbox.ToolAllowRule) error {
 }
 
 func (p *AgentPlugin) startSession() {
-	// 打开会话持久化 store。失败降级不阻塞插件启动。
-	p.store.Store(nil)
-	if p.cfg.Session.Enabled {
-		st, err := session.Open(p.cfg.Session.Dir)
+	// ① 打开会话持久化仓库（P1-3：每会话独立目录 + legacy 兼容挂载）。失败降级
+	// 不阻塞插件启动。进程内只开一次（首个会话边界即 Init），/new 复用同一仓库：
+	// 实例唯一缓存跨边界连续，重开会被缓存清空 + 跨进程文件锁拒绝。
+	if p.repo == nil && p.cfg.Session.Enabled {
+		repo, err := session.OpenRepository(p.cfg.Session.Dir)
 		if err != nil {
-			slog.Warn("session: store open failed, persistence disabled", "err", err)
+			slog.Warn("session: repository open failed, persistence disabled", "err", err)
 		} else {
-			p.store.Store(st)
+			p.repo = repo
 		}
+	}
+
+	// ② 解析本会话边界的 store：首个边界（Init，current 尚为 nil）对已有 legacy
+	// 槽原地挂载，维持旧版「打开 <dir>/current.jsonl」的启动行为（用户数据不动）；
+	// /new 驱动的边界一律 Create 独立目录新会话（新会话一律进 <root>/<id>/，
+	// repository 决策 2）——若仍挂载刚被 Archive 轮转出的空槽，repo.Open 会经同
+	// 目录别名规则复用旧实例，「新」会话拿不到独立目录。打开/创建失败降级纯内存。
+	var st *session.Store
+	if p.repo != nil {
+		st = p.openSessionStore(p.currentSession() == nil)
 	}
 
 	// 加载 skill：用户级 + 项目级（后者覆盖前者）。坏 skill 跳过并记录，不拖垮其他的
@@ -364,10 +413,10 @@ func (p *AgentPlugin) startSession() {
 		PersistAllowRule:     p.persistAllowRule,
 		PersistToolAllowRule: p.persistToolAllowRule,
 	}
-	// P0-3 起 deps.Store 是 ConversationStore 接口：仅持久化启用且打开成功时注入。
-	// 不能写 Store: p.store.Load() —— *Store 为 nil 时会塞进 typed-nil（接口持 nil
-	// 指针），Session 的 `deps.Store == nil` 纯内存判断随之失效。
-	if st := p.store.Load(); st != nil {
+	// P0-3 起 deps.Store 是 ConversationStore 接口：仅持久化启用且解析成功时注入。
+	// 不能写 Store: st —— st 为 nil 时会塞进 typed-nil（接口持 nil 指针），Session
+	// 的 `deps.Store == nil` 纯内存判断随之失效。
+	if st != nil {
 		p.deps.Store = st
 	}
 	// 指令快照与记忆组件同开关：memory disabled 时留 nil，buildSystemPrompt 跳过指令段。
@@ -375,13 +424,17 @@ func (p *AgentPlugin) startSession() {
 	if p.cfg.Memory.Enabled {
 		p.deps.Instruction = p.loadInstructions()
 	}
-	// 多会话内核接线（P0-4）：每会话一个 SessionRuntime，构造后注册进 manager 并
-	// 置为 current。id 本步固定 "current"（稳定单例）；/new 重建时同 id 注册冲突，
-	// 旧 runtime 保留在册——归档固化窗口内仍可经 manager.Get 触达（配套测试
-	// TestCurrentSessionSwapsOnNew 锁死），P1-3 换 store 的真实 SessionID 后新旧
-	// 以不同 id 共存。
+	// 多会话内核接线（P0-4/P1-3）：每会话一个 SessionRuntime，构造后注册进 manager
+	// 并置为 current。P1-3 起 id 取 store 的真实 SessionID——它是 currentStore()
+	// 经 repo 实例唯一缓存解析取数的键，新旧 runtime 以不同 id 共存（旧 runtime
+	// 保留在册，归档固化窗口内仍可经 manager.Get 触达）；纯内存降级（无 store）
+	// 维持 "current" 稳定单例，/new 重建时同 id 注册冲突、旧条目保留。
 	s := runtimeagent.NewSession(p.deps)
-	rt := runtimeagent.NewSessionRuntime("current", s)
+	id := "current"
+	if st != nil {
+		id = st.SessionID()
+	}
+	rt := runtimeagent.NewSessionRuntime(id, s)
 	if err := p.manager.Register(rt); err != nil {
 		slog.Debug("session: keep previous runtime registered", "id", rt.ID, "err", err)
 	}
@@ -399,6 +452,42 @@ func (p *AgentPlugin) startSession() {
 	p.mu.Unlock()
 	// s 即刚注册进 current runtime 的会话本体（等价 p.currentSession().Session()）。
 	s.SetCWD(cwd)
+}
+
+// openSessionStore 在仓库里解析本会话边界的 store（P1-3 startSession ②）。
+// firstCycle 标记进程首个会话边界（Init，此刻 currentSession() 仍为 nil）：
+//   - firstCycle 且 root 下已有 legacy 槽（current.jsonl）→ 原地挂载：id 经只读
+//     OpenArchiveView 读出（解析链与 repo.Open 的 legacy 分支同源——metadata 记录
+//     优先、缺失时按首节点/内容摘要合成 legacy id），不触碰写句柄；repo.Open
+//     命中后进实例唯一缓存。旧版启动行为（打开 <dir>/current.jsonl 并恢复对话）
+//     由此保持，现有用户数据不移动（总方案 P1 硬性要求）。
+//   - 其余（无 legacy 槽的首次启动、全部 /new 边界）→ Create 独立目录新会话
+//     （<root>/<id>/，目录名 == 文件内 SessionID）。
+//
+// 失败返回 nil（调用方降级纯内存，不阻塞会话创建）。
+func (p *AgentPlugin) openSessionStore(firstCycle bool) *session.Store {
+	if firstCycle {
+		legacyPath := filepath.Join(p.cfg.Session.Dir, "current.jsonl")
+		if _, err := os.Stat(legacyPath); err == nil {
+			view, err := session.OpenArchiveView(legacyPath)
+			if err != nil {
+				slog.Warn("session: legacy slot inspect failed, persistence disabled", "err", err)
+				return nil
+			}
+			st, err := p.repo.Open(view.SessionID())
+			if err != nil {
+				slog.Warn("session: legacy store open failed, persistence disabled", "err", err)
+				return nil
+			}
+			return st
+		}
+	}
+	st, err := p.repo.Create(context.Background(), session.CreateOptions{})
+	if err != nil {
+		slog.Warn("session: store create failed, persistence disabled", "err", err)
+		return nil
+	}
+	return st
 }
 
 // SetSession 记录 ACP 提交方声明的会话工作目录并应用到当前会话（单活动会话模型：
