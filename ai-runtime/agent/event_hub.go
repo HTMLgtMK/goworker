@@ -1,0 +1,442 @@
+package agent
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/tinguo/goworker/ai-runtime/session"
+)
+
+// event_hub.go 是 P3-2 的事件回放写侧与广播核心(总方案 P3 第 2 条):Seq 分配、
+// 关键事件 durable-first 落盘、高频 delta 合并落盘、fan-out 非阻塞广播。
+// 订阅读取面(Subscribe/Replay/ErrCursorExpired)属 P3-3,本文件只提供其依赖的
+// 内部结构(hubSub/subs 表)。P3-4 再把它接进 StartRun(teeRunCallbacks)。
+//
+// 语义契约(总方案第五节,落实为 P3-0 契约表):
+//   - Seq 是 Session 维度严格递增游标,跨 Run 不重复(P3-0 表第 1 行):seq 在
+//     hub.mu 内单调分配,构造时自 journal 既有 max seq 播种,BeginRun/EndRun
+//     切换 run 不重置游标;
+//   - 关键事件必须持久化且 durable-first(P3-0 表第 2 行):IsKeyEvent 的 9 类
+//     事件在 mu 内 journal fsync 成功后才广播,失败不广播、返回错误——总方案
+//     第五节「持久化写入失败不能继续把事件当作可恢复事件正常广播」;
+//   - 高频 delta 合并落盘(P3-0 表第 3 行):3 类 delta 先逐事件实时广播
+//     (per-event seq),再进 50ms/4KB 合并窗,按 Type 分桶合并为一条
+//     [FromSeq..Seq] 记录(合并记录 Seq=ToSeq、FromSeq 声明范围,P3-1 契约);
+//     合并落盘失败仅 warn——重放缺 delta 段可接受,assistant.message_finalized
+//     兜底定稿(降级语义,P3-0 表第 7 行的对偶面);
+//   - 慢订阅者背压(P3-0 表第 8 行):fan-out 非阻塞投递,缓冲满即断开该订阅者
+//     (delete + close(sub.live)),绝不阻塞 AgentRun 执行与其他订阅者;重连从
+//     游标补齐属 P3-3 的 Subscribe。
+//
+// 并发与锁论证(plan P3-2「并发与锁论证」):hub.mu 全程保护 seq/earliest/
+// latest/subs/nextSubID/journal 目标/curRunID/deltaBuf/flushTimer/closed 全部
+// 可变字段。Publish 的 journal fsync 在 mu 内是 V1 正确性优先的取舍:delta 合并
+// 把写频率压到 ≤20 次/s(50ms 窗),key 事件低频;若生产不达标,P5 优化为
+// 「mu 内定序号槽、mu 外写、写完补广播」(注释留档,本 Plan 不做)。fan-out 的
+// close(sub.live) 在 mu 内合法(Go channel close 本身无锁竞争)。无嵌套获取:
+// hub.mu 内只做非阻塞 send 与文件写,不触 gate/runSlots/manager.mu/rt.mu
+// (journal 的 AppendEvent 走 RunJournalStore 自持的 s.mu→j.mu,单向无回边)
+// ⇒ 无锁环。
+
+// EventJournal 是事件持久化的 agent 侧消费面(P3-2 定稿,P3-4 进 SessionDeps.
+// RunEvents):与 RunStateJournal(spec.go)同构的「消费侧最小面」先例,由
+// session.RunJournalStore(P3-1)实现。ReadEvents/SeqRange 目前只有 P3-3 的
+// Subscribe 回放消费,接口一次定形避免 P3-3 再动 SessionDeps。
+type EventJournal interface {
+	AppendEvent(rec session.EventRecord) error
+	ReadEvents(afterSeq uint64) ([]session.EventRecord, error)
+	SeqRange() (earliest, latest uint64, ok bool)
+}
+
+// 编译期断言:session.RunJournalStore(P3-1)满足 agent 侧消费面。签名漂移在
+// 编译期暴露(plan P2-3 的先例:断言在实现类型就位的那一步补)。
+var _ EventJournal = (*session.RunJournalStore)(nil)
+
+// ErrHubClosed 是 hub 停机后的拒绝 sentinel:Close 之后 Publish/Subscribe
+// (P3-3)一律拒绝——「关掉的事件流不能再产出事件」。
+var ErrHubClosed = errors.New("session: event hub closed")
+
+// delta 合并窗与订阅者缓冲参数(P3-2 常量):
+//   - deltaFlushInterval/deltaFlushBytes 是总方案第五节「50~100ms 或一定字节
+//     数」取下限:50ms 窗 ⇒ 合并落盘频率上界 20 次/s(plan §5 风险 2 的依据);
+//   - subscriberBuffer 是 fan-out 直投通道容量:256 条给慢订阅者的宽限,超出
+//     即断开(P3-0 表第 8 行,不阻塞执行/他人)。
+const (
+	deltaFlushInterval = 50 * time.Millisecond
+	deltaFlushBytes    = 4 << 10
+	subscriberBuffer   = 256
+)
+
+// hubSub 是一个已注册的订阅者(live 广播直投端)。P3-2 只需要 live 通道与
+// fan-out;watermark(注册点 latest,防 Race B 的回放边界)随 P3-3 的
+// Subscribe 落地时再加。
+type hubSub struct {
+	live chan session.SessionEvent // fan-out 直投(容量 subscriberBuffer,非阻塞)
+}
+
+// pendingDelta 是 delta 合并缓冲的一个分桶(按 Type,同 run 内同型合并):
+// 攒 [fromSeq..toSeq] 区间内的全部 payload,窗满(50ms/4KB)或 EndRun/Close
+// 时合并为一条 EventRecord 落盘。runID/lastTime 取桶内首末事件的值(合并记录
+// 的归属与时间戳);parts 是逐事件原始 payload(聚合策略见 aggregateDeltaPayload);
+// bytes 是 payload 粗略字节数(4KB 阈值判据,不求精确)。
+type pendingDelta struct {
+	runID    string
+	fromSeq  uint64
+	toSeq    uint64
+	lastTime time.Time
+	parts    []json.RawMessage
+	bytes    int
+}
+
+// IngressEvent 是 Publish 的入口形状(P3-4 的 teeRunCallbacks 从 RunCallbacks
+// 三入口产出):RunID 由产生方逐事件携带(tee 捕获 run.ID);为空时回落
+// curRunID(BeginRun 括起的当前 run)。Payload 已是 JSON 编码(逐事件一次
+// marshal,合并时复用原字节)。
+type IngressEvent struct {
+	RunID   string
+	Type    string
+	Payload json.RawMessage
+}
+
+// EventHub 是一个会话的事件枢纽(每会话一个,P3-4 挂在 SessionRuntime.events,
+// 惰性创建):Publish 写侧(分配 Seq + durable-first/合并落盘 + fan-out),
+// Subscribe 读侧属 P3-3。j 为 nil 合法(纯内存 hub:不落盘、delta 不进合并
+// 缓冲——纯内存场景无重放,缓冲无意义),测试与未启用持久化的宿主用。
+type EventHub struct {
+	sessionID string
+
+	// mu 保护以下全部字段(plan 的字段清单 + flushTimer:定时 flush 必须 mu
+	// 协调——上锁判空、落锁清 nil,Close 时停止,不泄漏 timer 回调)。
+	mu sync.Mutex
+
+	// seq 是下一个待分配的会话游标;earliest/latest 是保留历史区间(构造时
+	// 自 journal.SeqRange 播种,V1 无修剪故 earliest 恒定,plan §5 风险 6);
+	// latest 随每次成功发布推进为已分配的最大 seq(= 最新广播事件的 seq)。
+	// key 事件落盘失败不推进 latest 也不回退 seq:该 seq 被烧掉(见 Publish
+	// 注释的失败语义论证),live 与重放两侧一致跳过,缺口显式可观测。
+	seq      uint64
+	earliest uint64
+	latest   uint64
+
+	// subs 是订阅者表(键=nextSubID 自增号);fan-out 与断开都在 mu 内。
+	subs      map[uint64]*hubSub
+	nextSubID uint64
+
+	// journal 是持久化面(nil=纯内存);curRunID 是 BeginRun/EndRun 括起的
+	// 当前 run(AppendEvent 目标的兜底与 delta 分桶归属;逐事件 RunID 以
+	// IngressEvent.RunID 优先)。
+	journal  EventJournal
+	curRunID string
+
+	// deltaBuf 是 delta 合并缓冲(key=Type;BeginRun/EndRun 括起保证单 run,
+	// 切换前 flush);flushTimer 是窗定时器(time.AfterFunc 回调经 mu 协调)。
+	deltaBuf   map[string]*pendingDelta
+	flushTimer *time.Timer
+
+	closed bool
+}
+
+// NewEventHub 创建事件枢纽并播种游标:j 非 nil 时经 SeqRange 读既有保留历史
+// 的 [earliest..latest](磁盘扫描;扫描失败由 RunJournalStore.SeqRange 降级为
+// ok=false 并 warn,journal_store.go——按「从零开始」处理,真实 I/O 故障会在
+// 随后的 AppendEvent/ReadEvents 显式上抛),seq=latest+1 续接分配;j 为 nil 时
+// latest=0、seq=1(纯内存 hub 从 1 起算)。
+func NewEventHub(sessionID string, j EventJournal) *EventHub {
+	h := &EventHub{
+		sessionID: sessionID,
+		subs:      make(map[uint64]*hubSub),
+		journal:   j,
+		deltaBuf:  make(map[string]*pendingDelta),
+	}
+	if j != nil {
+		if earliest, latest, ok := j.SeqRange(); ok {
+			h.earliest, h.latest = earliest, latest
+		}
+	}
+	h.seq = h.latest + 1
+	return h
+}
+
+// BeginRun 括起一个 run 的产生边界:设置 AppendEvent 目标兜底(curRunID),
+// 并防御性 flush 上一 run 残留的合并缓冲(正常次序由 EndRun 收口,此处只兜
+// 「未 EndRun 就 BeginRun」的调用形态——缓冲跨 run 混桶会破坏「同 run 内同型
+// 合并」)。Close 后为幂等空操作。
+func (h *EventHub) BeginRun(runID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	h.flushAllDeltaLocked()
+	h.curRunID = runID
+}
+
+// EndRun 收口当前 run:flush 合并缓冲(delta 落盘先于该 run 的终态 state 记录
+// ——RunJournalStore.AppendEvent 依赖此次序,终态落盘会 Close+逐出句柄,晚了
+// 会撞 ErrRunExists,journal_store.go:125-130 的次序约束)+ 清 curRunID。flush
+// 失败仅 warn(降级语义见文件头)。Close 后为幂等空操作(Close 已 flush)。
+func (h *EventHub) EndRun() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	h.flushAllDeltaLocked()
+	h.curRunID = ""
+}
+
+// Publish 发布一个事件(P3-2 核心语义,全程持 hub.mu):
+//
+//   - closed → ErrHubClosed;
+//   - seq++ 分配会话游标(跨 Run 不重复,BeginRun/EndRun 不重置),包成
+//     session.SessionEvent 广播形状(逐事件 Time,广播与落盘同源);
+//   - key 事件(session.IsKeyEvent,9 类):journal.AppendEvent(fsync)成功后
+//     才 fan-out(durable-first);失败 → 不广播、返回错误(总方案第五节
+//     「持久化写入失败不能继续把事件当作可恢复事件正常广播」)。失败时该 seq
+//     被烧掉不回退:回退会让「Sync 失败但 Write 已完整落行」的记录与下一个
+//     事件共用同 seq,重放去重会丢掉后者(真事件丢失);烧号只留下一个两侧
+//     一致跳过的显式缺口,是失败语义下更安全的取舍。j==nil 的纯内存 hub 跳过
+//     落盘直接广播(key 语义只约束「可恢复的持久化事件」);
+//   - delta(3 类高频):先 fan-out(实时逐事件,per-event seq——订阅者看到
+//     的流不合并),后进合并缓冲(50ms/4KB 窗,按 Type 分桶;落盘失败仅 warn
+//     ——重放缺 delta 段可接受,assistant.message_finalized 兜底定稿);
+//   - fan-out:遍历 subs 非阻塞 send;缓冲满 → delete+close(sub.live) 断开该
+//     订阅者(总方案第五节背压:不阻塞 AgentRun 执行与其他订阅者;重连从游标
+//     补齐属 P3-3)。
+//
+// 成功发布(广播已发生)推进 latest 为本事件 seq——它是 P3-3 订阅注册点的
+// watermark 语义来源。journal 落盘在 mu 内:V1 正确性优先取舍,P5 优化路径见
+// 文件头锁论证。
+func (h *EventHub) Publish(ev IngressEvent) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return ErrHubClosed
+	}
+
+	// 取用后自增:seq 语义是「下一个待分配」(播种 latest+1),首个事件即取
+	// 该值——新鲜 hub 的首事件 seq=1,磁盘续接的首事件 seq=latest+1,无跳号。
+	seq := h.seq
+	h.seq++
+	runID := ev.RunID
+	if runID == "" {
+		runID = h.curRunID
+	}
+	now := time.Now()
+	out := session.SessionEvent{
+		SessionID: h.sessionID,
+		RunID:     runID,
+		Seq:       seq,
+		Type:      ev.Type,
+		Time:      now,
+		Payload:   ev.Payload,
+	}
+
+	if session.IsKeyEvent(ev.Type) {
+		// durable-first:fsync 成功后才广播;失败不广播、上抛(缺口显式)。
+		// EventRecord.Kind 由存储边界强制(journal.go RunJournal.AppendEvent
+		// 置 eventKind),此处不依赖其常量。
+		if h.journal != nil {
+			rec := session.EventRecord{
+				SessionID: h.sessionID,
+				RunID:     runID,
+				Type:      ev.Type,
+				Seq:       seq,
+				Time:      now,
+				Payload:   ev.Payload,
+			}
+			if err := h.journal.AppendEvent(rec); err != nil {
+				return fmt.Errorf("agent: event hub: append key event %s seq %d: %w", ev.Type, seq, err)
+			}
+		}
+		h.latest = seq
+		h.fanOutLocked(out)
+		return nil
+	}
+
+	// delta:实时逐事件广播(不合并),后进合并缓冲(仅持久化面,j!=nil)。
+	h.latest = seq
+	h.fanOutLocked(out)
+	if h.journal != nil {
+		h.bufferDeltaLocked(ev.Type, ev.Payload, out)
+	}
+	return nil
+}
+
+// LatestSeq 返回已成功广播的最大 seq(订阅注册 watermark 语义);无事件时为
+// 播种值(磁盘 latest 或 0)。
+func (h *EventHub) LatestSeq() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.latest
+}
+
+// EarliestSeq 返回保留历史的最早 seq(V1 无修剪,恒为播种值;纯内存 hub 为 0)。
+func (h *EventHub) EarliestSeq() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.earliest
+}
+
+// Close 停机:置 closed(此后 Publish/Subscribe(P3-3)→ ErrHubClosed)→ 停
+// 窗定时器 → flush 残留合并缓冲 → 断开全部订阅者(delete+close(sub.live),与
+// 慢订阅者断开同一惯用法;P3-3 的 pump range sub.live 由此自然退出)→ 关
+// journal 当前句柄。幂等(重复 Close 返回 nil)。
+//
+// 「关 journal 当前句柄」(plan P3-2 Close 语义):EventJournal 接口无 Close
+// ——P3-1 的 RunJournalStore 自管句柄生命周期(终态 state 记录落盘时 Close+
+// 逐出,journal_store.go 文件头),故只对实现了 io.Closer 的 journal 桥接关闭,
+// RunJournalStore 不实现它,桥接为空操作。flush 失败仅 warn(降级语义)。
+func (h *EventHub) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+	h.flushAllDeltaLocked()
+	for id, sub := range h.subs {
+		delete(h.subs, id)
+		close(sub.live)
+	}
+	var err error
+	if c, ok := h.journal.(io.Closer); ok {
+		if cerr := c.Close(); err == nil {
+			err = cerr
+		}
+	}
+	return err
+}
+
+// fanOutLocked 非阻塞广播:对每个订阅者 select 直投,缓冲满即断开(delete+
+// close)。断开语义:该订阅者此后收不到任何事件,其 live 通道关闭(消费方
+// range 到关闭即知断线,重连从游标补齐属 P3-3);不阻塞、不影响他人。
+// 调用方必须持 h.mu。
+func (h *EventHub) fanOutLocked(ev session.SessionEvent) {
+	for id, sub := range h.subs {
+		select {
+		case sub.live <- ev:
+		default:
+			delete(h.subs, id)
+			close(sub.live)
+			slog.Warn("agent: event hub disconnected slow subscriber", "session", h.sessionID, "type", ev.Type, "seq", ev.Seq)
+		}
+	}
+}
+
+// bufferDeltaLocked 把一条 delta 追加进合并缓冲(调用方必须持 h.mu,且广播已
+// 完成):按 Type 取桶(无则开新桶,fromSeq=本事件 seq),推进 toSeq/parts/
+// bytes/lastTime;首条进空缓冲时上 50ms 窗定时器(AfterFunc 回调经 mu 协调,
+// 见 flushDeltaOnTimer);单桶越过 4KB 阈值立即 flush 该桶(窗提前关闭,缓冲
+// 不设上界增长)。RunID/Time 取广播形状(与逐事件实时流同源)。
+func (h *EventHub) bufferDeltaLocked(typ string, payload json.RawMessage, out session.SessionEvent) {
+	b := h.deltaBuf[typ]
+	if b == nil {
+		b = &pendingDelta{runID: out.RunID, fromSeq: out.Seq}
+		h.deltaBuf[typ] = b
+		if h.flushTimer == nil {
+			h.flushTimer = time.AfterFunc(deltaFlushInterval, h.flushDeltaOnTimer)
+		}
+	}
+	b.toSeq = out.Seq
+	b.lastTime = out.Time
+	b.parts = append(b.parts, payload)
+	b.bytes += len(payload)
+	if b.bytes >= deltaFlushBytes {
+		h.flushDeltaTypeLocked(typ)
+		if len(h.deltaBuf) == 0 {
+			h.stopFlushTimerLocked()
+		}
+	}
+}
+
+// flushDeltaOnTimer 是窗定时器回调:50ms 窗到点,flush 全部缓冲桶。经 mu 协调
+// ——与 Close 竞争时谁先拿锁谁生效,后到者见空桶/见 closed,无双重 flush、
+// 无泄漏(Close 必停 timer;本回调自身也不重启 timer)。
+func (h *EventHub) flushDeltaOnTimer() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	h.flushAllDeltaLocked()
+}
+
+// flushAllDeltaLocked flush 全部缓冲桶并在清空后停掉窗定时器(空缓冲无需
+// 定时;下一条 delta 会重新上窗)。调用方必须持 h.mu。
+func (h *EventHub) flushAllDeltaLocked() {
+	for typ := range h.deltaBuf {
+		h.flushDeltaTypeLocked(typ)
+	}
+	h.stopFlushTimerLocked()
+}
+
+// flushDeltaTypeLocked 把一个缓冲桶合并为一条 EventRecord 落盘(Seq=ToSeq、
+// FromSeq 声明 [FromSeq..Seq] 范围,P3-1 契约;payload 聚合见
+// aggregateDeltaPayload)。失败仅 warn——重放缺 delta 段可接受,
+// assistant.message_finalized 兜底定稿(降级语义,文件头)。j==nil 不会到这
+// (bufferDeltaLocked 仅在 j!=nil 时被调)。调用方必须持 h.mu。
+func (h *EventHub) flushDeltaTypeLocked(typ string) {
+	b, ok := h.deltaBuf[typ]
+	if !ok {
+		return
+	}
+	delete(h.deltaBuf, typ)
+	rec := session.EventRecord{
+		SessionID: h.sessionID,
+		RunID:     b.runID,
+		Type:      typ,
+		Seq:       b.toSeq,   // 合并记录 Seq=ToSeq:回放方推进游标到 Seq
+		FromSeq:   b.fromSeq, // >0 声明覆盖 [FromSeq..Seq],消除「缺口歧义」
+		Time:      b.lastTime,
+		Payload:   aggregateDeltaPayload(b.parts),
+	}
+	if err := h.journal.AppendEvent(rec); err != nil {
+		slog.Warn("agent: event hub delta flush failed (replay may miss delta range)",
+			"err", err, "session", h.sessionID, "run", b.runID, "type", typ,
+			"from_seq", b.fromSeq, "to_seq", b.toSeq)
+	}
+}
+
+// stopFlushTimerLocked 停掉窗定时器并清引用(定时器必须 mu 协调判空/清理,
+// Close 与 flush 路径共用;AfterFunc 停止/触发均不泄漏 goroutine)。调用方必须
+// 持 h.mu。
+func (h *EventHub) stopFlushTimerLocked() {
+	if h.flushTimer != nil {
+		h.flushTimer.Stop()
+		h.flushTimer = nil
+	}
+}
+
+// aggregateDeltaPayload 聚合一个合并窗的 delta payload:全部为 JSON 字符串时
+// 拼接为单个字符串(text.delta/thinking.delta 的 token 流语义——重放侧可还原
+// 窗内完整文本);任一非字符串(如 usage.progress 的对象 payload)则退化为
+// 窗内最后一条 payload(最终状态)。全空窗退化为空(omitempty 省略)。聚合
+// 语义是合并记录的文档化行为,TestDeltaMergeWindow 钉死字符串拼接路径。
+func aggregateDeltaPayload(parts []json.RawMessage) json.RawMessage {
+	if len(parts) == 0 {
+		return nil
+	}
+	texts := make([]string, 0, len(parts))
+	allStrings := true
+	for _, p := range parts {
+		var s string
+		if len(p) == 0 || json.Unmarshal(p, &s) != nil {
+			allStrings = false
+			break
+		}
+		texts = append(texts, s)
+	}
+	if allStrings {
+		if joined, err := json.Marshal(strings.Join(texts, "")); err == nil {
+			return joined
+		}
+	}
+	return parts[len(parts)-1]
+}
