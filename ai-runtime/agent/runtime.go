@@ -118,6 +118,9 @@ func (r *SessionRuntime) RecordRun(fn func(*Session) (RunResult, error)) RunResu
 	res, err := fn(r.session)
 	switch {
 	case err != nil:
+		// call-layer 映射保留为冗余防御(P2-1):主映射已前移至 Session.Run
+		// (session.go 的 agent.Run 失败分支)。这里兜底 fn 返回 error 而非带终态
+		// RunResult 的调用层错误(现状恒 nil),同样按 ctx 语义分流。
 		state := RunFailed
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			state = RunCancelled

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -86,6 +87,7 @@ func (s *Session) updateToolAllowRule(next sandbox.ToolAllowRule) {
 // 第一返回值是 Run 生命周期记账（「模型成功 ≠ 持久化成功」）：
 //   - 空输入未进入 ReAct → RunCancelled（不创建 AgentRun 语义，由调用方记账）；
 //   - provider / agent.Run 失败 → RunFailed+Persisted=false（用户可见输出逐字不变，仍写 ✘）；
+//     其中 ctx 取消/超时归一为 RunCancelled（P2-1，取消不是失败，只分流 State）；
 //   - 持久化 Compact/Commit 失败 → RunFailed+Persisted=false，绝不记 RunCompleted；
 //     Checkpoint 失败维持 warn 不改 State；
 //   - 全部成功（含纯内存模式，内存 conversation 即事实源）→ RunCompleted+Persisted=true。
@@ -158,6 +160,13 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 	if err != nil {
 		if cb.Write != nil {
 			cb.Write(fmt.Sprintf("✘ %v\n", err))
+		}
+		// 取消态归一(P2-1):ctx 取消/超时属取消而非失败——断连、宿主停机与
+		// 后续 CancelRun 的 Run 状态持久化(总方案第九节)不能把取消记成 failed。
+		// 用户可见输出逐字不变(✘ 照旧写),仅 RunResult.State 分流;RecordRun 的
+		// call-layer 同型映射(runtime.go)保留为冗余防御。
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return RunResult{State: RunCancelled, Err: err, Persisted: false}, nil
 		}
 		return RunResult{State: RunFailed, Err: err, Persisted: false}, nil
 	}

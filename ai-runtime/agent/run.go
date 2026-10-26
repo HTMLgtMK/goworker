@@ -97,11 +97,14 @@ func (run *AgentRun) finish(res RunResult) {
 	run.transition(res.State)
 }
 
-// runSeq 是 RunID 的进程内自增序列。RunID 只需进程内唯一(标识"本进程的第 N 次
-// 执行");跨进程归因/Trace 属 P2 RunSupervisor 与 Journal 的范围。
+// runSeq 是 RunID 的进程内自增序列,作 UnixNano 时间戳后的同刻消歧后缀:
+// 进程内 seq 保唯一(UnixNano 单调性不做强假设);跨重启同会话目录同 nano+同
+// seq 概率可忽略,且由 P2-2 RunJournal 建文件 O_EXCL 兜底——碰撞变成可观测
+// 错误(ErrRunExists)而非静默损坏。文件名字符序=创建序(nano 定宽至 2262 年),
+// P3-1 的跨文件 seq 拼接依赖此序。
 var runSeq atomic.Uint64
 
-// newRunID 返回新的 run id(run-N,进程内自增)。
+// newRunID 返回新的 run id(run-<unixnano>-<seq>,跨重启唯一)。
 func newRunID() string {
-	return fmt.Sprintf("run-%d", runSeq.Add(1))
+	return fmt.Sprintf("run-%d-%d", time.Now().UnixNano(), runSeq.Add(1))
 }
