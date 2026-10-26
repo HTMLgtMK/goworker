@@ -86,7 +86,11 @@ type AgentPlugin struct {
 // 会话边界上构造并注册进 manager；此前 currentSession() 返回 nil，命令报
 // 「no active session」（命令本就要等 Init 完成后才可派发）。
 func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *AgentPlugin {
-	return &AgentPlugin{cfg: cfg, paths: paths, manager: runtimeagent.NewSessionManager()}
+	// P2-7：全局并发配额接 SessionConfig（openQuestion ③）。cfg 先于 NewPlugin
+	// 注入（签名现状即成立）；WithRunLimits 对 <=0 回落默认 4/16——daemon app
+	// config 默认块未设新字段（0 值）或旧配置文件缺键时由此兜底，不依赖 yaml
+	// 载入路径（双保险，agent/manager.go WithRunLimits）。
+	return &AgentPlugin{cfg: cfg, paths: paths, manager: runtimeagent.NewSessionManager(runtimeagent.WithRunLimits(cfg.Session.MaxConcurrentRuns, cfg.Session.MaxPendingRuns))}
 }
 
 // currentSession 返回当前会话的 runtime——§1.1 路由规则（命令按 SessionID 路由的
@@ -382,6 +386,19 @@ func (p *AgentPlugin) startSession() {
 		st = p.openSessionStore(p.currentSession() == nil)
 	}
 
+	// P2-7 启动恢复扫描（总方案第九节「Daemon 重启后」）：本会话边界的 store 若
+	// 挂着上一进程遗留的非终态 run journal（runs/*.jsonl 末记录 queued/running），
+	// 追加 interrupted 标记——恢复绝不重跑（纯标记 + 尾截断，幂等，P2-2 保证）。
+	// 失败仅 warn 不阻塞启动；有标记时 warn 提示（用户可见行为不变：只进日志，
+	// 不进任何前端通道）。每个会话边界（Init / /new）执行一次。
+	if p.repo != nil && st != nil {
+		if marked, err := p.repo.MarkInterruptedRuns(context.Background(), st.SessionID()); err != nil {
+			slog.Warn("session: mark interrupted runs failed", "err", err)
+		} else if len(marked) > 0 {
+			slog.Warn("session: marked interrupted runs from previous process", "count", len(marked), "session", st.SessionID(), "runs", strings.Join(marked, ","))
+		}
+	}
+
 	// 加载 skill：用户级 + 项目级（后者覆盖前者）。坏 skill 跳过并记录，不拖垮其他的
 	discovered, skillErrs := skills.Discover(
 		p.paths.SkillsUser,
@@ -413,9 +430,13 @@ func (p *AgentPlugin) startSession() {
 	}
 	// P0-3 起 deps.Store 是 ConversationStore 接口：仅持久化启用且解析成功时注入。
 	// 不能写 Store: st —— st 为 nil 时会塞进 typed-nil（接口持 nil 指针），Session
-	// 的 `deps.Store == nil` 纯内存判断随之失效。
+	// 的 `deps.Store == nil` 纯内存判断随之失效。P2-7 起 RunJournal 同纪律：仅
+	// st 非 nil 时注入 *session.RunJournalStore（按 runID 委派 repo.OpenRunJournal，
+	// 句柄随 run 终态关闭）；纯内存（st == nil）不设，与 deps.Store 的 typed-nil
+	// 纪律一致。编译期断言在 runjournal_wiring_test.go。
 	if st != nil {
 		p.deps.Store = st
+		p.deps.RunJournal = session.NewRunJournalStore(p.repo, st)
 	}
 	// 指令快照与记忆组件同开关：memory disabled 时留 nil，buildSystemPrompt 跳过指令段。
 	// 会话边界（Init / /new）经 startSession 重载 —— system prompt 在会话创建前就绪。

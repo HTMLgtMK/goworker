@@ -96,6 +96,13 @@ type MemoryConfig struct {
 type SessionConfig struct {
 	Dir     string `yaml:"dir"`     // 会话 jsonl 存储目录
 	Enabled bool   `yaml:"enabled"` // false = 会话持久化关闭，走纯内存逻辑
+	// MaxConcurrentRuns/MaxPendingRuns 是后台 Run 的全局并发配额（P2-5 两级
+	// 调度：runSlots 容量 / 排队面 pending 容量，P2-7 接入本配置，openQuestion ③）。
+	// 0 值经 omitempty 省略——旧二进制读含新字段的配置安全（未识别键被忽略）；
+	// 消费侧 WithRunLimits 对 <=0 回落默认 4/16（agent/manager.go 默认常量），
+	// 不依赖 yaml 载入路径，构造点 0 值双保险。
+	MaxConcurrentRuns int `yaml:"max_concurrent_runs,omitempty"`
+	MaxPendingRuns    int `yaml:"max_pending_runs,omitempty"`
 }
 
 // MCPConfig 是 MCP server 连接配置。
