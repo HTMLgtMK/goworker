@@ -36,6 +36,16 @@ type FrontendHandler struct {
 	sessions model.SessionSource
 	gate     *SessionGate
 
+	// connectionID 是本连接的稳定句柄(P5-7,工厂内 crypto/rand 生成):x-goworker
+	// control lease 的持有者寻址面,连接退出时经 Close 归还(P5-8/P5-9 的泵清理
+	// 与能力解绑同钩子)。仅在本连接内自洽,跨连接无意义。
+	connectionID string
+	// runs 是 x-goworker 扩展协议的消费面(P5-6 的 model.RunControlSource,工厂内
+	// 对 sessions type-assert 获得)。nil = 后端无 run control 能力(纯
+	// SessionSource 插件/测试桩):全部 x-goworker 方法诚实报错,与 loader/lister
+	// 降级同型。
+	runs model.RunControlSource
+
 	mu         sync.Mutex
 	promptable map[string]struct{} // 可 prompt 集合：session/new 与当前会话 load 记入
 	readOnly   map[string]struct{} // 只读集合：归档 load 记入，prompt 诚实报错
@@ -55,14 +65,25 @@ var (
 // 装配层须保证（如注入 Engine.Eval）。gate 不可为 nil：单活动会话模型的执行门禁，
 // 由装配层创建一次、被本工厂闭包捕获，跨所有连接共享——每连接一份的话 TOCTOU
 // 守卫等于没装。
+//
+// P5-7：工厂内生成 connectionID（crypto/rand hex），并对 sessions type-assert
+// model.RunControlSource 得到 x-goworker 消费面（断言失败 → runs=nil，方法降级
+// 为诚实报错）。type-assert 只对非 nil 接口进行：nil SessionSource 直接跳过。
 func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Command, sessions model.SessionSource, gate *SessionGate) HandlerFactory {
 	return func() aiacp.SessionHandler {
-		return &FrontendHandler{
-			evaluate: evaluate,
-			commands: commands,
-			sessions: sessions,
-			gate:     gate,
+		handler := &FrontendHandler{
+			evaluate:     evaluate,
+			commands:     commands,
+			sessions:     sessions,
+			gate:         gate,
+			connectionID: newConnectionID(),
 		}
+		if sessions != nil {
+			if runs, ok := sessions.(model.RunControlSource); ok {
+				handler.runs = runs
+			}
+		}
+		return handler
 	}
 }
 

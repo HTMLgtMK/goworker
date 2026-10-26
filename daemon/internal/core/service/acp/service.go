@@ -15,6 +15,16 @@ import (
 // session state never leaks across peers.
 type HandlerFactory func() aiacp.SessionHandler
 
+// connectionCloser 是 handler 的可选连接退出钩子(daemon 侧扩展约定,ai-acp 无
+// 此接口):accept 在 server 退出后调用,承载断连收口语义——FrontendHandler.Close
+// 释放 control lease(P5-7),P5-8/P5-9 追加订阅泵清理与能力解绑。编译期断言
+// 钉住 FrontendHandler 的钩子实现,防止签名漂移后静默失去收口语义。
+type connectionCloser interface {
+	Close()
+}
+
+var _ connectionCloser = (*FrontendHandler)(nil)
+
 // Service is a reusable ACP daemon adapter. It owns the listener returned by
 // listenerFactory and all connected peers; callers supply factories for both the
 // transport and the per-connection protocol handler. Daemon task/session routing
@@ -191,6 +201,11 @@ func (s *Service) accept(conn io.ReadWriteCloser) {
 		slog.Error("failed to create ACP server", "error", err)
 		return
 	}
+	// x-goworker 扩展方法注册(P5-7):标准 6 方法之外由 FrontendHandler 承载的
+	// 增量面,显式注册(server.Handle,peer.go:86)——NewServer 的自动发现只认
+	// ai-acp 静态接口,标准面零改动。必须在 Start 之前:读循环未启动,注册表
+	// 无并发面。
+	registerXGWMethods(server, handler)
 	if !s.addPeer(server) {
 		_ = server.Close()
 		return
@@ -200,6 +215,13 @@ func (s *Service) accept(conn io.ReadWriteCloser) {
 
 	server.Start()
 	<-server.Done()
+	// 连接退出钩子(P5-7):server 读循环已结束,断开即释放本连接在 daemon 侧的
+	// 状态(control lease 归还;addPeer 失败的提前 return 不经过此路径——该
+	// handler 从未服务,Close 钩子的幂等语义也不受影响)。仅对实现钩子的
+	// handler 调用(测试桩/简化壳零感知)。
+	if closer, ok := handler.(connectionCloser); ok {
+		closer.Close()
+	}
 }
 
 func (s *Service) addPeer(server *aiacp.Server) bool {
