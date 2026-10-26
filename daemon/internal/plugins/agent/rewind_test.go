@@ -84,7 +84,7 @@ func TestHandleRewind_Numbering(t *testing.T) {
 	}
 
 	s := runtimeagent.NewSession(runtimeagent.SessionDeps{Store: st})
-	p := &AgentPlugin{runGate: make(chan struct{}, 1)}
+	p := &AgentPlugin{runSession: runtimeagent.NewSessionRuntime("current", nil)}
 	p.store.Store(st)
 	p.session.Store(s)
 

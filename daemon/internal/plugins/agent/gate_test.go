@@ -10,7 +10,7 @@ import (
 )
 
 // newGatedPlugin 构造仅用于 gate 测试的插件：NewPlugin 不触碰 cfg/paths、不创建会话，
-// acquire/release 只操作 runGate 信号量，全程无 LLM 网络调用。
+// 互斥只经过 p.runSession（SessionRuntime 的容量 1 gate），全程无 LLM 网络调用。
 func newGatedPlugin() *AgentPlugin {
 	return NewPlugin(&runtimeconfig.Config{}, runtimeconfig.Paths{})
 }
@@ -77,17 +77,26 @@ func TestWithSession_WaitsForOtherOwnerAndRespectsCancellation(t *testing.T) {
 	}
 }
 
-// 第一个持有者未释放时，第二个 acquire 必须阻塞；release 后阻塞者立即进入。
+// 第一个持有者未释放时，第二个 AcquireRun 必须阻塞；release 后阻塞者立即进入。
+// P0-2 起互斥点从 plugin 的 runGate 换成 p.runSession（SessionRuntime），
+// 对 plugin 持有的 runtime 实例做等价断言。
 func TestRunGate_SecondAcquireBlocksUntilRelease(t *testing.T) {
 	p := newGatedPlugin()
 	ctx := context.Background()
 
-	if err := p.acquireRun(ctx); err != nil {
+	release, err := p.runSession.AcquireRun(ctx)
+	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 
 	acquired := make(chan error, 1)
-	go func() { acquired <- p.acquireRun(ctx) }()
+	go func() {
+		r, err := p.runSession.AcquireRun(ctx)
+		if err == nil {
+			defer r()
+		}
+		acquired <- err
+	}()
 
 	select {
 	case err := <-acquired:
@@ -96,7 +105,7 @@ func TestRunGate_SecondAcquireBlocksUntilRelease(t *testing.T) {
 		// 预期：仍阻塞在 gate 上
 	}
 
-	p.releaseRun()
+	release()
 	select {
 	case err := <-acquired:
 		if err != nil {
@@ -105,20 +114,23 @@ func TestRunGate_SecondAcquireBlocksUntilRelease(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("blocked acquirer did not enter after release")
 	}
-	p.releaseRun()
 }
 
 // gate 被持有且不释放时，排队者 ctx 取消后必须立即返回 ctx.Err()。
 func TestRunGate_AcquireReturnsContextErrorOnCancel(t *testing.T) {
 	p := newGatedPlugin()
-	if err := p.acquireRun(context.Background()); err != nil {
+	release, err := p.runSession.AcquireRun(context.Background())
+	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
-	defer p.releaseRun()
+	defer release()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	acquired := make(chan error, 1)
-	go func() { acquired <- p.acquireRun(ctx) }()
+	go func() {
+		_, err := p.runSession.AcquireRun(ctx)
+		acquired <- err
+	}()
 	time.Sleep(20 * time.Millisecond) // 给排队者时间进入阻塞
 	cancel()
 

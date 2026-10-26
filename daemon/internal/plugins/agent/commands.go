@@ -21,30 +21,25 @@ import (
 
 // ---- /agent 命令 ----
 
-// acquireRun 获取主会话执行权：容量 1 的 runGate 满时阻塞，直到持有者释放或 ctx 取消。
-func (p *AgentPlugin) acquireRun(ctx context.Context) error {
-	select {
-	case p.runGate <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (p *AgentPlugin) releaseRun() {
-	<-p.runGate
-}
-
+// sessionGateKey 是 withSession 的 ctx 重入标记：agent 运行期间 collectTools
+// 嵌套 hub.Eval 执行会话命令时，嵌套调用已经处于 gate 临界区内，直接放行，
+// 避免重复排队死锁。标记值经 ai-core 的工具执行链路（agent.go 的 toolCtx）
+// 流入嵌套 Eval。
 type sessionGateKey struct{}
 
+// withSession 在当前会话的独占执行权下运行 run：互斥点在 p.runSession 的
+// SessionRuntime gate（容量 1，AcquireRun 监听 ctx 取消），7 个会话命令
+// handler（/agent /new /compact /usage /history /task /rewind）全部经此排队。
+// ctx 已携带本插件的 sessionGateKey 标记视为重入，直接执行不再排队。
 func (p *AgentPlugin) withSession(ctx context.Context, run func(context.Context) error) error {
 	if owner, _ := ctx.Value(sessionGateKey{}).(*AgentPlugin); owner == p {
 		return run(ctx)
 	}
-	if err := p.acquireRun(ctx); err != nil {
+	release, err := p.runSession.AcquireRun(ctx)
+	if err != nil {
 		return err
 	}
-	defer p.releaseRun()
+	defer release()
 	return run(context.WithValue(ctx, sessionGateKey{}, p))
 }
 
