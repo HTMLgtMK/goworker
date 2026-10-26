@@ -90,7 +90,21 @@ func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *AgentPlugi
 	// 注入（签名现状即成立）；WithRunLimits 对 <=0 回落默认 4/16——daemon app
 	// config 默认块未设新字段（0 值）或旧配置文件缺键时由此兜底，不依赖 yaml
 	// 载入路径（双保险，agent/manager.go WithRunLimits）。
-	return &AgentPlugin{cfg: cfg, paths: paths, manager: runtimeagent.NewSessionManager(runtimeagent.WithRunLimits(cfg.Session.MaxConcurrentRuns, cfg.Session.MaxPendingRuns))}
+	//
+	// P5-1：runCtx 注入 sessionGateKey 重入标记（WithRunContext）——manager 起
+	// 的每个后台 Run 的 runCtx 都携带 {sessionGateKey{} → p}，后台 Run 内 hub
+	// 工具嵌套 Eval 同会话命令（tools.go collectTools 的 p.hub.Eval →
+	// commands.go withSession）时 owner == p 放行，不再「持 gate 重复排队」
+	// 死锁（P2-5 契约兑现，supervisor.go StartRun 注释②；§6 风险 2：P5-6/P5-7
+	// 的 StartRun 接线以本步为顺序硬前置）。Key 保持包内非导出（commands.go
+	// sessionGateKey），Value 携带本插件指针——与 withSession 的判等（owner == p）
+	// 精确匹配，其他插件实例的同名 ctx 值不放行。
+	p := &AgentPlugin{cfg: cfg, paths: paths}
+	p.manager = runtimeagent.NewSessionManager(
+		runtimeagent.WithRunLimits(cfg.Session.MaxConcurrentRuns, cfg.Session.MaxPendingRuns),
+		runtimeagent.WithRunContext(runtimeagent.RunContextValue{Key: sessionGateKey{}, Value: p}),
+	)
+	return p
 }
 
 // currentSession 返回当前会话的 runtime——§1.1 路由规则（命令按 SessionID 路由的

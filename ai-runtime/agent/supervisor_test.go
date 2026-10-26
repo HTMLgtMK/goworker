@@ -956,3 +956,113 @@ func TestStartRunEmitsJournalEvents(t *testing.T) {
 		t.Fatalf("middle lines missing running state (%v) or event records (%v) — 同文件混存不成立", hasRunning, hasEvent)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// P5-1:WithRunContext 注入机制(总方案 §6 风险 2,sessionGateKey 死锁契约的
+// SDK 侧透传证明)。
+// ---------------------------------------------------------------------------
+
+// TestStartRunInjectsRunContextValues:WithRunContext 声明的键值对随 StartRun
+// 派生的 runCtx 透传,在 Session.Run 内的两个读点可见:
+//   - ToolSource 探测点(session.go:128,Session.Run 以 runCtx 直接调用
+//     req.ToolSource(ctx));
+//   - 工具 Execute 读点(ai-core 的 toolCtx := context.WithTimeout(agentCtx,
+//     60s)(ai-core/agent/agent.go:147),值沿 runCtx → agentCtx(WithCancel)→
+//     toolCtx 的 ctx 链传播)——后者是 P5-1 死锁契约的关键读点:hub 工具的嵌套
+//     Eval(daemon commands.go withSession 的 ctx.Value(sessionGateKey{}))就
+//     发生在 Execute ctx 上。
+func TestStartRunInjectsRunContextValues(t *testing.T) {
+	type probeKeyA struct{}
+	type probeKeyB struct{}
+
+	m := NewSessionManager(WithRunContext(
+		RunContextValue{Key: probeKeyA{}, Value: "value-A"},
+		RunContextValue{Key: probeKeyB{}, Value: "value-B"},
+	))
+	defer m.Close()
+
+	// scripted provider:第 0 轮发起 probe_tool 工具调用,第 1 轮终答(与
+	// TestStartRunEmitsJournalEvents 同型——工具调用经流式重组响应携带)。
+	pv := &scriptedStreamProvider{rounds: []func(ch chan<- core.Token){
+		func(ch chan<- core.Token) {
+			ch <- core.Token{Type: core.TokenTypeText, Done: true, Response: &core.ChatResponse{
+				Choices: []core.ResponseChoice{{Message: core.Message{
+					Role: "assistant",
+					ToolCalls: []core.ToolCall{{
+						ID:       "call-1",
+						Type:     "function",
+						Function: core.ToolCallFunction{Name: "probe_tool", Arguments: `{}`},
+					}},
+				}}},
+			}}
+		},
+		func(ch chan<- core.Token) {
+			ch <- core.Token{Type: core.TokenTypeText, Done: true, Response: &core.ChatResponse{
+				Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: "final"}}}},
+			}
+		},
+	}}
+	s := NewSession(SessionDeps{
+		Config:   runtimeconfig.Default(),
+		AuditDir: "",
+		CollectTools: func(*sandbox.Config) []core.Tool {
+			return nil
+		},
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			return pv, nil
+		},
+		Store: &fakeConversationStore{},
+	})
+	rt := NewSessionRuntime("ctx-inject", s)
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// 两个读点的命中记录:写点分别在 execute goroutine(ToolSource 探测)与
+	// agent goroutine(工具 Execute),读取在 waitHandle(run.done 关闭)之后
+	// ——happens-before 齐备,mu 仅为 -race 明示。
+	type probeHit struct {
+		where string
+		a, b  any
+	}
+	var (
+		mu   sync.Mutex
+		hits []probeHit
+	)
+	record := func(where string, ctx context.Context) {
+		mu.Lock()
+		defer mu.Unlock()
+		hits = append(hits, probeHit{where: where, a: ctx.Value(probeKeyA{}), b: ctx.Value(probeKeyB{})})
+	}
+
+	req := RunRequest{Input: "q"}
+	req.ToolSource = func(ctx context.Context) []core.Tool {
+		record("toolsource", ctx)
+		return []core.Tool{{
+			Name:        "probe_tool",
+			Description: "ctx probe",
+			Parameters:  NormalizeSchema(nil),
+			Execute: func(ctx context.Context, args map[string]any) (string, error) {
+				record("execute", ctx)
+				return "probe-ok", nil
+			},
+		}}
+	}
+
+	h, err := m.StartRun("ctx-inject", req, testRunCallbacks(&strings.Builder{}))
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	waitHandle(t, h)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hits) != 2 {
+		t.Fatalf("probe hits = %d (%+v), want 2 (toolsource + execute)", len(hits), hits)
+	}
+	for _, hit := range hits {
+		if hit.a != "value-A" || hit.b != "value-B" {
+			t.Fatalf("probe hit at %s = {a:%v b:%v}, want {value-A value-B}(runCtx 注入值未透传)", hit.where, hit.a, hit.b)
+		}
+	}
+}

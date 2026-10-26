@@ -69,6 +69,10 @@ type SessionManager struct {
 	// TTL 兜底「连接死而无人 Unbind」,UnbindConnection 由连接退出收口(P5-7
 	// handler.Close 钩子 / P5-9 daemon 探测面接线)。
 	capabilities *CapabilityRegistry
+	// runCtxValues 是 WithRunContext(P5-1)声明的 runCtx 注入项:StartRun 派生
+	// runCtx 时逐项 context.WithValue(supervisor.go ⑦)。构造期经 ManagerOption
+	// 一次写入,此后只读——无运行期写者,无锁(并发论证见 WithRunContext)。
+	runCtxValues []RunContextValue
 }
 
 // ManagerOption 是 NewSessionManager 的配置选项。
@@ -88,6 +92,30 @@ func WithRunLimits(maxConcurrent, maxPending int) ManagerOption {
 		}
 		m.runSlots = make(chan struct{}, maxConcurrent)
 		m.pending = make(chan struct{}, maxPending)
+	}
+}
+
+// RunContextValue 是 WithRunContext 的单项注入(P5-1):Key/Value 原样传给
+// context.WithValue,由 StartRun 的 runCtx 携带(supervisor.go ⑦)。Key 必须
+// 可比较(与 context.WithValue 同约束)——daemon 以包内非导出的 sessionGateKey{}
+// 为 Key、*AgentPlugin 为 Value 注入 gate 重入标记。
+type RunContextValue struct {
+	Key   any
+	Value any
+}
+
+// WithRunContext 声明注入每次 StartRun runCtx 的键值对(P5-1,兑现 P2-5 契约
+// supervisor.go 的 StartRun 注释②):典型用途是 sessionGateKey 重入标记——后台
+// Run 内 hub 工具嵌套 Eval 同会话命令(commands.go withSession)时,标记放行
+// SessionGate,杜绝「持 gate 重复排队」死锁(总方案 §6 风险 2,P5-6/P5-7
+// StartRun 接线的顺序硬前置)。
+//
+// 并发论证:写入只发生在 NewSessionManager 的选项应用(构造期),此后
+// runCtxValues 只读(StartRun 派生 ctx 时只遍历),无运行期写者、无锁;派生
+// context.WithValue 链不改变既有取消传播(WithCancel 仍以宿主 ctx 为根)。
+func WithRunContext(values ...RunContextValue) ManagerOption {
+	return func(m *SessionManager) {
+		m.runCtxValues = append(m.runCtxValues, values...)
 	}
 }
 

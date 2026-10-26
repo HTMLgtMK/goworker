@@ -68,11 +68,12 @@ func (h RunHandle) Wait(ctx context.Context) (RunResult, error) {
 //     使用者,调用方不得再读写 cb 的任何字段/捕获变量,否则数据竞争;
 //  2. run 的 runCtx 由本方法同步段以 manager 宿主 ctx(m.contextOf())为父派生
 //     (StartRun ⑦,P2-6 修正)——调用方 ctx 不参与(API 形状即保证:连接断开
-//     不影响后台 Run,TestRunSurvivesDisconnect 钉死),且 runCtx **不带
-//     sessionGateKey 重入标记**:后台 Run 与前端同会话
-//     操作靠 gate 互斥,但 run 内经 hub.Eval 等路径嵌套发起同会话 prompt(需要
-//     重入标记放行 SessionGate,commands.go:28-50)会死锁——P5 接前端时必须在
-//     注入点补上该标记,本方法不做;
+//     不影响后台 Run,TestRunSurvivesDisconnect 钉死)。P5-1 起 runCtx 携带
+//     WithRunContext 注入的键值对:daemon 以 sessionGateKey 重入标记兑现 P2-5
+//     契约——后台 Run 内 hub 工具嵌套 Eval 同会话命令(tools.go 的
+//     p.hub.Eval → commands.go withSession)不再「持 gate 重复排队」死锁
+//     (总方案 §6 风险 2,P5-6/P5-7 StartRun 接线的顺序硬前置);未配置注入项
+//     时 ctx 链与 P2-5 完全一致(零注入零变化)。
 //  3. 审批回退(P4-2):cb.Decide 为 nil 时,HITL 决策由 manager 的
 //     ApprovalManager 承担(decideFunc 闭包,⑦.5 注入)——run 在等待决策期间
 //     迁移 RunWaiting(waiting_input)并落 waiting_input journal 记录,决策经
@@ -152,10 +153,16 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	// 句柄立即可取消。若推迟到 execute 内写入(P2-5 原形态),StartRun 返回后
 	// 立即 CancelRun 会与 execute 的调度竞争,对排队中的 Run 误报
 	// ErrRunNotCancellable(plan P2-6 的 TestCancelIsolation 实测 20 次复跑 6 次
-	// 命中)。runCtx 以宿主 ctx 为父(契约②:调用方 ctx 不参与、无
-	// sessionGateKey 重入标记);同步 RecordRun 路径不经此处,run.cancel 恒 nil
-	// 的语义不变(ErrRunNotCancellable 的产生面仍只有同步路径)。
-	runCtx, cancel := context.WithCancel(m.contextOf())
+	// 命中)。runCtx 以宿主 ctx 为父(契约②:调用方 ctx 不参与);P5-1 起先逐项
+	// WithValue 注入 WithRunContext 声明的键值对(构造期写定、此处只读,无锁),
+	// 再 WithCancel——取消传播不变(WithCancel 的父是注入链,根仍是宿主 ctx)。
+	// 同步 RecordRun 路径不经此处,run.cancel 恒 nil 的语义不变
+	// (ErrRunNotCancellable 的产生面仍只有同步路径)。
+	runCtx := m.contextOf()
+	for _, kv := range m.runCtxValues {
+		runCtx = context.WithValue(runCtx, kv.Key, kv.Value)
+	}
+	runCtx, cancel := context.WithCancel(runCtx)
 	run.mu.Lock()
 	run.cancel = cancel
 	run.mu.Unlock()
