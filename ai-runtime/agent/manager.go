@@ -56,6 +56,11 @@ type SessionManager struct {
 	// 释放逆序(supervisor.go 的锁次序论证),两把「锁」全序无环。
 	runSlots chan struct{}
 	pending  chan struct{}
+	// approvals 是 HITL 审批决策管理器(P4-1):进程内存量、全局单例,不随
+	// runtime 增删联动——Wait/Resolve/Pending 以 SessionID/RunID/requestID
+	// 寻址。V1 审批不持久化:重启清空,无跨重启 requestID 碰撞(interrupt
+	// id=req-N 进程级 atomic,middlewares/hitl.go:68)。
+	approvals *ApprovalManager
 }
 
 // ManagerOption 是 NewSessionManager 的配置选项。
@@ -83,9 +88,10 @@ func WithRunLimits(maxConcurrent, maxPending int) ManagerOption {
 // plugin 等)零改动;配额经 WithRunLimits 覆盖。
 func NewSessionManager(opts ...ManagerOption) *SessionManager {
 	m := &SessionManager{
-		runtimes: make(map[string]*SessionRuntime),
-		runSlots: make(chan struct{}, defaultMaxConcurrentRuns),
-		pending:  make(chan struct{}, defaultMaxPendingRuns),
+		runtimes:  make(map[string]*SessionRuntime),
+		runSlots:  make(chan struct{}, defaultMaxConcurrentRuns),
+		pending:   make(chan struct{}, defaultMaxPendingRuns),
+		approvals: NewApprovalManager(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -139,6 +145,12 @@ func (m *SessionManager) List() []*SessionRuntime {
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 	return list
+}
+
+// Approvals 返回审批决策管理器(P4-1):manager 构造即建,恒非 nil。P4-2 起
+// decideFunc 消费 Wait,P5 协议面经 Pending/Resolve 直转包装读取与决策。
+func (m *SessionManager) Approvals() *ApprovalManager {
+	return m.approvals
 }
 
 // contextOf 返回宿主生命周期 ctx(包内访问器):StartRun(P2-5)以它为父派生

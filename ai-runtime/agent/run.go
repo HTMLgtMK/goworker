@@ -21,7 +21,11 @@ const (
 	RunCompleted RunState = "completed"
 	RunFailed    RunState = "failed"
 	RunCancelled RunState = "cancelled"
-	// RunWaiting(waiting_input)属 P4 ApprovalManager(审批等待),本步不定义。
+	// RunWaiting(waiting_input)P4-1 定义,产生方 P4-2 审批等待(HITL 决策
+	// 挂起期间 Run 停留此态)。非终态:journal 恢复扫描(isTerminalRunState)
+	// 不视其为收尾,重启后照旧标 interrupted(总方案 §9;V1 审批在内存、
+	// 不跨重启,自动续跑不做)。
+	RunWaiting RunState = "waiting_input"
 )
 
 // RunResult 是一次会话执行的结果快照。Persisted 语义见 P0-3「模型成功 ≠
