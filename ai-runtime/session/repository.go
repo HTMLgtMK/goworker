@@ -4,6 +4,7 @@
 // 目录布局：
 //
 //	<root>/<sessionID>/current.jsonl        新布局（P1 起创建，目录名即会话 id）
+//	<root>/<sessionID>/runs/<runID>.jsonl   run 状态 journal（P2-2 起，每 run 一文件；legacy 槽落 <root>/runs/）
 //	<root>/current.jsonl + <root>/archive/  legacy 布局（现有用户数据，只读兼容挂载）
 //
 // 三个关键决策（评审点，对应实施计划 §3 P1-1）：
@@ -54,6 +55,13 @@ var (
 	// ErrLegacyImmutable：legacy 根槽（<root>/current.jsonl）不可删除——它是现有
 	// 用户数据的唯一活跃文件，删除等于毁历史；淘汰靠 Archive 轮转（决策 2）。
 	ErrLegacyImmutable = errors.New("session: legacy root session is immutable")
+	// ErrSessionNotOpen：custody 前置不满足——该会话的 Store 不在本 Repository
+	// 的 open 缓存中。RunJournal 依附 Store in-cache（journal.go 文件头论证，
+	// 勘察修正 C：不新增锁面），开不了 Store 就开不了 Journal。
+	ErrSessionNotOpen = errors.New("session: session store not open")
+	// ErrRunExists：同 runID 的 journal 文件已存在（O_EXCL 创建被拒）。P2-1 的
+	// RunID 跨重启碰撞由它兜底——变成可观测错误而非静默覆盖（run.go:100-104）。
+	ErrRunExists = errors.New("session: run journal already exists")
 )
 
 // CreateOptions 是 Create 的选项。Title/CWD 按 P1-1 计划仅作接口占位：本层不持久化

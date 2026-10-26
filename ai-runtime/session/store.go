@@ -775,18 +775,41 @@ func (s *Store) remapCursor(retainIDs []string, cloneMap map[string]string, last
 // 中部坏行维持跳过语义（纯追加原则，文件头注释）。文件在最后一条合法记录之后
 // 只剩空白字节时同样会触发截断（本存储从不写空行，此为无害的手工修复）。
 func loadRecords(path string) (recs []Record, lastGoodEnd int64, err error) {
-	f, err := os.Open(path)
-	if os.IsNotExist(err) {
-		return nil, 0, nil
-	}
+	lastGoodEnd, err = scanJSONL(path, func(line []byte, lineEnd int64) bool {
+		var r Record
+		if uerr := json.Unmarshal(line, &r); uerr != nil {
+			slog.Warn("session: skip bad jsonl line", "err", uerr, "line_preview", truncate(string(line), 80))
+			return false
+		}
+		recs = append(recs, r)
+		return true
+	})
 	if err != nil {
 		return nil, 0, err
+	}
+	return recs, lastGoodEnd, nil
+}
+
+// scanJSONL 是 loadRecords 与 run journal 解析（journal.go loadStateRecords）
+// 共用的行扫描骨架：单行最大 1MB，超出视为坏行（由 handle 返回 false 跳过）；
+// 空行跳过。对每个非空行调用 handle(line, lineEnd)，handle 返回 true 表示该行
+// 为合法记录。返回 lastGoodEnd：最后一条合法记录行末的字节偏移（含行尾 '\n'，
+// 即下一条记录应写入的位置；无任何合法记录时为 0）。文件末行无 '\n' 时该行的
+// lineEnd 报到 size+1，循环后统一钳回文件大小（该行合法即无截断需求，钳回后
+// 恰为行末）。扫描 I/O 错误返回 err，此时 lastGoodEnd 为 0。
+func scanJSONL(path string, handle func(line []byte, lineEnd int64) bool) (int64, error) {
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
 	}
 	defer f.Close()
 
 	var pos int64 // 已扫描过的字节偏移（行内容 + 行尾分隔符）
+	var lastGoodEnd int64
 	sc := bufio.NewScanner(f)
-	// 单行最大 1MB，超出视为坏行跳过
 	sc.Buffer(make([]byte, 64*1024), 1<<20)
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
@@ -798,21 +821,17 @@ func loadRecords(path string) (recs []Record, lastGoodEnd int64, err error) {
 		if len(line) == 0 {
 			continue
 		}
-		var r Record
-		if err := json.Unmarshal(line, &r); err != nil {
-			slog.Warn("session: skip bad jsonl line", "err", err, "line_preview", truncate(string(line), 80))
-			continue
+		if handle(line, lineEnd) {
+			lastGoodEnd = lineEnd
 		}
-		recs = append(recs, r)
-		lastGoodEnd = lineEnd
 	}
 	if err := sc.Err(); err != nil {
-		return nil, 0, fmt.Errorf("scan %s: %w", path, err)
+		return 0, fmt.Errorf("scan %s: %w", path, err)
 	}
 	if info, statErr := f.Stat(); statErr == nil && lastGoodEnd > info.Size() {
 		lastGoodEnd = info.Size()
 	}
-	return recs, lastGoodEnd, nil
+	return lastGoodEnd, nil
 }
 
 // truncate 按 rune 截断字符串到 max 长度，中文安全。max <= 0 不截断（防 slice 越界 panic）。
