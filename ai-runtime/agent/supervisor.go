@@ -242,6 +242,56 @@ func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx conte
 		At:        time.Now(),
 	})
 
+	// ④.5 能力等待观察者注入(P4-4):包装 req.ToolSource,给携带
+	// capabilityWaitMetaKey 标记的代理工具注入 onWait 闭包——等待重绑期间 run
+	// 迁移 RunWaitingCapability 并落 waiting_capability journal 记录(与
+	// decideFunc 的 waiting_input 迁移同构:transition 在 run.mu 内、journal
+	// 在 rt.mu 外),等待收敛回 RunRunning(仅迁移,journal 由 ④ 与终态记录
+	// 夹注,不重复落 running)。onWait 经 ctx 注入代理 Execute(capability.go
+	// 的 withCapabilityWaitObserver):ai-core 的 toolCtx 是本 Run agentCtx 的
+	// 子 ctx,值随链传播。
+	//
+	// **RecordRun 同步路径不注入**(不包装 ToolSource):同步 Run 的代理工具
+	// 拿不到观察者,等待照常发生(安全超时兜底)但 RunState 不迁移——
+	// waiting_capability 仅后台 Run 可观测,同步路径记 running(limitation,
+	// plan P4-4 行为变化声明的组成部分)。
+	//
+	// 契约前提:ToolSource 每 Run 恰被调用一次且返回当轮新构造的工具
+	// (session.go:124-129 probe 一次;P5-9 的 binder 每 prompt 重建代理)——
+	// 若未来缓存跨 Run 复用同一 Execute 闭包,重复包装会把旧 Run 的观察者叠进
+	// 新 Run,该契约破坏须先修。
+	if req.ToolSource != nil {
+		orig := req.ToolSource
+		sess := rt.Session()
+		onWait := func(waiting bool) {
+			if waiting {
+				run.transition(RunWaitingCapability)
+				journalRunState(sess, session.RunStateRecord{
+					Kind:      "state",
+					SessionID: run.SessionID,
+					RunID:     run.ID,
+					State:     string(RunWaitingCapability),
+					At:        time.Now(),
+				})
+				return
+			}
+			run.transition(RunRunning)
+		}
+		req.ToolSource = func(ctx context.Context) []core.Tool {
+			tools := orig(ctx)
+			for i := range tools {
+				if tools[i].Metadata[capabilityWaitMetaKey] == "" || tools[i].Execute == nil {
+					continue
+				}
+				inner := tools[i].Execute
+				tools[i].Execute = func(toolCtx context.Context, args map[string]any) (string, error) {
+					return inner(withCapabilityWaitObserver(toolCtx, onWait), args)
+				}
+			}
+			return tools
+		}
+	}
+
 	// ⑤ 执行。Session.Run 的取消态归一(P2-1)在这里生效,但 ai-core 的
 	// Agent.Run 把 provider 错误漏斗进 note token(P2-1 探针实测:Session.Run
 	// 对 ctx 取消也可能返回 completed——错误经流式出口,不进返回值)。runCtx

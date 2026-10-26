@@ -194,9 +194,12 @@ func Default() *Config {
 		Sandbox: sandbox.SandboxConfig{
 			Mode: "normal",
 		},
-		// MaxConcurrentRuns/MaxPendingRuns 取总方案第四节建议值 4/16；daemon app
-		// config 默认块未设的字段为 0，由 WithRunLimits 的 <=0 回落兜底（双保险）。
-		Session: SessionConfig{Enabled: true, MaxConcurrentRuns: 4, MaxPendingRuns: 16},
+		// MaxConcurrentRuns/MaxPendingRuns 取总方案第四节建议值 4/16;
+		// CapabilityWaitTimeout 取 openQuestions ③ 拍板值 45(秒,硬约束 <
+		// ai-core toolCtx 60s,ai-core/agent/agent.go:147-153)。daemon app
+		// config 默认块未设的字段为 0,分别由 WithRunLimits /
+		// resolveCapabilityWait 的 <=0 回落兜底(双保险)。
+		Session: SessionConfig{Enabled: true, MaxConcurrentRuns: 4, MaxPendingRuns: 16, CapabilityWaitTimeout: 45},
 	}
 }
 

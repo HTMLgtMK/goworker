@@ -2,16 +2,25 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/tinguo/goworker/ai-core/core"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/ai-runtime/hitl"
+	"github.com/tinguo/goworker/ai-runtime/session"
+	"github.com/tinguo/goworker/ai-sandbox"
 )
 
-// 本文件是 P4-3 CapabilityRegistry / ClientToolProxy 构造面的验收测试(纯单元
-// 面,零 Provider、零 LLM):Bind/Lookup 的幂等往返与 TTL 过期、重绑刷新、跨
-// connection 隔离(不存在隐式路由面)、代理构造断言(Name/Description/Schema/
-// Metadata 透传 + capability_wait 标记)。语义铁律见 capability.go 头注释
-// (总方案 §8);Execute 的等待/失效语义属 P4-4,本文件只钉构造面与占位错误。
+// 本文件是 P4-3 CapabilityRegistry / ClientToolProxy 构造面与 P4-4 等待/失效
+// 语义的验收测试:Bind/Lookup 的幂等往返与 TTL 过期、重绑刷新、跨 connection
+// 隔离(不存在隐式路由面)、代理构造断言(Name/Description/Schema/Metadata
+// 透传 + capability_wait 标记)、Execute 的直通/等待/超时单元面,以及四个
+// StartRun 全链测试(TestToolBindingDisconnect 等,总方案第十一节 → P4-4)。
+// 语义铁律见 capability.go 头注释(总方案 §8);全部模拟 Provider,零真实 LLM。
 
 // fakeClientExecutor 是 ClientToolExecutor 的测试桩:记录调用次数,返回预置
 // 结果。各绑定用独立实例,靠指针相等断言 Lookup 返回的正是登记的执行通道。
@@ -274,25 +283,408 @@ func TestClientToolProxyConstruction(t *testing.T) {
 	}
 }
 
-// TestClientToolProxyExecutePlaceholder:本步只做构造面——Execute 返回占位
-// 错误(等待/绑定解析/失败失效语义在 P4-4 落码);waitTimeout<=0 回落
-// defaultCapabilityWaitTimeout=45s(双保险,硬约束 < ai-core toolCtx 60s),
-// 占位错误文本带预算以便上层辨认。
-func TestClientToolProxyExecutePlaceholder(t *testing.T) {
+// TestClientToolProxyExecuteInvokeAndTimeoutFail(P4-4):Execute 真实语义的
+// 单元面——绑定在 → Invoke 结果直通;无绑定 → 等待满短预算 → 明确失败文本
+// (device tool X unavailable: connection lost, waited Ns)。失败是工具结果
+// 不是执行异常(error 恒 nil),交 Agent 决定下一步(总方案 §8 :677)。
+func TestClientToolProxyExecuteInvokeAndTimeoutFail(t *testing.T) {
 	r := NewCapabilityRegistry()
+	specs := []ClientToolSpec{{Name: "sys_x", Schema: "{}"}}
 
-	custom := NewClientToolProxy(r, "sess-1", []ClientToolSpec{{Name: "sys_x", Schema: "{}"}}, 2*time.Second)
-	if _, err := custom[0].Execute(context.Background(), map[string]any{}); err == nil ||
-		!strings.Contains(err.Error(), "P4-4") || !strings.Contains(err.Error(), "2s") {
-		t.Fatalf("placeholder execute must fail with budget echoed, got %v", err)
+	// 绑定在:Invoke 结果直通,零等待(onWait 零调用面无观察者可断,结果即证)。
+	exec := &fakeClientExecutor{result: "invoked-ok"}
+	r.Bind("sess-1", "conn-A", []string{"sys_x"}, time.Minute, exec)
+	tools := NewClientToolProxy(r, "sess-1", specs, time.Second)
+	got, err := tools[0].Execute(context.Background(), map[string]any{"k": "v"})
+	if err != nil || got != "invoked-ok" {
+		t.Fatalf("Execute with live binding = (%q, %v), want (invoked-ok, nil)", got, err)
+	}
+	if exec.calls != 1 {
+		t.Fatalf("executor invoked %d time(s), want 1", exec.calls)
 	}
 
-	fallback := NewClientToolProxy(r, "sess-1", []ClientToolSpec{{Name: "sys_x", Schema: "{}"}}, 0)
-	_, err := fallback[0].Execute(context.Background(), map[string]any{})
-	if err == nil || !strings.Contains(err.Error(), "45s") {
-		t.Fatalf("non-positive waitTimeout must fall back to %s, got %v", defaultCapabilityWaitTimeout, err)
+	// 无绑定:等待满短预算 → 明确失败文本(error 恒 nil,不 panic、不中断)。
+	empty := NewClientToolProxy(NewCapabilityRegistry(), "sess-1", specs, 80*time.Millisecond)
+	start := time.Now()
+	res, err := empty[0].Execute(context.Background(), map[string]any{})
+	if err != nil {
+		t.Fatalf("timeout exit must be a tool result, not an error: %v", err)
+	}
+	if !strings.Contains(res, "device tool sys_x unavailable: connection lost") || !strings.Contains(res, "waited") {
+		t.Fatalf("timeout result = %q, want explicit failure text", res)
+	}
+	if elapsed := time.Since(start); elapsed < 60*time.Millisecond {
+		t.Fatalf("Execute returned after %v, want it to hold the wait window", elapsed)
+	}
+}
+
+// TestCapabilityWaitTimeoutFallback:waitTimeout<=0 回落 defaultCapabilityWait
+// Timeout(45s,双保险 P2-7 同款;硬约束 < ai-core toolCtx 60s)。行为面经
+// resolveCapabilityWait 单元钉死,45s 不做真实等待。
+func TestCapabilityWaitTimeoutFallback(t *testing.T) {
+	if got := resolveCapabilityWait(0); got != defaultCapabilityWaitTimeout {
+		t.Fatalf("resolveCapabilityWait(0) = %v, want %v", got, defaultCapabilityWaitTimeout)
+	}
+	if got := resolveCapabilityWait(-time.Second); got != defaultCapabilityWaitTimeout {
+		t.Fatalf("resolveCapabilityWait(-1s) = %v, want %v", got, defaultCapabilityWaitTimeout)
+	}
+	if got := resolveCapabilityWait(3 * time.Second); got != 3*time.Second {
+		t.Fatalf("resolveCapabilityWait(3s) = %v, want 3s(显式预算不被覆盖)", got)
 	}
 	if defaultCapabilityWaitTimeout != 45*time.Second {
 		t.Fatalf("defaultCapabilityWaitTimeout must stay 45s (< ai-core toolCtx 60s), got %v", defaultCapabilityWaitTimeout)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P4-4:等待/安全超时/失效语义 + waiting_capability + 观察者注入(总方案
+// 第十一节 TestToolBindingDisconnect → 本步,P4 完成线)。
+//
+// 测试装置:scriptedChatProvider(approval_test.go,非流式脚本,tool call 轮
+// 经真实 kernel 工具循环 + HITL 中间件链)+ newCapabilityRunRuntime(仅
+// ToolSource 工具面)+ fakeClientExecutor(绑定执行通道,Invoke 计数钉死
+// 「不静默路由」)。断连的确定性编排:EmitToken 钩子看到本工具的 tool_call
+// token 即 Unbind——ai-core 对 tool_call token 的发送阻塞在消费面
+// (streamTokens)上,解绑严格先于工具 Execute,无竞态窗口。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// capToolName 是能力测试的代理工具名:sys_ 前缀命中 HITL 的 checkSys 面
+// (hitl.go:201-249),metadata risk_level 声明即策略(never=normal 模式直接
+// 放行,mode=normal 模式询问)。
+const capToolName = "sys_camera"
+
+// capToolCallRound 构造一轮对代理工具的 tool call 消息(scriptedChatProvider 脚本)。
+func capToolCallRound(id string) core.Message {
+	return core.Message{Role: "assistant", ToolCalls: []core.ToolCall{{
+		ID:       id,
+		Type:     "function",
+		Function: core.ToolCallFunction{Name: capToolName, Arguments: `{"resolution":"4k"}`},
+	}}}
+}
+
+// capToolSpecs 构造代理声明;riskLevel 透传进 Metadata(HITL 门控的事实源)。
+func capToolSpecs(riskLevel string) []ClientToolSpec {
+	return []ClientToolSpec{{
+		Name:        capToolName,
+		Description: "take a photo",
+		Schema:      `{"type":"object"}`,
+		Metadata:    map[string]string{"risk_level": riskLevel},
+	}}
+}
+
+// newCapabilityRunRuntime 构造「仅 ToolSource 工具面」的后台 Run 测试装置:
+// CollectTools 返回 nil(代理工具只经 RunRequest.ToolSource 进入),沙箱用
+// 默认配置(normal)。RunJournal 仅非 nil 时装配(typed-nil 纪律同
+// newHitlRunRuntime,approval_test.go)。
+func newCapabilityRunRuntime(t *testing.T, m *SessionManager, id string, pv core.Provider, jr *stubRunJournal) string {
+	t.Helper()
+	deps := SessionDeps{
+		Config:       runtimeconfig.Default(),
+		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			return pv, nil
+		},
+		Store: &fakeConversationStore{},
+	}
+	if jr != nil {
+		deps.RunJournal = jr
+	}
+	s := NewSession(deps)
+	rt := NewSessionRuntime(id, s)
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	return id
+}
+
+// waitRunState 轮询直至句柄到达 want 状态(onWait(true) 的迁移与观察者注入
+// 都在执行 goroutine 上,观察点异步可达,有界等待防挂死)。
+func waitRunState(t *testing.T, h RunHandle, want RunState) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for h.State() != want {
+		select {
+		case <-deadline:
+			t.Fatalf("state never reached %q (now %q)", want, h.State())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+// waitToolCallUnbound 返回 EmitToken 钩子:首个本工具 tool_call token 到达时
+// 执行 disconnect(解绑 conn-A)并关闭 done——token 消费先于工具 Execute,
+// 「先断连、后执行」的次序由此钉死。toolResults 收集 tool_result 文本
+// (单写者 = 执行 goroutine;主 goroutine 在 Wait 返回后读取,happens-before)。
+func waitToolCallUnbound(disconnect func(), toolResults *[]string) (cb RunCallbacks, done chan struct{}) {
+	done = make(chan struct{})
+	fired := false // 仅执行 goroutine 读写(EmitToken 单调用面)
+	cb = RunCallbacks{
+		EmitToken: func(tok core.Token) {
+			if tok.Type == core.TokenTypeToolCall && tok.ToolCall.Function.Name == capToolName && !fired {
+				fired = true
+				disconnect()
+				close(done)
+			}
+			if tok.Type == core.TokenTypeToolResult {
+				*toolResults = append(*toolResults, tok.Content)
+			}
+		},
+	}
+	return cb, done
+}
+
+// TestToolBindingDisconnect(总方案第十一节 → 本步):StartRun + ToolSource
+// 返回代理(绑 conn-A 的 dead executor,Invoke 置失败做陷阱)+ scripted
+// provider 先发 tool_call 再 final → run 到工具调用(EmitToken 钩子解绑
+// conn-A)→ run 迁移 RunWaitingCapability → Bind(conn-B, 含同名工具, 新
+// executor)→ 工具在 conn-B 执行完成 → RunCompleted。dead executor 的
+// Invoke 计数==0:等待重绑绝不把请求静默路由到已断开(或任何未显式重绑)的
+// 连接(总方案 §8 :650 断言钉死)。
+func TestToolBindingDisconnect(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+	reg := m.Capabilities()
+
+	dead := &fakeClientExecutor{err: errors.New("connection dead")}
+	execB := &fakeClientExecutor{result: "photo-bytes-from-B"}
+	reg.Bind("cap-disc", "conn-A", []string{capToolName}, time.Minute, dead)
+
+	pv := &scriptedChatProvider{msgs: []core.Message{
+		capToolCallRound("call-cap-1"),
+		{Role: "assistant", Content: "photo taken"},
+	}}
+	sid := newCapabilityRunRuntime(t, m, "cap-disc", pv, nil)
+	tools := NewClientToolProxy(reg, sid, capToolSpecs("never"), 5*time.Second)
+
+	var toolResults []string
+	cb, unbound := waitToolCallUnbound(func() { reg.UnbindConnection("conn-A") }, &toolResults)
+
+	h, err := m.StartRun(sid, RunRequest{Input: "take a photo", ToolSource: func(context.Context) []core.Tool { return tools }}, cb)
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	select {
+	case <-unbound:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tool call never reached the disconnect hook")
+	}
+	waitRunState(t, h, RunWaitingCapability) // 断连 → waiting_capability(与 waiting_input 可区分)
+
+	reg.Bind(sid, "conn-B", []string{capToolName}, time.Minute, execB) // 显式重绑:含同名工具
+
+	res := waitHandle(t, h) // 工具在 conn-B 执行完成 → RunCompleted+Persisted
+	if dead.calls != 0 {
+		t.Fatalf("dead executor invoked %d time(s), want 0(绝不静默路由到已断开连接)", dead.calls)
+	}
+	if execB.calls != 1 {
+		t.Fatalf("conn-B executor invoked %d time(s), want 1(重绑后恰执行一次)", execB.calls)
+	}
+	if len(toolResults) != 1 || toolResults[0] != "photo-bytes-from-B" {
+		t.Fatalf("tool results = %v, want [photo-bytes-from-B](结果来自 conn-B)", toolResults)
+	}
+	if res.State != RunCompleted {
+		t.Fatalf("state = %q, want RunCompleted", res.State)
+	}
+}
+
+// TestToolBindingTimeoutFails:无重绑 → 短窗等待 → 超时返回明确失败文本交
+// Agent → run 正常完成(失败是工具结果不是执行异常:journal 终态 completed
+// 但工具结果可辨,总方案 §8 :677)。
+func TestToolBindingTimeoutFails(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+	reg := m.Capabilities() // 从不绑定:等待预算耗尽是唯一出口
+
+	jr := &stubRunJournal{}
+	pv := &scriptedChatProvider{msgs: []core.Message{
+		capToolCallRound("call-cap-t"),
+		{Role: "assistant", Content: "handled unavailable tool"},
+	}}
+	sid := newCapabilityRunRuntime(t, m, "cap-timeout", pv, jr)
+	tools := NewClientToolProxy(reg, sid, capToolSpecs("never"), 200*time.Millisecond)
+
+	var toolResults []string
+	cb, _ := waitToolCallUnbound(func() {}, &toolResults) // 只收集 tool_result
+
+	h, err := m.StartRun(sid, RunRequest{Input: "take a photo", ToolSource: func(context.Context) []core.Tool { return tools }}, cb)
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	res := waitHandle(t, h) // 超时不挂死:run 正常 RunCompleted
+
+	if len(toolResults) != 1 {
+		t.Fatalf("tool results = %v, want exactly 1", toolResults)
+	}
+	if !strings.Contains(toolResults[0], "device tool "+capToolName+" unavailable: connection lost") ||
+		!strings.Contains(toolResults[0], "waited") {
+		t.Fatalf("tool result %q missing explicit failure text", toolResults[0])
+	}
+	if res.State != RunCompleted {
+		t.Fatalf("state = %q, want RunCompleted(失败结果交给 Agent,run 不失败)", res.State)
+	}
+
+	// journal 观测面:queued → running → waiting_capability → completed,
+	// waiting_capability 先于终态(durable-first;isTerminalRunState 不含它,
+	// 恢复扫描把卡在此态的 run 标 interrupted)。
+	recs := jr.snapshot()
+	wantStates := []string{string(RunQueued), string(RunRunning), string(RunWaitingCapability), string(RunCompleted)}
+	if len(recs) != len(wantStates) {
+		var got []string
+		for _, rec := range recs {
+			got = append(got, rec.Kind+":"+rec.State)
+		}
+		t.Fatalf("journal records = %v, want states %v", got, wantStates)
+	}
+	for i, rec := range recs {
+		if rec.RunID != h.RunID || rec.State != wantStates[i] {
+			t.Fatalf("record %d = {run:%q state:%q}, want run=%q state=%q", i, rec.RunID, rec.State, h.RunID, wantStates[i])
+		}
+	}
+}
+
+// TestRebindRequiresCapabilityMatch:重绑连接的 ToolNames 不含该工具 → 等待
+// 不解除直至超时。就绪通知按 (sessionID, toolName) 寻址:mismatch 的 Bind 根
+// 本不会唤醒 sys_camera 的等待者;且唤醒后的事实源仍是 registry 重查(通知
+// 只是唤醒,不匹配继续等)——双重不依赖通知面的「善意」。
+func TestRebindRequiresCapabilityMatch(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+	reg := m.Capabilities()
+
+	execA := &fakeClientExecutor{result: "from-A"}
+	execOther := &fakeClientExecutor{result: "from-other"}
+	reg.Bind("cap-mismatch", "conn-A", []string{capToolName}, time.Minute, execA)
+
+	pv := &scriptedChatProvider{msgs: []core.Message{
+		capToolCallRound("call-cap-m"),
+		{Role: "assistant", Content: "gave up waiting"},
+	}}
+	sid := newCapabilityRunRuntime(t, m, "cap-mismatch", pv, nil)
+	tools := NewClientToolProxy(reg, sid, capToolSpecs("never"), 600*time.Millisecond)
+
+	var toolResults []string
+	cb, unbound := waitToolCallUnbound(func() { reg.UnbindConnection("conn-A") }, &toolResults)
+
+	h, err := m.StartRun(sid, RunRequest{Input: "take a photo", ToolSource: func(context.Context) []core.Tool { return tools }}, cb)
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	select {
+	case <-unbound:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tool call never reached the disconnect hook")
+	}
+	waitRunState(t, h, RunWaitingCapability)
+
+	// mismatch 重绑:conn-B 只声明 sys_other,不含 sys_camera。
+	reg.Bind(sid, "conn-B", []string{"sys_other"}, time.Minute, execOther)
+
+	// 等待不得被 mismatch 解除:mismatch 后 300ms(< 600ms 预算)run 仍未
+	// 完成、状态仍停在 waiting_capability。
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	_, waitErr := h.Wait(waitCtx)
+	cancelWait()
+	if waitErr == nil {
+		t.Fatalf("run finished before the wait budget despite mismatched rebind(等待被 mismatch 解除)")
+	}
+	if got := h.State(); got != RunWaitingCapability {
+		t.Fatalf("state after mismatched-rebind window = %q, want still %q", got, RunWaitingCapability)
+	}
+
+	waitHandle(t, h) // 超时出口:明确失败文本,run 正常完成
+	if execOther.calls != 0 {
+		t.Fatalf("mismatched executor invoked %d time(s), want 0(不匹配的重绑不得承接执行)", execOther.calls)
+	}
+	if execA.calls != 0 {
+		t.Fatalf("dead conn-A executor invoked %d time(s), want 0", execA.calls)
+	}
+	if len(toolResults) != 1 || !strings.Contains(toolResults[0], "device tool "+capToolName+" unavailable: connection lost") {
+		t.Fatalf("tool results = %v, want explicit failure text", toolResults)
+	}
+}
+
+// TestRebindReconfirmViaHITL:重绑后的执行再次触发 interrupt——代理把
+// risk_level 原样透传进 Metadata,HITL 门控读固化在工具定义上的 Metadata 在
+// 每次「调用」裁决:第 1 次调用(approve)在 conn-A 上 Invoke 失败 → Invalidate
+// → 等待 → 重绑 conn-B → 等待收敛后重新 Invoke;第 2 次调用在重绑后的
+// conn-B 上执行前再次触发 interrupt——第二次 permission.requested,危险操作
+// 重绑后仍需确认(总方案 §6 :524)。
+func TestRebindReconfirmViaHITL(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	pv := &scriptedChatProvider{msgs: []core.Message{
+		capToolCallRound("call-cap-h1"),
+		capToolCallRound("call-cap-h2"),
+		{Role: "assistant", Content: "device work done"},
+	}}
+	fx := newEventRunRuntime(t, m, pv) // RunEvents=真 RunJournalStore:permission.requested 可回放断言
+	sid := fx.sessionID
+	reg := m.Capabilities()
+
+	dead := &fakeClientExecutor{err: errors.New("connection dead")}
+	execB := &fakeClientExecutor{result: "photo-bytes-from-B"}
+	reg.Bind(sid, "conn-A", []string{capToolName}, time.Minute, dead)
+
+	tools := NewClientToolProxy(reg, sid, capToolSpecs("mode"), 5*time.Second) // normal 模式 → hitl
+
+	var decideMu sync.Mutex
+	decides := 0
+	cb := RunCallbacks{
+		EmitToken: func(core.Token) {},
+		Decide: func(*hitl.InterruptRequest) hitl.Decision {
+			decideMu.Lock()
+			decides++
+			decideMu.Unlock()
+			return hitl.Decision{Type: hitl.DecisionApprove}
+		},
+	}
+
+	h, err := m.StartRun(sid, RunRequest{Input: "take a photo", ToolSource: func(context.Context) []core.Tool { return tools }}, cb)
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	// 第 1 次调用:approve 后 conn-A Invoke 失败 → Invalidate → 等待重绑。
+	waitRunState(t, h, RunWaitingCapability)
+	reg.Bind(sid, "conn-B", []string{capToolName}, time.Minute, execB)
+
+	res := waitHandle(t, h)
+
+	decideMu.Lock()
+	gotDecides := decides
+	decideMu.Unlock()
+	if gotDecides != 2 {
+		t.Fatalf("interrupts = %d, want 2(重绑后的执行再次触发确认)", gotDecides)
+	}
+	if dead.calls != 1 {
+		t.Fatalf("dead executor invoked %d time(s), want 1(第 1 次调用真实尝试过 conn-A 后失效)", dead.calls)
+	}
+	if execB.calls != 2 {
+		t.Fatalf("conn-B executor invoked %d time(s), want 2(重绑收敛执行 + 第 2 次调用)", execB.calls)
+	}
+	if res.State != RunCompleted {
+		t.Fatalf("state = %q, want RunCompleted", res.State)
+	}
+
+	// 事件面(tee 包 Decide → permission.requested/resolved 事件对):第二次
+	// permission.requested 在事件流可回放。
+	evs, err := fx.journal.ReadEvents(0)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	requested, resolved := 0, 0
+	for _, ev := range evs {
+		switch ev.Type {
+		case session.EventPermissionRequested:
+			requested++
+		case session.EventPermissionResolved:
+			resolved++
+		}
+	}
+	if requested != 2 || resolved != 2 {
+		t.Fatalf("permission events requested=%d resolved=%d, want 2/2(第二次 permission.requested)", requested, resolved)
 	}
 }

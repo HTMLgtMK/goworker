@@ -26,6 +26,14 @@ const (
 	// 不视其为收尾,重启后照旧标 interrupted(总方案 §9;V1 审批在内存、
 	// 不跨重启,自动续跑不做)。
 	RunWaiting RunState = "waiting_input"
+	// RunWaitingCapability(waiting_capability)P4-4 定义,产生方 P4-4 能力代理
+	// 的等待重绑(supervisor 观察者注入的 onWait 闭包):客户端工具的绑定连接
+	// 断开后,Run 在等待具备相同工具能力的客户端显式重绑期间停留此态。与 HITL
+	// 的 waiting_input 在 run/get 观测面上可区分(总方案 §8 :673「waiting_input
+	// 或 waiting_capability」取后者)。非终态:journal 恢复扫描(isTerminalRun
+	// State,session/journal.go:143-150)不含它——卡在等待重绑的 run 重启后
+	// 照旧标 interrupted(V1 不做等待重绑的跨重启续跑)。
+	RunWaitingCapability RunState = "waiting_capability"
 )
 
 // RunResult 是一次会话执行的结果快照。Persisted 语义见 P0-3「模型成功 ≠
