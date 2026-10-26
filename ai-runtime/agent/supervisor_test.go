@@ -1066,3 +1066,215 @@ func TestStartRunInjectsRunContextValues(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// P5-2:run.* 生命周期事件产出(仅 hub 非 nil 路径,plan §4)。
+// ---------------------------------------------------------------------------
+
+// runLifecycleEvent 在 ReadEvents 全量回放中取某事件类型的唯一记录:缺失或多条
+// 都 fatal(每 run 的 started/finished/error 均应恰产出一次)。
+func runLifecycleEvent(t *testing.T, recs []session.EventRecord, typ string) *session.EventRecord {
+	t.Helper()
+	var hit *session.EventRecord
+	count := 0
+	for i := range recs {
+		if recs[i].Type == typ {
+			hit = &recs[i]
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("event %s persisted %d times, want exactly 1 (records: %d)", typ, count, len(recs))
+	}
+	return hit
+}
+
+// assertEventPayload 解码事件载荷并断言键值(只校验 want 中列出的键;json 反序列
+// 化后 string/bool 与 any 的直接比较成立)。
+func assertEventPayload(t *testing.T, rec *session.EventRecord, want map[string]any) {
+	t.Helper()
+	var got map[string]any
+	if err := json.Unmarshal(rec.Payload, &got); err != nil {
+		t.Fatalf("decode %s payload %s: %v", rec.Type, rec.Payload, err)
+	}
+	for k, w := range want {
+		g, ok := got[k]
+		if !ok {
+			t.Fatalf("%s payload %v missing key %q, want %v", rec.Type, got, k, w)
+		}
+		if g != w {
+			t.Fatalf("%s payload[%q] = %v, want %v", rec.Type, k, g, w)
+		}
+	}
+}
+
+// assertEventBeforeTerminalState 断言原始 journal 文件(事件与 state 同文件混存)
+// 中某事件类型的行先于终态 state 行——次序铁律(事件先于终态 state 记录,
+// journal_store.go 句柄逐出约束)的文件序可见面,与 TestStartRunEmitsJournalEvents
+// 的「末行 completed」口径同源。
+func assertEventBeforeTerminalState(t *testing.T, fx eventRunFixture, runID, typ, termState string) {
+	t.Helper()
+	data, err := os.ReadFile(fx.runJournalPath(runID))
+	if err != nil {
+		t.Fatalf("read run journal: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var probe struct {
+		Kind  string `json:"kind"`
+		Type  string `json:"type"`
+		State string `json:"state"`
+	}
+	eventLine, termLine := -1, -1
+	for i, line := range lines {
+		if err := json.Unmarshal([]byte(line), &probe); err != nil {
+			t.Fatalf("decode journal line %q: %v", line, err)
+		}
+		switch {
+		case probe.Kind == "event" && probe.Type == typ && eventLine == -1:
+			eventLine = i
+		case probe.Kind == "state" && probe.State == termState:
+			termLine = i
+		}
+	}
+	if eventLine == -1 {
+		t.Fatalf("journal file has no %s event line", typ)
+	}
+	if termLine == -1 {
+		t.Fatalf("journal file has no terminal state %s line", termState)
+	}
+	if eventLine > termLine {
+		t.Fatalf("%s event at line %d is after terminal state %s at line %d(次序铁律:事件先于终态 state 记录)", typ, eventLine, termState, termLine)
+	}
+}
+
+// TestStartRunEmitsRunLifecycleEvents(P5-2):RunEvents=真 RunJournalStore →
+// ReadEvents 断言 run.* 四类的产出面与次序铁律:
+//   - 正常 run:run.started 先于 run.finished(Seq 序),finished 的行先于终态
+//     completed state 记录(文件序);
+//   - failed run(captureProvider.chatErr 注入,AC-1 归一 RunFailed):含
+//     run.error{err} 且先于 run.finished,两者都先于终态 state 记录;
+//   - 取消 run(CancelRun,early-exit 路径):含 run.finished{cancelled},且无
+//     run.started(run 未达 running)。
+//
+// 全部走真 journal 全链(manager → runtime → Session → ai-core → tee → hub →
+// RunJournalStore 落盘,装置同 TestStartRunEmitsJournalEvents)。
+func TestStartRunEmitsRunLifecycleEvents(t *testing.T) {
+	t.Run("completed run emits started then finished before terminal state", func(t *testing.T) {
+		m := NewSessionManager()
+		defer m.Close()
+		pv := &scriptedStreamProvider{rounds: []func(ch chan<- core.Token){
+			func(ch chan<- core.Token) {
+				ch <- core.Token{Type: core.TokenTypeText, Done: true, Response: &core.ChatResponse{
+					Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: "final answer"}}},
+				}}
+			},
+		}}
+		fx := newEventRunRuntime(t, m, pv)
+
+		h, err := m.StartRun(fx.sessionID, RunRequest{Input: "q"}, eventRunCallbacks())
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		waitHandle(t, h)
+
+		recs, err := fx.journal.ReadEvents(0)
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		started := runLifecycleEvent(t, recs, session.EventRunStarted)
+		finished := runLifecycleEvent(t, recs, session.EventRunFinished)
+		if started.Seq >= finished.Seq {
+			t.Fatalf("started seq %d >= finished seq %d, want started strictly before finished", started.Seq, finished.Seq)
+		}
+		assertEventPayload(t, started, map[string]any{"state": string(RunRunning)})
+		assertEventPayload(t, finished, map[string]any{"state": string(RunCompleted), "persisted": true})
+		assertEventBeforeTerminalState(t, fx, h.RunID, session.EventRunFinished, string(RunCompleted))
+	})
+
+	t.Run("failed run emits error before finished", func(t *testing.T) {
+		m := NewSessionManager()
+		defer m.Close()
+		fx := newEventRunRuntime(t, m, &captureProvider{chatErr: errors.New("boom provider")})
+
+		h, err := m.StartRun(fx.sessionID, RunRequest{Input: "q"}, eventRunCallbacks())
+		if err != nil {
+			t.Fatalf("StartRun: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		res, err := h.Wait(ctx)
+		if err != nil {
+			t.Fatalf("Wait: %v (state=%s)", err, h.State())
+		}
+		if res.State != RunFailed {
+			t.Fatalf("run result = %+v, want RunFailed (provider 失败经 AC-1 capture 归一)", res)
+		}
+
+		recs, err := fx.journal.ReadEvents(0)
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		started := runLifecycleEvent(t, recs, session.EventRunStarted)
+		errEv := runLifecycleEvent(t, recs, session.EventRunError)
+		finished := runLifecycleEvent(t, recs, session.EventRunFinished)
+		if started.Seq >= errEv.Seq || errEv.Seq >= finished.Seq {
+			t.Fatalf("seq order: started %d, error %d, finished %d, want strictly increasing", started.Seq, errEv.Seq, finished.Seq)
+		}
+		assertEventPayload(t, errEv, map[string]any{"err": "boom provider"})
+		assertEventPayload(t, finished, map[string]any{"state": string(RunFailed)})
+		assertEventBeforeTerminalState(t, fx, h.RunID, session.EventRunError, string(RunFailed))
+		assertEventBeforeTerminalState(t, fx, h.RunID, session.EventRunFinished, string(RunFailed))
+	})
+
+	t.Run("queued cancel emits finished cancelled at early exit", func(t *testing.T) {
+		m := NewSessionManager(WithRunLimits(1, 8))
+		defer m.Close()
+		startedA := make(chan struct{})
+		releaseA := make(chan struct{})
+		defer close(releaseA) // 失败路径也放行 A,防 defer 的 m.Close 死等在途 run
+		hangPv := &gatedProvider{
+			replies: []string{"reply-A"},
+			starts:  []chan struct{}{startedA},
+			release: []chan struct{}{releaseA},
+		}
+		fxA := newEventRunRuntime(t, m, hangPv)                                       // A:占住唯一全局槽挂起中
+		fxB := newEventRunRuntime(t, m, &gatedProvider{replies: []string{"reply-B"}}) // B:排队即取消,provider 不开工
+
+		if _, err := m.StartRun(fxA.sessionID, RunRequest{Input: "q-A"}, eventRunCallbacks()); err != nil {
+			t.Fatalf("StartRun A: %v", err)
+		}
+		hB, err := m.StartRun(fxB.sessionID, RunRequest{Input: "q-B"}, eventRunCallbacks())
+		if err != nil {
+			t.Fatalf("StartRun B: %v", err)
+		}
+		waitStarted(t, startedA) // A 已占住唯一 runSlots 槽
+		if got := hB.State(); got != RunQueued {
+			t.Fatalf("B state = %q, want RunQueued (排队中)", got)
+		}
+		if err := m.CancelRun(fxB.sessionID, hB.RunID); err != nil {
+			t.Fatalf("CancelRun queued B: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		resB, err := hB.Wait(ctx)
+		if err != nil {
+			t.Fatalf("Wait: %v (state=%s)", err, hB.State())
+		}
+		if resB.State != RunCancelled {
+			t.Fatalf("B result = %+v, want RunCancelled (早退出口终态)", resB)
+		}
+
+		recs, err := fxB.journal.ReadEvents(0)
+		if err != nil {
+			t.Fatalf("ReadEvents: %v", err)
+		}
+		for _, rec := range recs {
+			if rec.Type == session.EventRunStarted {
+				t.Fatalf("early-exit run emitted %s (run 未达 running 不应产出 started 事件)", session.EventRunStarted)
+			}
+		}
+		finished := runLifecycleEvent(t, recs, session.EventRunFinished)
+		assertEventPayload(t, finished, map[string]any{"state": string(RunCancelled)})
+		assertEventBeforeTerminalState(t, fxB, hB.RunID, session.EventRunFinished, string(RunCancelled))
+	})
+}

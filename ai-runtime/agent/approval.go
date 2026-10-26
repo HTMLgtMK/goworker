@@ -212,16 +212,20 @@ func (m *ApprovalManager) Pending(sessionID string) []PendingApproval {
 //  5. 返回决策,交 streamTokens 投进 decisions channel → 中间件裁决工具放行
 //     /拒绝。
 //
-// 事件面不属于本闭包:审批回退先于 teeRunCallbacks 注入(supervisor.go StartRun
-// ⑦.5),tee 检测 cb.Decide 非 nil 自动包 permission.requested/resolved 事件对
-// ——回放面免费获得审批事件,闭包保持纯决策面(P5-2 再增 state_changed 事件)。
+// 事件面(P5-2 起):waiting 两处迁移增发 run.state_changed{from,to}(hub 非
+// nil 时,emitRunEvent 收敛降级)——迁移与 transition 同点产出,回放面可从事件
+// 流重建 RunWaiting↔RunRunning 的往返;事件失败仅 warn,不影响决策链。审批
+// requested/resolved 事件对仍由 tee 承担:审批回退先于 teeRunCallbacks 注入
+// (supervisor.go StartRun ⑦.5),tee 检测 cb.Decide 非 nil 自动包装。
 //
 // 并发论证(plan P4-2):闭包在 execute goroutine 上阻塞——与 P3-4 tee 论证同构
 // (等待在 hub 锁外);transition 在 run.mu 内;ApprovalManager.mu 与 run.mu/
 // rt.mu/hub.mu 无嵌套,无锁环。
-func (m *ApprovalManager) decideFunc(runCtx context.Context, sess *Session, run *AgentRun, sessionID string) func(*hitl.InterruptRequest) hitl.Decision {
+func (m *ApprovalManager) decideFunc(runCtx context.Context, sess *Session, run *AgentRun, sessionID string, hub *EventHub) func(*hitl.InterruptRequest) hitl.Decision {
 	return func(req *hitl.InterruptRequest) hitl.Decision {
+		from := run.snapshot().State
 		run.transition(RunWaiting)
+		emitRunEvent(hub, run.ID, session.EventRunStateChanged, map[string]any{"from": string(from), "to": string(RunWaiting)})
 		journalRunState(sess, session.RunStateRecord{
 			Kind:      "state",
 			SessionID: run.SessionID,
@@ -230,7 +234,9 @@ func (m *ApprovalManager) decideFunc(runCtx context.Context, sess *Session, run 
 			At:        time.Now(),
 		})
 		decision := m.Wait(runCtx, sessionID, run.ID, req)
+		from = run.snapshot().State
 		run.transition(RunRunning)
+		emitRunEvent(hub, run.ID, session.EventRunStateChanged, map[string]any{"from": string(from), "to": string(RunRunning)})
 		return decision
 	}
 }

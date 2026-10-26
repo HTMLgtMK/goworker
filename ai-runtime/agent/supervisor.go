@@ -168,13 +168,14 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	run.mu.Unlock()
 
 	// ⑦.5 审批回退(P4-2,总方案 §6 Decide 适配):cb.Decide 为 nil 时注入
-	// ApprovalManager 的 decideFunc 闭包——闭包捕获 runCtx/sess/run/sessionID,
-	// 等待期间 run 迁移 RunWaiting 并落 waiting_input journal 记录(见
-	// approval.go decideFunc 注释);取消经 runCtx.Done → Wait reject → 工具
-	// 中止 → 既有取消路径收敛。调用方自带 Decide(CLI/测试形态)不受影响。
+	// ApprovalManager 的 decideFunc 闭包——闭包捕获 runCtx/sess/run/sessionID
+	// 与 hub(P5-2:hub 非 nil 时 waiting 两处迁移增发 run.state_changed 事件,
+	// 从纯决策面扩展),等待期间 run 迁移 RunWaiting 并落 waiting_input journal
+	// 记录(见 approval.go decideFunc 注释);取消经 runCtx.Done → Wait reject →
+	// 工具中止 → 既有取消路径收敛。调用方自带 Decide(CLI/测试形态)不受影响。
 	// 必须先于 ⑦.6 的 tee:tee 检测 cb.Decide 非 nil 才包审批事件对。
 	if cb.Decide == nil {
-		cb.Decide = m.approvals.decideFunc(runCtx, sess, run, sessionID)
+		cb.Decide = m.approvals.decideFunc(runCtx, sess, run, sessionID, hub)
 	}
 
 	// ⑦.6 tee 包装(P3-4):审批回退已就位,tee 看到的是 decideFunc 版本的
@@ -215,6 +216,11 @@ func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx conte
 	releaseGate, err := rt.AcquireRun(runCtx)
 	if err != nil {
 		<-m.pending
+		// run.finished{cancelled}(P5-2,仅 hub 非 nil;execute ① 早退出口)——
+		// 次序铁律:事件先于终态 state 记录(finalizeRun 的 AppendState 会 Close+
+		// 逐出 journal 句柄,journal_store.go 的次序约束),也先于上方 defer 的
+		// EndRun(显式调用,不依赖 defer)。
+		emitRunEvent(hub, run.ID, session.EventRunFinished, map[string]any{"state": string(RunCancelled)})
 		finalizeRun(rt, run, RunResult{State: RunCancelled, Err: err, Persisted: false})
 		return
 	}
@@ -227,6 +233,8 @@ func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx conte
 	case <-runCtx.Done():
 		releaseGate()
 		<-m.pending
+		// run.finished{cancelled}(P5-2,同 ① 早退出口的次序铁律)。
+		emitRunEvent(hub, run.ID, session.EventRunFinished, map[string]any{"state": string(RunCancelled)})
 		finalizeRun(rt, run, RunResult{State: RunCancelled, Err: runCtx.Err(), Persisted: false})
 		return
 	}
@@ -239,8 +247,10 @@ func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx conte
 	<-m.pending
 
 	// ④ 推进 running 并落盘 running 记录(与 RecordRun 同款次序:transition 先
-	// 于 journal;失败 warn 不阻塞)。
+	// 于 journal;失败 warn 不阻塞)。run.started{state:"running"}(P5-2,仅 hub
+	// 非 nil)紧随 transition 产出——run 生命周期的起点事件。
 	run.transition(RunRunning)
+	emitRunEvent(hub, run.ID, session.EventRunStarted, map[string]any{"state": string(RunRunning)})
 	journalRunState(rt.Session(), session.RunStateRecord{
 		Kind:      "state",
 		SessionID: run.SessionID,
@@ -317,15 +327,35 @@ func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx conte
 		res = RunResult{State: RunCancelled, Err: err, Persisted: res.Persisted}
 	}
 
+	// ⑤.4 run.* 生命周期事件(P5-2,仅 hub 非 nil)——**次序铁律**(plan 表
+	// 「execute ⑤ 与 ⑤.5 之间」):run.* 全是 key 事件(Publish 内 durable-first
+	// fsync 落盘),必须落在该 run 的终态 state 记录**之前**(⑥ finalizeRun 的
+	// AppendState 会 Close+逐出该 run 的 journal 句柄,其后的 AppendEvent 撞
+	// ErrRunExists,journal_store.go 的次序约束),也先于 ⑤.5 的 EndRun。失败
+	// 仅 warn 不阻塞终态化(emitRunEvent 内收敛,与 teePublish/journalRunState
+	// 的降级语义一致)。res.State 已含 ⑤ 的取消归一,finished 无条件产出
+	// (含 RunCancelled/RunCompleted);run.error 仅 RunFailed 产出。
+	if res.State == RunFailed {
+		runErrMsg := ""
+		if res.Err != nil {
+			runErrMsg = res.Err.Error()
+		}
+		emitRunEvent(hub, run.ID, session.EventRunError, map[string]any{"err": runErrMsg})
+	}
+	emitRunEvent(hub, run.ID, session.EventRunFinished, map[string]any{
+		"state":     string(res.State),
+		"persisted": res.Persisted,
+	})
+
 	// ⑤.5 事件收口——**次序铁律**(主 agent 补充约束一,P3-1 发现):事件必须
 	// 落在该 run 的终态 state 记录**之前**。RunJournalStore.AppendState 写终态
 	// 会 Close 并逐出该 run 的 journal 句柄(journal_store.go 句柄生命周期),
 	// 此后再 flush 的合并 delta 只能经 OpenRunJournal 撞已存在文件 → ErrRunExists
 	// 降级 warn → 该 run 的 delta 缺段。因此显式调用必须落在 ⑤ 取消覆盖检查
-	// 之后、⑥ journal 终态之前;开头的 defer 只兜 ①/② 早退(无事件,幂等空
-	// 操作),到达时缓冲已空,不能替代本调用。EndRun 失败(delta flush 落盘
-	// 失败)仅 warn(event_hub.go 降级语义,assistant.message_finalized 兜底
-	// 定稿),不阻塞终态化。
+	// 之后、⑥ journal 终态之前;开头的 defer 只兜 ①/② 早退(仅 run.finished
+	// key 事件,不进合并缓冲,到达时缓冲仍空,幂等空操作),不能替代本调用。
+	// EndRun 失败(delta flush 落盘失败)仅 warn(event_hub.go 降级语义,
+	// assistant.message_finalized 兜底定稿),不阻塞终态化。
 	if hub != nil {
 		hub.EndRun()
 	}
@@ -462,5 +492,37 @@ func teePublish(hub *EventHub, runID, typ string, v any) {
 	}
 	if err := hub.Publish(IngressEvent{RunID: runID, Type: typ, Payload: payload}); err != nil {
 		slog.Warn("agent: event tee publish failed", "err", err, "run", runID, "type", typ)
+	}
+}
+
+// emitRunEvent 发布一条 run.* 生命周期事件(P5-2,plan §4:run.started/
+// state_changed/finished/error 四类,常量见 journal.go:108-111,产生面仅
+// StartRun 后台路径):hub 为 nil 直接跳过(RunEvents 未启用——daemon 现状不接
+// deps.RunEvents,P5-4 才接线;同步 RecordRun 路径本就不建 hub——零行为变化);
+// 非 nil 经 Publish 走 key 事件的 durable-first 语义(run.* 四类都在
+// IsKeyEvent 的 9 类内:journal fsync 成功才广播,失败不广播返回 err)。payload
+// 一次 marshal(map 值仅 string/bool 纯数据,实际不可失败;真失败按 teePublish
+// 的 key 事件降级——null 载荷仍发布,生命周期边界标记的价值在「事件存在」)。
+// Publish 失败(journal 落盘失败被 hub 拒绝广播、或 hub 已关)在此收敛为 warn
+// 不上抛——事件可用性低于执行可用性,与 teePublish/journalRunState 的降级语义
+// 一致;调用点(execute ①/②/④/⑤.4 与 decideFunc,全在 execute goroutine)不得
+// 因事件失败改变终态化路径(事件失败绝不阻塞终态化)。
+//
+// 并发论证(plan P5-2):Publish 持 hub.mu(durable-first fsync)——P3-2 论证
+// 原样;新调用点全在 execute goroutine / decideFunc(后者同在 execute goroutine
+// 上被 streamTokens 同步调用),无新共享状态。
+func emitRunEvent(hub *EventHub, runID, typ string, payload map[string]any) {
+	if hub == nil {
+		return
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		if !session.IsKeyEvent(typ) {
+			return
+		}
+		data = json.RawMessage("null")
+	}
+	if err := hub.Publish(IngressEvent{RunID: runID, Type: typ, Payload: data}); err != nil {
+		slog.Warn("agent: run lifecycle event publish failed", "err", err, "run", runID, "type", typ)
 	}
 }
