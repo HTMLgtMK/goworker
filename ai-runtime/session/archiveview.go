@@ -27,7 +27,7 @@ func OpenArchiveView(path string) (*ArchiveView, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("session: open archive view %s: %w", path, err)
 	}
-	recs, err := loadRecords(path)
+	recs, _, err := loadRecords(path)
 	if err != nil {
 		return nil, fmt.Errorf("session: open archive view %s: %w", path, err)
 	}

@@ -132,19 +132,27 @@ func (r *Repository) Create(ctx context.Context, opts CreateOptions) (*Store, er
 //     Open(root) 原地挂载（决策 2，不移动文件，Archive 仍在槽内轮转）；
 //  3. 否则 ErrSessionNotFound。
 //
-// 命中缓存直接返回同一实例（决策 3）；慢路径打开后再次双检，并按「同目录」兜底：
-// legacy 槽 Archive 后 id 会变，旧 id 的缓存条目与新 id 必须指向同一 *Store。
+// 命中缓存直接返回同一实例（决策 3）。P1-2 起 Store.Open 对会话目录加跨进程
+// flock：同进程对已持锁目录的第二次 Open 会被拒绝（ErrStoreLocked），因此慢
+// 路径全程在 r.mu 内串行——进程内恒返回同一实例、从不触碰本进程已持有的锁：
+//   - 双检：并发 Open 同 id 时只有第一个真正执行 Store.Open，其余在锁内命中
+//     缓存返回同一实例（决策 3；串行化后不再产生需要关闭的输家句柄）；
+//   - 别名先于 Store.Open：legacy 槽 Archive 换 id 后，Open(新 id) 必须复用
+//     已挂载实例，而不是对同一 <root>/current.jsonl 再开第二个句柄——目标目录
+//     已被本进程另一 id 条目持锁时，先开后查必然被 flock 拒绝；
+//   - 跨进程第二写者不受影响：另一进程持锁时 Store.Open 的 LOCK_NB 立即返回
+//     ErrStoreLocked（宁拒勿双写，store.go ErrStoreLocked）。
 func (r *Repository) Open(id string) (*Store, error) {
 	if !validSessionID(id) {
 		return nil, fmt.Errorf("session: open %q: %w", id, ErrSessionNotFound)
 	}
 
 	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if s, ok := r.open[id]; ok {
-		r.mu.Unlock()
 		return s, nil
 	}
-	r.mu.Unlock()
 
 	// 解析 id → 目标目录
 	target := ""
@@ -158,37 +166,20 @@ func (r *Repository) Open(id string) (*Store, error) {
 		return nil, fmt.Errorf("session: open %s: %w", id, ErrSessionNotFound)
 	}
 
+	// 同目录别名：目标目录已被本进程以其他 id 挂载（legacy 槽 Archive 换 id
+	// 后的复用路径，决策 3）。必须先于 Store.Open——见函数头注释。
+	for _, existing := range r.open {
+		if existing.dir == target {
+			r.open[id] = existing
+			return existing, nil
+		}
+	}
+
 	s, err := Open(target)
 	if err != nil {
 		return nil, err
 	}
-
-	// 双检 + 同目录别名（均在锁内定案，输家在锁外关闭）：
-	//   双检 —— 并发 Open 同 id 时以先注册者为准，输家关闭多余句柄（决策 3）；
-	//   别名 —— legacy 槽 Archive 换 id 后，Open(新 id) 必须复用已挂载的实例，
-	//   而不是为同一 <root>/current.jsonl 再开第二个句柄。
-	r.mu.Lock()
-	var winner *Store
-	if existing, ok := r.open[id]; ok {
-		winner = existing
-	} else {
-		for _, existing := range r.open {
-			if existing.dir == target {
-				r.open[id] = existing
-				winner = existing
-				break
-			}
-		}
-	}
-	if winner == nil {
-		r.open[id] = s
-	}
-	r.mu.Unlock()
-
-	if winner != nil {
-		closeLoser(s)
-		return winner, nil
-	}
+	r.open[id] = s
 	return s, nil
 }
 
@@ -306,7 +297,7 @@ func seedSessionMetadata(dir, id string) error {
 // 记录时间（与 OpenArchiveView 同策略；与 Store.Open 落盘的 time.Now 可能不同，
 // 以落盘值为准的调用方应 Open 后读 Store.Metadata()）。
 func resolveSlotMetadata(path string) (Metadata, bool) {
-	recs, err := loadRecords(path)
+	recs, _, err := loadRecords(path)
 	if err != nil {
 		return Metadata{}, false
 	}
