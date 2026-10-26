@@ -120,12 +120,13 @@ func (l *orderLog) snapshot() []string {
 }
 
 // addTestSub 直接向 hub.subs 注册一个缓冲订阅者(同包白盒;P3-3 的 Subscribe
-// 落地前订阅注册面的唯一入口),返回收事件通道。
+// 落地前订阅注册面的唯一入口),返回收事件通道。dead 与 Subscribe 的构造同款
+// (close-only 断开信号,Close/fanOut 关闭它)。
 func (h *EventHub) addTestSub() <-chan session.SessionEvent {
 	ch := make(chan session.SessionEvent, subscriberBuffer)
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.subs[h.nextSubID] = &hubSub{live: ch}
+	h.subs[h.nextSubID] = &hubSub{live: ch, dead: make(chan struct{})}
 	h.nextSubID++
 	return ch
 }

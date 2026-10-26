@@ -93,6 +93,7 @@ type SessionDeps struct {
 	Instruction          *memory.InstructionSet                                 // 会话边界刷新（Init / /new 经 startSession 重载）
 	Store                ConversationStore                                      // nil = 持久化禁用（接口字段必须真 nil，typed-nil 会让禁用判断失效）
 	RunJournal           RunStateJournal                                        // nil = Run 状态不持久化（接口字段必须真 nil，typed-nil 陷阱同 Store）
+	RunEvents            EventJournal                                           // nil = 不启用事件流（P2+P3 的 daemon 不接线，openQuestion ④；P5 随 x-goworker 协议接入；接口字段必须真 nil，typed-nil 陷阱同 Store/RunJournal）
 	PersistAllowRule     func(sandbox.AllowRule) error                          // 持久化 bash allow_always 规则
 	PersistToolAllowRule func(sandbox.ToolAllowRule) error                      // 持久化外部工具 allow_always 规则
 }

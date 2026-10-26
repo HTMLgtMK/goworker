@@ -33,6 +33,12 @@ type SessionRuntime struct {
 	// 一律零值起步——新会话无声明,不继承任何旧值。
 	cwd    string
 	cwdErr error
+	// events 是本会话的事件枢纽(P3-4,惰性):仅 StartRun 且 deps.RunEvents 非
+	// nil 时经 bindEvents 创建恰好一次,后续 run 复用同一实例(跨 run 的 Seq
+	// 游标连续不重置依赖此语义)。RecordRun 同步路径**不**创建、**不**写事件
+	// ——同步路径行为零变化(plan P3-4 边界,§6)。读写全部在 rt.mu 内,见
+	// bindEvents/eventHub 的并发论证。
+	events *EventHub
 }
 
 // NewSessionRuntime 创建运行时。s 允许 nil,由 BindSession 后置绑定。
@@ -101,6 +107,57 @@ func (r *SessionRuntime) DeclareCWD(cwd string, err error) {
 	r.mu.Lock()
 	r.cwd, r.cwdErr = cwd, err
 	r.mu.Unlock()
+}
+
+// bindEvents 惰性创建并返回本 runtime 的 EventHub(P3-4):journal 非 nil 才创建,
+// 否则返回 nil(未启用,SessionDeps.RunEvents=nil 的宿主/同步路径零事件)。创建
+// 恰好一次,后续 StartRun 复用同一 hub——EventHub 的 Seq 是会话维度游标,跨 run
+// 不重置(event_hub.go 语义契约),复用即游标连续的前提。调用点只有 StartRun
+// 同步段;RecordRun 不经此处(同步路径行为零变化)。
+//
+// 并发论证(plan P3-4「hub 创建一次,后续复用」):
+//   - 创建点唯一(StartRun 同步段),而同会话的第二 StartRun 在 active 占位检查
+//     处被拒(ErrRunActive,supervisor.go ②)——同一 runtime 上不存在并发
+//     bindEvents,「读-判-写」的竞态窗口按前提不可达;rt.mu 内判空互斥同时兜底
+//     读侧(eventHub 与 P3-5 的 closeEvents 经同一把锁);
+//   - NewEventHub 构造含 journal.SeqRange 磁盘扫描(播种游标),按 P2-3 起的
+//     「锁内不做文件 I/O」纪律放在 rt.mu 外执行:锁内判空 → 锁外构造 → 锁内
+//     二次确认写入(双重检查)。两把锁无嵌套:rt.mu 释放后才进 NewEventHub
+//     (hub.mu 由 hub 自持,不回触 rt.mu),无锁环;极端竞态下(前提被未来改动
+//     破坏)最坏结果是多造一个被丢弃的 hub——构造只读不写,丢弃无副作用;
+//   - 与 Manager.Close 的 closeEvents(P3-5)的交集(预留注释,P3-5 落码兑现):
+//     Close 的次序是「先等全部在途 run 终态,再逐 runtime closeEvents」,而
+//     bindEvents 只发生在 StartRun 同步段——Close 置 closed 后 StartRun 在 ①
+//     即被拒,二者无并发窗口;events 字段的全部读写都在 rt.mu 内。
+func (r *SessionRuntime) bindEvents(sessionID string, journal EventJournal) *EventHub {
+	if journal == nil {
+		return nil
+	}
+	r.mu.Lock()
+	if hub := r.events; hub != nil {
+		r.mu.Unlock()
+		return hub
+	}
+	r.mu.Unlock()
+
+	hub := NewEventHub(sessionID, journal) // SeqRange 扫描在 rt.mu 外(锁内不做文件 I/O)
+
+	r.mu.Lock()
+	if r.events == nil {
+		r.events = hub
+	} else {
+		hub = r.events // 双重检查:极端竞态下以先创建者为准,丢弃后造者
+	}
+	r.mu.Unlock()
+	return hub
+}
+
+// eventHub 返回本 runtime 的 EventHub(未启用或尚未有 StartRun 时为 nil)。读侧
+// 访问器:P3-5 的 closeEvents 与包内测试消费;读写与 bindEvents 同在 rt.mu 内。
+func (r *SessionRuntime) eventHub() *EventHub {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.events
 }
 
 // journalRunState 将一条 Run 状态记录写入会话绑定的 Run journal(s.deps.RunJournal,

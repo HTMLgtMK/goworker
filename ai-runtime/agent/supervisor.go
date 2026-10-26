@@ -20,8 +20,13 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
 	"time"
 
+	core "github.com/tinguo/goworker/ai-core/core"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/ai-runtime/session"
 )
 
@@ -116,7 +121,8 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 
 	// ⑤ queued 记录 durable-first:先落盘再返回(总方案第七节「run/start 响应
 	// 在 Run 被接受并持久化登记后立即返回」);失败 warn 继续(journalRunState,
-	// 缺口由恢复扫描显式标记 interrupted,不静默)。
+	// 缺口由恢复扫描显式标记 interrupted,不静默)。queued 记录同时是 run 事件
+	// 文件的首条记录(RunJournalStore 的句柄经它建立,后续事件走缓存命中)。
 	journalRunState(sess, session.RunStateRecord{
 		Kind:      "state",
 		SessionID: run.SessionID,
@@ -125,7 +131,19 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 		At:        time.Now(),
 	})
 
-	// ⑥ 派生 runCtx 并写入 run.cancel——**同步段完成**(P2-6 修正):返回的
+	// ⑥ 事件面接线(P3-4,可选):deps.RunEvents 非 nil 时惰性创建会话级
+	// EventHub(runtime.bindEvents,创建一次后续 run 复用),括起本 run 的
+	// 产生边界(BeginRun:设 AppendEvent 目标兜底 + 防御性 flush 上一 run 残留
+	// 合并缓冲),并把 cb 包装成 tee(事件映射见 teeRunCallbacks)。RunEvents
+	// 为 nil 时 hub 为 nil、cb 原样透传——零开销路径,同步 RecordRun 路径
+	// 完全不经此处(行为零变化)。
+	hub := rt.bindEvents(sessionID, sess.deps.RunEvents)
+	if hub != nil {
+		hub.BeginRun(run.ID)
+	}
+	cb = teeRunCallbacks(cb, hub, run.ID)
+
+	// ⑦ 派生 runCtx 并写入 run.cancel——**同步段完成**(P2-6 修正):返回的
 	// 句柄立即可取消。若推迟到 execute 内写入(P2-5 原形态),StartRun 返回后
 	// 立即 CancelRun 会与 execute 的调度竞争,对排队中的 Run 误报
 	// ErrRunNotCancellable(plan P2-6 的 TestCancelIsolation 实测 20 次复跑 6 次
@@ -137,18 +155,31 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	run.cancel = cancel
 	run.mu.Unlock()
 
-	// ⑦ 执行转移给 supervisor goroutine(cb 所有权随之转移,契约①),立即返回。
-	go m.execute(rt, run, runCtx, cancel, req, cb)
+	// ⑧ 执行转移给 supervisor goroutine(cb 所有权随之转移,契约①;tee 包装
+	// 不改变所有权归属——execute 仍是 cb 的唯一使用者),立即返回。
+	go m.execute(rt, run, runCtx, cancel, req, cb, hub)
 	return RunHandle{SessionID: sessionID, RunID: run.ID, run: run}, nil
 }
 
 // execute 是后台 Run 的单 goroutine 执行体(cb 所有权自 StartRun 返回起归它,
-// 契约①):gate → runSlots → 出队 → running → Session.Run → 终态化。runCtx/
-// cancel 由 StartRun 同步段派生并写入 run.cancel(P2-6 修正,见 StartRun ⑥),
-// execute 负责在出口释放 cancel。每条出口路径上 pending/gate/runSlots/active
-// 四项资源各恰好释放一次(评审重点,plan §5.8 的释放矩阵)。
-func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx context.Context, cancel context.CancelFunc, req RunRequest, cb RunCallbacks) {
+// 契约①;cb 可能已被 teeRunCallbacks 包装,事件随执行流入会话 hub):gate →
+// runSlots → 出队 → running → Session.Run → 事件收口 → 终态化。runCtx/cancel
+// 由 StartRun 同步段派生并写入 run.cancel(P2-6 修正,见 StartRun ⑦),execute
+// 负责在出口释放 cancel。每条出口路径上 pending/gate/runSlots/active 四项资源
+// 各恰好释放一次(评审重点,plan §5.8 的释放矩阵)。
+//
+// hub 为 nil 表示会话未启用事件流(SessionDeps.RunEvents=nil):全部事件动作
+// 跳过,行为与 P2 完全一致。
+func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx context.Context, cancel context.CancelFunc, req RunRequest, cb RunCallbacks, hub *EventHub) {
 	defer cancel()
+
+	// 事件收口兜底(P3-4):早退路径(①/② 失败)从未产生事件,EndRun 是幂等
+	// 空操作;正常路径由 ⑤ 之后的显式 EndRun 先行收口,本 defer 到达时合并缓冲
+	// 已空。次序铁律见显式调用处注释——defer 晚于 finalizeRun(晚于终态落盘),
+	// 不能替代显式调用。
+	if hub != nil {
+		defer hub.EndRun()
+	}
 
 	// ① 每会话 gate:与同步路径(withSession)天然互斥。失败(runCtx 取消,如
 	// 宿主 Close)→ 归还 pending 预留 → 终态化取消 → return(pending/gate/
@@ -209,9 +240,150 @@ func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx conte
 		res = RunResult{State: RunCancelled, Err: err, Persisted: res.Persisted}
 	}
 
+	// ⑤.5 事件收口——**次序铁律**(主 agent 补充约束一,P3-1 发现):事件必须
+	// 落在该 run 的终态 state 记录**之前**。RunJournalStore.AppendState 写终态
+	// 会 Close 并逐出该 run 的 journal 句柄(journal_store.go 句柄生命周期),
+	// 此后再 flush 的合并 delta 只能经 OpenRunJournal 撞已存在文件 → ErrRunExists
+	// 降级 warn → 该 run 的 delta 缺段。因此显式调用必须落在 ⑤ 取消覆盖检查
+	// 之后、⑥ journal 终态之前;开头的 defer 只兜 ①/② 早退(无事件,幂等空
+	// 操作),到达时缓冲已空,不能替代本调用。EndRun 失败(delta flush 落盘
+	// 失败)仅 warn(event_hub.go 降级语义,assistant.message_finalized 兜底
+	// 定稿),不阻塞终态化。
+	if hub != nil {
+		hub.EndRun()
+	}
+
 	// ⑥ 终态化:finalizeRun 内部先 journal 终态(durable-first)再关闭 done——
 	// 等待者被唤醒时终态记录已持久(总方案第九节)。
 	finalizeRun(rt, run, res)
 
 	// ⑦ runSlots/gate 由 defer 释放(LIFO:runSlots → gate)。
+}
+
+// ── teeRunCallbacks:RunCallbacks → SessionEvent 的事件分流(P3-4)──────────
+//
+// 把 StartRun 的 cb 三个事件入口(EmitToken/Decide/Publish)按 plan P3-4 表
+// (P3-0 契约,源自 streamTokens 实际流 session.go:213-249)映射成 SessionEvent
+// 投进会话 hub(journal+广播),再原样转发给调用方 cb——tee 先落事件、后转发,
+// 消费方看到的事件流先于其输出被持久化/广播(与 hub 内 key 事件的 durable-first
+// 同向)。Write/WriteToken 不包装:终端文本由 assistant.message_finalized 覆盖,
+// 不进事件 journal(plan P3-4 表「Write:不进 journal」)。
+//
+// 并发论证(plan P3-4):tee 的全部函数都在 supervisor goroutine(execute→
+// Session.Run→streamTokens/中间件)上同步调用,Publish 的调用方即 execute——
+// hub.mu 只包住 hub 内部单条事件的处理,不与 execute 持有的 gate/runSlots 嵌套
+// (hub 不回触 runtime),慢订阅者满缓冲的断开路径不可能卡住 execute(P3-2 机制
+// 在真实链路成立,TestSlowSubscriber 钉死)。特别地,Decide 的包装只在调用
+// 前后各发一条事件,HITL 决策等待(inner 的阻塞)本身在 hub 锁外——等待期间
+// 其他订阅者/发布者不受阻塞。
+//
+// cb 所有权:包装后的 teed 只在 execute 内使用(StartRun 返回起归 supervisor,
+// 契约①),tee 不引入新的跨 goroutine 共享。
+func teeRunCallbacks(cb RunCallbacks, hub *EventHub, runID string) RunCallbacks {
+	if hub == nil {
+		return cb // RunEvents 未启用:原样透传,零开销路径
+	}
+	teed := cb
+	// 仅包装非 nil 入口:未提供的回调本就不会被 streamTokens/中间件调用
+	// (session.go 的 nil 检查),tee 不替调用方发明事件。
+	if cb.EmitToken != nil {
+		inner := cb.EmitToken
+		teed.EmitToken = func(tok core.Token) {
+			teeToken(hub, runID, tok)
+			inner(tok)
+		}
+	}
+	if cb.Decide != nil {
+		inner := cb.Decide
+		teed.Decide = func(req *hitl.InterruptRequest) hitl.Decision {
+			// requested 先于决策等待落盘:回放侧在等待期间就能看到「审批挂起」
+			// 这一事实(resolved 由返回前的下一行补上)。inner 的阻塞在 hub 锁外
+			// (见函数头并发论证)。
+			teePublish(hub, runID, session.EventPermissionRequested, req)
+			decision := inner(req)
+			teePublish(hub, runID, session.EventPermissionResolved, decision)
+			return decision
+		}
+	}
+	if cb.Publish != nil {
+		inner := cb.Publish
+		teed.Publish = func(event string, data any) {
+			switch event {
+			case runtimeconfig.EventUsage, runtimeconfig.EventIteration:
+				// usage/iteration 同型映射为 usage.progress 高频 delta(plan P3-4
+				// 表「usage/iteration 类→EventUsageProgress(delta)」)。iteration
+				// 的 data 为 nil,marshal 为 null payload——合并聚合按「非字符串
+				// 退化为窗内末条」处理,无语义损害。
+				teePublish(hub, runID, session.EventUsageProgress, data)
+			default:
+				// 其余事件名不在 P3-0 契约(现产生方只用上述两个),防御性跳过:
+				// 未知类型进 journal 会让回放方面对契约外语义。
+			}
+			inner(event, data)
+		}
+	}
+	return teed
+}
+
+// teeToken 把一个 core.Token 映射为事件类型并发布(payload=整个 Token 的 JSON,
+// plan P3-4 表;回放侧可从 payload 还原 token 全貌,含 ToolCall/ToolCallID 的
+// 结构化关联)。映射(与 streamTokens 的转发条件对齐,session.go:226-234):
+//
+//	TokenTypeToolCall        → tool_call(key)
+//	TokenTypeToolResult      → tool_result(key)
+//	文本 Done token          → assistant.message_finalized(key)(空 content 的
+//	                           收尾 Done 也映射——前端靠它定稿流式渲染,
+//	                           session.go:225;错误 note 的 Done 同样落此,
+//	                           定稿即「本 run 的最终消息」)
+//	TokenTypeThinking 增量   → thinking.delta(delta)
+//	其余文本增量             → text.delta(delta)
+//	TokenTypeEvent           → 跳过:HITL 中断等运行时事件不在 P3-0 事件契约,
+//	                           中断的事件面由 Decide 的 requested/resolved 对覆盖
+func teeToken(hub *EventHub, runID string, tok core.Token) {
+	var typ string
+	switch tok.Type {
+	case core.TokenTypeToolCall:
+		typ = session.EventToolCall
+	case core.TokenTypeToolResult:
+		typ = session.EventToolResult
+	case core.TokenTypeText:
+		if tok.Done {
+			typ = session.EventAssistantMessageFinalized
+		} else {
+			typ = session.EventTextDelta
+		}
+	case core.TokenTypeThinking:
+		// thinking token 在实际流中恒为增量(kernel 不发 Done thinking);
+		// 若未来出现 Done thinking,仍按增量映射——payload 内的 Done 字段自明。
+		typ = session.EventThinkingDelta
+	default:
+		return
+	}
+	teePublish(hub, runID, typ, tok)
+}
+
+// teePublish marshal 载荷并发布。marshal 失败的降级是**不对称**的(主 agent
+// 补充约束五「null 或跳过,按你论证」):
+//   - key 事件降级为 null payload 仍发布:边界标记(定稿/审批对)的价值在
+//     「事件存在」——回放游标的推进锚点与生命周期边界不能因载荷损失而丢失;
+//     null 是合法 JSON 载荷,EventRecord 落盘/广播语义完整;
+//   - delta 直接跳过:null payload 会污染合并聚合——aggregateDeltaPayload 把
+//     非字符串窗退化为「窗内末条」,一个 null 会顶掉窗内真实文本段(重放侧
+//     还原出错误内容),宁缺勿错。
+//
+// 实际上两条路径均不可达:Token/hitl 结构/UsageEvent 均为纯数据类型,marshal
+// 恒成功;分支只为「未来字段引入不可 marshal 类型」兜底。Publish 失败(key 事件
+// 落盘失败被 hub 拒绝广播,或 hub 已关)只 warn 不阻塞——事件可用性低于执行
+// 可用性,与 journalRunState 的降级语义一致(runtime.go)。
+func teePublish(hub *EventHub, runID, typ string, v any) {
+	payload, err := json.Marshal(v)
+	if err != nil {
+		if !session.IsKeyEvent(typ) {
+			return
+		}
+		payload = json.RawMessage("null")
+	}
+	if err := hub.Publish(IngressEvent{RunID: runID, Type: typ, Payload: payload}); err != nil {
+		slog.Warn("agent: event tee publish failed", "err", err, "run", runID, "type", typ)
+	}
 }

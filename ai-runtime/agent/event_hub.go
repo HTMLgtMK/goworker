@@ -88,9 +88,19 @@ const (
 // 晚于注册的 Publish 必然分配到更大的 seq,该不变量时序上天然成立;fanOut
 // 侧的显式 skip 与 pump 的 lastSeq 去重是同一防线的 belt-and-braces(Race B:
 // 回放与实时重复/乱序)。
+//
+// dead 是断开信号的 close-only 通道(P3-4 TestSlowSubscriber 暴露的缺口):
+// 断开 = fanOutLocked/Close 关闭 live+dead 两个通道。pump 的投递若被消费方
+// 停读卡死(ch 满),它阻塞在 ch 发送上、无法经「接收 live」感知 live 已关
+// ——对已关闭且带缓冲的 channel 发起接收会先排干缓冲,把接收 case 加进投递
+// select 等于给 pump 开一条无界虹吸,反而令 live 永不满、断开永不触发。dead
+// 恒空、close-only:关闭后接收立即就绪且不消耗数据,是被阻塞投递解锁的
+// 唯一干净信号。消费方的可见断开面仍是「返回的 ch 被关闭」(pump 退出时
+// defer close)。
 type hubSub struct {
 	live      chan session.SessionEvent // fan-out 直投(容量 subscriberBuffer,非阻塞)
 	watermark uint64                    // 注册点 latest:live 广播只含 seq>watermark 的事件
+	dead      chan struct{}             // 断开信号(close-only):投递阻塞时经它感知断开并退出
 }
 
 // pendingDelta 是 delta 合并缓冲的一个分桶(按 Type,同 run 内同型合并):
@@ -381,6 +391,7 @@ func (h *EventHub) Subscribe(ctx context.Context, fromSeq uint64) (<-chan sessio
 	sub := &hubSub{
 		live:      make(chan session.SessionEvent, subscriberBuffer),
 		watermark: h.latest,
+		dead:      make(chan struct{}),
 	}
 	id := h.nextSubID
 	h.nextSubID++
@@ -408,10 +419,11 @@ func (h *EventHub) Subscribe(ctx context.Context, fromSeq uint64) (<-chan sessio
 // close(ch)(消费方 range 到关闭即知断线,重连从游标补齐)。sub.live 的
 // close 所有权只在 Close/fanOutLocked,pump 不碰。
 //
-// hub 关闭感知的最简实现(plan 征询「关闭信号或轮询 closed」):取关闭信号
-// (h.done)——阻塞投递无法靠轮询及时唤醒,而 done 是 Close 内一行 close 的
-// 既有形态;阶段二无需它,sub.live 关闭已是全部 hub 侧断开(Close/慢订阅者)
-// 的统一信号。
+// 断开感知(P3-4 TestSlowSubscriber):投递被消费方停读卡死(ch 满)时,
+// 阻塞中的 select 必须仍能感知断开——sub.dead 是 close-only 信号,关闭后
+// 接收立即就绪且不消耗数据(与「接收 live」的排干语义不同,见 hubSub 注释),
+// 是被阻塞投递解锁的唯一干净出口。没有它,慢订阅者(订阅后不读)的 ch 永远
+// 不会被关闭——断开的消费方可见信号(pump defer close(ch))无法送达。
 func (h *EventHub) pumpEvents(ctx context.Context, id uint64, ch chan<- session.SessionEvent, sub *hubSub, replay []session.SessionEvent) {
 	defer close(ch)
 	defer h.removeSub(id)
@@ -425,6 +437,8 @@ func (h *EventHub) pumpEvents(ctx context.Context, id uint64, ch chan<- session.
 		case <-ctx.Done():
 			return
 		case <-h.done:
+			return
+		case <-sub.dead:
 			return
 		}
 		lastSeq = ev.Seq
@@ -445,6 +459,8 @@ func (h *EventHub) pumpEvents(ctx context.Context, id uint64, ch chan<- session.
 			select {
 			case ch <- ev:
 			case <-ctx.Done():
+				return
+			case <-sub.dead: // ch 满被停读阻塞时,断开信号解锁退出(见函数头)
 				return
 			}
 			lastSeq = ev.Seq
@@ -486,6 +502,7 @@ func (h *EventHub) Close() error {
 	for id, sub := range h.subs {
 		delete(h.subs, id)
 		close(sub.live)
+		close(sub.dead) // 与慢订阅者断开同款:解锁可能阻塞在投递上的 pump
 	}
 	var err error
 	if c, ok := h.journal.(io.Closer); ok {
@@ -512,6 +529,7 @@ func (h *EventHub) fanOutLocked(ev session.SessionEvent) {
 		default:
 			delete(h.subs, id)
 			close(sub.live)
+			close(sub.dead) // 解锁可能阻塞在投递上的 pump(hubSub 注释)
 			slog.Warn("agent: event hub disconnected slow subscriber", "session", h.sessionID, "type", ev.Type, "seq", ev.Seq)
 		}
 	}
