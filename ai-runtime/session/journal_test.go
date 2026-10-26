@@ -354,3 +354,365 @@ func TestRestoreInterruptedRun(t *testing.T) {
 		t.Fatalf("run-B lines after rescan = %d, want %d (幂等：不追加第二个标记)", bLines2, bLines)
 	}
 }
+
+// ── P3-1：EventRecord 契约与跨文件事件读写 ──────────────────────────────
+
+// mustAppendEvent 经 RunJournalStore.AppendEvent 落一条事件记录（Kind 显式置
+// eventKind，对齐 agent 侧 state 记录的显式 Kind 先例；AppendEvent 内还有存储
+// 边界强制，双保险）。
+func mustAppendEvent(t *testing.T, jst *RunJournalStore, sid, runID, typ string, seq, fromSeq uint64, at time.Time, payload string) {
+	t.Helper()
+	if err := jst.AppendEvent(EventRecord{
+		Kind:      eventKind,
+		SessionID: sid,
+		RunID:     runID,
+		Type:      typ,
+		Seq:       seq,
+		FromSeq:   fromSeq,
+		Time:      at,
+		Payload:   json.RawMessage(payload),
+	}); err != nil {
+		t.Fatalf("AppendEvent %s seq %d: %v", typ, seq, err)
+	}
+}
+
+// eventSeqs 提取记录序号序列，供有序性断言。
+func eventSeqs(recs []EventRecord) []uint64 {
+	out := make([]uint64, len(recs))
+	for i, r := range recs {
+		out[i] = r.Seq
+	}
+	return out
+}
+
+// uint64sEqual 判定两个 []uint64 逐元素相等（store_test.go 的 equalSlices 只收 string）。
+func uint64sEqual(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestEventRecordsCrossFileRoundTrip 钉死 P3-1 的核心不变量「文件名序=seq 序」：
+// 两个 run 文件、Seq 跨文件连续（run-1: 1..3 含一条合并 [2..3] 记录；run-2:
+// 4..5），ReadEvents(0) 全量有序拼接。顺带验证：
+//
+//	① state/event 同文件混存互不误读（loadStateRecords 只见 state、ReadEvents
+//	   只见 event）；
+//	② handles 缓存 state/event 共用：run-1 的 state 记录建文件后事件走缓存句柄
+//	   追加（ErrRunExists 即失败）；
+//	③ run-2 无 state 记录先行，AppendEvent 自行建文件（OpenRunJournal 路径）；
+//	④ 终态逐出后对同一 run 的 AppendEvent 被拒（ErrRunExists）——AppendEvent
+//	   注释的次序约束（事件必须先于终态 state 记录）；
+//	⑤ EventRecord 逐字段往返一致（含 FromSeq 合并声明与 Payload 原字节）。
+func TestEventRecordsCrossFileRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	root := tempDir(t)
+	repo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	s, err := repo.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	sid := s.SessionID()
+	jst := NewRunJournalStore(repo, s)
+
+	run1, run2 := "run-1000-1", "run-2000-1"
+	at := time.Now()
+
+	// run-1：state 记录先建文件并缓存句柄（queued → running），事件复用同一句柄。
+	for _, st := range []string{"queued", "running"} {
+		if err := jst.AppendState(RunStateRecord{Kind: "state", SessionID: sid, RunID: run1, State: st, At: at}); err != nil {
+			t.Fatalf("AppendState %s: %v", st, err)
+		}
+	}
+	mustAppendEvent(t, jst, sid, run1, EventToolCall, 1, 0, at, `{"name":"grep"}`)
+	mustAppendEvent(t, jst, sid, run1, EventTextDelta, 3, 2, at.Add(time.Millisecond), `"he"`)
+
+	// run-1 终态：句柄 Close+逐出（AppendState 的既有机制）。
+	if err := jst.AppendState(RunStateRecord{Kind: "state", SessionID: sid, RunID: run1, State: "completed", Persisted: true, At: at.Add(2 * time.Millisecond)}); err != nil {
+		t.Fatalf("AppendState completed: %v", err)
+	}
+	// ④ 终态逐出后的事件追加被拒：文件已在磁盘（O_EXCL），宁拒勿双写。
+	err = jst.AppendEvent(EventRecord{Kind: eventKind, SessionID: sid, RunID: run1, Type: EventTextDelta, Seq: 9, Time: at})
+	if !errors.Is(err, ErrRunExists) {
+		t.Fatalf("AppendEvent after terminal state: err = %v, want ErrRunExists", err)
+	}
+
+	// run-2：无 state 先行，事件经 OpenRunJournal 建文件。
+	mustAppendEvent(t, jst, sid, run2, EventToolResult, 4, 0, at.Add(3*time.Millisecond), `{"ok":true}`)
+	mustAppendEvent(t, jst, sid, run2, EventAssistantMessageFinalized, 5, 0, at.Add(4*time.Millisecond), `"done"`)
+
+	// ReadEvents(0)：跨文件全量有序（文件名序=创建序=nano 序 ⇒ seq 序）。
+	got, err := jst.ReadEvents(0)
+	if err != nil {
+		t.Fatalf("ReadEvents(0): %v", err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("ReadEvents(0) = %d records, want 4", len(got))
+	}
+	if seqs := eventSeqs(got); !uint64sEqual(seqs, []uint64{1, 3, 4, 5}) {
+		t.Fatalf("ReadEvents(0) seqs = %v, want [1 3 4 5] (跨文件有序拼接)", seqs)
+	}
+
+	// ⑤ 逐字段往返一致。
+	want := []EventRecord{
+		{Kind: eventKind, SessionID: sid, RunID: run1, Type: EventToolCall, Seq: 1, Time: at, Payload: json.RawMessage(`{"name":"grep"}`)},
+		{Kind: eventKind, SessionID: sid, RunID: run1, Type: EventTextDelta, Seq: 3, FromSeq: 2, Time: at.Add(time.Millisecond), Payload: json.RawMessage(`"he"`)},
+		{Kind: eventKind, SessionID: sid, RunID: run2, Type: EventToolResult, Seq: 4, Time: at.Add(3 * time.Millisecond), Payload: json.RawMessage(`{"ok":true}`)},
+		{Kind: eventKind, SessionID: sid, RunID: run2, Type: EventAssistantMessageFinalized, Seq: 5, Time: at.Add(4 * time.Millisecond), Payload: json.RawMessage(`"done"`)},
+	}
+	for i, w := range want {
+		g := got[i]
+		if g.Kind != w.Kind || g.SessionID != w.SessionID || g.RunID != w.RunID || g.Type != w.Type ||
+			g.Seq != w.Seq || g.FromSeq != w.FromSeq || !g.Time.Equal(w.Time) ||
+			!bytes.Equal(g.Payload, w.Payload) {
+			t.Errorf("record #%d = %+v (payload %s), want %+v (payload %s)", i, g, g.Payload, w, w.Payload)
+		}
+	}
+
+	// ① 混存互不误读：run-1 文件的 5 行都能被两个读取方解析（事件行 Unmarshal
+	// 进 RunStateRecord 也合法，未知字段忽略）；恢复扫描的末条 state 判定按
+	// kind 域过滤（MarkInterruptedRuns 只认 kind==stateKind），事件行不干扰
+	// 终态判定——这是 interrupted 标记在混存文件上依然正确的前提。
+	run1Path := filepath.Join(s.dir, "runs", run1+".jsonl")
+	allRecs, _, err := loadStateRecords(run1Path)
+	if err != nil {
+		t.Fatalf("loadStateRecords(run-1): %v", err)
+	}
+	if len(allRecs) != 5 {
+		t.Fatalf("run-1 lines = %d, want 5 (3 state + 2 event，逐行均合法)", len(allRecs))
+	}
+	var states []string
+	for _, r := range allRecs {
+		if r.Kind == stateKind {
+			states = append(states, r.State)
+		}
+	}
+	if !equalSlices(states, []string{"queued", "running", "completed"}) {
+		t.Fatalf("run-1 state kinds filter = %v, want [queued running completed]", states)
+	}
+	run1Events, err := loadEventRecords(run1Path)
+	if err != nil {
+		t.Fatalf("loadEventRecords(run-1): %v", err)
+	}
+	if len(run1Events) != 2 || run1Events[0].Seq != 1 || run1Events[1].Seq != 3 {
+		t.Fatalf("run-1 event records = %+v, want seq [1 3]", eventSeqs(run1Events))
+	}
+
+	// 两个 run 文件确已分别创建。
+	for _, run := range []string{run1, run2} {
+		if _, err := os.Stat(filepath.Join(s.dir, "runs", run+".jsonl")); err != nil {
+			t.Errorf("stat %s journal: %v", run, err)
+		}
+	}
+}
+
+// TestReadEventsFiltersAfterSeq 钉死回放游标过滤：只返回 Seq>afterSeq 的记录
+// （严格大于），afterSeq=latest 或更晚 → 空结果。
+func TestReadEventsFiltersAfterSeq(t *testing.T) {
+	ctx := context.Background()
+	root := tempDir(t)
+	repo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	s, err := repo.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	sid := s.SessionID()
+	jst := NewRunJournalStore(repo, s)
+
+	run1, run2 := "run-1000-1", "run-2000-1"
+	at := time.Now()
+	for i, run := range []string{run1, run1, run1, run2, run2} {
+		mustAppendEvent(t, jst, sid, run, EventTextDelta, uint64(i+1), 0, at, `"x"`)
+	}
+
+	cases := []struct {
+		after uint64
+		want  []uint64
+	}{
+		{after: 0, want: []uint64{1, 2, 3, 4, 5}},
+		{after: 2, want: []uint64{3, 4, 5}},
+		{after: 3, want: []uint64{4, 5}}, // 边界：Seq==afterSeq 不返回（严格大于）
+		{after: 5, want: nil},            // 游标=最新 → 空
+		{after: 99, want: nil},
+	}
+	for _, tc := range cases {
+		got, err := jst.ReadEvents(tc.after)
+		if err != nil {
+			t.Fatalf("ReadEvents(%d): %v", tc.after, err)
+		}
+		if seqs := eventSeqs(got); !uint64sEqual(seqs, tc.want) {
+			t.Errorf("ReadEvents(%d) seqs = %v, want %v", tc.after, seqs, tc.want)
+		}
+	}
+}
+
+// TestSeqRangeSeedsFromDisk 钉死 SeqRange 的播种语义（hub 构造用）：
+//
+//	① 空 runs/ → ok=false；
+//	② 只有 state 记录（无事件）→ ok=false；
+//	③ 非连续事件（3/5/7）→ (3,7,true)，min/max 而非「首末即边界」假设；
+//	④ 新 Repository 实例 + 新 RunJournalStore（重启模拟，句柄缓存全空）仍从
+//	   磁盘播种——播种不依赖进程内状态。
+func TestSeqRangeSeedsFromDisk(t *testing.T) {
+	ctx := context.Background()
+	root := tempDir(t)
+	repo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	s, err := repo.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	sid := s.SessionID()
+	jst := NewRunJournalStore(repo, s)
+
+	// ① 空 runs/。
+	if e, l, ok := jst.SeqRange(); ok {
+		t.Fatalf("SeqRange on empty runs/ = (%d,%d,true), want ok=false", e, l)
+	}
+
+	run1 := "run-1000-1"
+	at := time.Now()
+	// ② 只有 state 记录：文件存在但无事件。
+	if err := jst.AppendState(RunStateRecord{Kind: "state", SessionID: sid, RunID: run1, State: "running", At: at}); err != nil {
+		t.Fatalf("AppendState: %v", err)
+	}
+	if e, l, ok := jst.SeqRange(); ok {
+		t.Fatalf("SeqRange with state-only file = (%d,%d,true), want ok=false", e, l)
+	}
+
+	// ③ 非连续 seq：min/max 单遍扫描。
+	for _, seq := range []uint64{5, 3, 7} {
+		mustAppendEvent(t, jst, sid, run1, EventTextDelta, seq, 0, at, `"x"`)
+	}
+	if e, l, ok := jst.SeqRange(); !ok || e != 3 || l != 7 {
+		t.Fatalf("SeqRange = (%d,%d,%v), want (3,7,true)", e, l, ok)
+	}
+
+	// ④ 重启模拟：终态收口（关句柄）→ repo.Close → 新 Repository + 新聚合实例。
+	if err := jst.AppendState(RunStateRecord{Kind: "state", SessionID: sid, RunID: run1, State: "completed", At: at.Add(time.Second)}); err != nil {
+		t.Fatalf("AppendState completed: %v", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("repo.Close: %v", err)
+	}
+	repo2, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository 2: %v", err)
+	}
+	t.Cleanup(func() { _ = repo2.Close() })
+	st2, err := repo2.Open(sid)
+	if err != nil {
+		t.Fatalf("repo2.Open: %v", err)
+	}
+	jst2 := NewRunJournalStore(repo2, st2)
+	if e, l, ok := jst2.SeqRange(); !ok || e != 3 || l != 7 {
+		t.Fatalf("SeqRange after restart = (%d,%d,%v), want (3,7,true) (播种来自磁盘)", e, l, ok)
+	}
+	got, err := jst2.ReadEvents(3)
+	if err != nil {
+		t.Fatalf("ReadEvents(3) after restart: %v", err)
+	}
+	if seqs := eventSeqs(got); !uint64sEqual(seqs, []uint64{5, 7}) {
+		t.Fatalf("ReadEvents(3) after restart = %v, want [5 7]", seqs)
+	}
+}
+
+// TestEventTailRecovery 钉死事件读取的坏尾行语义：事件文件尾部半行（崩溃时
+// Write 被截断，无行尾 '\n'）→ ReadEvents 跳过坏行返回合法前缀，不报错、不
+// 截断文件（截断修复是 MarkInterruptedRuns 的职责，读取方只容忍）。
+func TestEventTailRecovery(t *testing.T) {
+	ctx := context.Background()
+	root := tempDir(t)
+	repo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	s, err := repo.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	sid := s.SessionID()
+	jst := NewRunJournalStore(repo, s)
+
+	// 手写 run 文件：两条合法事件 + 一条截断尾行（半行 json，无 '\n'）。
+	runsDir := filepath.Join(s.dir, "runs")
+	if err := os.MkdirAll(runsDir, 0o700); err != nil {
+		t.Fatalf("mkdir runs: %v", err)
+	}
+	at := time.Now()
+	good := []EventRecord{
+		{Kind: eventKind, SessionID: sid, RunID: "run-3000-1", Type: EventToolCall, Seq: 1, Time: at, Payload: json.RawMessage(`"a"`)},
+		{Kind: eventKind, SessionID: sid, RunID: "run-3000-1", Type: EventTextDelta, Seq: 2, Time: at.Add(time.Millisecond), Payload: json.RawMessage(`"b"`)},
+	}
+	var buf []byte
+	for _, rec := range good {
+		line, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatalf("marshal event: %v", err)
+		}
+		buf = append(buf, line...)
+		buf = append(buf, '\n')
+	}
+	buf = append(buf, []byte(`{"kind":"event","run_id":"run-3000-1","type":"tool_result","seq":3`)...) // 崩溃半行
+	run3Path := filepath.Join(runsDir, "run-3000-1.jsonl")
+	if err := os.WriteFile(run3Path, buf, 0o600); err != nil {
+		t.Fatalf("write run-3000-1: %v", err)
+	}
+
+	// 合法前缀完整返回，坏尾行跳过且无错误。
+	got, err := jst.ReadEvents(0)
+	if err != nil {
+		t.Fatalf("ReadEvents(0) with bad tail: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ReadEvents(0) = %d records, want 2 (坏尾行跳过，返回合法前缀)", len(got))
+	}
+	if seqs := eventSeqs(got); !uint64sEqual(seqs, []uint64{1, 2}) {
+		t.Fatalf("ReadEvents(0) seqs = %v, want [1 2]", seqs)
+	}
+	for i, w := range good {
+		if got[i].Type != w.Type || got[i].RunID != w.RunID || got[i].Seq != w.Seq ||
+			!bytes.Equal(got[i].Payload, w.Payload) {
+			t.Errorf("record #%d = %+v, want %+v", i, got[i], w)
+		}
+	}
+	if got2, err := jst.ReadEvents(1); err != nil || len(got2) != 1 || got2[0].Seq != 2 {
+		t.Fatalf("ReadEvents(1) = %v (err %v), want seq [2]", eventSeqs(got2), err)
+	}
+
+	// SeqRange 同样容忍坏尾行：(1,2,true)。
+	if e, l, ok := jst.SeqRange(); !ok || e != 1 || l != 2 {
+		t.Fatalf("SeqRange with bad tail = (%d,%d,%v), want (1,2,true)", e, l, ok)
+	}
+
+	// 文件未被读取路径截断（尾修复归 MarkInterruptedRuns，读取方只容忍）。
+	info, err := os.Stat(run3Path)
+	if err != nil {
+		t.Fatalf("stat after read: %v", err)
+	}
+	if int64(len(buf)) != info.Size() {
+		t.Fatalf("file size after read = %d, want %d (ReadEvents 不截断)", info.Size(), len(buf))
+	}
+}

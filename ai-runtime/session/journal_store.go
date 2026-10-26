@@ -15,6 +15,13 @@
 // 路径每轮 /agent 泄漏一个 fd 直到 Stop，长跑进程会 fd 耗尽（P2-3 as-built 的
 // RecordRun 未关闭句柄，由本类型收口）。
 //
+// P3-1 起本类型兼作事件 Journal 聚合：AppendEvent/ReadEvents/SeqRange（agent
+// 侧 EventJournal 消费面，P3-2 进 SessionDeps.RunEvents）。事件记录与该 run 的
+// state 记录同文件混存，handles 缓存为两者共用——plan 原稿「runID 变化时关闭
+// 旧句柄再开新文件」的切换逻辑由既有终态逐出机制天然覆盖：上一 run 的句柄在其
+// 终态 state 记录落盘时已 Close+逐出（AppendState），新 run 首条记录自然打开
+// 新文件，无需 AppendEvent 感知 run 切换。
+//
 // 并发与锁论证：s.mu 只护 handles map 与句柄的取/存/逐出；单文件追加串行由
 // RunJournal 自身的 j.mu 保证（journal.go:82-89）。同会话的调用方本就被 gate
 // 串行（RecordRun 持 gate；StartRun 的 queued 记录先于 execute 获得 gate），
@@ -25,6 +32,10 @@ package session
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -100,6 +111,130 @@ func (s *RunJournalStore) AppendState(rec RunStateRecord) error {
 	}
 	if err != nil {
 		return fmt.Errorf("session: run journal store %s: append %s/%s: %w", s.sessionID, rec.RunID, rec.State, err)
+	}
+	return nil
+}
+
+// AppendEvent 按 rec.RunID 路由一条事件记录（P3-1）：命中 handles 缓存即复用
+// （与该 run 的 state 记录同句柄同文件混存）；未命中经 OpenRunJournal 打开——
+// 通常 state 记录（queued/running）已先建文件，事件的追加走缓存命中路径。路由
+// 按 rec.RunID 全量寻址，无「当前 run」概念：单写者下同一会话的 run 不会并发
+// 产生事件（gate 串行，P3-0 契约表），跨 run 切换由终态逐出（见文件头）兜住，
+// AppendEvent 无需感知。
+//
+// 次序约束（P3-2/P3-4 落码时注意）：事件必须落在该 run 的终态 state 记录之前
+// ——终态记录会 Close+逐出句柄，此后的 AppendEvent 走 OpenRunJournal 撞上已存
+// 在的文件 → ErrRunExists（custody 的「宁拒勿双写」，可观测错误而非静默续写）。
+// EventHub.EndRun 的 delta flush 因此必须先于终态 state 记录落盘；若 flush 晚到
+// 而 OpenRunJournal 被拒，delta 缺段可接受（P3-2 的降级语义：
+// assistant.message_finalized 兜底定稿），调用方按 warn 处理。
+func (s *RunJournalStore) AppendEvent(rec EventRecord) error {
+	if rec.RunID == "" {
+		return fmt.Errorf("session: run journal store %s: append event %q: empty run id", s.sessionID, rec.Type)
+	}
+
+	s.mu.Lock()
+	j, ok := s.handles[rec.RunID]
+	if !ok {
+		// OpenRunJournal 要求 store 在 repo 打开缓存中（custody）；ctx 仅用于
+		// 取消检查，Background 恒通过。
+		var err error
+		j, err = s.repo.OpenRunJournal(context.Background(), s.sessionID, rec.RunID)
+		if err != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("session: run journal store %s: open %s: %w", s.sessionID, rec.RunID, err)
+		}
+		s.handles[rec.RunID] = j
+	}
+	s.mu.Unlock()
+
+	// 追加在 s.mu 外（文件 I/O 不持聚合锁；单句柄串行由 j.mu 保证）。Kind 由
+	// RunJournal.AppendEvent 在存储边界强制（journal.go AppendEvent 注释）。
+	if err := j.AppendEvent(rec); err != nil {
+		return fmt.Errorf("session: run journal store %s: append event %s/%s: %w", s.sessionID, rec.RunID, rec.Type, err)
+	}
+	return nil
+}
+
+// ReadEvents 回放读取（P3-1，总方案第五节）：扫 <dir>/runs/*.jsonl 按文件名序
+// 拼接全部事件记录（kind=="event" 且 Seq>afterSeq）。文件名序 = 创建序 = nano
+// 序（run-<unixnano>-<seq> 的 nano 定宽至 2262 年，run.go:121-123），跨文件
+// Seq 区间单调不重叠（P3-0 契约表：gate 串行 ⇒ 后启动 run 的 seq 区间整体大于
+// 先前的），拼接即全局有序——本不变量由 TestEventRecordsCrossFileRoundTrip 钉死。
+//
+// 坏行跳过（loadEventRecords，与 loadStateRecords 同策略）：并发追加下读方容忍
+// 半行（写方单 Write 整行，store.go:686 同款）；不做尾截断（MarkInterruptedRuns
+// 的职责）。不按 SessionID 过滤（勘察修正 I：Archive 换 id 后 runs/ 的归属歧义
+// V1 不处理，P5 清单）。
+//
+// 只读扫描不持 s.mu：读不到 handles map；与追加并存的正确性由坏行跳过语义保证
+// （见上），与 P2-2「Append 串行、读方容忍」的取舍一致。
+func (s *RunJournalStore) ReadEvents(afterSeq uint64) ([]EventRecord, error) {
+	var out []EventRecord
+	if err := s.walkEventRecords(func(rec EventRecord) {
+		if rec.Seq > afterSeq {
+			out = append(out, rec)
+		}
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SeqRange 单遍扫描 runs/ 全部事件记录取 (min Seq, max Seq)，hub 构造播种用
+// （P3-2：EventHub 以 latest 恢复 seq 分配、以 earliest 做游标窗口校验）。
+// 空 runs/ 或无任何事件记录 → ok=false。扫描 I/O 错误（runs/ 存在但不可读等）
+// 同样返回 ok=false 并 warn——本签名无 error 出参（agent 侧 EventJournal 接口
+// 形状，P3-2 定稿），播种方拿到 false 以「从零开始」处理，真实 I/O 故障会在
+// 随后的 AppendEvent/ReadEvents 以错误显式上抛，此处不静默放大。
+func (s *RunJournalStore) SeqRange() (earliest, latest uint64, ok bool) {
+	first := true
+	err := s.walkEventRecords(func(rec EventRecord) {
+		if first {
+			earliest, latest = rec.Seq, rec.Seq
+			first = false
+			return
+		}
+		if rec.Seq < earliest {
+			earliest = rec.Seq
+		}
+		if rec.Seq > latest {
+			latest = rec.Seq
+		}
+	})
+	if err != nil {
+		slog.Warn("session: seq range scan failed", "session", s.sessionID, "err", err)
+		return 0, 0, false
+	}
+	return earliest, latest, !first
+}
+
+// walkEventRecords 是 ReadEvents/SeqRange 共用的单遍扫描骨架：runs/ 目录按
+// os.ReadDir 的文件名序（排序保证，MarkInterruptedRuns 同款遍历），逐文件
+// loadEventRecords 后把事件记录依次交给 visit。runs/ 不存在 = 无 run 历史，
+// 空扫描。仅访问磁盘与 visit 回调，不触碰 s.mu/handles（读路径无 custody，
+// 见 ReadEvents 注释）。
+func (s *RunJournalStore) walkEventRecords(visit func(rec EventRecord)) error {
+	runsDir := filepath.Join(s.st.dir, "runs")
+	entries, err := os.ReadDir(runsDir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("session: scan runs dir %s: %w", runsDir, err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		path := filepath.Join(runsDir, e.Name())
+		recs, err := loadEventRecords(path)
+		if err != nil {
+			return fmt.Errorf("session: load run journal %s: %w", path, err)
+		}
+		for _, rec := range recs {
+			visit(rec)
+		}
 	}
 	return nil
 }
