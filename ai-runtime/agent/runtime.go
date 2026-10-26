@@ -160,6 +160,42 @@ func (r *SessionRuntime) eventHub() *EventHub {
 	return r.events
 }
 
+// Hub 返回本 runtime 的 EventHub(导出访问器,P5-6;eventHub() 的导出形):
+// daemon 侧 RunControlSource 的 RunStatus 经它读 LatestSeq。未启用 RunEvents
+// 或尚无 StartRun 时为 nil——与 eventHub() 同语义,只导出不改行为。
+func (r *SessionRuntime) Hub() *EventHub {
+	return r.eventHub()
+}
+
+// EnsureHub 惰性创建并返回本 runtime 的 EventHub(P5-6,遗留③「重启后 attach
+// 时 hub 未建」的解法):bindEvents 只在 StartRun 同步段触发(supervisor.go ⑥),
+// 重启后的 runtime 若从未 StartRun,events 恒 nil——attach 即建补上该缺口,
+// NewEventHub 构造含 journal.SeqRange 磁盘播种(游标续接既有事件历史)。
+// daemon 的 RunControlSource.Attach(P5-8 的 attach 面)是唯一预期调用点;
+// StartRun 的既有路径不受影响(bindEvents 幂等,创建恰好一次,后续复用)。
+//
+// journal 来源:经 Session deps 读(本方法在 rt.mu 内快照 r.session,取
+// sess.deps.RunEvents 后交 bindEvents)——与 StartRun ⑥ 的
+// rt.bindEvents(sessionID, sess.deps.RunEvents) 同一来源、同一形状,不新增
+// runtime 字段。会话未绑定(sess == nil)或 RunEvents 未接线(nil)时返回 nil,
+// 由调用方诚实报错(P5-8:「RunEvents 未接线/纯内存 → 诚实错误」)。
+//
+// 并发论证:与 bindEvents 同构——rt.mu 内快照 session 后立即释放,构造(含
+// SeqRange 磁盘扫描)在 rt.mu 外(锁内不做文件 I/O 纪律),bindEvents 内部
+// 双重检查保证创建恰好一次;与 closeEvents 的交集由 Manager.Close 的次序
+// (先等在途 run 终态、置 closed 拒绝后续 StartRun)覆盖,Attach 若在 Close
+// 后到达,拿到的是已 Close 的 hub(Subscribe/Publish 一律 ErrHubClosed,可
+// 观测)或 nil,无新锁面。
+func (r *SessionRuntime) EnsureHub() *EventHub {
+	r.mu.Lock()
+	sess := r.session
+	r.mu.Unlock()
+	if sess == nil {
+		return nil
+	}
+	return r.bindEvents(r.ID, sess.deps.RunEvents)
+}
+
 // closeEvents 收口本 runtime 的事件枢纽(P3-5 生命周期断线/关闭语义):events
 // 非 nil 时依次 EndRun(幂等:flush 残留合并缓冲 + 清 curRunID)与 Close(幂等:
 // 置 closed、断开全部订阅者、关 journal 桥接)——此后 hub 一律拒绝 Publish/

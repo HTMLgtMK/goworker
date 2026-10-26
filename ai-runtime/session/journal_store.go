@@ -224,6 +224,40 @@ func (s *RunJournalStore) SeqRange() (earliest, latest uint64, ok bool) {
 	return earliest, latest, !first
 }
 
+// LastRunState 返回某 run 的末条 state 记录(P5-6):daemon 侧 RunControlSource
+// 的 RunStatus 对已终态( active 已清)run 的观测面——读该 run 的 journal 文件
+// runs/<runID>.jsonl,取末条 kind=="state" 的记录(与 MarkInterruptedRuns 的末条
+// 判定同源:事件记录与 state 记录同文件混存,末行未必是 state,逐条扫 kind 域)。
+//
+// 文件不存在(run 无 journal 或纯内存宿主)→ ok=false;解析失败/无 state 记录
+// 同样 ok=false——本方法无 error 出参(plan P5-6 签名),读方 RunStatus 把
+// false 归一为 run-not-found 语义;真实 I/O 故障的降级与 SeqRange 同型(宁缺
+// 记录勿放大, AppendEvent/ReadEvents 的后续显式错误仍可观测)。坏行跳过策略
+// 同 loadStateRecords(scanJSONL)。runID 经 validRunID 校验(防 traversal,与
+// OpenRunJournal 同款),非法 id → ok=false。
+//
+// 只读扫描不持 s.mu(与 ReadEvents/SeqRange 同策略,见 walkEventRecords 注释)。
+func (s *RunJournalStore) LastRunState(runID string) (RunStateRecord, bool) {
+	if !validRunID(runID) {
+		return RunStateRecord{}, false
+	}
+	path := filepath.Join(s.st.dir, "runs", runID+".jsonl")
+	recs, _, err := loadStateRecords(path)
+	if err != nil {
+		slog.Warn("session: last run state scan failed", "session", s.sessionID, "run", runID, "err", err)
+		return RunStateRecord{}, false
+	}
+	var last RunStateRecord
+	found := false
+	for i := range recs {
+		if recs[i].Kind == stateKind {
+			last = recs[i]
+			found = true
+		}
+	}
+	return last, found
+}
+
 // walkEventRecords 是 ReadEvents/SeqRange 共用的单遍扫描骨架：runs/ 目录按
 // os.ReadDir 的文件名序（排序保证，MarkInterruptedRuns 同款遍历），逐文件
 // loadEventRecords 后把事件记录依次交给 visit。runs/ 不存在 = 无 run 历史，

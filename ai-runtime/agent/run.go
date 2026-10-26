@@ -106,6 +106,14 @@ func (run *AgentRun) snapshot() RunResult {
 	return res
 }
 
+// State 返回运行当前状态快照(P5-6 导出访问器):daemon 侧 RunControlSource 的
+// RunStatus 经 rt.Active() 命中 runID 后读取状态——snapshot() 未导出,daemon
+// 跨包不可达(runtime.go DeclareCWD 同款先例:plan 预留消费面,编译器指路后按
+// 包边界导出)。与 RunHandle.State() 同一快照面(run.mu 内读)。
+func (run *AgentRun) State() RunState {
+	return run.snapshot().State
+}
+
 // cancelFunc 返回运行取消函数;未设置(RecordRun 同步路径)返回 nil。
 // 一次写入(execute 派生 runCtx 后)多个读者,读写都在 run.mu 内。
 func (run *AgentRun) cancelFunc() context.CancelFunc {

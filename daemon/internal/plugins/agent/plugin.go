@@ -78,6 +78,21 @@ type AgentPlugin struct {
 	// 模式下它是「谁拥有 daemon 当前活动状态」的记号:FrontendHandler.Prompt 据此
 	// 拒绝已被其他连接顶掉的旧会话,而不是让 prompt 静默串到新声明的工作区里跑。
 	activeTransportSession string
+
+	// reqMu 保护 run/start 的 requestId 幂等表(runcontrol.go,P5-6):map 记
+	// requestID → 提交时返回的 RunHandle(重试返回原 runID 与其当前状态),
+	// requestOrder 是环形逐出队列(容量 4096,防无界)。持有临界区覆盖
+	// manager.StartRun 同步段——同会话第二 run 本就被 ErrRunActive 串行,锁的
+	// 额外代价可忽略,换来同 requestID 并发重试的严格幂等。
+	reqMu        sync.Mutex
+	runRequests  map[string]runtimeagent.RunHandle
+	requestOrder []string
+	// leaseMu 保护 controlLease(P5-6 control lease,V1 宿主授权简化形,拍板②):
+	// 本机信任、每会话至多一个持有者、断开即释放(P5-7 handler.Close)、后到连接
+	// 显式接管(tookOver=true + slog.Info 审计)。独立小锁,不与 mu/manager 锁
+	// 嵌套。
+	leaseMu      sync.Mutex
+	controlLease string
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
