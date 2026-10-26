@@ -12,6 +12,7 @@ import (
 	memory "github.com/tinguo/goworker/ai-memory"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
+	"github.com/tinguo/goworker/ai-runtime/session"
 	sandbox "github.com/tinguo/goworker/ai-sandbox"
 )
 
@@ -70,6 +71,16 @@ type ConversationStore interface {
 	AdvanceCursor(id string) error
 }
 
+// RunStateJournal 是 Run 状态持久化的消费侧最小面(同 ConversationStore 先例,
+// spec.go:64-71):RecordRun(daemon 同步路径,P2-3)与 StartRun(P2-5)共用。
+// 每个实例对应一个 run 的 journal 文件(runs/<runID>.jsonl,durable-first 追加);
+// *session.RunJournal 的聚合形态(P2-7 的 *session.RunJournalStore)天然满足,
+// 宿主持具体类型传参零改动。State 用 string 字符串化:session 不得反向 import
+// agent(勘察修正 D)。
+type RunStateJournal interface {
+	AppendState(rec session.RunStateRecord) error
+}
+
 // SessionDeps 是会话构造输入包：插件级资源 + 本会话参数，Init 组装后每次 NewSession 复用。
 // 其余字段跨会话不变。可变资源（instructions）的装载在 plugin 层，这里只收最终值。
 type SessionDeps struct {
@@ -81,6 +92,7 @@ type SessionDeps struct {
 	NewProvider          func(cfg *runtimeconfig.Config) (core.Provider, error) // 按当前 default_provider 构造协议适配器
 	Instruction          *memory.InstructionSet                                 // 会话边界刷新（Init / /new 经 startSession 重载）
 	Store                ConversationStore                                      // nil = 持久化禁用（接口字段必须真 nil，typed-nil 会让禁用判断失效）
+	RunJournal           RunStateJournal                                        // nil = Run 状态不持久化（接口字段必须真 nil，typed-nil 陷阱同 Store）
 	PersistAllowRule     func(sandbox.AllowRule) error                          // 持久化 bash allow_always 规则
 	PersistToolAllowRule func(sandbox.ToolAllowRule) error                      // 持久化外部工具 allow_always 规则
 }

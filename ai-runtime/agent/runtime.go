@@ -3,7 +3,11 @@ package agent
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
+	"time"
+
+	"github.com/tinguo/goworker/ai-runtime/session"
 )
 
 // 本文件是多会话执行内核的会话运行时:SessionRuntime 持有「每会话一个」的
@@ -99,6 +103,22 @@ func (r *SessionRuntime) DeclareCWD(cwd string, err error) {
 	r.mu.Unlock()
 }
 
+// journalRunState 将一条 Run 状态记录写入会话绑定的 Run journal(s.deps.RunJournal,
+// P2-3):daemon 同步路径(RecordRun)与后台路径(P2-5 StartRun)共用同一持久化面。
+// s 为 nil(未绑定会话)或 RunJournal 为 nil(不持久化)时直接跳过——接口字段必须
+// 真 nil 的宿主约定(spec.go typed-nil 陷阱同 Store)保证零值 deps 的测试路径安全。
+// AppendState 失败只 warn 不阻塞:journal 可用性低于执行可用性,缺终态记录由恢复
+// 扫描显式标记 interrupted(缺口可观测,不静默)。调用点在 rt.mu 外(锁内不做文件
+// I/O);同会话串行由调用方已持的 gate 保证,跨会话互不共享句柄(每 run 一文件)。
+func journalRunState(s *Session, rec session.RunStateRecord) {
+	if s == nil || s.deps.RunJournal == nil {
+		return
+	}
+	if err := s.deps.RunJournal.AppendState(rec); err != nil {
+		slog.Warn("agent: run journal append failed", "err", err, "run_id", rec.RunID, "state", rec.State)
+	}
+}
+
 // RecordRun 在「调用方已持 gate」的前提下执行一轮会话并记账——withSession 的
 // 临界区是唯一预期调用点,这里绝不再 AcquireRun(二次排队即死锁)。流程:创建
 // AgentRun 存入 r.active → 执行 fn → 按 result/ctx 终态化 → 清 r.active → 返回结果。
@@ -115,6 +135,17 @@ func (r *SessionRuntime) RecordRun(fn func(*Session) (RunResult, error)) RunResu
 	r.active = run
 	r.mu.Unlock()
 
+	// ① 起跑记录:每 run journal 文件的首条 state 记录。fn 尚未执行,取本体
+	// r.session(与 fn(r.session) 同一指针,Session() 已绑定);nil 会话/nil
+	// journal 由 journalRunState 跳过,不影响执行。
+	journalRunState(r.session, session.RunStateRecord{
+		Kind:      "state", // session.stateKind 未导出;恢复扫描只认 kind=="state"(journal.go:47)
+		SessionID: run.SessionID,
+		RunID:     run.ID,
+		State:     string(RunRunning),
+		At:        time.Now(),
+	})
+
 	res, err := fn(r.session)
 	switch {
 	case err != nil:
@@ -130,6 +161,24 @@ func (r *SessionRuntime) RecordRun(fn func(*Session) (RunResult, error)) RunResu
 		// 防御:fn 返回非终态且无错误时按完成记账,避免 active 永悬。
 		res.State = RunCompleted
 	}
+
+	// ② 终态记录:写在 run.finish 之前——次序即不变量:fn(s.Run)返回时 Conversation
+	// Commit 已定(session.go:181-217),此处 completed 只会出现在 Commit 成功之后
+	// (总方案第九节「Conversation Commit 失败不能记录 RunCompleted」由既有结构天然
+	// 满足,run_journal_test.go 钉死);且 done 关闭前落盘,等待者被唤醒时终态已持久。
+	termErr := ""
+	if res.Err != nil {
+		termErr = res.Err.Error()
+	}
+	journalRunState(r.session, session.RunStateRecord{
+		Kind:      "state",
+		SessionID: run.SessionID,
+		RunID:     run.ID,
+		State:     string(res.State),
+		Err:       termErr, // nil 时留空,omitted 由 json tag 兜底(journal.go:42)
+		Persisted: res.Persisted,
+		At:        time.Now(),
+	})
 
 	run.finish(res)
 	r.mu.Lock()
