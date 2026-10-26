@@ -63,6 +63,12 @@ type SessionManager struct {
 	// 寻址。V1 审批不持久化:重启清空,无跨重启 requestID 碰撞(interrupt
 	// id=req-N 进程级 atomic,middlewares/hitl.go:68)。
 	approvals *ApprovalManager
+	// capabilities 是客户端工具能力注册表(P4-3):sessionID→connectionID→binding
+	// 的绑定面,能力代理工具(capability.go 的 proxy)在每次 Execute 时经
+	// Lookup 解析当前执行通道。进程内存量、全局单例,不随 runtime 增删联动;
+	// TTL 兜底「连接死而无人 Unbind」,UnbindConnection 由连接退出收口(P5-7
+	// handler.Close 钩子 / P5-9 daemon 探测面接线)。
+	capabilities *CapabilityRegistry
 }
 
 // ManagerOption 是 NewSessionManager 的配置选项。
@@ -90,10 +96,11 @@ func WithRunLimits(maxConcurrent, maxPending int) ManagerOption {
 // plugin 等)零改动;配额经 WithRunLimits 覆盖。
 func NewSessionManager(opts ...ManagerOption) *SessionManager {
 	m := &SessionManager{
-		runtimes:  make(map[string]*SessionRuntime),
-		runSlots:  make(chan struct{}, defaultMaxConcurrentRuns),
-		pending:   make(chan struct{}, defaultMaxPendingRuns),
-		approvals: NewApprovalManager(),
+		runtimes:     make(map[string]*SessionRuntime),
+		runSlots:     make(chan struct{}, defaultMaxConcurrentRuns),
+		pending:      make(chan struct{}, defaultMaxPendingRuns),
+		approvals:    NewApprovalManager(),
+		capabilities: NewCapabilityRegistry(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -153,6 +160,15 @@ func (m *SessionManager) List() []*SessionRuntime {
 // decideFunc 消费 Wait,P5 协议面经 Pending/Resolve 直转包装读取与决策。
 func (m *SessionManager) Approvals() *ApprovalManager {
 	return m.approvals
+}
+
+// Capabilities 返回客户端工具能力注册表(P4-3):manager 构造即建,恒非 nil。
+// daemon 每轮 prompt 探测到设备工具后经 Bind 刷新连接绑定(P5-9 接线),能力
+// 代理工具的 Execute 经 Lookup 解析当前执行通道(P4-4);连接退出时
+// UnbindConnection 收口(P5-7 handler.Close 钩子)。绑定关系归属
+// (session, connection) 二元组,与 approvals 的 (session, run) 寻址正交。
+func (m *SessionManager) Capabilities() *CapabilityRegistry {
+	return m.capabilities
 }
 
 // PendingApprovals 返回会话未过期的审批快照(P4-2,ApprovalManager.Pending 的
