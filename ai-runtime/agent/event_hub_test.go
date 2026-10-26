@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"testing"
@@ -12,7 +14,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 )
 
-// 本文件是 P3-2 的 EventHub 写侧验收测试(plan P3-2「新增测试」):
+// 本文件是 P3-2/P3-3 的 EventHub 验收测试。P3-2 写侧(plan P3-2「新增测试」):
 //   - TestEventHubSeqMonotonicAcrossRuns:BeginRun 切换后 seq 连续不重复
 //     (跨 Run 游标,P3-0 契约表第 1 行);
 //   - TestKeyEventDurableFirst:stub journal AppendEvent 注错 → Publish 返回
@@ -23,8 +25,14 @@ import (
 //     合并记录(Seq=最后一条、FromSeq=第一条),订阅者仍逐条收到 100 条
 //     (实时不合并,P3-0 契约表第 3 行)。
 //
-// 订阅注册在 P3-3 的 Subscribe(Replay+Live 原子切换)落地前只有内部结构,
-// 测试经 addTestSub(同包白盒)直接进 subs 表;P3-3 落地后这些测试照旧成立。
+// P3-3 读侧(plan P3-3「新增测试」):
+//   - TestAttachReplayNoGap(总方案第十一节 → 本步):Replay+Live 原子切换的
+//     无缺口无重复压测(-race);
+//   - TestSubscribeCursorExpired / TestSubscribeAfterClose /
+//     TestSubscribeCtxCancelCleansUp:窗口校验、关停拒绝、断线清理。
+//
+// P3-2 时代的订阅注册经 addTestSub(同包白盒)直接进 subs 表;P3-3 的
+// Subscribe 落地后这些测试照旧成立(addTestSub 的 watermark=0 不触发水位过滤)。
 
 // 编译期断言:测试桩满足 EventJournal 消费面。
 var _ EventJournal = (*stubEventJournal)(nil)
@@ -379,5 +387,380 @@ func TestDeltaMergeWindow(t *testing.T) {
 	}
 	if gotText != wantText.String() {
 		t.Fatalf("merged payload = %q, want concatenated %q", gotText, wantText.String())
+	}
+}
+
+// ── P3-3:Subscribe Replay+Live 原子切换(防 Race A/B)+ ErrCursorExpired ────
+
+// TestAttachReplayNoGap(总方案第十一节 → P3-3):单 hub,N 轮
+// BeginRun/Publish(混合 key+delta,含合并窗)/EndRun;M 个订阅者在随机时刻以
+// 随机 fromSeq(含 0、含注册时 latest)Subscribe,各收集到 Close;断言每个
+// 订阅者收到的 seq 严格覆盖 (fromSeq, finalLatest] 无缺口无重复。
+//
+// 记账口径(plan 原文「合并记录按 Seq 记账、FromSeq 只作范围声明」):收到的
+// 每个 SessionEvent 以其 Seq 定位 journal 记录——命中合并记录(Seq=ToSeq、
+// FromSeq>0)按 [FromSeq..Seq] 展开计入覆盖,未命中(实时逐事件广播的
+// delta/key)按单点计入。展开不会掩盖真缺口:实时收到某合并窗末事件的订阅者
+// 必然订阅早于窗起点(否则订阅时的 flush 会把整窗并进它的回放),窗内其余
+// seq 也经实时逐条送达;「无重复」由收到流严格递增独立钉死,不依赖展开。
+//
+// 时序收口:Close 前先轮询等全部订阅者抵达 finalLatest(10s 上界)——Close
+// 断开订阅者,提前 Close 会截断在途投递使覆盖断言失真;fromSeq==finalLatest
+// 的订阅者期望空覆盖,轮询按此豁免。随机源按 goroutine 独立播种(固定种子,
+// 失败可复现,且 rand.Rand 非并发安全)。
+func TestAttachReplayNoGap(t *testing.T) {
+	jr := &stubEventJournal{}
+	hub := NewEventHub("replay-nogap", jr)
+	defer hub.Close()
+
+	const (
+		rounds      = 6
+		perRound    = 19 // 4+4+4 text.delta + tool_call + 3 thinking.delta + 2 usage.progress + tool_result
+		finalLatest = rounds * perRound
+	)
+
+	// subRec 是一个订阅者的收集记录:fromSeq、收到流(期望严格递增)、收尾
+	// 信号(collector 退出即 Close 已断开订阅者)。
+	type subRec struct {
+		name string
+		from uint64
+		ch   <-chan session.SessionEvent
+		mu   sync.Mutex
+		seqs []uint64
+		done chan struct{}
+	}
+	var (
+		subsMu sync.Mutex
+		subs   []*subRec
+	)
+	startSub := func(name string, from uint64) {
+		ch, err := hub.Subscribe(context.Background(), from)
+		if err != nil {
+			t.Errorf("sub %s: Subscribe(from=%d): %v", name, from, err)
+			return
+		}
+		rec := &subRec{name: name, from: from, ch: ch, done: make(chan struct{})}
+		subsMu.Lock()
+		subs = append(subs, rec)
+		subsMu.Unlock()
+		go func() {
+			defer close(rec.done)
+			for ev := range ch {
+				rec.mu.Lock()
+				rec.seqs = append(rec.seqs, ev.Seq)
+				rec.mu.Unlock()
+			}
+		}()
+	}
+
+	// 发布者:N 轮混合 key+delta;delta 突发远小于 50ms 窗 ⇒ 每轮 EndRun 收口
+	// 出合并记录;轮间随机小睡给订阅者留出随机订阅窗口。
+	pubDone := make(chan struct{})
+	go func() {
+		defer close(pubDone)
+		rng := rand.New(rand.NewSource(101))
+		for r := 0; r < rounds; r++ {
+			runID := fmt.Sprintf("run-r%d", r)
+			hub.BeginRun(runID)
+			pub := func(typ string) {
+				if err := hub.Publish(IngressEvent{RunID: runID, Type: typ, Payload: json.RawMessage(`"p"`)}); err != nil {
+					t.Errorf("publish %s in %s: %v", typ, runID, err)
+				}
+			}
+			for i := 0; i < 4; i++ {
+				pub(session.EventTextDelta)
+			}
+			pub(session.EventToolCall) // key,打断 text 窗:journal 物理序 ≠ seq 序
+			for i := 0; i < 4; i++ {
+				pub(session.EventTextDelta)
+			}
+			for i := 0; i < 3; i++ {
+				pub(session.EventThinkingDelta)
+			}
+			for i := 0; i < 2; i++ {
+				pub(session.EventUsageProgress)
+			}
+			pub(session.EventToolResult) // key
+			for i := 0; i < 4; i++ {
+				pub(session.EventTextDelta)
+			}
+			hub.EndRun()
+			time.Sleep(time.Duration(rng.Intn(3)) * time.Millisecond)
+		}
+	}()
+
+	startSub("early", 0) // 发布前订阅:fromSeq=0,全程实时
+	var randWG sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		randWG.Add(1)
+		go func(i int) {
+			defer randWG.Done()
+			rng := rand.New(rand.NewSource(int64(200 + i)))
+			time.Sleep(time.Duration(rng.Intn(12)) * time.Millisecond)
+			latest := hub.LatestSeq()
+			var from uint64
+			switch i % 3 {
+			case 0:
+				from = 0 // 含 0
+			case 1:
+				from = latest // 含注册时 latest
+			case 2:
+				if latest > 0 {
+					from = uint64(rng.Intn(int(latest) + 1)) // [0..latest] 随机
+				}
+			}
+			startSub(fmt.Sprintf("rand-%d", i), from)
+		}(i)
+	}
+	<-pubDone
+	if got := hub.LatestSeq(); got != finalLatest {
+		t.Fatalf("LatestSeq after publisher = %d, want %d(%d 轮 × 每轮 %d 事件,发布不得失败)", got, finalLatest, rounds, perRound)
+	}
+
+	// waitAtLatest 轮询等全部已注册订阅者抵达 finalLatest(from==finalLatest
+	// 者期望空覆盖,豁免)。
+	waitAtLatest := func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			subsMu.Lock()
+			var pending []string
+			for _, s := range subs {
+				if s.from == finalLatest {
+					continue
+				}
+				s.mu.Lock()
+				maxSeq := uint64(0)
+				for _, sq := range s.seqs {
+					if sq > maxSeq {
+						maxSeq = sq
+					}
+				}
+				n := len(s.seqs)
+				s.mu.Unlock()
+				if maxSeq != finalLatest {
+					pending = append(pending, fmt.Sprintf("%s(from=%d, max=%d of %d events)", s.name, s.from, maxSeq, n))
+				}
+			}
+			subsMu.Unlock()
+			if len(pending) == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("subscribers did not reach final latest %d: %v", finalLatest, pending)
+			}
+			time.Sleep(500 * time.Microsecond)
+		}
+	}
+	waitAtLatest()
+	randWG.Wait() // 全部随机订阅者已完成订阅(先于 Close,杜绝对已关 hub 订阅)
+
+	// 收口期确定性订阅:全量回放(fromSeq=0)与恰在 latest(fromSeq=
+	// finalLatest:零回放、零实时,期望零事件)。
+	startSub("late-full", 0)
+	startSub("late-at-latest", finalLatest)
+	waitAtLatest()
+
+	hub.Close() // 各收集到 Close:订阅通道关闭,collector 退出
+	for _, s := range subs {
+		select {
+		case <-s.done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("sub %s collector did not finish after Close", s.name)
+		}
+	}
+
+	// journal 记账表:rec.Seq → 覆盖范围(合并记录 [FromSeq..Seq],逐条 [Seq..Seq])。
+	coverage := map[uint64][2]uint64{}
+	for _, rec := range jr.snapshot() {
+		lo := rec.Seq
+		if rec.FromSeq > 0 && rec.FromSeq < lo {
+			lo = rec.FromSeq
+		}
+		coverage[rec.Seq] = [2]uint64{lo, rec.Seq}
+	}
+	if len(coverage) == 0 {
+		t.Fatal("journal has no event records")
+	}
+
+	for _, s := range subs {
+		s.mu.Lock()
+		seqs := append([]uint64(nil), s.seqs...)
+		s.mu.Unlock()
+
+		// 无重复:收到流严格递增(回放按 Seq 升序 + live 递增 + watermark 衔接)。
+		for i := 1; i < len(seqs); i++ {
+			if seqs[i] <= seqs[i-1] {
+				t.Errorf("sub %s: seq stream not strictly increasing at #%d (%d after %d): %v", s.name, i, seqs[i], seqs[i-1], seqs)
+				break
+			}
+		}
+
+		// 严格覆盖 (fromSeq, finalLatest]:按 Seq 记账、FromSeq 范围声明展开。
+		covered := make([]bool, finalLatest+1)
+		for _, sq := range seqs {
+			if sq > finalLatest {
+				t.Errorf("sub %s: received seq %d beyond final latest %d", s.name, sq, finalLatest)
+				continue
+			}
+			lo, hi := sq, sq
+			if rg, ok := coverage[sq]; ok {
+				lo, hi = rg[0], rg[1]
+			}
+			for x := lo; x <= hi && x <= finalLatest; x++ {
+				covered[x] = true
+			}
+		}
+		for x := s.from + 1; x <= finalLatest; x++ {
+			if !covered[x] {
+				t.Errorf("sub %s (from=%d): seq %d missing — coverage of (%d,%d] has a gap; got %v", s.name, s.from, x, s.from, finalLatest, seqs)
+				break
+			}
+		}
+	}
+
+	// late-at-latest:订阅时 latest 已是 finalLatest ⇒ 无回放可读、无实时可收。
+	for _, s := range subs {
+		if s.name != "late-at-latest" {
+			continue
+		}
+		s.mu.Lock()
+		n := len(s.seqs)
+		s.mu.Unlock()
+		if n != 0 {
+			t.Errorf("late-at-latest received %d events, want 0", n)
+		}
+	}
+}
+
+// TestSubscribeCursorExpired:窗口校验(plan P3-3 ①)——fromSeq 超前 latest
+// (客户端声称收到未发事件)与落于保留历史 earliest 之前 → ErrCursorExpired;
+// fromSeq=0(从保留最早开始)与区间内(含恰为 latest)→ 成功。
+func TestSubscribeCursorExpired(t *testing.T) {
+	t.Run("AheadOfLatest", func(t *testing.T) {
+		jr := &stubEventJournal{}
+		hub := NewEventHub("cursor-ahead", jr)
+		defer hub.Close()
+		hub.BeginRun("run-c")
+		if err := hub.Publish(IngressEvent{RunID: "run-c", Type: session.EventToolCall, Payload: json.RawMessage(`"c"`)}); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		if err := hub.Publish(IngressEvent{RunID: "run-c", Type: session.EventTextDelta, Payload: json.RawMessage(`"d"`)}); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+
+		for _, from := range []uint64{3, 100} { // latest=2:超前一律拒
+			if _, err := hub.Subscribe(context.Background(), from); !errors.Is(err, ErrCursorExpired) {
+				t.Fatalf("Subscribe(%d) err = %v, want ErrCursorExpired", from, err)
+			}
+		}
+		for _, from := range []uint64{0, 1, 2} { // 0 与区间内(含恰为 latest)成功
+			if _, err := hub.Subscribe(context.Background(), from); err != nil {
+				t.Fatalf("Subscribe(%d): %v", from, err)
+			}
+		}
+	})
+
+	t.Run("BeforeEarliest", func(t *testing.T) {
+		// 白盒预置 journal 历史 [3..5]:earliest=3。V1 无修剪,该状态仅 hub
+		// 重建且历史被截短时可达,直接构造以驱动校验分支。
+		jr := &stubEventJournal{}
+		for seq := uint64(3); seq <= 5; seq++ {
+			if err := jr.AppendEvent(session.EventRecord{SessionID: "cursor-old", RunID: "run-old", Type: session.EventToolCall, Seq: seq, Time: time.Now()}); err != nil {
+				t.Fatalf("seed journal seq %d: %v", seq, err)
+			}
+		}
+		hub := NewEventHub("cursor-old", jr)
+		defer hub.Close()
+		if got := hub.EarliestSeq(); got != 3 {
+			t.Fatalf("EarliestSeq = %d, want 3", got)
+		}
+		if got := hub.LatestSeq(); got != 5 {
+			t.Fatalf("LatestSeq = %d, want 5", got)
+		}
+
+		// fromSeq=1:要的首事件 2 落于保留最早 3 之前 → 拒。
+		if _, err := hub.Subscribe(context.Background(), 1); !errors.Is(err, ErrCursorExpired) {
+			t.Fatalf("Subscribe(1) err = %v, want ErrCursorExpired", err)
+		}
+		// fromSeq=0(从保留最早开始)与 fromSeq=2(首事件恰为 earliest)成功。
+		for _, from := range []uint64{0, 2} {
+			if _, err := hub.Subscribe(context.Background(), from); err != nil {
+				t.Fatalf("Subscribe(%d): %v", from, err)
+			}
+		}
+	})
+}
+
+// TestSubscribeAfterClose:Close 后 Subscribe 一律拒绝(plan P3-3 ①)。
+func TestSubscribeAfterClose(t *testing.T) {
+	hub := NewEventHub("sub-closed", nil) // 纯内存 hub 走同一拒绝路径
+	if err := hub.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := hub.Subscribe(context.Background(), 0); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("Subscribe after Close err = %v, want ErrHubClosed", err)
+	}
+}
+
+// TestSubscribeCtxCancelCleansUp:断线清理(plan P3-3 ④)——ctx 取消后 pump
+// 退出,hub.subs 不残留(内部计数断言,LatestSeq 看不到订阅者),订阅通道
+// 关闭(消费方 range 语义的断线告知)。
+func TestSubscribeCtxCancelCleansUp(t *testing.T) {
+	hub := NewEventHub("sub-cancel", nil) // 纯内存:无回放,直入 live 等待
+	defer hub.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := hub.Subscribe(ctx, 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	subsCount := func() int {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return len(hub.subs)
+	}
+	if n := subsCount(); n != 1 {
+		t.Fatalf("hub.subs after Subscribe = %d, want 1", n)
+	}
+
+	// 实时通路先验证(发布在订阅后:纯内存 hub 无回放,订阅前的收不到)。
+	if err := hub.Publish(IngressEvent{RunID: "run-x", Type: session.EventTextDelta, Payload: json.RawMessage(`"d"`)}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if ev := recvEvent(t, ch); ev.Seq != 1 {
+		t.Fatalf("first event seq = %d, want 1", ev.Seq)
+	}
+
+	cancel() // 模拟断线:pump 必须自行退出并摘除注册
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n := subsCount(); n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hub.subs not cleaned up after ctx cancel (still %d)", subsCount())
+		}
+		time.Sleep(500 * time.Microsecond)
+	}
+
+	// 订阅通道最终关闭(先排干在途缓冲,再见到关闭)。
+	closed := false
+	for !closed {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				closed = true
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("subscribe channel not closed after ctx cancel")
+		}
+	}
+	// hub 仍健康:清理不影响写侧。
+	if err := hub.Publish(IngressEvent{RunID: "run-x", Type: session.EventTextDelta, Payload: json.RawMessage(`"d"`)}); err != nil {
+		t.Fatalf("Publish after subscriber cleanup: %v", err)
+	}
+	if got := hub.LatestSeq(); got != 2 {
+		t.Fatalf("LatestSeq = %d, want 2", got)
 	}
 }

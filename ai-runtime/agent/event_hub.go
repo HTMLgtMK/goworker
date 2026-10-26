@@ -1,11 +1,13 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -13,10 +15,10 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 )
 
-// event_hub.go 是 P3-2 的事件回放写侧与广播核心(总方案 P3 第 2 条):Seq 分配、
-// 关键事件 durable-first 落盘、高频 delta 合并落盘、fan-out 非阻塞广播。
-// 订阅读取面(Subscribe/Replay/ErrCursorExpired)属 P3-3,本文件只提供其依赖的
-// 内部结构(hubSub/subs 表)。P3-4 再把它接进 StartRun(teeRunCallbacks)。
+// event_hub.go 是 P3-2/P3-3 的事件枢纽(总方案 P3 第 2/3 条):写侧 Seq 分配、
+// 关键事件 durable-first 落盘、高频 delta 合并落盘、fan-out 非阻塞广播(P3-2);
+// 读侧 Subscribe 的 Replay+Live 原子切换、ErrCursorExpired 窗口校验、断线清理
+// (P3-3)。P3-4 再把它接进 StartRun(teeRunCallbacks)。
 //
 // 语义契约(总方案第五节,落实为 P3-0 契约表):
 //   - Seq 是 Session 维度严格递增游标,跨 Run 不重复(P3-0 表第 1 行):seq 在
@@ -34,20 +36,21 @@ import (
 //     (delete + close(sub.live)),绝不阻塞 AgentRun 执行与其他订阅者;重连从
 //     游标补齐属 P3-3 的 Subscribe。
 //
-// 并发与锁论证(plan P3-2「并发与锁论证」):hub.mu 全程保护 seq/earliest/
+// 并发与锁论证(plan P3-2/P3-3「并发与锁论证」):hub.mu 全程保护 seq/earliest/
 // latest/subs/nextSubID/journal 目标/curRunID/deltaBuf/flushTimer/closed 全部
-// 可变字段。Publish 的 journal fsync 在 mu 内是 V1 正确性优先的取舍:delta 合并
-// 把写频率压到 ≤20 次/s(50ms 窗),key 事件低频;若生产不达标,P5 优化为
-// 「mu 内定序号槽、mu 外写、写完补广播」(注释留档,本 Plan 不做)。fan-out 的
-// close(sub.live) 在 mu 内合法(Go channel close 本身无锁竞争)。无嵌套获取:
-// hub.mu 内只做非阻塞 send 与文件写,不触 gate/runSlots/manager.mu/rt.mu
+// 可变字段(done 是 close-only 信号,构造后只关一次,无锁读安全)。Publish 的
+// journal fsync 与 Subscribe 的 ReadEvents 在 mu 内都是 V1 正确性优先的取舍:
+// delta 合并把写频率压到 ≤20 次/s(50ms 窗)、订阅低频;若生产不达标,P5 优化
+// 为「mu 内定序号槽、mu 外写、写完补广播」(注释留档,本 Plan 不做)。fan-out
+// 的 close(sub.live) 在 mu 内合法(Go channel close 本身无锁竞争)。无嵌套获取:
+// hub.mu 内只做非阻塞 send 与文件读写,不触 gate/runSlots/manager.mu/rt.mu
 // (journal 的 AppendEvent 走 RunJournalStore 自持的 s.mu→j.mu,单向无回边)
 // ⇒ 无锁环。
 
 // EventJournal 是事件持久化的 agent 侧消费面(P3-2 定稿,P3-4 进 SessionDeps.
 // RunEvents):与 RunStateJournal(spec.go)同构的「消费侧最小面」先例,由
-// session.RunJournalStore(P3-1)实现。ReadEvents/SeqRange 目前只有 P3-3 的
-// Subscribe 回放消费,接口一次定形避免 P3-3 再动 SessionDeps。
+// session.RunJournalStore(P3-1)实现。ReadEvents/SeqRange 由 P3-3 的 Subscribe
+// 回放消费,接口一次定形避免再动 SessionDeps。
 type EventJournal interface {
 	AppendEvent(rec session.EventRecord) error
 	ReadEvents(afterSeq uint64) ([]session.EventRecord, error)
@@ -59,8 +62,15 @@ type EventJournal interface {
 var _ EventJournal = (*session.RunJournalStore)(nil)
 
 // ErrHubClosed 是 hub 停机后的拒绝 sentinel:Close 之后 Publish/Subscribe
-// (P3-3)一律拒绝——「关掉的事件流不能再产出事件」。
+// 一律拒绝——「关掉的事件流不能再产出事件」。
 var ErrHubClosed = errors.New("session: event hub closed")
+
+// ErrCursorExpired 是订阅游标失效 sentinel(P3-3,总方案第五节「不允许静默
+// 跳过缺失事件」):fromSeq 超前 latest(客户端声称收到了尚未发布的事件,只能
+// 是客户端错误或状态错乱)或 fromSeq+1 落于保留历史 earliest 之前(要的首事件
+// 已被清理;V1 无修剪,仅 hub 重建且历史被截短时可达)——两种失效都明确报错,
+// 绝不静默归零或跳段续播。fromSeq=0 是「从保留最早开始」,不算失效。
+var ErrCursorExpired = errors.New("session: event cursor expired")
 
 // delta 合并窗与订阅者缓冲参数(P3-2 常量):
 //   - deltaFlushInterval/deltaFlushBytes 是总方案第五节「50~100ms 或一定字节
@@ -73,11 +83,14 @@ const (
 	subscriberBuffer   = 256
 )
 
-// hubSub 是一个已注册的订阅者(live 广播直投端)。P3-2 只需要 live 通道与
-// fan-out;watermark(注册点 latest,防 Race B 的回放边界)随 P3-3 的
-// Subscribe 落地时再加。
+// hubSub 是一个已注册的订阅者(live 广播直投端)。watermark 是注册点的
+// latest(P3-3):fan-out 只会投递 seq>watermark 的事件——注册在 hub.mu 内,
+// 晚于注册的 Publish 必然分配到更大的 seq,该不变量时序上天然成立;fanOut
+// 侧的显式 skip 与 pump 的 lastSeq 去重是同一防线的 belt-and-braces(Race B:
+// 回放与实时重复/乱序)。
 type hubSub struct {
-	live chan session.SessionEvent // fan-out 直投(容量 subscriberBuffer,非阻塞)
+	live      chan session.SessionEvent // fan-out 直投(容量 subscriberBuffer,非阻塞)
+	watermark uint64                    // 注册点 latest:live 广播只含 seq>watermark 的事件
 }
 
 // pendingDelta 是 delta 合并缓冲的一个分桶(按 Type,同 run 内同型合并):
@@ -140,6 +153,11 @@ type EventHub struct {
 	flushTimer *time.Timer
 
 	closed bool
+
+	// done 是 hub 停机广播信号(NewEventHub 创建,Close 恰好关闭一次):pump
+	// 阶段一投递 select 借它感知 Close 并退出(阶段二由 Close/fanOut 关闭
+	// sub.live 感知,无需重复信号)。close-only 通道,pump 无锁只读,安全。
+	done chan struct{}
 }
 
 // NewEventHub 创建事件枢纽并播种游标:j 非 nil 时经 SeqRange 读既有保留历史
@@ -153,6 +171,7 @@ func NewEventHub(sessionID string, j EventJournal) *EventHub {
 		subs:      make(map[uint64]*hubSub),
 		journal:   j,
 		deltaBuf:  make(map[string]*pendingDelta),
+		done:      make(chan struct{}),
 	}
 	if j != nil {
 		if earliest, latest, ok := j.SeqRange(); ok {
@@ -284,10 +303,172 @@ func (h *EventHub) EarliestSeq() uint64 {
 	return h.earliest
 }
 
-// Close 停机:置 closed(此后 Publish/Subscribe(P3-3)→ ErrHubClosed)→ 停
-// 窗定时器 → flush 残留合并缓冲 → 断开全部订阅者(delete+close(sub.live),与
-// 慢订阅者断开同一惯用法;P3-3 的 pump range sub.live 由此自然退出)→ 关
-// journal 当前句柄。幂等(重复 Close 返回 nil)。
+// Subscribe 注册一个事件订阅者并返回只读投递通道(P3-3,总方案第五节第 3 条
+// Replay+Live 原子切换):fromSeq=0 从保留最早开始;fromSeq=N 投递 Seq>N 的
+// 事件——先回放 (fromSeq, 注册点 latest] 的持久化历史,再无缝续上此后实时
+// 广播的 >latest 事件。游标失效(超前 / 落于保留历史之前)返回 ErrCursorExpired,
+// hub 已关闭返回 ErrHubClosed,回放读取失败上抛。
+//
+// mu 内一口气完成 ①-③(总方案第五节「订阅注册与确定回放边界组合成一个原子
+// 逻辑操作」= 防 Race A:先查历史再注册、其间事件永久丢失的窗口不存在):
+//
+//	① closed → ErrHubClosed;窗口校验 → ErrCursorExpired;
+//	② replay := journal.ReadEvents(fromSeq)(快照止于注册点 latest,见下);
+//	③ 注册 sub(watermark=latest)+ nextSubID++;
+//	④ 起 pump goroutine,返回只读 chan(容量 subscriberBuffer)。
+//
+// 顺序论证(plan 原文):replay 快照止于注册点 latest;此后 Publish 的事件
+// seq 恒 >latest 且 fan-out 只投 sub.live ⇒ pump 先发完 ≤latest 的 replay 再
+// 转发 >latest 的 live:无缝、无重、无乱序。
+//
+// 并发与锁:①-③ 同一 mu 临界区(上文 Race A);mu 内文件读是 V1 取舍(plan
+// 原文)——ReadEvents 扫 runs/ 会阻塞 Publish 数 ms,正确性优先,P5 优化路径
+// 同 Publish(文件头锁论证);hub.mu→journal 读锁单向(hub.mu → stub 的 j.mu /
+// RunJournalStore 读路径无锁),与 Publish 的 hub.mu → s.mu → j.mu 同向,无锁环。
+// 消费方契约:不再消费必须取消 ctx(断线/关页),否则 pump 在投递上等待至
+// hub Close;通道关闭(pump 退出)即订阅终结,重连以已确认游标重新 Subscribe。
+func (h *EventHub) Subscribe(ctx context.Context, fromSeq uint64) (<-chan session.SessionEvent, error) {
+	h.mu.Lock()
+	// ① 拒绝面:关闭与窗口校验(总方案第五节,ErrCursorExpired 注释)。
+	if h.closed {
+		h.mu.Unlock()
+		return nil, ErrHubClosed
+	}
+	if fromSeq > h.latest || (fromSeq != 0 && fromSeq+1 < h.earliest) {
+		h.mu.Unlock()
+		return nil, ErrCursorExpired
+	}
+
+	// ② 回放快照。快照前先 flush 合并缓冲:pending 窗内的 delta 已实时广播但
+	// 尚未落盘,不 flush 则 ReadEvents 止于更早的 seq,而 watermark=latest 又令
+	// live 侧只投 >latest ——(fromSeq, latest] 会出现两侧都不投的缺口,违背
+	// 「无缝」;flush 后 journal 完整覆盖到 latest,「replay 快照止于注册点
+	// latest」才成立。flush 是 50ms 窗定时路径的同款操作(mu 内、幂等),订阅
+	// 是低频动作,不侵蚀 delta 合并收益。
+	//
+	// journal 物理序 ≠ seq 序:key 事件在发布时逐条落盘,其前后 delta 的合并
+	// 记录在 flush 时才追加,故同段历史里 key 记录可排在合并记录之前。总方案
+	// 第五节要求回放「按 Seq 排序的历史事件」,读出后排序;Seq 全局唯一(每
+	// 事件恰落一条记录,合并记录 Seq=ToSeq),按 Seq 排序即全序。
+	var replay []session.SessionEvent
+	if h.journal != nil {
+		h.flushAllDeltaLocked()
+		recs, err := h.journal.ReadEvents(fromSeq)
+		if err != nil {
+			h.mu.Unlock()
+			return nil, fmt.Errorf("agent: event hub: subscribe %s read events from %d: %w", h.sessionID, fromSeq, err)
+		}
+		replay = make([]session.SessionEvent, 0, len(recs))
+		for _, rec := range recs {
+			// EventRecord → SessionEvent(传输形状):丢 Kind 信封与 FromSeq
+			// 合并声明——合并对传输方不可见,一条合并记录产出一条 Seq=ToSeq
+			// 的 SessionEvent(P3-1 契约),FromSeq 只作范围声明由回放方的
+			// 记账使用。
+			replay = append(replay, session.SessionEvent{
+				SessionID: rec.SessionID,
+				RunID:     rec.RunID,
+				Seq:       rec.Seq,
+				Type:      rec.Type,
+				Time:      rec.Time,
+				Payload:   rec.Payload,
+			})
+		}
+		sort.Slice(replay, func(i, j int) bool { return replay[i].Seq < replay[j].Seq })
+	}
+
+	// ③ 注册订阅:watermark=注册点 latest(防 Race B 的回放/实时边界,见
+	// hubSub 注释)。
+	sub := &hubSub{
+		live:      make(chan session.SessionEvent, subscriberBuffer),
+		watermark: h.latest,
+	}
+	id := h.nextSubID
+	h.nextSubID++
+	h.subs[id] = sub
+
+	// ④ pump:单线程消费两源(排定的 replay 快照 + sub.live),先 ≤watermark
+	// 的 replay 后 >watermark 的 live。ch 容量 subscriberBuffer:replay/live
+	// 投递只阻塞 pump 自身,慢消费不反压 hub(会满的是 fan-out 直投侧,满了
+	// 断开该订阅者;pump 侧由 ctx 感知弃读)。
+	ch := make(chan session.SessionEvent, subscriberBuffer)
+	h.mu.Unlock()
+	go h.pumpEvents(ctx, id, ch, sub, replay)
+	return ch, nil
+}
+
+// pumpEvents 是单订阅者的投递协程(Subscribe ④):阶段一逐条投递 replay 快照,
+// 阶段二转发 live 广播。退出路径全覆盖、不泄漏 goroutine:
+//   - ctx 取消:两阶段的投递 select 都含 <-ctx.Done(),阻塞即醒;
+//   - hub Close:阶段一经 h.done( Close 恰好关闭一次)唤醒——快照投递中途
+//     停机即断开,与 Close「断开全部订阅者」语义一致;阶段二由 Close 关闭
+//     sub.live 感知(range 收到 ok=false);
+//   - 慢订阅者断开:fanOutLocked 关闭 sub.live,同阶段二路径退出。
+//
+// 任一出口都经 defer 做 mu 内 removeSub(断线清理,重复删除是 no-op)与
+// close(ch)(消费方 range 到关闭即知断线,重连从游标补齐)。sub.live 的
+// close 所有权只在 Close/fanOutLocked,pump 不碰。
+//
+// hub 关闭感知的最简实现(plan 征询「关闭信号或轮询 closed」):取关闭信号
+// (h.done)——阻塞投递无法靠轮询及时唤醒,而 done 是 Close 内一行 close 的
+// 既有形态;阶段二无需它,sub.live 关闭已是全部 hub 侧断开(Close/慢订阅者)
+// 的统一信号。
+func (h *EventHub) pumpEvents(ctx context.Context, id uint64, ch chan<- session.SessionEvent, sub *hubSub, replay []session.SessionEvent) {
+	defer close(ch)
+	defer h.removeSub(id)
+
+	// 阶段一:replay 快照,已按 Seq 升序。lastSeq 是「已投递的最大 Seq」哨兵
+	// (Seq 恒 ≥1,0 即「尚未投递」)。
+	var lastSeq uint64
+	for _, ev := range replay {
+		select {
+		case ch <- ev:
+		case <-ctx.Done():
+			return
+		case <-h.done:
+			return
+		}
+		lastSeq = ev.Seq
+	}
+	// 阶段二:live 转发。fan-out 只投 seq>watermark ≥ 快照最大 seq,序天然
+	// 衔接;skip ≤ lastSeq 是 Race B 的 belt-and-braces(真重复在 mu 临界区
+	// 下不可达,到达即纪律)——收到重复 Seq 去重,但不吞真实缺口(缺口处
+	// seq 不重复,原样透传,由消费方游标推进语义显式可见)。
+	for {
+		select {
+		case ev, ok := <-sub.live:
+			if !ok {
+				return
+			}
+			if ev.Seq <= lastSeq {
+				continue
+			}
+			select {
+			case ch <- ev:
+			case <-ctx.Done():
+				return
+			}
+			lastSeq = ev.Seq
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// removeSub 从订阅表摘除一个订阅者(pump 退出路径专用)。Close/fanOutLocked
+// 断开时已各自 delete,此处重复删除是 no-op。不 close(sub.live):close 的
+// 所有权在 Close/fanOutLocked(仅有的两个 close 点);ctx 退出路径的 sub.live
+// 随注册摘除后无人再投递,由 GC 回收。调用方必须不持 h.mu。
+func (h *EventHub) removeSub(id uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.subs, id)
+}
+
+// Close 停机:置 closed(此后 Publish/Subscribe 一律拒绝)→ 广播 done(唤醒
+// 可能阻塞在阶段一 replay 投递上的 pump;阶段二 pump 由下一步的 sub.live 关闭
+// 唤醒)→ 停窗定时器 → flush 残留合并缓冲 → 断开全部订阅者(delete+close
+// (sub.live),与慢订阅者断开同一惯用法;P3-3 的 pump range sub.live 由此自然
+// 退出)→ 关 journal 当前句柄。幂等(重复 Close 返回 nil)。
 //
 // 「关 journal 当前句柄」(plan P3-2 Close 语义):EventJournal 接口无 Close
 // ——P3-1 的 RunJournalStore 自管句柄生命周期(终态 state 记录落盘时 Close+
@@ -300,6 +481,7 @@ func (h *EventHub) Close() error {
 		return nil
 	}
 	h.closed = true
+	close(h.done)
 	h.flushAllDeltaLocked()
 	for id, sub := range h.subs {
 		delete(h.subs, id)
@@ -314,12 +496,17 @@ func (h *EventHub) Close() error {
 	return err
 }
 
-// fanOutLocked 非阻塞广播:对每个订阅者 select 直投,缓冲满即断开(delete+
-// close)。断开语义:该订阅者此后收不到任何事件,其 live 通道关闭(消费方
-// range 到关闭即知断线,重连从游标补齐属 P3-3);不阻塞、不影响他人。
-// 调用方必须持 h.mu。
+// fanOutLocked 非阻塞广播:对每个订阅者先按注册点水位过滤(P3-0 表 Race B 行
+// 「只广播 seq>注册点 latest」——该不变量由 mu 内注册时序天然成立,显式 skip
+// 是 belt-and-braces;watermark=0 的白盒订阅者不受影响,seq 恒 ≥1),再 select
+// 直投,缓冲满即断开(delete+close)。断开语义:该订阅者此后收不到任何事件,
+// 其 live 通道关闭(消费方 range 到关闭即知断线,重连从游标补齐属 P3-3 的
+// Subscribe);不阻塞、不影响他人。调用方必须持 h.mu。
 func (h *EventHub) fanOutLocked(ev session.SessionEvent) {
 	for id, sub := range h.subs {
+		if ev.Seq <= sub.watermark {
+			continue
+		}
 		select {
 		case sub.live <- ev:
 		default:
