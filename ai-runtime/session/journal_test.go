@@ -716,3 +716,107 @@ func TestEventTailRecovery(t *testing.T) {
 		t.Fatalf("file size after read = %d, want %d (ReadEvents 不截断)", info.Size(), len(buf))
 	}
 }
+
+// TestReadEventsFiltersBySessionID 钉死 P5-3 的 SessionID 过滤（勘察修正 I 的
+// 收口）：同一 runs/ 目录混入异 SessionID 的事件记录（历史混存模拟：Archive
+// 同目录换 SessionID，store.go:556）→ ReadEvents 与 SeqRange 均不含它们，本
+// session 记录照常返回——attach 回放不串他 incarnation 的事件。覆盖两种混存
+// 形态：
+//
+//	① 同文件混行：AppendEvent 只按 RunID 寻址、不校验 rec.SessionID，异 id 记录
+//	   可与本 id 记录同文件混行（写入侧无拦截，过滤只在读取侧）；
+//	② 独立异 id run 文件：整文件来自历史 incarnation（读路径文件名不走
+//	   validRunID，TestRestoreInterruptedRun 同款手写先例）。
+func TestReadEventsFiltersBySessionID(t *testing.T) {
+	ctx := context.Background()
+	root := tempDir(t)
+	repo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	s, err := repo.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	sid := s.SessionID()
+	jst := NewRunJournalStore(repo, s)
+
+	foreign := "session_deadbeefdeadbeefdeadbeefdeadbeef" // 历史 incarnation 的异 id（构造期快照之外）
+	run1, run2, foreignRun := "run-1000-1", "run-2000-1", "run-1500-9"
+	at := time.Now()
+
+	// 本 session：run-1 两条、run-2 一条（经 AppendEvent 正常建文件）。
+	mustAppendEvent(t, jst, sid, run1, EventToolCall, 1, 0, at, `{"name":"grep"}`)
+	mustAppendEvent(t, jst, sid, run1, EventTextDelta, 3, 2, at.Add(time.Millisecond), `"he"`)
+	mustAppendEvent(t, jst, sid, run2, EventToolResult, 5, 0, at.Add(3*time.Millisecond), `{"ok":true}`)
+
+	// ① 同文件混行：异 id 记录写进本 session 的 run-1 文件，seq 恰落在本 id 两条
+	// 记录之间（过滤若失效，ReadEvents 序列立即混入 seq 2）。
+	mustAppendEvent(t, jst, foreign, run1, EventTextDelta, 2, 0, at.Add(time.Millisecond), `"f1"`)
+
+	// ② 独立异 id run 文件：文件名序在 run-1 与 run-2 之间，seq 跨在本 id 首末
+	// 之外（4、6；过滤若失效，SeqRange 上界会被拉到 6）。
+	foreignRecs := []EventRecord{
+		{Kind: eventKind, SessionID: foreign, RunID: foreignRun, Type: EventToolResult, Seq: 4, Time: at.Add(2 * time.Millisecond), Payload: json.RawMessage(`{"ok":false}`)},
+		{Kind: eventKind, SessionID: foreign, RunID: foreignRun, Type: EventAssistantMessageFinalized, Seq: 6, Time: at.Add(4 * time.Millisecond), Payload: json.RawMessage(`"f-done"`)},
+	}
+	var fbuf []byte
+	for _, rec := range foreignRecs {
+		line, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatalf("marshal foreign event: %v", err)
+		}
+		fbuf = append(fbuf, line...)
+		fbuf = append(fbuf, '\n')
+	}
+	if err := os.WriteFile(filepath.Join(s.dir, "runs", foreignRun+".jsonl"), fbuf, 0o600); err != nil {
+		t.Fatalf("write %s: %v", foreignRun, err)
+	}
+
+	// ReadEvents(0)：只含本 session 的 [1,3,5]（文件名序拼接，异 id 三条剔除）。
+	got, err := jst.ReadEvents(0)
+	if err != nil {
+		t.Fatalf("ReadEvents(0): %v", err)
+	}
+	if seqs := eventSeqs(got); !uint64sEqual(seqs, []uint64{1, 3, 5}) {
+		t.Fatalf("ReadEvents(0) seqs = %v, want [1 3 5] (异 SessionID 记录被过滤)", seqs)
+	}
+	for i, rec := range got {
+		if rec.SessionID != sid {
+			t.Errorf("record #%d SessionID = %q, want %q (过滤不得漏异 id 记录)", i, rec.SessionID, sid)
+		}
+	}
+
+	// 游标与 SessionID 两道过滤正交：ReadEvents(1) 越过本 id seq 1 与异 id seq 2。
+	if got2, err := jst.ReadEvents(1); err != nil || !uint64sEqual(eventSeqs(got2), []uint64{3, 5}) {
+		t.Fatalf("ReadEvents(1) = %v (err %v), want [3 5]", eventSeqs(got2), err)
+	}
+	// 游标越过本 id 末条后为空——异 id seq 6 不得漏出。
+	if got3, err := jst.ReadEvents(5); err != nil || len(got3) != 0 {
+		t.Fatalf("ReadEvents(5) = %v (err %v), want empty (异 id seq 6 不漏出)", eventSeqs(got3), err)
+	}
+
+	// SeqRange：播种游标与回放同源——(1,5,true)；异 id seq 2/4/6 不参与播种。
+	if e, l, ok := jst.SeqRange(); !ok || e != 1 || l != 5 {
+		t.Fatalf("SeqRange = (%d,%d,%v), want (1,5,true) (异 id seq 不参与播种)", e, l, ok)
+	}
+
+	// 前置自证：混入数据确在磁盘上（剔除是读取侧行为，不是写入失败）——
+	// run-1 文件 3 条事件（2 本 id + 1 异 id 混行）、异 id 文件 2 条全异 id。
+	r1Events, err := loadEventRecords(filepath.Join(s.dir, "runs", run1+".jsonl"))
+	if err != nil {
+		t.Fatalf("loadEventRecords(run-1): %v", err)
+	}
+	if len(r1Events) != 3 || r1Events[2].SessionID != foreign || r1Events[2].Seq != 2 {
+		t.Fatalf("run-1 event records = %+v, want 3 records ending in the foreign seq-2 one", r1Events)
+	}
+	fEvents, err := loadEventRecords(filepath.Join(s.dir, "runs", foreignRun+".jsonl"))
+	if err != nil {
+		t.Fatalf("loadEventRecords(%s): %v", foreignRun, err)
+	}
+	if len(fEvents) != 2 || fEvents[0].SessionID != foreign || fEvents[1].SessionID != foreign {
+		t.Fatalf("foreign file records = %+v, want 2 records of %q", fEvents, foreign)
+	}
+}

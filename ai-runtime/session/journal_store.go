@@ -157,21 +157,30 @@ func (s *RunJournalStore) AppendEvent(rec EventRecord) error {
 }
 
 // ReadEvents 回放读取（P3-1，总方案第五节）：扫 <dir>/runs/*.jsonl 按文件名序
-// 拼接全部事件记录（kind=="event" 且 Seq>afterSeq）。文件名序 = 创建序 = nano
+// 拼接全部事件记录（kind=="event" 且 rec.SessionID==s.sessionID 且 Seq>afterSeq）。
+// 文件名序 = 创建序 = nano
 // 序（run-<unixnano>-<seq> 的 nano 定宽至 2262 年，run.go:121-123），跨文件
 // Seq 区间单调不重叠（P3-0 契约表：gate 串行 ⇒ 后启动 run 的 seq 区间整体大于
 // 先前的），拼接即全局有序——本不变量由 TestEventRecordsCrossFileRoundTrip 钉死。
 //
 // 坏行跳过（loadEventRecords，与 loadStateRecords 同策略）：并发追加下读方容忍
 // 半行（写方单 Write 整行，store.go:686 同款）；不做尾截断（MarkInterruptedRuns
-// 的职责）。不按 SessionID 过滤（勘察修正 I：Archive 换 id 后 runs/ 的归属歧义
-// V1 不处理，P5 清单）。
+// 的职责）。SessionID 过滤（P5-3 起按构造期快照的 sessionID 过滤，勘察修正 I 的
+// 收口）：s.sessionID 是 repo 实例唯一缓存的挂载键（类型注释），比对在 visit
+// 回调（消费侧）完成而非扫描侧——walkEventRecords 对两类调用方共用且零过滤
+// 逻辑，loadEventRecords 的坏行跳过语义不变。对历史上已存在的混存文件（Archive
+// 同目录换 SessionID，store.go:556），attach 回放不再含他 incarnation 段；现网
+// 数据流无同目录多 incarnation（/new 一律 Create 新目录，legacy 根槽仅首轮
+// 挂载），本过滤对既有用户可见面=零（TestReadEventsFiltersBySessionID 钉死）。
 //
 // 只读扫描不持 s.mu：读不到 handles map；与追加并存的正确性由坏行跳过语义保证
 // （见上），与 P2-2「Append 串行、读方容忍」的取舍一致。
 func (s *RunJournalStore) ReadEvents(afterSeq uint64) ([]EventRecord, error) {
 	var out []EventRecord
 	if err := s.walkEventRecords(func(rec EventRecord) {
+		if rec.SessionID != s.sessionID {
+			return // 他 incarnation 段（P5-3：过滤在消费侧，扫描侧零逻辑）
+		}
 		if rec.Seq > afterSeq {
 			out = append(out, rec)
 		}
@@ -183,6 +192,9 @@ func (s *RunJournalStore) ReadEvents(afterSeq uint64) ([]EventRecord, error) {
 
 // SeqRange 单遍扫描 runs/ 全部事件记录取 (min Seq, max Seq)，hub 构造播种用
 // （P3-2：EventHub 以 latest 恢复 seq 分配、以 earliest 做游标窗口校验）。
+// SessionID 过滤与 ReadEvents 同源（P5-3：播种游标与回放同源，构造期快照的
+// sessionID，比对在 visit 回调消费侧完成，见 ReadEvents 注释）——混存文件中
+// 他 incarnation 的 seq 不参与播种，否则游标窗口会被异 id 区间拉宽。
 // 空 runs/ 或无任何事件记录 → ok=false。扫描 I/O 错误（runs/ 存在但不可读等）
 // 同样返回 ok=false 并 warn——本签名无 error 出参（agent 侧 EventJournal 接口
 // 形状，P3-2 定稿），播种方拿到 false 以「从零开始」处理，真实 I/O 故障会在
@@ -190,6 +202,9 @@ func (s *RunJournalStore) ReadEvents(afterSeq uint64) ([]EventRecord, error) {
 func (s *RunJournalStore) SeqRange() (earliest, latest uint64, ok bool) {
 	first := true
 	err := s.walkEventRecords(func(rec EventRecord) {
+		if rec.SessionID != s.sessionID {
+			return // 他 incarnation 段（P5-3：过滤在消费侧，扫描侧零逻辑）
+		}
 		if first {
 			earliest, latest = rec.Seq, rec.Seq
 			first = false
