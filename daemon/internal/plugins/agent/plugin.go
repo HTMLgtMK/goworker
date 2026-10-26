@@ -448,9 +448,19 @@ func (p *AgentPlugin) startSession() {
 	// st 非 nil 时注入 *session.RunJournalStore（按 runID 委派 repo.OpenRunJournal，
 	// 句柄随 run 终态关闭）；纯内存（st == nil）不设，与 deps.Store 的 typed-nil
 	// 纪律一致。编译期断言在 runjournal_wiring_test.go。
+	//
+	// P5-4 起 RunEvents 与 RunJournal 注入同一个 *session.RunJournalStore 实例
+	//（P3-1 起该类型同时实现 AppendState/AppendEvent/ReadEvents/SeqRange，编译断言
+	// event_hub.go:62）——事件持久化与 run 状态 journal 同文件同源。typed-nil 纪律
+	// 同 spec.go:96：st == nil 不设，RunEvents 的「nil = 不启用事件流」判断保持真
+	// nil。零行为：bindEvents 仅 StartRun 触发（supervisor.go:147），daemon 现无
+	// StartRun 调用方；同步 RecordRun 路径不建 hub、不写事件（P5-6/7 起
+	// x-goworker 路径改变）。
 	if st != nil {
 		p.deps.Store = st
-		p.deps.RunJournal = session.NewRunJournalStore(p.repo, st)
+		journalStore := session.NewRunJournalStore(p.repo, st)
+		p.deps.RunJournal = journalStore
+		p.deps.RunEvents = journalStore
 	}
 	// 指令快照与记忆组件同开关：memory disabled 时留 nil，buildSystemPrompt 跳过指令段。
 	// 会话边界（Init / /new）经 startSession 重载 —— system prompt 在会话创建前就绪。

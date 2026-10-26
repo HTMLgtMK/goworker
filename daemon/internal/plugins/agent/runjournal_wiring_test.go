@@ -177,6 +177,21 @@ func TestAgentRunJournalsThroughDaemon(t *testing.T) {
 	}
 	p.refreshSession()
 
+	// P5-4 断言：持久化启用变体下 deps.RunEvents 非 nil，且与 deps.RunJournal 是
+	// 同一个 *session.RunJournalStore 实例（事件持久化与 run 状态 journal 同源，
+	// startSession 的 st != nil 分支组装，plugin.go）。
+	jr, ok := p.deps.RunJournal.(*session.RunJournalStore)
+	if !ok {
+		t.Fatalf("deps.RunJournal type = %T, want *session.RunJournalStore", p.deps.RunJournal)
+	}
+	ev, ok := p.deps.RunEvents.(*session.RunJournalStore)
+	if !ok {
+		t.Fatalf("deps.RunEvents type = %T, want *session.RunJournalStore", p.deps.RunEvents)
+	}
+	if jr != ev {
+		t.Fatalf("deps.RunEvents and deps.RunJournal must be the same *session.RunJournalStore instance")
+	}
+
 	ctx, _ := newContext("hello")
 	if err := p.handleAgent(ctx); err != nil {
 		t.Fatalf("handleAgent: %v", err)
@@ -230,6 +245,12 @@ func TestAgentRunJournalsThroughDaemon_SessionDisabled(t *testing.T) {
 		return fixedProvider{content: "ok"}, nil
 	}
 	p.refreshSession()
+
+	// P5-4 断言：纯内存变体（st == nil）不设 RunEvents——typed-nil 纪律同
+	// spec.go:96，「nil = 不启用事件流」判断必须保持真 nil。
+	if p.deps.RunEvents != nil {
+		t.Fatalf("deps.RunEvents = %T, want nil when session persistence disabled", p.deps.RunEvents)
+	}
 
 	ctx, _ := newContext("hello")
 	if err := p.handleAgent(ctx); err != nil {
