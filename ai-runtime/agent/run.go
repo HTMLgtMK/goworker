@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,10 @@ type AgentRun struct {
 	startedAt time.Time
 	done      chan struct{}
 	result    RunResult
+	// cancel 是后台 Run 的取消函数(mu 保护):P2-5 的 execute 在派生 runCtx
+	// 后写入,CancelRun(P2-6)经 cancelFunc() 读取并调用。RecordRun 同步路径
+	// 恒 nil——同步 Run 的取消入口是调用方请求 ctx,不经 run 记账。
+	cancel context.CancelFunc
 }
 
 // newAgentRun 创建一条运行记录:初始态 RunQueued,done 未关闭。
@@ -86,6 +91,14 @@ func (run *AgentRun) snapshot() RunResult {
 	res := run.result
 	res.State = run.state
 	return res
+}
+
+// cancelFunc 返回运行取消函数;未设置(RecordRun 同步路径)返回 nil。
+// 一次写入(execute 派生 runCtx 后)多个读者,读写都在 run.mu 内。
+func (run *AgentRun) cancelFunc() context.CancelFunc {
+	run.mu.RLock()
+	defer run.mu.RUnlock()
+	return run.cancel
 }
 
 // finish 记录最终结果并推进到终态。result 必须先于 done 关闭写入(与 transition

@@ -9,16 +9,36 @@ import (
 )
 
 // 本文件是多会话执行内核的注册表:SessionManager 按 SessionID 管理
-// SessionRuntime,并持有宿主生命周期 ctx(P2-4)——StartRun(P2-5)的 runCtx
-// 以它为父,Close = 取消宿主 ctx + 等待在途 Run 终态 + 拒绝后续 Register。
-// 全局并发配额(runSlots)仍属 P2「有界全局并发调度」(P2-5),本结构预留。
+// SessionRuntime,并持有宿主生命周期 ctx(P2-4)与全局并发配额(P2-5 的
+// runSlots/pending)——StartRun(P2-5,supervisor.go)的 runCtx 以宿主 ctx 为父,
+// Close = 取消宿主 ctx + 等待在途 Run 终态 + 拒绝后续 Register。
 
 // ErrManagerClosed 是 manager 停机后的注册拒绝 sentinel:Close 之后不再接受
 // 新 runtime(同步 Register 与 P2-5 的 StartRun 共用同一拒绝语义)。
 var ErrManagerClosed = errors.New("session: manager closed")
 
+// StartRun(P2-5)与其余 Run 记账面的拒绝语义 sentinel。ErrRunNotFound/
+// ErrRunNotCancellable 的产生方是 CancelRun(P2-6),随本步一并定义以保持
+// sentinel 面完整(未使用不报错,由 P2-6 接线)。
+var (
+	ErrSessionNotFound   = errors.New("session: session not found")
+	ErrRunActive         = errors.New("session: run already active")
+	ErrTooManyPending    = errors.New("session: too many pending runs")
+	ErrSessionNotBound   = errors.New("session: session not bound")
+	ErrRunNotFound       = errors.New("session: run not found")
+	ErrRunNotCancellable = errors.New("session: run not cancellable")
+)
+
+// 全局并发默认配额(总方案第四节建议值):WithRunLimits 对 <=0 回落此处,
+// P2-7 接 SessionConfig 时 0 值配置由此双保险。
+const (
+	defaultMaxConcurrentRuns = 4
+	defaultMaxPendingRuns    = 16
+)
+
 // SessionManager 是 SessionRuntime 的进程内注册表:一个 SessionID 至多一个
-// runtime,互斥执行权由各 runtime 自持的 gate 保证,manager 不参与排队。
+// runtime,互斥执行权由各 runtime 自持的 gate 保证;全局并发配额(P2-5)由
+// runSlots/pending 两级 channel 承担,manager 不参与会话内排队。
 type SessionManager struct {
 	mu       sync.RWMutex
 	runtimes map[string]*SessionRuntime
@@ -29,17 +49,51 @@ type SessionManager struct {
 	cancel context.CancelFunc
 	// closed 标记 Close 已发生,只在 mu 内读写。
 	closed bool
+	// runSlots 是全局并发槽(P2-5 两级调度的外层):容量 = 最大同时在跑的后台
+	// Run 数(每会话 gate 之上再限全局总量)。pending 是排队计数令牌(非锁):
+	// 容量 = 最大排队数;StartRun 同步段非阻塞预留(满即拒 ErrTooManyPending),
+	// execute 进入运行前(③)或失败出口归还。通道获取次序固定 gate → runSlots、
+	// 释放逆序(supervisor.go 的锁次序论证),两把「锁」全序无环。
+	runSlots chan struct{}
+	pending  chan struct{}
 }
 
-// NewSessionManager 创建空注册表,并内建宿主生命周期 ctx。签名保持无参:
-// 调用点(daemon plugin 等)零改动,runSlots/配额选项在 P2-5 变参化时接入。
-func NewSessionManager() *SessionManager {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &SessionManager{
-		runtimes: make(map[string]*SessionRuntime),
-		ctx:      ctx,
-		cancel:   cancel,
+// ManagerOption 是 NewSessionManager 的配置选项。
+type ManagerOption func(*SessionManager)
+
+// WithRunLimits 设置全局并发槽与排队上限:超限的后台 Run 在 pending 排队,
+// 排队也满时 StartRun 拒绝(ErrTooManyPending)。任一参数 <=0 回落默认
+// (defaultMaxConcurrentRuns/defaultMaxPendingRuns)——P2-7 接 config 时的
+// 0 值双保险,不依赖 yaml 载入路径。
+func WithRunLimits(maxConcurrent, maxPending int) ManagerOption {
+	return func(m *SessionManager) {
+		if maxConcurrent <= 0 {
+			maxConcurrent = defaultMaxConcurrentRuns
+		}
+		if maxPending <= 0 {
+			maxPending = defaultMaxPendingRuns
+		}
+		m.runSlots = make(chan struct{}, maxConcurrent)
+		m.pending = make(chan struct{}, maxPending)
 	}
+}
+
+// NewSessionManager 创建空注册表,并内建宿主生命周期 ctx 与默认全局配额。
+// 变参化(P2-5):不传选项时行为与旧无参签名完全一致,现有调用点(daemon
+// plugin 等)零改动;配额经 WithRunLimits 覆盖。
+func NewSessionManager(opts ...ManagerOption) *SessionManager {
+	m := &SessionManager{
+		runtimes: make(map[string]*SessionRuntime),
+		runSlots: make(chan struct{}, defaultMaxConcurrentRuns),
+		pending:  make(chan struct{}, defaultMaxPendingRuns),
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(m)
+		}
+	}
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+	return m
 }
 
 // Register 注册 runtime;同 ID 冲突报错(一个会话至多一个 runtime)。manager

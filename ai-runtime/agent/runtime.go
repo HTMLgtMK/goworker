@@ -119,14 +119,65 @@ func journalRunState(s *Session, rec session.RunStateRecord) {
 	}
 }
 
+// finalizeRun 是 RecordRun(同步路径)与 StartRun/execute(P2-5 后台路径)共享
+// 的终态化路径:终态归一防御 → journal 终态记录(durable-first)→ run.finish
+// (关闭 done 唤醒等待者)→ 清 active(仅当仍为本 run,防御不覆盖后续记账)。
+// 返回归一后的结果供调用方继续使用(RecordRun 的返回值即它)。次序即不变量:
+// journal 落盘先于 done 关闭——等待者被唤醒时终态已持久(总方案第九节);
+// journalRunState 在 rt.mu 外调用(P2-3:锁内不做文件 I/O)。
+//
+// 终态归一(P2-1 防御分支原样移自 RecordRun,主映射在 Session.Run,与 execute
+// 层归一(supervisor.go)三层互补):res.Err 非 nil 时按 ctx 语义分流——取消/
+// 超时记 RunCancelled,其余记 RunFailed;无错误但状态非终态时按完成记账,避免
+// active 永悬。RecordRun 在调用前把 fn 的 call-layer error 并入 res.Err(见
+// RecordRun),使两条路径经同一分支归一。
+func finalizeRun(r *SessionRuntime, run *AgentRun, res RunResult) RunResult {
+	switch {
+	case res.Err != nil:
+		state := RunFailed
+		if errors.Is(res.Err, context.Canceled) || errors.Is(res.Err, context.DeadlineExceeded) {
+			state = RunCancelled
+		}
+		res = RunResult{State: state, Err: res.Err, Persisted: res.Persisted}
+	case res.State != RunCompleted && res.State != RunFailed && res.State != RunCancelled:
+		res.State = RunCompleted
+	}
+
+	termErr := ""
+	if res.Err != nil {
+		termErr = res.Err.Error()
+	}
+	// 会话指针在 rt.mu 内快照(锁内不做 I/O):execute 失败出口未持 gate,不能
+	// 像 RecordRun 那样依赖「调用方已持 gate」直读 r.session。
+	r.mu.Lock()
+	sess := r.session
+	r.mu.Unlock()
+	journalRunState(sess, session.RunStateRecord{
+		Kind:      "state",
+		SessionID: run.SessionID,
+		RunID:     run.ID,
+		State:     string(res.State),
+		Err:       termErr, // nil 时留空,omitted 由 json tag 兜底(journal.go:42)
+		Persisted: res.Persisted,
+		At:        time.Now(),
+	})
+
+	run.finish(res)
+	r.mu.Lock()
+	if r.active == run { // 防御:不覆盖后续记账(当前 gate 独占下不会发生)
+		r.active = nil
+	}
+	r.mu.Unlock()
+	return res
+}
+
 // RecordRun 在「调用方已持 gate」的前提下执行一轮会话并记账——withSession 的
 // 临界区是唯一预期调用点,这里绝不再 AcquireRun(二次排队即死锁)。流程:创建
-// AgentRun 存入 r.active → 执行 fn → 按 result/ctx 终态化 → 清 r.active → 返回结果。
-// 终态映射:fn 返回的 RunResult 已带终态则原样记账;调用层 error(fn 未归类的
-// 失败)按 ctx 语义分流——取消/超时记 RunCancelled,其余记 RunFailed。
+// AgentRun 存入 r.active → 执行 fn → finalizeRun 终态化(归一+journal 终态+
+// finish+清 active)→ 返回归一后结果。
 //
-// 这是 P0 阶段 daemon 同步调用形态的适配;「独占 + 记账 + 宿主 ctx」合一的完整
-// 形态(StartRun)由 P2 的 RunSupervisor 提供。
+// 这是 P0 阶段 daemon 同步调用形态的适配;后台形态(StartRun)由 P2-5 的
+// RunSupervisor 提供,二者经 finalizeRun 共享终态化。
 func (r *SessionRuntime) RecordRun(fn func(*Session) (RunResult, error)) RunResult {
 	// SessionID 暂以 runtime id 充当("current");store 的稳定 SessionID 在 P1-3 接线。
 	run := newAgentRun(newRunID(), r.ID)
@@ -147,44 +198,11 @@ func (r *SessionRuntime) RecordRun(fn func(*Session) (RunResult, error)) RunResu
 	})
 
 	res, err := fn(r.session)
-	switch {
-	case err != nil:
-		// call-layer 映射保留为冗余防御(P2-1):主映射已前移至 Session.Run
-		// (session.go 的 agent.Run 失败分支)。这里兜底 fn 返回 error 而非带终态
-		// RunResult 的调用层错误(现状恒 nil),同样按 ctx 语义分流。
-		state := RunFailed
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			state = RunCancelled
-		}
-		res = RunResult{State: state, Err: err, Persisted: res.Persisted}
-	case res.State != RunCompleted && res.State != RunFailed && res.State != RunCancelled:
-		// 防御:fn 返回非终态且无错误时按完成记账,避免 active 永悬。
-		res.State = RunCompleted
+	if err != nil {
+		// call-layer 错误并入 res 后交 finalizeRun 归一(原 switch 的 err 分支
+		// 语义保留:err 驱动状态映射,仅保留 res.Persisted)。Session.Run 恒以
+		// 第二返回值 nil、错误在 RunResult.Err 内返回,此合并只兜底非常规 fn。
+		res = RunResult{Err: err, Persisted: res.Persisted}
 	}
-
-	// ② 终态记录:写在 run.finish 之前——次序即不变量:fn(s.Run)返回时 Conversation
-	// Commit 已定(session.go:181-217),此处 completed 只会出现在 Commit 成功之后
-	// (总方案第九节「Conversation Commit 失败不能记录 RunCompleted」由既有结构天然
-	// 满足,run_journal_test.go 钉死);且 done 关闭前落盘,等待者被唤醒时终态已持久。
-	termErr := ""
-	if res.Err != nil {
-		termErr = res.Err.Error()
-	}
-	journalRunState(r.session, session.RunStateRecord{
-		Kind:      "state",
-		SessionID: run.SessionID,
-		RunID:     run.ID,
-		State:     string(res.State),
-		Err:       termErr, // nil 时留空,omitted 由 json tag 兜底(journal.go:42)
-		Persisted: res.Persisted,
-		At:        time.Now(),
-	})
-
-	run.finish(res)
-	r.mu.Lock()
-	if r.active == run { // 防御:不覆盖后续记账(当前 gate 独占下不会发生)
-		r.active = nil
-	}
-	r.mu.Unlock()
-	return res
+	return finalizeRun(r, run, res)
 }
