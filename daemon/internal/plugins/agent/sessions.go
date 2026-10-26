@@ -99,11 +99,18 @@ func (p *AgentPlugin) SessionModes() *model.SessionModeState {
 	}
 }
 
-// currentSessionCwd 返回最近一次有效声明的会话 cwd（锁内快照，未声明为空）。
+// currentSessionCwd 返回当前会话最近一次有效声明的 cwd（P1-4 起声明随 current
+// runtime 走：无效标记下 cwd 恒空、无活动 runtime 或未声明返回空）。
 func (p *AgentPlugin) currentSessionCwd() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.sessionCwd
+	rt := p.currentSession()
+	if rt == nil {
+		return ""
+	}
+	cwd, err := rt.DeclaredCWD()
+	if err != nil {
+		return "" // 无效标记：DeclareCWD 已保证 cwd 清空，这里防御性兜底
+	}
+	return cwd
 }
 
 // CurrentSessionID returns the stable logical identity, not the mutable head.

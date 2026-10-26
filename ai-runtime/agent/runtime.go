@@ -21,6 +21,14 @@ type SessionRuntime struct {
 	session *Session
 	gate    chan struct{}
 	active  *AgentRun
+	// cwd/cwdErr 是本 runtime 的会话工作目录声明(P1-4 状态绑定收口):cwd 为
+	// 最近一次有效声明的绝对路径(空 = 未声明,工具回退 cfg.AllowedWorkDir),
+	// cwdErr 为最近一次声明的校验错误(非 nil 即无效标记,且 cwd 恒空——宿主
+	// DeclareCWD 时保证)。每 runtime 一份,随会话走;/new 的会话边界上由宿主
+	// 从旧 runtime 显式迁移有效声明(startSession),Register 与 NewSessionRuntime
+	// 一律零值起步——新会话无声明,不继承任何旧值。
+	cwd    string
+	cwdErr error
 }
 
 // NewSessionRuntime 创建运行时。s 允许 nil,由 BindSession 后置绑定。
@@ -64,6 +72,31 @@ func (r *SessionRuntime) Active() *AgentRun {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.active
+}
+
+// DeclaredCWD 返回本 runtime 的会话 cwd 声明快照(cwd, err):err 非 nil = 最近
+// 一次声明未通过宿主校验(无效标记,此时 cwd 恒空);err == nil 且 cwd == "" =
+// 未声明。声明是 runtime 级状态(P1-4):/usage 式的清单回显与 prompt 门都按
+// current runtime 解析,会话边界(/new)上由宿主负责迁移与作废。
+func (r *SessionRuntime) DeclaredCWD() (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cwd, r.cwdErr
+}
+
+// DeclareCWD 记录本 runtime 的会话 cwd 声明(宿主校验后调用):有效声明(err ==
+// nil)携带 cwd(空 = 未声明重置);无效声明(err != nil)强制清空 cwd——无效
+// 标记与有效声明互斥,读侧只需判 err 即可知道 cwd 是否可信。复用 runtime.mu,
+// 与 Session()/Active() 同一把锁。导出:声明落点是宿主(daemon plugin)的
+// SetSession/startSession,跨包不可用小写(Plan 文本写 declareCWD,编译器指路
+// 后按包边界导出为 DeclareCWD)。
+func (r *SessionRuntime) DeclareCWD(cwd string, err error) {
+	if err != nil {
+		cwd = ""
+	}
+	r.mu.Lock()
+	r.cwd, r.cwdErr = cwd, err
+	r.mu.Unlock()
 }
 
 // RecordRun 在「调用方已持 gate」的前提下执行一轮会话并记账——withSession 的

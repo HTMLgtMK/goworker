@@ -68,17 +68,15 @@ type AgentPlugin struct {
 	mcpTools   []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
 	memory     *memory.Client        // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
 
-	// 会话工作目录状态（mu 保护）。ACP 提交方经 session/new|load 声明的 cwd 经
-	// sandbox 边界校验后落到这里并应用到当前会话；非法声明只记 cwdErr（无效标记），
-	// session/prompt 时明确报错，绝不静默生效或回落旧值。
+	// mu 只保护 activeTransportSession:ACP 提交方经 session/new|load 声明的会话
+	// cwd 已随 P1-4 状态绑定收口下沉到当前 runtime(SessionRuntime.cwd/cwdErr,
+	// 每会话一份、经 currentSession() 解析),插件不再持有跨会话的 cwd 单值。
 	mu          sync.Mutex
 	allowRuleMu sync.Mutex
-	sessionCwd  string // 最近一次有效声明的会话 cwd（绝对路径；空 = 未声明）
-	cwdErr      error  // 最近一次声明的校验错误（nil = 无声明或已通过）
-	// activeTransportSession 是最近一次有效声明的 transport 会话 id（连接方自造
-	// 的 UUID，与 store 的稳定 id 不同源）。空 = 尚无 ACP 会话声明。单活动会话
-	// 模型下它是「谁拥有 daemon 当前活动状态」的记号：FrontendHandler.Prompt 据此
-	// 拒绝已被其他连接顶掉的旧会话，而不是让 prompt 静默串到新声明的工作区里跑。
+	// activeTransportSession 是最近一次有效声明的 transport 会话 id(连接方自造
+	// 的 UUID,与 store 的稳定 id 不同源)。空 = 尚无 ACP 会话声明。单活动会话
+	// 模式下它是「谁拥有 daemon 当前活动状态」的记号:FrontendHandler.Prompt 据此
+	// 拒绝已被其他连接顶掉的旧会话,而不是让 prompt 静默串到新声明的工作区里跑。
 	activeTransportSession string
 }
 
@@ -435,23 +433,28 @@ func (p *AgentPlugin) startSession() {
 		id = st.SessionID()
 	}
 	rt := runtimeagent.NewSessionRuntime(id, s)
+
+	// 会话重建 = 新的会话边界。cwd 声明走 runtime 级迁移（P1-4）：旧 current
+	// runtime 的有效声明迁移到新 runtime 并应用到新会话 —— 工作区没变，/new 不该
+	// 让工具悄悄回退到别的目录；无效声明作废（新 runtime 零值起步，cwdErr 不随
+	// 边界存活），否则会毒化新会话的每个 prompt。Register/NewSessionRuntime 不
+	// 继承声明，迁移只能在这里显式做。取舍不变：不追踪「声明了 cwd 的 transport
+	// 会话与 store 会话的对应关系」，单活动会话模型下一律落当前会话。
+	// activeTransportSession 有意不清：/new 只是 REPL 内换掉运行时会话对象，
+	// transport 会话的声明（连同其活动身份）依旧成立，prompt 它不算 superseded。
+	var carriedCwd string
+	if old := p.currentSession(); old != nil { // Init 首边界无旧 runtime,即无声明可迁
+		if cwd, err := old.DeclaredCWD(); err == nil {
+			carriedCwd = cwd
+			rt.DeclareCWD(cwd, nil)
+		}
+	}
 	if err := p.manager.Register(rt); err != nil {
 		slog.Debug("session: keep previous runtime registered", "id", rt.ID, "err", err)
 	}
 	p.current.Store(rt)
-
-	// 会话重建 = 新的会话边界。无效 cwd 标记随旧会话作废（否则会毒化新会话的
-	// 每个 prompt）；有效声明跨会话保留并应用到新会话 —— 工作区没变，/new 不该
-	// 让工具悄悄回退到别的目录。取舍：不追踪「声明了 cwd 的 transport 会话与
-	// store 会话的对应关系」，单活动会话模型下一律落当前会话。
-	// activeTransportSession 有意不清：/new 只是 REPL 内换掉运行时会话对象，
-	// transport 会话的声明（连同其活动身份）依旧成立，prompt 它不算 superseded。
-	p.mu.Lock()
-	p.cwdErr = nil
-	cwd := p.sessionCwd
-	p.mu.Unlock()
 	// s 即刚注册进 current runtime 的会话本体（等价 p.currentSession().Session()）。
-	s.SetCWD(cwd)
+	s.SetCWD(carriedCwd)
 }
 
 // openSessionStore 在仓库里解析本会话边界的 store（P1-3 startSession ②）。
@@ -495,9 +498,9 @@ func (p *AgentPlugin) openSessionStore(firstCycle bool) *session.Store {
 //
 // sandbox 边界在插件侧校验：cfg.Sandbox.AllowedWorkDir 非空时，声明的 cwd 必须
 // 落在它之下（Abs + EvalSymlinks 解析后判断前缀，符号链接与相对路径钉到真实
-// 位置）；非法声明存为无效标记，session/prompt 时返回明确错误，不让越界目录
-// 静默生效。AllowedWorkDir 为空 = 不限制，接受任意 cwd；cwd 为空 = 未声明，
-// 清空会话目录回退现行为。
+// 位置）；非法声明存为无效标记（P1-4 起落 current runtime 的 cwdErr，cwd 随之
+// 清空），session/prompt 时返回明确错误，不让越界目录静默生效。AllowedWorkDir
+// 为空 = 不限制，接受任意 cwd；cwd 为空 = 未声明，清空会话目录回退现行为。
 func (p *AgentPlugin) SetSession(sessionID, cwd string) {
 	cwd = strings.TrimSpace(cwd)
 	if cwd != "" {
@@ -505,24 +508,34 @@ func (p *AgentPlugin) SetSession(sessionID, cwd string) {
 			cwd = abs // cmd.Dir 要求绝对路径；SessionInfo.Cwd 也回显规范化值
 		}
 	}
+	// 声明与应用取同一 current 快照：P1-4 起声明落 runtime（SessionRuntime.cwd/
+	// cwdErr），会话本体绑定其上——分开解析可能在 /new 换轨瞬间把声明与应用
+	// 劈到两个 runtime。
+	rt := p.currentSession()
 	if err := p.validateSessionCWD(cwd); err != nil {
-		p.mu.Lock()
-		p.sessionCwd, p.cwdErr = "", err
-		p.mu.Unlock()
+		// 无效标记落 current runtime（cwd 清空 + err 记账）。无 runtime（Init 未
+		// 跑完/失败回滚）时无处落声明，直接丢弃——该窗口内 prompt 本就被
+		// withSession 的「no active session」挡住，标记没有可守之门。
+		if rt != nil {
+			rt.DeclareCWD("", err)
+		}
 		slog.Warn("agent: reject session cwd", "session", sessionID, "cwd", cwd, "err", err)
 		return
 	}
 	p.mu.Lock()
-	p.sessionCwd, p.cwdErr = cwd, nil
 	// 有效声明（含空 cwd 的「未声明」重置）才转移活动会话标记。取舍：无效声明
 	// 不能顶掉别连接的好会话——B 连接的坏 session/new 若同时转移 active，A 的
 	// 好会话会被顶成 superseded 而无法 prompt；保持不动则与 prompt 侧的 cwdErr
 	// 防线一致（B 的 prompt 本来就会被拒）。
 	p.activeTransportSession = sessionID
 	p.mu.Unlock()
-	// 无活动会话（Init 未跑完/失败回滚）时跳过应用：声明已落 sessionCwd，
-	// startSession 的 cwd 重放会在会话创建时补上。
-	if s := p.boundSession(); s != nil {
+	// 无活动 runtime（Init 未跑完/失败回滚）时声明无处落、会话不存在，无事可做：
+	// 正常路径上首个 runtime 在 Init 创建，任何 ACP 声明都晚于它。
+	if rt == nil {
+		return
+	}
+	rt.DeclareCWD(cwd, nil)
+	if s := rt.Session(); s != nil {
 		s.SetCWD(cwd)
 	}
 }
@@ -565,12 +578,16 @@ func (p *AgentPlugin) validateSessionCWD(cwd string) error {
 	return nil
 }
 
-// sessionCWDError 返回最近一次会话 cwd 声明的校验错误（无声明或已通过 = nil）。
-// session/prompt 入口（handleAgent）先查它：无效声明下不执行任何工具。
+// sessionCWDError 返回当前会话 runtime 最近一次 cwd 声明的校验错误（无活动
+// runtime、无声明或已通过 = nil）。session/prompt 入口（handleAgent）先查它：
+// 无效声明下不执行任何工具。P1-4 起声明随 current runtime 走——/new 后无效
+// 标记随旧 runtime 作废，不会毒化新会话。
 func (p *AgentPlugin) sessionCWDError() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.cwdErr
+	if rt := p.currentSession(); rt != nil {
+		_, err := rt.DeclaredCWD()
+		return err
+	}
+	return nil
 }
 
 /**
