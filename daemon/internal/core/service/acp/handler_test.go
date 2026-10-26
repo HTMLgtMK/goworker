@@ -394,54 +394,141 @@ func decodeCaps(t *testing.T, raw string) protocol.ClientCapabilities {
 	return caps
 }
 
-// TestPromptInjectsDeviceToolSourceWhenCapable：对端声明 x-device 且提供 Call
-// 通道时，Prompt 注入惰性工具源；调用即 probe，工具带 sys_ 前缀。
-func TestPromptInjectsDeviceToolSourceWhenCapable(t *testing.T) {
-	reporter := &capsReporter{caps: decodeCaps(t, `{"x-device": {"tools": true}}`)}
-	var (
-		mu      sync.Mutex
-		toolSrc func(context.Context) []core.Tool
-	)
-	handler := &FrontendHandler{
-		evaluate: func(ctx *model.Context, _ string) error {
-			mu.Lock()
-			toolSrc = ctx.ToolSource
-			mu.Unlock()
-			return nil
-		},
-		gate: NewSessionGate(),
-	}
-	if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	if _, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
-		t.Fatalf("Prompt: %v", err)
-	}
-
-	mu.Lock()
-	ts := toolSrc
-	mu.Unlock()
-	if ts == nil {
-		t.Fatal("Prompt did not inject ToolSource for x-device capable reporter")
-	}
-	tools := ts(context.Background())
-	if len(tools) != 1 {
-		t.Fatalf("tool source returned %d tools, want 1", len(tools))
-	}
-	if tools[0].Name != "sys_vibrate" {
-		t.Fatalf("tool name = %q, want sys_vibrate", tools[0].Name)
-	}
+// binderSessionSource 在 fakeSessionSource 之上实现 model.ClientToolBinder
+// （P5-9）：记录 handler 转发来的 connectionID 与 caller，工具源由测试注入。
+// 真实 binder（AgentPlugin）的编排面在 plugins/agent 的集成测试；此处钉
+// handler 的接线契约：能力门控在前 → binder 优先 → type-assert 失败回落 relay。
+type binderSessionSource struct {
+	fakeSessionSource
+	mu       sync.Mutex
+	lastConn string
+	lastCall model.DeviceCaller
+	source   func(context.Context) []core.Tool
 }
 
-// TestPromptOmitsDeviceToolSourceWithoutCapability：能力门控的两个否定分支 ——
-// caps 不含 x-device，或 reporter 没有反向 Call 通道，都必须零注入、零往返。
+func (b *binderSessionSource) ClientToolSource(connectionID string, caller model.DeviceCaller) func(context.Context) []core.Tool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.lastConn = connectionID
+	b.lastCall = caller
+	return b.source
+}
+
+func (b *binderSessionSource) consulted() (string, model.DeviceCaller) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastConn, b.lastCall
+}
+
+// TestPromptInjectsDeviceToolSourceWhenCapable：对端声明 x-device 且提供 Call
+// 通道时，Prompt 注入惰性工具源。P5-9 两个后端形态：
+//   - sessions 实现 model.ClientToolBinder → 走能力代理面（handler 的
+//     connectionID 与 reporter 的 Call 通道转发给 binder，工具源即 binder 产出）；
+//   - 未实现（纯 SessionSource 测试桩/无 sessions）→ 回落原始 relay 路径
+//     （调用即 probe，工具带 sys_ 前缀）——测试桩兼容语义。
+func TestPromptInjectsDeviceToolSourceWhenCapable(t *testing.T) {
+	reporter := &capsReporter{caps: decodeCaps(t, `{"x-device": {"tools": true}}`)}
+
+	t.Run("binder backend takes priority", func(t *testing.T) {
+		binder := &binderSessionSource{
+			source: func(context.Context) []core.Tool {
+				// 哨兵工具：只有 binder 产出的源能返回它，证明 ToolSource 来自
+				// binder 而非回落路径。
+				return []core.Tool{{Name: "binder-sentinel", Metadata: map[string]string{"goworker.capability_wait": "true"}}}
+			},
+		}
+		var (
+			mu      sync.Mutex
+			toolSrc func(context.Context) []core.Tool
+		)
+		handler := &FrontendHandler{
+			evaluate: func(ctx *model.Context, _ string) error {
+				mu.Lock()
+				toolSrc = ctx.ToolSource
+				mu.Unlock()
+				return nil
+			},
+			sessions:     binder,
+			gate:         NewSessionGate(),
+			connectionID: "conn-test",
+		}
+		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		if _, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt: %v", err)
+		}
+
+		mu.Lock()
+		ts := toolSrc
+		mu.Unlock()
+		if ts == nil {
+			t.Fatal("Prompt did not inject ToolSource for x-device capable reporter with a binder backend")
+		}
+		tools := ts(context.Background())
+		if len(tools) != 1 || tools[0].Name != "binder-sentinel" {
+			t.Fatalf("tool source = %+v, want the binder-produced sentinel tool", tools)
+		}
+		if conn, caller := binder.consulted(); conn != "conn-test" || caller == nil {
+			t.Fatalf("binder consulted with (conn=%q, caller=%v), want (\"conn-test\", non-nil reporter Call channel)", conn, caller)
+		}
+	})
+
+	t.Run("raw relay fallback without binder", func(t *testing.T) {
+		var (
+			mu      sync.Mutex
+			toolSrc func(context.Context) []core.Tool
+		)
+		handler := &FrontendHandler{
+			evaluate: func(ctx *model.Context, _ string) error {
+				mu.Lock()
+				toolSrc = ctx.ToolSource
+				mu.Unlock()
+				return nil
+			},
+			gate: NewSessionGate(),
+		}
+		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		if _, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt: %v", err)
+		}
+
+		mu.Lock()
+		ts := toolSrc
+		mu.Unlock()
+		if ts == nil {
+			t.Fatal("Prompt did not inject ToolSource for x-device capable reporter")
+		}
+		tools := ts(context.Background())
+		if len(tools) != 1 {
+			t.Fatalf("tool source returned %d tools, want 1", len(tools))
+		}
+		if tools[0].Name != "sys_vibrate" {
+			t.Fatalf("tool name = %q, want sys_vibrate", tools[0].Name)
+		}
+	})
+}
+
+// TestPromptOmitsDeviceToolSourceWithoutCapability：能力门控的否定分支 ——
+// caps 不含 x-device、reporter 没有反向 Call 通道、或后端是 binder 但 caps
+// 未声明 x-device，都必须零注入、零往返；binder 路径同样先过 caps 门（未声明
+// 的客户端 VS Code 等零变化，binder 不被征询）。
 func TestPromptOmitsDeviceToolSourceWithoutCapability(t *testing.T) {
+	notConsulted := &binderSessionSource{
+		source: func(context.Context) []core.Tool {
+			return []core.Tool{{Name: "binder-sentinel"}}
+		},
+	}
 	tests := []struct {
 		name     string
 		reporter aiacp.Reporter
+		sessions model.SessionSource
 	}{
 		{name: "caps without x-device", reporter: &capsReporter{caps: decodeCaps(t, `{"fs": {"readTextFile": true}}`)}},
 		{name: "reporter without Call channel", reporter: &recordingReporter{}},
+		{name: "binder backend but caps without x-device", reporter: &capsReporter{caps: decodeCaps(t, `{"fs": {"readTextFile": true}}`)}, sessions: notConsulted},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -456,7 +543,9 @@ func TestPromptOmitsDeviceToolSourceWithoutCapability(t *testing.T) {
 					mu.Unlock()
 					return nil
 				},
-				gate: NewSessionGate(),
+				sessions:     tc.sessions,
+				gate:         NewSessionGate(),
+				connectionID: "conn-omit",
 			}
 			if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, tc.reporter); err != nil {
 				t.Fatalf("CreateSession: %v", err)
@@ -470,6 +559,9 @@ func TestPromptOmitsDeviceToolSourceWithoutCapability(t *testing.T) {
 			mu.Unlock()
 			if ts != nil {
 				t.Fatal("ToolSource must be nil without x-device capability")
+			}
+			if conn, _ := notConsulted.consulted(); conn == "conn-omit" {
+				t.Fatal("binder must not be consulted without x-device capability")
 			}
 		})
 	}

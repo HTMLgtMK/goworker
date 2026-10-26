@@ -154,3 +154,96 @@ func TestProbeDeviceTools_FailureMeansNoCapability(t *testing.T) {
 	caller2 := &fakeCaller{result: `{"code":-32601,"message":"method not found"}`}
 	_ = caller2 // Call 把 result 解码失败也会走 err 分支 —— 由 fakeCaller.err 覆盖语义即可
 }
+
+// TestSpecDeviceTools_ConvertsToClientToolSpecs(P5-9):探测结果转换为 SDK 能力
+// 代理声明——注册名沿用 sys_ 前缀(与原始中继的 core.Tool.Name 同名,模型可见
+// 工具面两条路径一致),descriptor→metadata 经共用 helper 与 RelayDeviceTools
+// 逐字段一致(legacy never → low 且不门控的语义原样保留)。
+func TestSpecDeviceTools_ConvertsToClientToolSpecs(t *testing.T) {
+	caller := &fakeCaller{result: `{"tools":[{"name":"vibrate","description":"buzz the device","schema":"{\"type\":\"object\"}","risk_level":"never"}]}`}
+	specs, err := SpecDeviceTools(caller)
+	if err != nil {
+		t.Fatalf("SpecDeviceTools: %v", err)
+	}
+	if len(specs) != 1 {
+		t.Fatalf("specs = %d, want 1", len(specs))
+	}
+	spec := specs[0]
+	if spec.Name != "sys_vibrate" {
+		t.Errorf("name = %q, want sys_vibrate (注册名沿用 sys_ 前缀)", spec.Name)
+	}
+	if spec.Description != "buzz the device" {
+		t.Errorf("description = %q, want passthrough", spec.Description)
+	}
+	if spec.Schema != `{"type":"object"}` {
+		t.Errorf("schema = %q, want passthrough (解析回落由 NewClientToolProxy 承担)", spec.Schema)
+	}
+	if spec.Metadata["risk_level"] != "low" {
+		t.Errorf("risk_level = %q, want low (legacy never 归一语义不变)", spec.Metadata["risk_level"])
+	}
+	if _, gated := spec.Metadata["requires_permission"]; gated {
+		t.Errorf("legacy never must not be gated: metadata = %#v", spec.Metadata)
+	}
+}
+
+// TestSpecDeviceTools_ProbeFailureCollapses:探测失败/空 → 非 nil error + nil
+// specs,binder 据此走「无能力即无工具」的收缩语义。
+func TestSpecDeviceTools_ProbeFailureCollapses(t *testing.T) {
+	caller := &fakeCaller{err: context.DeadlineExceeded}
+	specs, err := SpecDeviceTools(caller)
+	if err == nil {
+		t.Fatal("probe failure must surface as an error (binder collapse path)")
+	}
+	if specs != nil {
+		t.Fatalf("specs = %+v, want nil", specs)
+	}
+}
+
+// TestCallDeviceTool_StripsRegisteredPrefixAndForwards:x-device/call 的 wire
+// 形状单一事实源——注册名(sys_ 前缀,P5-9 代理路径)剥回客户端原名转发;原名
+// 直传(原始中继路径)不受影响;结果与错误包装语义与原 RelayDeviceTools.Execute
+// 一致。
+func TestCallDeviceTool_StripsRegisteredPrefixAndForwards(t *testing.T) {
+	caller := &fakeCaller{result: `{"result":"buzzed"}`}
+	got, err := CallDeviceTool(context.Background(), caller, "sys_vibrate", []byte(`{"duration":1}`))
+	if err != nil {
+		t.Fatalf("CallDeviceTool: %v", err)
+	}
+	if got != "buzzed" {
+		t.Errorf("result = %q, want buzzed", got)
+	}
+	if caller.method != MethodDeviceCall {
+		t.Errorf("method = %q, want %s", caller.method, MethodDeviceCall)
+	}
+	var req deviceCallRequest
+	if err := json.Unmarshal(caller.params, &req); err != nil {
+		t.Fatalf("decode call request: %v", err)
+	}
+	if req.Name != "vibrate" {
+		t.Errorf("call name = %q, want vibrate (注册名剥回客户端原名)", req.Name)
+	}
+	if !strings.Contains(string(req.Arguments), `"duration"`) {
+		t.Errorf("arguments missing duration: %s", req.Arguments)
+	}
+
+	// 原名直传(原始中继路径):剥前缀为 no-op,语义不变。
+	if _, err := CallDeviceTool(context.Background(), caller, "vibrate", []byte(`{}`)); err != nil {
+		t.Fatalf("CallDeviceTool with bare name: %v", err)
+	}
+	if err := json.Unmarshal(caller.params, &req); err != nil {
+		t.Fatalf("decode call request: %v", err)
+	}
+	if req.Name != "vibrate" {
+		t.Errorf("bare-name call name = %q, want vibrate", req.Name)
+	}
+}
+
+// TestCallDeviceTool_ErrorWrapping:调用失败 → 「device call <原名>: …」包装,
+// 与原始中继的既有错误文案一致(stdio worker 路径行为不变)。
+func TestCallDeviceTool_ErrorWrapping(t *testing.T) {
+	caller := &fakeCaller{err: context.DeadlineExceeded}
+	if _, err := CallDeviceTool(context.Background(), caller, "sys_vibrate", []byte(`{}`)); err == nil ||
+		!strings.Contains(err.Error(), "device call vibrate") {
+		t.Fatalf("err = %v, want wrapped `device call vibrate` message", err)
+	}
+}

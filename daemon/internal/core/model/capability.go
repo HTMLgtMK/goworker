@@ -1,9 +1,11 @@
 package model
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
+	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 )
@@ -140,4 +142,29 @@ type RunControlSource interface {
 	// CapabilityWaitTimeout 返回设备工具断连等待重绑的预算（拍板③默认 45s，
 	// 硬约束 < ai-core 工具执行 60s）。
 	CapabilityWaitTimeout() time.Duration
+}
+
+// DeviceCaller 是 client-ward 调用通道的最小面（P5-9，结构类型——PermissionAsker
+// 先例 permission.go:32-34）：x-device 扩展的工具探测（x-device/tools）与执行
+// 转发（x-device/call）都经它发往客户端。acpworker.DeviceCaller（dispatch.Server
+// 实现）方法集相同、天然满足；model 不 import acpworker，无环。
+type DeviceCaller interface {
+	Call(ctx context.Context, method string, params, result any) error
+}
+
+// ClientToolBinder 是设备工具的能力代理面（P5-9，P5 显式可见变化 #1 的 daemon
+// 生产者）：对端声明 x-device 能力时，ACP handler 优先经它取得绑定 SDK
+// CapabilityRegistry 的稳定工具代理——断连后设备工具调用等待重绑（默认 45s，
+// CapabilityWaitTimeout）而非立即报错给模型；未实现此能力的插件/测试桩由
+// handler 以 type-assert 回落原始 relay 路径，行为不变。
+//
+//   - connectionID 是 x-goworker 控制面的连接句柄（handler 工厂生成）：绑定按
+//     （会话，connection）二元组登记，断连经 RunControlSource.UnbindCapabilities
+//     同键解绑（handler.Close 收口，连接退出即解绑）；
+//   - caller 是本连接的反向调用通道；
+//   - 返回 nil = 本连接无设备工具（能力未声明/探测失败：现状收缩语义「无能力
+//     即无工具」，不登记任何绑定）；非 nil 闭包的调用时机 = 每轮 prompt 工具
+//     收集（勘察结论 D），每次成功探测都幂等刷新绑定（重绑 = 刷新 TTL + 工具集）。
+type ClientToolBinder interface {
+	ClientToolSource(connectionID string, caller DeviceCaller) func(ctx context.Context) []core.Tool
 }

@@ -167,7 +167,14 @@ func (h *FrontendHandler) CreateSession(_ context.Context, sessionID string, req
 // deviceToolSource 按 initialize 协商的 clientCapabilities 门控：
 // 对端声明 x-device 且 reporter 提供反向 Call 通道时，返回惰性工具源；
 // 否则 nil（无设备工具，零往返）。
-func deviceToolSource(reporter aiacp.Reporter) func(ctx context.Context) []core.Tool {
+//
+// P5-9：后端实现 model.ClientToolBinder（工厂 type-assert h.sessions）时优先走
+// 能力代理面——工具绑定 CapabilityRegistry 到本连接，断连后设备工具调用等待
+// 重绑（默认 45s）而非立即报错给模型（P5 显式可见变化 #1）；type-assert 失败
+// （简化壳/测试桩无 binder）回落原始 relay 路径，行为不变。能力门控（caps.Has）
+// 在两种形态之前：未声明 x-device 的客户端（VS Code 等）零变化。DeviceCaller
+// 是结构类型（model 不 import acpworker），acpworker.DeviceCaller 天然满足。
+func (h *FrontendHandler) deviceToolSource(reporter aiacp.Reporter) func(ctx context.Context) []core.Tool {
 	capable, ok := reporter.(interface {
 		ClientCapabilities() protocol.ClientCapabilities
 	})
@@ -180,6 +187,10 @@ func deviceToolSource(reporter aiacp.Reporter) func(ctx context.Context) []core.
 	}
 	if !capable.ClientCapabilities().Has(acpworker.CapabilityDeviceTools) {
 		return nil
+	}
+	// type-assert 对 nil 接口安全（zero, false）：sessions 为 nil 直接落回落路径。
+	if binder, ok := h.sessions.(model.ClientToolBinder); ok {
+		return binder.ClientToolSource(h.connectionID, caller)
 	}
 	return func(ctx context.Context) []core.Tool {
 		pctx, cancel := context.WithTimeout(ctx, acpworker.ProbeTimeout)
@@ -257,7 +268,8 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 			// Device tool source is gated on the initialize-time clientCapabilities
 			// of this connection. Assigning nil directly is safe: Session.Run and
 			// the plugin both treat a nil ToolSource as "no device tools".
-			ToolSource: deviceToolSource(reporter),
+			// P5-9 起优先 binder 能力代理面（断连等待重绑），装配点不变。
+			ToolSource: h.deviceToolSource(reporter),
 		},
 		Values: make(map[string]any),
 	}

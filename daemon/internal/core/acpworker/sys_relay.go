@@ -12,9 +12,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
@@ -115,6 +117,37 @@ func normalizeDeviceToolDescriptor(d DeviceToolDescriptor) DeviceToolDescriptor 
 	return d
 }
 
+// clientToolMetadata 把规范化后的 descriptor 压成 core.Tool 侧策略元数据。
+// 原始中继（RelayDeviceTools）与 SDK 代理声明（SpecDeviceTools→ClientToolSpec）
+// 共用：声明的 risk_level/permissionPolicy 是策略的单一事实源，HITL 中间件按
+// 元数据在每次调用裁决（hitl.go checkSys）——透传即门控，两条路径的工具面
+// 门控行为逐字段一致。
+func clientToolMetadata(d DeviceToolDescriptor) map[string]string {
+	metadata := map[string]string{"risk_level": d.RiskLevel}
+	if d.permissionPolicy != "allow" {
+		metadata["requires_permission"] = "true"
+		metadata["allow_always_key"] = sysToolPrefix + d.Name
+	}
+	if d.permissionPolicy == "always_hitl" {
+		metadata["permission_policy"] = "always_hitl"
+	}
+	return metadata
+}
+
+// CallDeviceTool 转发一次设备工具执行（x-device/call）。toolName 支持两种形态：
+// 客户端侧原名（RelayDeviceTools 的 Execute 传 d.Name）与注册名「sys_+原名」
+// （P5-9 能力代理的 core.Tool.Name，x-device 端不感知前缀）——统一剥掉 sys_
+// 前缀后转发，deviceCallRequest.Name 的「原名」契约只有这一处事实源：原始
+// 中继与 daemon 侧能力执行通道（plugins/agent 的 deviceToolExecutor）共用。
+func CallDeviceTool(ctx context.Context, caller DeviceCaller, toolName string, argsJSON []byte) (string, error) {
+	name := strings.TrimPrefix(toolName, sysToolPrefix)
+	var resp deviceCallResponse
+	if err := caller.Call(ctx, MethodDeviceCall, deviceCallRequest{Name: name, Arguments: argsJSON}, &resp); err != nil {
+		return "", fmt.Errorf("device call %s: %w", name, err)
+	}
+	return resp.Result, nil
+}
+
 // RelayDeviceTools wraps client descriptors as agent tools. Metadata is kept
 // on the core.Tool boundary so policy middleware can inspect it without
 // leaking policy fields into the provider schema.
@@ -128,34 +161,48 @@ func RelayDeviceTools(caller DeviceCaller, descriptors []DeviceToolDescriptor) [
 			schema = map[string]any{"type": "object"}
 		}
 
-		metadata := map[string]string{"risk_level": d.RiskLevel}
-		if d.permissionPolicy != "allow" {
-			metadata["requires_permission"] = "true"
-			metadata["allow_always_key"] = sysToolPrefix + d.Name
-		}
-		if d.permissionPolicy == "always_hitl" {
-			metadata["permission_policy"] = "always_hitl"
-		}
-
 		tools = append(tools, core.Tool{
 			Name:        sysToolPrefix + d.Name,
 			Description: d.Description,
 			Parameters:  schema,
-			Metadata:    metadata,
+			Metadata:    clientToolMetadata(d),
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
 				argsJSON, err := json.Marshal(args)
 				if err != nil {
 					return "", fmt.Errorf("encode args: %w", err)
 				}
-				var resp deviceCallResponse
-				if err := caller.Call(ctx, MethodDeviceCall, deviceCallRequest{Name: d.Name, Arguments: argsJSON}, &resp); err != nil {
-					return "", fmt.Errorf("device call %s: %w", d.Name, err)
-				}
-				return resp.Result, nil
+				return CallDeviceTool(ctx, caller, d.Name, argsJSON)
 			},
 		})
 	}
 	return tools
+}
+
+// SpecDeviceTools 探测客户端设备工具清单并转换为 SDK 能力代理声明（P5-9，
+// daemon ClientToolBinder 的探测面）：复用 ProbeDeviceTools（ProbeTimeout 2s，
+// 失败/超时/method-not-found 一律空——「方向必须是收缩不是放行」）与
+// normalizeDeviceToolDescriptor，descriptor→metadata 映射经 clientToolMetadata
+// 与原始中继共用。注册名沿用 sys_ 前缀：与 RelayDeviceTools 的 core.Tool.Name
+// 同名，模型可见的工具面两条路径完全一致。
+//
+// descriptors 为空（探测失败或客户端声明零工具）→ 返回 nil specs 与非 nil
+// error：binder 据此走「无能力即无工具」的收缩语义（返回 nil 工具源、不登记
+// 任何绑定）。stdio worker 路径不经此函数，行为不变。
+func SpecDeviceTools(caller DeviceCaller) ([]runtimeagent.ClientToolSpec, error) {
+	descriptors := probeDeviceTools(caller)
+	if len(descriptors) == 0 {
+		return nil, fmt.Errorf("device tool probe failed or declared no tools (capability collapsed)")
+	}
+	specs := make([]runtimeagent.ClientToolSpec, 0, len(descriptors))
+	for _, d := range descriptors {
+		specs = append(specs, runtimeagent.ClientToolSpec{
+			Name:        sysToolPrefix + d.Name,
+			Description: d.Description,
+			Schema:      d.Schema,
+			Metadata:    clientToolMetadata(d),
+		})
+	}
+	return specs, nil
 }
 
 // probeDeviceTools 带默认超时的探测（SetSessionServer 用，无现成 ctx）。

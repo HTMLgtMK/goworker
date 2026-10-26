@@ -370,6 +370,10 @@ func (h *FrontendHandler) xgwSessionDetach(_ context.Context, params json.RawMes
 func (h *FrontendHandler) Close() {
 	if h.runs != nil {
 		h.runs.ReleaseControl(h.connectionID)
+		// P5-9:断连解绑客户端工具能力——连接退出即解绑 CapabilityRegistry 中
+		// 本连接的全部绑定;在途的设备工具等待由 P4-4 的「Invoke 失败→Invalidate
+		// →等待重绑」语义接管(预算内重绑成功则继续执行,超时返回明确失败文本)。
+		h.runs.UnbindCapabilities(h.connectionID)
 	}
 	h.mu.Lock()
 	subs := h.subs

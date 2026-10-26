@@ -1,13 +1,16 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/ai-runtime/session"
+	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -33,6 +36,11 @@ import (
 // RunControlSource 编译期断言(P5-6):AgentPlugin 满足可选能力接口,handler
 // 以 type-assert 获取(SessionSource 先例,capability.go:61-78)。
 var _ model.RunControlSource = (*AgentPlugin)(nil)
+
+// ClientToolBinder 编译期断言(P5-9):AgentPlugin 同时满足设备工具的能力代理
+// 面,ACP handler 优先 type-assert 它走 CapabilityRegistry + proxy(P5 显式
+// 可见变化 #1 的生产者),断言失败回落原始 relay。
+var _ model.ClientToolBinder = (*AgentPlugin)(nil)
 
 // maxTrackedRequestIDs 是 requestId 幂等表的容量上限(V1 进程内存量,环形逐出
 // 防无界;审批 requestID 与 run/start requestID 是两个命名空间——§6 风险 6,
@@ -377,4 +385,67 @@ func (p *AgentPlugin) CapabilityWaitTimeout() time.Duration {
 		return defaultCapabilityWaitTimeout
 	}
 	return time.Duration(secs) * time.Second
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ClientToolBinder(P5-9):设备工具的能力代理面(总方案 §8 的 daemon 接线,
+// P5 显式可见变化 #1)。stdio worker 路径(acpworker 自持原始 relay)不经此处。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// deviceToolExecutor 把 SDK 的 ClientToolExecutor 收窄面适配到 x-device/call:
+// Execute 收到的 toolName 是注册名(sys_ 前缀,与原始中继的 core.Tool.Name 同
+// 名),CallDeviceTool 统一剥前缀转发客户端原名(wire 形状单一事实源,
+// sys_relay.go CallDeviceTool)。Invoke 失败由代理 Execute 即时 Invalidate 该
+// 绑定并进入等待重绑(P4-4 语义),绝不静默路由到其他连接。
+type deviceToolExecutor struct {
+	caller model.DeviceCaller
+}
+
+func (e deviceToolExecutor) Invoke(ctx context.Context, toolName string, argsJSON []byte) (string, error) {
+	return acpworker.CallDeviceTool(ctx, e.caller, toolName, argsJSON)
+}
+
+// ClientToolSource 实现 model.ClientToolBinder(P5-9):返回本连接的设备工具惰性
+// 源。调用时机 = 每轮 prompt 工具收集(勘察结论 D),closure 内:
+//
+//   - 探测(acpworker.SpecDeviceTools,ProbeTimeout 2s 自计时)失败/空 → nil:
+//     现状收缩语义「无能力即无工具」,不登记任何绑定(方向必须是收缩不是放行);
+//   - 成功 → manager.Capabilities().Bind(会话 id, connectionID, 注册名,
+//     ttl=2*CapabilityWaitTimeout, deviceToolExecutor{caller}) →
+//     runtimeagent.NewClientToolProxy(reg, sessionID, specs, waitTimeout)。
+//
+// 键与预算(plan P5-9 表):
+//   - 会话 id 用 rt.ID:持久化模式它与 currentStore().SessionID() 同源
+//     (startSession/refreshSession 的会话边界以 store id 注册 runtime),纯内存
+//     降级为 "current" 单例——Bind/Lookup 同键,不引入第二会话标识;
+//   - ttl = 2*CapabilityWaitTimeout:等待预算内绑定不得被 TTL 判过期(过期条目
+//     视同无绑定,capability.go lazy expiry),2 倍留余量;
+//   - 每次 prompt 探测成功都重新 Bind:幂等刷新 TTL + 工具集(P4-3 的「每次
+//     prompt 探测都会 Bind」契约)。
+//
+// 断连语义(P5 显式可见变化 #1):handler.Close → UnbindCapabilities(connID)
+// 连接退出即解绑;在途的设备工具调用由 P4-4 的「无绑定/Invoke 失败 → 等待重绑
+// (默认 45s)→ 明确失败文本或重绑成功」接管;未声明 x-device 的客户端(VS Code
+// 等)不进此路径,零变化;沙箱/HITL 门控面零变化(spec.Metadata 透传,重绑后
+// 照常 per-call 裁决)。无 runtime(Init 未完成/失败回滚)→ nil。
+func (p *AgentPlugin) ClientToolSource(connectionID string, caller model.DeviceCaller) func(context.Context) []core.Tool {
+	return func(_ context.Context) []core.Tool {
+		specs, err := acpworker.SpecDeviceTools(caller)
+		if err != nil || len(specs) == 0 {
+			return nil
+		}
+		rt := p.currentSession()
+		if rt == nil {
+			return nil
+		}
+		sessionID := rt.ID
+		wait := p.CapabilityWaitTimeout()
+		names := make([]string, 0, len(specs))
+		for _, spec := range specs {
+			names = append(names, spec.Name)
+		}
+		reg := p.manager.Capabilities()
+		reg.Bind(sessionID, connectionID, names, 2*wait, deviceToolExecutor{caller: caller})
+		return runtimeagent.NewClientToolProxy(reg, sessionID, specs, wait)
+	}
 }
