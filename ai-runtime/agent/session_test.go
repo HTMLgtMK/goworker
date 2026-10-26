@@ -50,7 +50,7 @@ func TestSessionToolAllowRulesSnapshotAndRefresh(t *testing.T) {
 	provider := &captureProvider{}
 	sandboxCfg := sandbox.NewFromConfig(&cfg.Sandbox)
 	decisions := make(chan hitl.Decision, 1)
-	mws := s.buildMiddlewareChain(RunCallbacks{}, provider, sandboxCfg, cfg, decisions)
+	mws := s.buildMiddlewareChain(RunCallbacks{}, provider, sandboxCfg, cfg, decisions, &runErrorCapture{})
 	mw := mws[0].(*middlewares.HITLMiddleware)
 	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
 	ev := &core.BeforeToolEvent{

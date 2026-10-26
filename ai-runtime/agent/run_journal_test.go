@@ -20,7 +20,10 @@ import (
 //     (fakeConversationStore.commitErr,总方案第十一节的 journal 对偶)→ 终态
 //     记录 state=="failed" && !persisted,记录流中绝不出现 completed;
 //   - TestRecordRunJournalAppendErrorNonFatal:AppendState 失败只 warn 不阻塞,
-//     Run 照常完成(journal 可用性低于执行可用性)。
+//     Run 照常完成(journal 可用性低于执行可用性);
+//   - TestRecordRunJournalsProviderFailureAsFailed(AC-1):provider 失败(chatErr
+//     注入,经 runErrorCapture)→ 终态记录 state=="failed" && persisted=true
+//     (错误 note 已提交)——关闭「provider 失败被记 completed」的缺口。
 //
 // 编译期断言 `var _ RunStateJournal = (*session.RunJournal)(nil)` 按计划推迟到
 // P2-7(session 侧聚合类型 RunJournalStore 引入时补),本步测试用本地 stub。
@@ -52,6 +55,12 @@ func (j *stubRunJournal) snapshot() []session.RunStateRecord {
 // newJournaledSession 构造带 fake store + capture provider + journal stub 的会话
 // (其余依赖同 newFakeStoreSession,run_lifecycle_test.go)。
 func newJournaledSession(st ConversationStore, jr *stubRunJournal) *Session {
+	return newJournaledSessionWithProvider(st, jr, &captureProvider{})
+}
+
+// newJournaledSessionWithProvider 同 newJournaledSession,provider 可注入
+// (AC-1 的 chatErr 注入点;captureProvider 见 test_helpers_test.go)。
+func newJournaledSessionWithProvider(st ConversationStore, jr *stubRunJournal, pv core.Provider) *Session {
 	return NewSession(SessionDeps{
 		Config:   runtimeconfig.Default(),
 		AuditDir: "",
@@ -59,7 +68,7 @@ func newJournaledSession(st ConversationStore, jr *stubRunJournal) *Session {
 			return nil
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
-			return &captureProvider{}, nil
+			return pv, nil
 		},
 		Store:      st,
 		RunJournal: jr,
@@ -166,5 +175,43 @@ func TestRecordRunJournalAppendErrorNonFatal(t *testing.T) {
 	}
 	if got := rt.Active(); got != nil {
 		t.Fatalf("active after run = %+v, want nil (记账已终态化并清理)", got)
+	}
+}
+
+// TestRecordRunJournalsProviderFailureAsFailed:provider 失败(chatErr 注入,错误
+// 经 runErrorCapture 走 AC-1 主映射)跑 RecordRun → 终态 journal 记录
+// state=="failed" 且 persisted=true(错误 note 已随 messages 提交)——P2-3 journal
+// 对偶的补全,关闭「provider 失败被记 completed」的缺口(总方案第十一节 ai-core
+// 修正对偶;此前该场景 journal 终态为 completed 的行为在 run_test.go P2-1 实测
+// 留痕)。终态断言同时是「fire 先于 msgCh 发送」次序依赖的 journal 面钉死
+// (plan §6 风险 1):次序破坏时 capture 读不到错误、终态退回 completed。
+func TestRecordRunJournalsProviderFailureAsFailed(t *testing.T) {
+	jr := &stubRunJournal{}
+	s := newJournaledSessionWithProvider(&fakeConversationStore{}, jr, &captureProvider{chatErr: errors.New("boom")})
+	rt := NewSessionRuntime("journaled-provider-fail", s)
+
+	res := runOnce(rt)
+	if res.State != RunFailed || !res.Persisted {
+		t.Fatalf("run result = %+v, want RunFailed+Persisted=true (note committed, AC-1 mapping)", res)
+	}
+
+	recs := jr.snapshot()
+	if len(recs) != 2 {
+		t.Fatalf("journal records = %d, want 2 (running + terminal)", len(recs))
+	}
+	terminal := recs[len(recs)-1]
+	if terminal.State != string(RunFailed) {
+		t.Fatalf("terminal record state = %q, want %q", terminal.State, string(RunFailed))
+	}
+	if !terminal.Persisted {
+		t.Fatal("terminal record persisted = false, want true (error note committed with messages)")
+	}
+	if terminal.Err == "" {
+		t.Fatal("terminal record err = empty, want provider failure surfaced")
+	}
+	for i, rec := range recs {
+		if rec.State == string(RunCompleted) {
+			t.Fatalf("record %d state = completed in provider-failure journal stream: %+v", i, rec)
+		}
 	}
 }

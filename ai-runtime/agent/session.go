@@ -86,9 +86,17 @@ func (s *Session) updateToolAllowRule(next sandbox.ToolAllowRule) {
 //
 // 第一返回值是 Run 生命周期记账（「模型成功 ≠ 持久化成功」）：
 //   - 空输入未进入 ReAct → RunCancelled（不创建 AgentRun 语义，由调用方记账）；
-//   - provider / agent.Run 失败 → RunFailed+Persisted=false（用户可见输出逐字不变，仍写 ✘）；
-//     其中 ctx 取消/超时归一为 RunCancelled（P2-1，取消不是失败，只分流 State）；
-//   - 持久化 Compact/Commit 失败 → RunFailed+Persisted=false，绝不记 RunCompleted；
+//   - provider / agent.Run 失败 → 终态 RunFailed/RunCancelled。主映射走错误
+//     捕获中间件（runErrorCapture 读 AfterAgentEvent.Err，AC-1）——ai-core 把
+//     provider 错误漏斗成 note token 走流式出口、同步 err 恒 nil（ai-core/agent/
+//     agent.go:82-107,175），capture 在 <-msgCh 后读出；ctx 取消/超时归一为
+//     RunCancelled（P2-1，取消不是失败，只分流 State）；Persisted=true（错误
+//     note 已随 messages 提交/入内存历史成功，「持久化成功」与「模型成功」独立
+//     记账，用户可见输出逐字不变）。下方 call-layer 同步 err 分支保留为防御
+//     （RecordRun 对 fn error 的同型映射 runtime.go 仍可达，run_test.go:44-72
+//     既有测试不变）；
+//   - 持久化 Compact/Commit 失败 → RunFailed+Persisted=false，绝不记 RunCompleted
+//     （持久化错误优先于 provider 失败映射）；
 //     Checkpoint 失败维持 warn 不改 State；
 //   - 全部成功（含纯内存模式，内存 conversation 即事实源）→ RunCompleted+Persisted=true。
 //
@@ -139,7 +147,10 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 		return RunResult{State: RunFailed, Err: err, Persisted: false}, nil
 	}
 	decisions := make(chan hitl.Decision, 1)
-	mws := s.buildMiddlewareChain(cb, provider, &sandboxCfg, cfg, decisions)
+	// 每 Run 一实例的错误捕获(AC-1):捕获 AfterAgentEvent.Err 供最终记账,
+	// 见 errcapture.go 的 happens-before 论证。
+	cap := &runErrorCapture{}
+	mws := s.buildMiddlewareChain(cb, provider, &sandboxCfg, cfg, decisions, cap)
 	systemPrompt := s.buildSystemPrompt(cfg, tools)
 
 	opts := []coreagent.Option{coreagent.WithMaxIterations(cfg.LLM.MaxIterations)}
@@ -164,7 +175,9 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 		// 取消态归一(P2-1):ctx 取消/超时属取消而非失败——断连、宿主停机与
 		// 后续 CancelRun 的 Run 状态持久化(总方案第九节)不能把取消记成 failed。
 		// 用户可见输出逐字不变(✘ 照旧写),仅 RunResult.State 分流;RecordRun 的
-		// call-layer 同型映射(runtime.go)保留为冗余防御。
+		// call-layer 同型映射(runtime.go)保留为冗余防御。AC-1 起 provider 失败
+		// 的主映射在最终 return 前经 runErrorCapture 生效,本分支对 provider stub
+		// 不可达(ai-core 同步 err 恒 nil),仅兜未来的同步错误通道。
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return RunResult{State: RunCancelled, Err: err, Persisted: false}, nil
 		}
@@ -176,6 +189,11 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 	// 记忆块只服务本次 run 的注入，若漏进 STM：下次 run 会重发它、检查点会把
 	// 它当对话内容固化（自指污染）—— 必须过滤掉。
 	messages := <-msgCh
+	// runErr 读取点(AC-1):<-msgCh 与 agent goroutine 的 defer(ai-core/agent/
+	// agent.go:54-58)建立 happens-before —— defer 内 fireMiddlewareEvent(:55,
+	// capture 写入点)先于 `msgCh <- messages`(:57),读时必可见;c.mu 仅为防御
+	// 与 -race 明示。次序依赖由 run_test.go 的 AC-1 断言钉死(plan §6 风险 1)。
+	runErr := cap.captured()
 	if len(messages) > 1 {
 		conv2 := stripMemoryBlocks(messages[1:]) // messages[0] 是 system prompt
 		if s.deps.Store == nil {
@@ -213,6 +231,20 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 				slog.Warn("session: refresh conversation after run failed", "err", err)
 			}
 		}
+	}
+	// 最终记账(AC-1):runErr 非 nil = 本轮模型侧失败 —— 错误 note 已随上面
+	// 的 messages 提交(持久化模式)/写入内存 conversation(纯内存模式),用户
+	// 可见面零变化(勘察结论 B 三渲染面),仅终态分流:复用 call-layer 的 ctx
+	// 规则映射,取消/超时 → RunCancelled、其余 → RunFailed;Persisted=true
+	// (「持久化成功」与「模型成功」独立记账——note 已提交是事实)。持久化错误
+	// 不经此处:上方 commit 块失败已提前返回 RunFailed+Persisted=false,持久化
+	// 错误优先、绝不 RunCompleted。
+	if runErr != nil {
+		state := RunFailed
+		if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+			state = RunCancelled
+		}
+		return RunResult{State: state, Err: runErr, Persisted: true}, nil
 	}
 	return RunResult{State: RunCompleted, Persisted: true}, nil
 }
@@ -258,9 +290,13 @@ func (s *Session) streamTokens(cb RunCallbacks, agentCtx context.Context, tokenC
 }
 
 // buildMiddlewareChain 组装本轮 Run 的中间件链。
-// 顺序：hitl → usage → iteration →（memory 启用时插入）→ compress。
+// 顺序：hitl → usage → iteration →（memory 启用时插入）→ compress → errcapture。
 // memory 必须在 compress 前：压缩器测量的是注入记忆后的完整 history。
-func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, sandboxCfg *sandbox.Config, cfg *runtimeconfig.Config, decisions chan hitl.Decision) []core.Middleware {
+// errcapture（runErrorCapture，AC-1）挂链尾：AfterAgent hooks 全部触发、顺序
+// 无语义（fireMiddlewareEvent 逐个分发，ai-core/agent/agent.go:213-241），它
+// 只观察 AfterAgentEvent.Err 供 Session.Run 最终记账。cap 由 Run 每轮构造传入
+// （每 Run 一实例，跨 run 不复用）。
+func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, sandboxCfg *sandbox.Config, cfg *runtimeconfig.Config, decisions chan hitl.Decision, cap *runErrorCapture) []core.Middleware {
 	publish := func(event string, data any) {
 		if cb.Publish != nil {
 			cb.Publish(event, data)
@@ -305,7 +341,7 @@ func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, 
 		memMw := middlewares.NewMemoryMiddleware(&memoryClientAdapter{s.deps.Memory}, cfg.Memory, contextWindow(cfg))
 		mws = append(mws, memMw)
 	}
-	return append(mws, compressMw)
+	return append(mws, compressMw, cap)
 }
 
 func contextWindow(cfg *runtimeconfig.Config) int {
