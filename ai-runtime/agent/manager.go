@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+
+	"github.com/tinguo/goworker/ai-runtime/hitl"
 )
 
 // 本文件是多会话执行内核的注册表:SessionManager 按 SessionID 管理
@@ -151,6 +153,22 @@ func (m *SessionManager) List() []*SessionRuntime {
 // decideFunc 消费 Wait,P5 协议面经 Pending/Resolve 直转包装读取与决策。
 func (m *SessionManager) Approvals() *ApprovalManager {
 	return m.approvals
+}
+
+// PendingApprovals 返回会话未过期的审批快照(P4-2,ApprovalManager.Pending 的
+// 直转包装):P5-6/P5-7 的 x-goworker 协议面(PendingApprovals 消费)按
+// requestID 逐笔读取;未知会话/无审批返回空切片,不区分「未知会话」与
+// 「无审批」——审批注册表按 SessionID 过滤,快照即全部事实。
+func (m *SessionManager) PendingApprovals(sessionID string) []PendingApproval {
+	return m.approvals.Pending(sessionID)
+}
+
+// ResolveApproval 投递一笔审批决策(P4-2,ApprovalManager.Resolve 的直转包装):
+// 首个有效决策获胜;未知 requestID → ErrApprovalUnknown,迟到/重复 →
+// ErrApprovalResolved(sentinel 语义见 approval.go)。P5-6/P5-7 的
+// x-goworker/approval/respond 经此收口,错误原样上抛由协议面映射响应。
+func (m *SessionManager) ResolveApproval(requestID string, decision hitl.Decision) error {
+	return m.approvals.Resolve(requestID, decision)
 }
 
 // contextOf 返回宿主生命周期 ctx(包内访问器):StartRun(P2-5)以它为父派生

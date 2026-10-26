@@ -67,12 +67,17 @@ func (h RunHandle) Wait(ctx context.Context) (RunResult, error) {
 //  1. cb 所有权自本方法返回起归 supervisor:execute goroutine 是 cb 的唯一后续
 //     使用者,调用方不得再读写 cb 的任何字段/捕获变量,否则数据竞争;
 //  2. run 的 runCtx 由本方法同步段以 manager 宿主 ctx(m.contextOf())为父派生
-//     (StartRun ⑥,P2-6 修正)——调用方 ctx 不参与(API 形状即保证:连接断开
+//     (StartRun ⑦,P2-6 修正)——调用方 ctx 不参与(API 形状即保证:连接断开
 //     不影响后台 Run,TestRunSurvivesDisconnect 钉死),且 runCtx **不带
 //     sessionGateKey 重入标记**:后台 Run 与前端同会话
 //     操作靠 gate 互斥,但 run 内经 hub.Eval 等路径嵌套发起同会话 prompt(需要
 //     重入标记放行 SessionGate,commands.go:28-50)会死锁——P5 接前端时必须在
-//     注入点补上该标记,本方法不做。
+//     注入点补上该标记,本方法不做;
+//  3. 审批回退(P4-2):cb.Decide 为 nil 时,HITL 决策由 manager 的
+//     ApprovalManager 承担(decideFunc 闭包,⑦.5 注入)——run 在等待决策期间
+//     迁移 RunWaiting(waiting_input)并落 waiting_input journal 记录,决策经
+//     ResolveApproval/Approvals().Resolve 跨连接投递,超时/取消默认拒绝;
+//     调用方自带 Decide(CLI/测试形态)不受影响,本方法不覆盖。
 //
 // 拒绝语义:manager 已 Close → ErrManagerClosed;未知会话 → ErrSessionNotFound;
 // 同会话已有 Run(在跑或排队)→ ErrRunActive;会话未绑定 → ErrSessionNotBound;
@@ -134,14 +139,14 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	// ⑥ 事件面接线(P3-4,可选):deps.RunEvents 非 nil 时惰性创建会话级
 	// EventHub(runtime.bindEvents,创建一次后续 run 复用),括起本 run 的
 	// 产生边界(BeginRun:设 AppendEvent 目标兜底 + 防御性 flush 上一 run 残留
-	// 合并缓冲),并把 cb 包装成 tee(事件映射见 teeRunCallbacks)。RunEvents
-	// 为 nil 时 hub 为 nil、cb 原样透传——零开销路径,同步 RecordRun 路径
-	// 完全不经此处(行为零变化)。
+	// 合并缓冲)。RunEvents 为 nil 时 hub 为 nil——零开销路径,同步 RecordRun
+	// 路径完全不经此处(行为零变化)。tee 包装(cb = teeRunCallbacks)已下移到
+	// ⑦.6:P4-2 的审批回退(⑦.5)须先于 tee——tee 检测 cb.Decide 非 nil 才包
+	// permission.requested/resolved,次序颠倒会漏掉审批事件对。
 	hub := rt.bindEvents(sessionID, sess.deps.RunEvents)
 	if hub != nil {
 		hub.BeginRun(run.ID)
 	}
-	cb = teeRunCallbacks(cb, hub, run.ID)
 
 	// ⑦ 派生 runCtx 并写入 run.cancel——**同步段完成**(P2-6 修正):返回的
 	// 句柄立即可取消。若推迟到 execute 内写入(P2-5 原形态),StartRun 返回后
@@ -154,6 +159,21 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	run.mu.Lock()
 	run.cancel = cancel
 	run.mu.Unlock()
+
+	// ⑦.5 审批回退(P4-2,总方案 §6 Decide 适配):cb.Decide 为 nil 时注入
+	// ApprovalManager 的 decideFunc 闭包——闭包捕获 runCtx/sess/run/sessionID,
+	// 等待期间 run 迁移 RunWaiting 并落 waiting_input journal 记录(见
+	// approval.go decideFunc 注释);取消经 runCtx.Done → Wait reject → 工具
+	// 中止 → 既有取消路径收敛。调用方自带 Decide(CLI/测试形态)不受影响。
+	// 必须先于 ⑦.6 的 tee:tee 检测 cb.Decide 非 nil 才包审批事件对。
+	if cb.Decide == nil {
+		cb.Decide = m.approvals.decideFunc(runCtx, sess, run, sessionID)
+	}
+
+	// ⑦.6 tee 包装(P3-4):审批回退已就位,tee 看到的是 decideFunc 版本的
+	// Decide——permission.requested/resolved 事件对围绕真实等待产生,回放面
+	// 完整。包装对象仍是 cb 本体(execute 是唯一后续使用者,契约①不变)。
+	cb = teeRunCallbacks(cb, hub, run.ID)
 
 	// ⑧ 执行转移给 supervisor goroutine(cb 所有权随之转移,契约①;tee 包装
 	// 不改变所有权归属——execute 仍是 cb 的唯一使用者),立即返回。

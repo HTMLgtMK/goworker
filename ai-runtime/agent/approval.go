@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tinguo/goworker/ai-runtime/hitl"
+	"github.com/tinguo/goworker/ai-runtime/session"
 )
 
 // 本文件是 HITL 审批的独立决策管理器(P4-1 骨架;总方案 §6 的
@@ -186,4 +187,50 @@ func (m *ApprovalManager) Pending(sessionID string) []PendingApproval {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].RequestID < out[j].RequestID })
 	return out
+}
+
+// decideFunc 返回 StartRun 审批回退用的 HITL 决策闭包(P4-2,总方案 §6 的
+// Decide → approvalManager.Wait 适配形):run 的 cb.Decide 为 nil 时由
+// supervisor 注入本闭包,后台 Run 的 HITL 决策由此跨连接化——决策不归属任何
+// 连接,「原控制端断开、新控制端 Resolve」即总方案 §6 的断连语义。
+//
+// 闭包序列(调用点在 Session.Run→streamTokens 的 cb.Decide 面,即 execute
+// goroutine;req 为 streamTokens 从 interrupt token 解码的副本,非中间件原件):
+//  1. run.transition(RunWaiting):§6 状态机 Running→WFA——HITL 决策挂起期间
+//     Run 停留 waiting_input,经 RunHandle.State() 可观测;transition 在 run.mu
+//     内、幂等(run.go:72-90),与 ApprovalManager.mu 无嵌套;
+//  2. journalRunState(sess, {state:"waiting_input", ...}):durable-first 观测面
+//     ——等待事实先落盘,审批跨重启不恢复(V1 审批在内存),恢复扫描据此把
+//     卡在 waiting 的 run 标 interrupted 而非误报 lost;journalRunState 在
+//     rt.mu 外(runtime.go 的锁内不做文件 I/O 纪律),失败 warn 不阻塞;
+//  3. m.approvals.Wait(runCtx, sessionID, run.ID, req):阻塞至决策/超时/取消
+//     ——等待期间的取消(CancelRun/宿主 Close)经 runCtx.Done → Wait reject →
+//     中间件 reject → 工具中止 → 既有取消路径收敛(execute 层归一覆盖
+//     RunCancelled),本闭包不发明新的取消出口;
+//  4. run.transition(RunRunning):决策落定即回到运行态(§6 状态机 WFA→Running;
+//     终态仍由 finalizeRun 归一,此处不触终态);
+//  5. 返回决策,交 streamTokens 投进 decisions channel → 中间件裁决工具放行
+//     /拒绝。
+//
+// 事件面不属于本闭包:审批回退先于 teeRunCallbacks 注入(supervisor.go StartRun
+// ⑦.5),tee 检测 cb.Decide 非 nil 自动包 permission.requested/resolved 事件对
+// ——回放面免费获得审批事件,闭包保持纯决策面(P5-2 再增 state_changed 事件)。
+//
+// 并发论证(plan P4-2):闭包在 execute goroutine 上阻塞——与 P3-4 tee 论证同构
+// (等待在 hub 锁外);transition 在 run.mu 内;ApprovalManager.mu 与 run.mu/
+// rt.mu/hub.mu 无嵌套,无锁环。
+func (m *ApprovalManager) decideFunc(runCtx context.Context, sess *Session, run *AgentRun, sessionID string) func(*hitl.InterruptRequest) hitl.Decision {
+	return func(req *hitl.InterruptRequest) hitl.Decision {
+		run.transition(RunWaiting)
+		journalRunState(sess, session.RunStateRecord{
+			Kind:      "state",
+			SessionID: run.SessionID,
+			RunID:     run.ID,
+			State:     string(RunWaiting),
+			At:        time.Now(),
+		})
+		decision := m.Wait(runCtx, sessionID, run.ID, req)
+		run.transition(RunRunning)
+		return decision
+	}
 }

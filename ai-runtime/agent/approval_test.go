@@ -3,10 +3,15 @@ package agent
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/tinguo/goworker/ai-core/core"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
+	"github.com/tinguo/goworker/ai-sandbox"
 )
 
 // 本文件是 P4-1 ApprovalManager 骨架的验收测试(纯单元面,零 Provider、零
@@ -191,5 +196,288 @@ func TestApprovalLateResolveRejected(t *testing.T) {
 	}
 	if err := m.Resolve("req-late", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, ErrApprovalResolved) {
 		t.Fatalf("late Resolve = %v, want ErrApprovalResolved", err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P4-2:StartRun 审批回退接线 + waiting 迁移(总方案第十一节
+// TestApprovalAfterReconnect → 本步)。
+//
+// 测试装置:scriptedChatProvider(非流式脚本,含 tool call 轮,零真实 LLM)+
+// newHitlRunRuntime(真实 bash + 真实 HITL 中间件链:CollectTools=DefaultTools、
+// 沙箱 normal 模式——管道命令命中 DefaultRiskyPatterns 的 `\|`,RiskMedium →
+// DecisionHitl,ai-sandbox/defaults.go:31、policy.go:106-113;实测探针确认
+// decision=hitl)。审批面零真实连接:「原连接断开」= 提交方 goroutine 返回后
+// 不再存在(StartRun 无 ctx 参数,API 形状即保证连接无关);「新控制端」= 测试
+// 主 goroutine 经 manager 的 ResolveApproval 直转投递。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// hitlProbeCommand 是 HITL 触发命令:管道命中默认风险规则(normal 模式 →
+// DecisionHitl),但命令本身无副作用、可真实执行(approve 后输出 HITL-OK)。
+const hitlProbeCommand = `echo hitl-ok | tr a-z A-Z`
+
+// hitlToolCallRound 构造第 0 轮脚本消息:assistant 发起一次 bash tool call,
+// 命令即 hitlProbeCommand(经真实 kernel 工具循环,HITL 中间件拦截)。
+func hitlToolCallRound() core.Message {
+	return core.Message{Role: "assistant", ToolCalls: []core.ToolCall{{
+		ID:       "call-hitl-1",
+		Type:     "function",
+		Function: core.ToolCallFunction{Name: "bash", Arguments: `{"command":"` + hitlProbeCommand + `"}`},
+	}}}
+}
+
+// scriptedChatProvider 按调用序回放预置 assistant 消息(第 i 轮 = msgs[i];
+// 越界回落最终文本)。ChatStream 恒报错 → Session 回退非流式
+// (ai-core/agent/agent.go:184-188 的 chat() 回退),tool call 经真实 kernel
+// 循环 + 中间件链执行。
+type scriptedChatProvider struct {
+	mu    sync.Mutex
+	calls int
+	msgs  []core.Message
+}
+
+func (p *scriptedChatProvider) Name() string  { return "scripted-chat" }
+func (p *scriptedChatProvider) Model() string { return "m" }
+
+func (p *scriptedChatProvider) Chat(_ context.Context, _ *core.ChatRequest) (*core.ChatResponse, error) {
+	p.mu.Lock()
+	i := p.calls
+	p.calls++
+	p.mu.Unlock()
+	msg := core.Message{Role: "assistant", Content: "final"}
+	if i < len(p.msgs) {
+		msg = p.msgs[i]
+	}
+	return &core.ChatResponse{Choices: []core.ResponseChoice{{Message: msg}}}, nil
+}
+
+func (p *scriptedChatProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	return nil, errors.New("not implemented")
+}
+
+// newHitlRunRuntime 构造「真实 bash+HITL 链」的 runtime 并注册进 manager:
+// CollectTools 返回 DefaultTools(真实 bash 执行面,default_tools.go),沙箱用
+// 默认配置(Mode=normal,ai-runtime/config/config.go:195)并把 AllowedWorkDir
+// 锚定到临时目录(bash cmd.Dir;探针命令无文件副作用)。RunJournal 可为 nil
+// (journalRunState 按 nil 跳过)。返回会话 id(= runtime id,StartRun/
+// PendingApprovals 的寻址键)。
+func newHitlRunRuntime(t *testing.T, m *SessionManager, id string, pv core.Provider, jr *stubRunJournal) string {
+	t.Helper()
+	cfg := runtimeconfig.Default()
+	cfg.Sandbox.AllowedWorkDir = t.TempDir()
+	deps := SessionDeps{
+		Config: cfg,
+		CollectTools: func(sb *sandbox.Config) []core.Tool {
+			return DefaultTools(sb)
+		},
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			return pv, nil
+		},
+		Store: &fakeConversationStore{},
+	}
+	// RunJournal 仅在非 nil 时装配:接口字段必须真 nil(spec.go 的 typed-nil
+	// 纪律)——typed-nil 会让 journalRunState(runtime.go:200)的 nil 检查失效,
+	// nil 接收者 panic。
+	if jr != nil {
+		deps.RunJournal = jr
+	}
+	s := NewSession(deps)
+	rt := NewSessionRuntime(id, s)
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	return id
+}
+
+// waitApprovalPending 轮询直至会话审批挂起非空且 run 迁移 RunWaiting
+// (decideFunc 的 transition 先于 Wait 注册 entry,两条件同时稳定可达),
+// 有界等待防挂死。返回挂起审批的 requestID。
+func waitApprovalPending(t *testing.T, m *SessionManager, sessionID string, h RunHandle) string {
+	t.Helper()
+	var pending []PendingApproval
+	deadline := time.After(5 * time.Second)
+	for {
+		pending = m.PendingApprovals(sessionID)
+		if len(pending) == 1 && h.State() == RunWaiting {
+			return pending[0].RequestID
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("approval pending/waiting never reached: pending=%d state=%s", len(pending), h.State())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+// TestApprovalAfterReconnect(总方案第十一节 → 本步):cb.Decide 为 nil 的
+// StartRun 走审批回退(decideFunc)→ 真实 bash 的危险命令触发 DecisionHitl →
+// run 迁移 RunWaiting 且审批挂起可见 → 「原连接断开」零操作 → 「新控制端」
+// ResolveApproval(approve)→ run RunCompleted 且工具结果为命令真实输出
+// (非拒绝文案)——后台 Run 的 HITL 决策跨连接化,断连不影响等待。
+func TestApprovalAfterReconnect(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	pv := &scriptedChatProvider{msgs: []core.Message{
+		hitlToolCallRound(),
+		{Role: "assistant", Content: "approved run done"},
+	}}
+	sid := newHitlRunRuntime(t, m, "hitl-reconnect", pv, nil)
+
+	var out strings.Builder
+	// 提交方即「原控制端」:cb.Decide 为 nil(审批回退接管),StartRun 返回后
+	// 本 goroutine 不再持有任何连接语义(契约:StartRun 无 ctx 参数)。
+	h, err := m.StartRun(sid, RunRequest{Input: "run the pipe"}, testRunCallbacks(&out))
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	// 等待面:审批挂起可见(PendingApprovals 直转包装)且 run 已迁移
+	// RunWaiting(decideFunc 的 waiting 迁移)。
+	reqID := waitApprovalPending(t, m, sid, h)
+	if reqID == "" {
+		t.Fatal("pending approval has empty request id")
+	}
+	if h.State() != RunWaiting {
+		t.Fatalf("state = %q, want %q", h.State(), RunWaiting)
+	}
+
+	// 「原连接断开」零操作:StartRun 无 ctx 参数,提交方 ctx 不参与
+	// (P2P3 §6 语义在此复用为「断开不影响等待」)——此处显式无任何动作。
+
+	// 「新控制端」放行:决策按 requestID 跨连接投递,不经任何连接对象。
+	if err := m.ResolveApproval(reqID, hitl.Decision{Type: hitl.DecisionApprove}); err != nil {
+		t.Fatalf("ResolveApproval: %v", err)
+	}
+
+	res := waitHandle(t, h) // RunCompleted+Persisted=true(waitHandle 内断言)
+
+	// 决策落地后审批不再挂起(resolved 收口,单次有效)。
+	if ps := m.PendingApprovals(sid); len(ps) != 0 {
+		t.Fatalf("PendingApprovals after resolve = %+v, want empty(resolved 收口)", ps)
+	}
+	// 工具结果非拒绝文案:approve 后 bash 真实执行,结果经 WriteToken 流出。
+	if strings.Contains(out.String(), "⛔ rejected by user") {
+		t.Fatalf("tool output contains rejection text: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "HITL-OK") {
+		t.Fatalf("tool output %q missing command output HITL-OK(approve 未放行真实执行)", out.String())
+	}
+	if res.State != RunCompleted {
+		t.Fatalf("state = %q, want RunCompleted", res.State)
+	}
+}
+
+// TestApprovalTimeoutFailsTool:超时 = 安全拒绝(不挂死、不隐式放行)。
+// 中间件给 interrupt 硬编码 ExpiresAt=now+DefaultTimeout(2min,hitl.go:280,
+// 常量不可注入),故本测试以「调用方自带 Decide」形态(契约③:StartRun 不
+// 覆盖)把中间件原始请求收短成可测窗口后交给**同一条** Wait——超时出口
+// (ExpiresAt 到点 reject)由 Wait 真实计时触发,P4-1 单元测试覆盖的到点
+// 路径在真实 bash+HITL 链上端到端收敛:工具结果 = 「⛔ rejected by user」
+// (hitl.go:443 文案),命令从未执行,run 继续 RunCompleted。
+// (decideFunc 只是 Wait 的纯转发,等待期迁移由 TestApprovalAfterReconnect/
+// TestStartRunJournalsWaiting 覆盖,不因本窗口收短而失真。)
+func TestApprovalTimeoutFailsTool(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	pv := &scriptedChatProvider{msgs: []core.Message{
+		hitlToolCallRound(),
+		{Role: "assistant", Content: "continue after timeout"},
+	}}
+	sid := newHitlRunRuntime(t, m, "hitl-timeout", pv, nil)
+
+	var out strings.Builder
+	h, err := m.StartRun(sid, RunRequest{Input: "run the pipe"}, RunCallbacks{
+		Write: func(string) {},
+		WriteToken: func(_ RenderKind, s string, _ bool) {
+			out.WriteString(s)
+		},
+		Decide: func(req *hitl.InterruptRequest) hitl.Decision {
+			short := *req
+			short.ExpiresAt = time.Now().Add(150 * time.Millisecond)
+			return m.Approvals().Wait(context.Background(), sid, "run-timeout-probe", &short)
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	waitHandle(t, h) // 超时拒绝后模型收到拒绝文案继续 → RunCompleted(不挂死)
+
+	// 工具结果 = 拒绝文案,绝无命令输出(超时不隐式放行)。
+	if !strings.Contains(out.String(), "⛔ rejected by user") {
+		t.Fatalf("tool output %q missing rejection text ⛔ rejected by user", out.String())
+	}
+	if strings.Contains(out.String(), "HITL-OK") {
+		t.Fatalf("tool output %q contains command output — timeout must not execute the command", out.String())
+	}
+}
+
+// TestStartRunJournalsWaiting:审批等待落 journal(durable-first 观测面)——
+// 记录流 queued → running → waiting_input → completed,waiting_input 先于
+// 终态记录(decideFunc 的 journalRunState 在 Wait 阻塞前落盘,finalizeRun 的
+// 终态在 Wait 返回后)。恢复扫描据此可把卡在 waiting 的 run 标 interrupted
+// (isTerminalRunState 不含 waiting_input)。
+func TestStartRunJournalsWaiting(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	jr := &stubRunJournal{}
+	pv := &scriptedChatProvider{msgs: []core.Message{
+		hitlToolCallRound(),
+		{Role: "assistant", Content: "approved run done"},
+	}}
+	sid := newHitlRunRuntime(t, m, "hitl-journal", pv, jr)
+
+	h, err := m.StartRun(sid, RunRequest{Input: "run the pipe"}, testRunCallbacks(&strings.Builder{}))
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	// 等待面出现(Pending 非空 + RunWaiting)⇒ waiting_input 记录必已落盘:
+	// decideFunc 先 journalRunState 再 Wait 注册,同一 goroutine 内先后有序。
+	reqID := waitApprovalPending(t, m, sid, h)
+
+	if err := m.ResolveApproval(reqID, hitl.Decision{Type: hitl.DecisionApprove}); err != nil {
+		t.Fatalf("ResolveApproval: %v", err)
+	}
+	waitHandle(t, h)
+
+	recs := jr.snapshot()
+	wantStates := []string{
+		string(RunQueued),
+		string(RunRunning),
+		string(RunWaiting),
+		string(RunCompleted),
+	}
+	if len(recs) != len(wantStates) {
+		var got []string
+		for _, rec := range recs {
+			got = append(got, rec.Kind+":"+rec.State)
+		}
+		t.Fatalf("journal records = %v, want states %v", got, wantStates)
+	}
+	waitingIdx, terminalIdx := -1, -1
+	for i, rec := range recs {
+		if rec.RunID != h.RunID || rec.SessionID != sid {
+			t.Fatalf("record %d = {run:%q session:%q}, want run=%q session=%q(RunID/SessionID 同源)", i, rec.RunID, rec.SessionID, h.RunID, sid)
+		}
+		if rec.Kind != "state" {
+			t.Fatalf("record %d kind = %q, want state", i, rec.Kind)
+		}
+		if rec.State != wantStates[i] {
+			t.Fatalf("record %d state = %q, want %q", i, rec.State, wantStates[i])
+		}
+		if rec.State == string(RunWaiting) {
+			waitingIdx = i
+		}
+		if rec.State == string(RunCompleted) || rec.State == string(RunFailed) || rec.State == string(RunCancelled) {
+			terminalIdx = i
+		}
+	}
+	// waiting_input 存在且先于终态记录(计划验收口径,序列断言的显式对偶)。
+	if waitingIdx < 0 || terminalIdx < 0 || waitingIdx >= terminalIdx {
+		t.Fatalf("waiting record (idx %d) must exist and precede terminal record (idx %d)", waitingIdx, terminalIdx)
 	}
 }
