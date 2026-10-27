@@ -67,50 +67,40 @@ const eventKind = "event"
 
 // EventRecord 是 run journal 中的一条事件记录（kind 恒 "event"，与 state 记录
 // 同文件混存）。Seq 是会话维度严格递增游标（P3-0 契约表：EventHub 单调分配，
-// 跨 Run 不重复）；Seq 记「记录末事件序号」，合并记录（FromSeq>0）声明覆盖
-// [FromSeq..Seq] 的连续区间且 Seq=ToSeq——回放方推进游标到 Seq，范围声明消除
-// 「缺口歧义」（总方案第五节「实时与重放相同事件序号语义」）。
+// 跨 Run 不重复）；Seq 记「记录末事件序号」，合并批次记录（FromSeq>0）的
+// Seq=批次末事件 seq、FromSeq=批次首事件 seq。
 //
-// FromSeq 批量语义（I6 定稿，与 agent 侧 event_hub.go 的回放注释、PROTOCOL.md
-// 「事件批量语义」小节同文）：FromSeq==0 = 单条事件；FromSeq>0 = 批量聚合事件
-// （Seq=区间末、FromSeq=区间首、payload 为聚合结果）。批量是**按 Type 分桶**
-// 的产物：只覆盖同型 delta 的区间，区间内可能穿插逐条落盘的其他类型事件记录
-// ——消费方（回放客户端）游标以实际收到的每条记录 Seq 推进，不得假设
-// [FromSeq..Seq] 区间内没有其他类型事件。
+// FromSeq 批次语义（CR3-I1 定稿，与 agent 侧 event_hub.go 的回放注释同文）：
+// FromSeq==0 = 单条事件记录（key 事件与逐条落盘形态）；FromSeq>0 = 合并批次
+// 记录，payload 为 agent.DeltaBatch JSON（窗内逐事件 {seq,payload} 按序保留）。
+// 批次是**按 Type 分桶**的产物：批次记录只含同型 delta 的 part，区间内其他
+// 类型事件是独立记录（与批次 seq 交错）——FromSeq/Seq 只是存储层的批次标记，
+// 消费方（agent.EventHub 的 Subscribe 回放）按批次内 per-part seq 展开投递，
+// wire 上单条与批次不可区分（SessionEvent 已无 FromSeq 字段）。
 type EventRecord struct {
 	Kind      string          `json:"kind"`       // 恒 "event"（AppendEvent 强制，存储层不变量）
 	SessionID string          `json:"session_id"` // 诊断字段（勘察修正 I，同 RunStateRecord.SessionID）
 	RunID     string          `json:"run_id"`
 	Type      string          `json:"type"`               // 事件类型常量之一（下方两组）
-	Seq       uint64          `json:"seq"`                // 记录末事件序号（合并记录=ToSeq）
-	FromSeq   uint64          `json:"from_seq,omitempty"` // >0 = 合并 [FromSeq..Seq]
+	Seq       uint64          `json:"seq"`                // 记录末事件序号（合并批次记录=批次末 seq）
+	FromSeq   uint64          `json:"from_seq,omitempty"` // >0 = 合并批次记录，payload 为 DeltaBatch JSON
 	Time      time.Time       `json:"time"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
 // SessionEvent 是事件回放/实时投递的传输形状（总方案第五节，agent 侧 EventHub
-// 消费）。与 EventRecord 的差异：无 Kind 信封（存储信封对传输方不可见），Payload
-// 不 omit 空值。FromSeq 上 wire（I2lite 修复，GPT 评审）：>0 = 本条是合并记录、
-// 覆盖 [FromSeq..Seq] 的连续区间（且 Seq=ToSeq）——实时逐事件投递恒为 0（省略），
-// 客户端据此区分批量与单条：同一 Seq 区间在实时侧呈现逐事件粒度、回放侧呈现
-// 合并粒度的差异（I2）由范围声明显式化，不再与「单条事件恰逢游标」不可辨。
-// EventHub.Publish 把 IngressEvent 包成本类型后既广播又落盘（P3-2，实时侧
-// FromSeq=0），Subscribe 的回放转换透传持久化记录的 FromSeq（P3-3）。
+// 消费）。与 EventRecord 的差异：无 Kind 信封（存储信封对传输方不可见），无
+// FromSeq（批次只存在于存储面——CR3-I1 起 Subscribe 回放把合并批次展开为
+// 原始 per-seq 事件，实时与回放形状彻底一致，wire 上单条/批次不可区分，断点
+// 恢复精确到 seq），Payload 不 omit 空值。EventHub.Publish 把 IngressEvent 包
+// 成本类型后既广播又落盘（P3-2）；Subscribe 的回放把持久化记录（单条或合并
+// 批次）展开为本类型逐事件投递（P3-3）。
 //
-// 协议批量语义（I6 定稿，PROTOCOL.md「事件批量语义」小节的实现侧事实源）：
-//   - FromSeq==0 = 单条事件（seq 即该事件自身序号）；
-//   - FromSeq>0 = 批量聚合事件：Seq=区间末事件序号、FromSeq=区间首事件序号，
-//     payload 为窗内逐事件 payload 的聚合结果（文本类 delta=拼接字符串，对象类
-//     =窗内末条，agent 侧 aggregateDeltaPayload 的文档化行为）；
-//   - 客户端游标以实际收到的每条事件 Seq 推进（回放方推进到 Seq=ToSeq），
-//     **不得假设 [FromSeq..Seq] 区间内没有其他类型事件**——key 事件逐条落盘，
-//     可与合并窗区间交错；范围声明不是「区间内仅此一条」的承诺，游标授权永远
-//     以逐事件 Seq 为准。
+// 客户端游标以实际收到的每条事件 Seq 逐条推进。
 type SessionEvent struct {
 	SessionID string          `json:"session_id"`
 	RunID     string          `json:"run_id"`
 	Seq       uint64          `json:"seq"`
-	FromSeq   uint64          `json:"from_seq,omitempty"` // >0 = 合并记录，覆盖 [FromSeq..Seq]（实时逐事件恒省略）
 	Type      string          `json:"type"`
 	Time      time.Time       `json:"time"`
 	Payload   json.RawMessage `json:"payload"`
@@ -133,8 +123,9 @@ const (
 	EventRunError                  = "run.error"
 )
 
-// 高频 delta 事件类型（P3-0 契约表的 3 类）：进合并缓冲，50ms/4KB 窗合并为一条
-// [FromSeq..Seq] 记录落盘（P3-2）；实时广播仍逐事件（per-event seq）。命名对齐
+// 高频 delta 事件类型（P3-0 契约表的 3 类）：进合并缓冲，50ms/4KB 窗合并为
+// 一条批次记录（FromSeq..Seq 范围声明 + DeltaBatch payload，CR3-I1）落盘
+// （P3-2）；实时广播仍逐事件（per-event seq）。命名对齐
 // runtimeconfig.Event* 既有风格（config/spec.go:251-252）。
 const (
 	EventTextDelta     = "text.delta"

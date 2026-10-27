@@ -182,12 +182,6 @@ func xgwError(format string, args ...any) *protocol.RPCError {
 	return &protocol.RPCError{Code: xgwErrorCode, Message: fmt.Sprintf(format, args...)}
 }
 
-// xgwControlLeaseError 是 control 缺失的统一拒绝:connectionID 回显请求方
-// 自身 id,客户端可对照 attach(接管)回显确认持有者已易主。
-func xgwControlLeaseError(connectionID string) *protocol.RPCError {
-	return xgwError("x-goworker: control lease held by another connection (connection %s does not hold the lease)", connectionID)
-}
-
 // xgwNotAvailableError 是后端无 RunControlSource(纯 SessionSource 插件/测试
 // 桩)时全部 x-goworker 方法的诚实报错,与 session load 降级同型
 // ("acp frontend: session load not supported")。

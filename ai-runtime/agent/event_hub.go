@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -28,10 +27,12 @@ import (
 //     事件在 mu 内 journal fsync 成功后才广播,失败不广播、返回错误——总方案
 //     第五节「持久化写入失败不能继续把事件当作可恢复事件正常广播」;失败同时
 //     把 replayIntegrity 置为 Incomplete(I4 三态,粘滞永不复位);
-//   - 高频 delta 合并落盘(P3-0 表第 3 行):3 类 delta 先逐事件实时广播
-//     (per-event seq),再进 50ms/4KB 合并窗,按 Type 分桶合并为一条
-//     [FromSeq..Seq] 记录(合并记录 Seq=ToSeq、FromSeq 声明范围,P3-1 契约;
-//     I2lite 起范围声明随回放透传上 wire);合并落盘失败仅 warn——重放缺 delta
+//   - 高频 delta 合并落盘(P3-0 表第 3 行,CR3-I1 定稿存储形状):3 类 delta
+//     先逐事件实时广播(per-event seq),再进 50ms/4KB 合并窗,按 Type 分桶
+//     合并为一条批次记录(EventRecord FromSeq>0、Seq=批次末 seq,payload 为
+//     DeltaBatch JSON——按序保留窗内每个事件的 {seq,payload} 边界);Subscribe
+//     回放把批次展开为原始 per-seq 事件,实时与回放形状彻底一致(wire 上单条/
+//     批次不可区分,断点恢复精确到 seq)。合并落盘失败仅 warn——重放缺 delta
 //     段可接受,assistant.message_finalized 兜底定稿(降级语义,P3-0 表第 7 行
 //     的对偶面),失败同样置 Incomplete:执行结果与事件完整性是两个独立状态,
 //     后者经 ReplayIntegrity()/attach 与 run/get 的 replayIntegrity 字段向
@@ -59,7 +60,12 @@ import (
 type EventJournal interface {
 	AppendEvent(rec session.EventRecord) error
 	ReadEvents(afterSeq uint64) ([]session.EventRecord, error)
-	SeqRange() (earliest, latest uint64, ok bool)
+	// SeqRange 返回保留历史的 [earliest..latest] 事件 seq 区间。四出参形状
+	// (第三轮评审 I3 定稿):ok=false 且 err=nil = 空历史(无任何事件记录,从 1
+	// 起算);err 非 nil = Journal 扫描 I/O 失败——空历史与读取失败必须可辨,
+	// 调用方 NewEventHub 对后者显式拒绝创建,绝不把读取失败当空历史从 Seq=1
+	// 重起(与既有记录冲突)。
+	SeqRange() (earliest, latest uint64, ok bool, err error)
 }
 
 // 编译期断言:session.RunJournalStore(P3-1)满足 agent 侧消费面。签名漂移在
@@ -126,17 +132,34 @@ type hubSub struct {
 	dead      chan struct{}             // 断开信号(close-only):投递阻塞时经它感知断开并退出
 }
 
+// DeltaPart 是合并批次内的一个原始事件位:Seq 为该事件自身的会话游标,
+// Payload 为实时广播的原字节(不透明 RawMessage,展开时原样透传)。
+type DeltaPart struct {
+	Seq     uint64          `json:"seq"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+// DeltaBatch 是合并批次记录(EventRecord FromSeq>0)的 payload 形状(CR3-I1):
+// Events 按追加序(即 seq 序)保存窗内每个事件的 {seq,payload}。批次只存在
+// 于存储面——合并只压缩落盘记录条数,不压缩事件边界;携带 DeltaBatch payload
+// 的 EventRecord 从不直接上 wire,Subscribe 的回放把批次展开为逐事件
+// SessionEvent,wire 上单条与批次不可区分。
+type DeltaBatch struct {
+	Events []DeltaPart `json:"events"`
+}
+
 // pendingDelta 是 delta 合并缓冲的一个分桶(按 Type,同 run 内同型合并):
-// 攒 [fromSeq..toSeq] 区间内的全部 payload,窗满(50ms/4KB)或 EndRun/Close
+// 攒 [fromSeq..toSeq] 区间内的全部事件,窗满(50ms/4KB)或 EndRun/Close
 // 时合并为一条 EventRecord 落盘。runID/lastTime 取桶内首末事件的值(合并记录
-// 的归属与时间戳);parts 是逐事件原始 payload(聚合策略见 aggregateDeltaPayload);
-// bytes 是 payload 粗略字节数(4KB 阈值判据,不求精确)。
+// 的归属与时间戳);parts 按序保存窗内每个事件的 {seq,payload}(bufferDelta
+// Locked 追加时记录 out.Seq——批次内部边界不丢,回放展开 per-seq 事件、断点
+// 恢复精确到 seq 的依据);bytes 是 payload 粗略字节数(4KB 阈值判据,不求精确)。
 type pendingDelta struct {
 	runID    string
 	fromSeq  uint64
 	toSeq    uint64
 	lastTime time.Time
-	parts    []json.RawMessage
+	parts    []DeltaPart
 	bytes    int
 }
 
@@ -207,14 +230,17 @@ type EventHub struct {
 }
 
 // NewEventHub 创建事件枢纽并播种游标与完整性三态:j 非 nil 时经 SeqRange 读
-// 既有保留历史的 [earliest..latest](磁盘扫描;扫描失败由 RunJournalStore.
-// SeqRange 降级为 ok=false 并 warn,journal_store.go——按「从零开始」处理,
-// 真实 I/O 故障会在随后的 AppendEvent/ReadEvents 显式上抛),seq=latest+1 续接
-// 分配;j 为 nil 时 latest=0、seq=1(纯内存 hub 从 1 起算)。完整性播种(I4):
-// 有既有历史(ok)→ Unknown——历史产生于旧进程纪元,其间的落盘失败无从在本
-// 进程验证,诚实报 Unknown 绝不谎报完整;空历史/纯内存 → Complete——本进程
-// 观察面即全部,此后的失败由写侧置 Incomplete。
-func NewEventHub(sessionID string, j EventJournal) *EventHub {
+// 既有保留历史的 [earliest..latest](磁盘扫描),seq=latest+1 续接分配;j 为
+// nil 时 latest=0、seq=1(纯内存 hub 从 1 起算)。播种失败(第三轮评审 I3):
+// SeqRange 返回 err(Journal 读取/解析失败)→ 返回 (nil, err) 显式上抛——
+// 持久化会话的 hub 创建失败绝不创建「看似健康」的 hub(旧形态把读取失败降级
+// 为空历史:replayIntegrity 恒 complete 且 seq 从 1 重起,与既有记录冲突);
+// 调用链 bindEvents/EnsureHub/StartRun 同步上抛。空历史(ok=false, err=nil)
+// 与既有历史(ok=true)照旧分别播种 Complete/Unknown。完整性播种(I4):有既有
+// 历史(ok)→ Unknown——历史产生于旧进程纪元,其间的落盘失败无从在本进程验证,
+// 诚实报 Unknown 绝不谎报完整;空历史/纯内存 → Complete——本进程观察面即全部,
+// 此后的失败由写侧置 Incomplete。
+func NewEventHub(sessionID string, j EventJournal) (*EventHub, error) {
 	h := &EventHub{
 		sessionID:       sessionID,
 		subs:            make(map[uint64]*hubSub),
@@ -224,13 +250,17 @@ func NewEventHub(sessionID string, j EventJournal) *EventHub {
 		done:            make(chan struct{}),
 	}
 	if j != nil {
-		if earliest, latest, ok := j.SeqRange(); ok {
+		earliest, latest, ok, err := j.SeqRange()
+		if err != nil {
+			return nil, fmt.Errorf("agent: event hub: session %s: seed seq range: %w", sessionID, err)
+		}
+		if ok {
 			h.earliest, h.latest = earliest, latest
 			h.replayIntegrity = ReplayIntegrityUnknown
 		}
 	}
 	h.seq = h.latest + 1
-	return h
+	return h, nil
 }
 
 // BeginRun 括起一个 run 的产生边界:设置 AppendEvent 目标兜底(curRunID),
@@ -428,30 +458,52 @@ func (h *EventHub) Subscribe(ctx context.Context, fromSeq uint64) (<-chan sessio
 		}
 		replay = make([]session.SessionEvent, 0, len(recs))
 		for _, rec := range recs {
-			// EventRecord → SessionEvent(传输形状):丢 Kind 信封,FromSeq 透传
-			// (I2lite 修复:合并记录的范围声明上 wire,客户端可区分批量与单条
-			// ——实时逐事件投递的 FromSeq 恒 0,回放的合并记录带 [FromSeq..Seq];
-			// 游标语义不变,回放方仍按 Seq=ToSeq 推进)。
+			// EventRecord → SessionEvent(传输形状)展开(CR3-I1):丢 Kind 信封。
+			//   - FromSeq==0 = 单条事件记录(key 事件与逐条落盘形态)→ 原样产出
+			//     一条 SessionEvent;
+			//   - FromSeq>0 = 合并批次记录(payload 为 DeltaBatch JSON)→ 按
+			//     per-part 逐条展开产出,并跳过 part.Seq <= fromSeq:批次记录的
+			//     Seq=批次末 seq 可能远大于游标(ReadEvents 只按记录末 seq 过滤),
+			//     批次内早于游标的部分不得重发——断点恢复精确到 seq,不重复、
+			//     不丢失(CR3-I1 的交错实例:批次 [101..104] 内含 103/104,游标
+			//     102 之后的恢复面恰为 103/104,101 绝不重放);
+			//   - part 顺序即 seq 序(桶内追加序),展开后统一按 Seq 升序排序。
 			//
-			// FromSeq 批量语义(I6 定稿,与 journal.go SessionEvent 注释同文):
-			//   - FromSeq==0 = 单条事件(实时投递与未合并的持久化记录);
-			//   - FromSeq>0 = 批量聚合事件:Seq=区间末、FromSeq=区间首,payload
-			//     为聚合结果(文本类=窗内增量拼接,对象类=窗内末条,见
-			//     aggregateDeltaPayload);
-			//   - 客户端游标以**实际收到的事件 Seq** 逐条推进,不得假设
-			//     [FromSeq..Seq] 区间内没有其他类型事件——key 事件在发布时逐条
-			//     落盘,可与合并窗的 seq 区间交错(物理序 ≠ seq 序,上方注释),
-			//     范围声明只描述本条聚合记录的覆盖范围,不是「区间内仅此一条」
-			//     的承诺;游标授权永远以逐事件 Seq 为准。
-			replay = append(replay, session.SessionEvent{
-				SessionID: rec.SessionID,
-				RunID:     rec.RunID,
-				Seq:       rec.Seq,
-				FromSeq:   rec.FromSeq,
-				Type:      rec.Type,
-				Time:      rec.Time,
-				Payload:   rec.Payload,
-			})
+			// 展开后实时与回放形状彻底一致:wire 上均为 per-seq 单条事件,无
+			// 范围声明、无批量语义,客户端游标以实际收到的 Seq 逐条推进。
+			if rec.FromSeq == 0 {
+				replay = append(replay, session.SessionEvent{
+					SessionID: rec.SessionID,
+					RunID:     rec.RunID,
+					Seq:       rec.Seq,
+					Type:      rec.Type,
+					Time:      rec.Time,
+					Payload:   rec.Payload,
+				})
+				continue
+			}
+			var batch DeltaBatch
+			if err := json.Unmarshal(rec.Payload, &batch); err != nil {
+				// 批次解码失败 → warn 跳过该记录(降级语义,与落盘失败对偶:
+				// 重放缺 delta 段可接受,assistant.message_finalized 兜底定稿)。
+				slog.Warn("agent: event hub replay skip undecodable delta batch",
+					"err", err, "session", h.sessionID, "run", rec.RunID,
+					"type", rec.Type, "seq", rec.Seq)
+				continue
+			}
+			for _, part := range batch.Events {
+				if part.Seq <= fromSeq {
+					continue
+				}
+				replay = append(replay, session.SessionEvent{
+					SessionID: rec.SessionID,
+					RunID:     rec.RunID,
+					Seq:       part.Seq,
+					Type:      rec.Type,
+					Time:      rec.Time,
+					Payload:   part.Payload,
+				})
+			}
 		}
 		sort.Slice(replay, func(i, j int) bool { return replay[i].Seq < replay[j].Seq })
 	}
@@ -621,7 +673,7 @@ func (h *EventHub) bufferDeltaLocked(typ string, payload json.RawMessage, out se
 	}
 	b.toSeq = out.Seq
 	b.lastTime = out.Time
-	b.parts = append(b.parts, payload)
+	b.parts = append(b.parts, DeltaPart{Seq: out.Seq, Payload: payload})
 	b.bytes += len(payload)
 	if b.bytes >= deltaFlushBytes {
 		h.flushDeltaTypeLocked(typ)
@@ -653,24 +705,36 @@ func (h *EventHub) flushAllDeltaLocked() {
 }
 
 // flushDeltaTypeLocked 把一个缓冲桶合并为一条 EventRecord 落盘(Seq=ToSeq、
-// FromSeq 声明 [FromSeq..Seq] 范围,P3-1 契约;payload 聚合见
-// aggregateDeltaPayload)。失败仅 warn——重放缺 delta 段可接受,
-// assistant.message_finalized 兜底定稿(降级语义,文件头)。j==nil 不会到这
-// (bufferDeltaLocked 仅在 j!=nil 时被调)。调用方必须持 h.mu。
+// FromSeq 声明 [FromSeq..Seq] 范围,payload 为 DeltaBatch JSON——窗内逐事件
+// 的 {seq,payload} 按序保留,CR3-I1;回放侧展开为 per-seq 事件)。失败仅
+// warn——重放缺 delta 段可接受,assistant.message_finalized 兜底定稿(降级
+// 语义,文件头)。j==nil 不会到这(bufferDeltaLocked 仅在 j!=nil 时被调)。
+// 调用方必须持 h.mu。
 func (h *EventHub) flushDeltaTypeLocked(typ string) {
 	b, ok := h.deltaBuf[typ]
 	if !ok {
 		return
 	}
 	delete(h.deltaBuf, typ)
+	payload, err := json.Marshal(DeltaBatch{Events: b.parts})
+	if err != nil {
+		// parts 全为合法 JSON 的 RawMessage,marshal 理论不可达(原始 payload
+		// 均经 json.Marshal 产出);与 append 失败同款降级(warn + Incomplete,
+		// 不落盘)。
+		h.replayIntegrity = ReplayIntegrityIncomplete
+		slog.Warn("agent: event hub delta batch marshal failed (replay may miss delta range)",
+			"err", err, "session", h.sessionID, "run", b.runID, "type", typ,
+			"from_seq", b.fromSeq, "to_seq", b.toSeq)
+		return
+	}
 	rec := session.EventRecord{
 		SessionID: h.sessionID,
 		RunID:     b.runID,
 		Type:      typ,
-		Seq:       b.toSeq,   // 合并记录 Seq=ToSeq:回放方推进游标到 Seq
-		FromSeq:   b.fromSeq, // >0 声明覆盖 [FromSeq..Seq],消除「缺口歧义」
+		Seq:       b.toSeq,   // 合并记录 Seq=批次末事件 seq(区间声明,存储层批次标记)
+		FromSeq:   b.fromSeq, // >0 = 合并批次记录(payload 为 DeltaBatch JSON)
 		Time:      b.lastTime,
-		Payload:   aggregateDeltaPayload(b.parts),
+		Payload:   payload,
 	}
 	if err := h.journal.AppendEvent(rec); err != nil {
 		// I4:合并 flush 失败置 Incomplete(粘滞永不复位)——重放缺 [FromSeq..
@@ -692,31 +756,4 @@ func (h *EventHub) stopFlushTimerLocked() {
 		h.flushTimer.Stop()
 		h.flushTimer = nil
 	}
-}
-
-// aggregateDeltaPayload 聚合一个合并窗的 delta payload:全部为 JSON 字符串时
-// 拼接为单个字符串(text.delta/thinking.delta 的 token 流语义——重放侧可还原
-// 窗内完整文本);任一非字符串(如 usage.progress 的对象 payload)则退化为
-// 窗内最后一条 payload(最终状态)。全空窗退化为空(omitempty 省略)。聚合
-// 语义是合并记录的文档化行为,TestDeltaMergeWindow 钉死字符串拼接路径。
-func aggregateDeltaPayload(parts []json.RawMessage) json.RawMessage {
-	if len(parts) == 0 {
-		return nil
-	}
-	texts := make([]string, 0, len(parts))
-	allStrings := true
-	for _, p := range parts {
-		var s string
-		if len(p) == 0 || json.Unmarshal(p, &s) != nil {
-			allStrings = false
-			break
-		}
-		texts = append(texts, s)
-	}
-	if allStrings {
-		if joined, err := json.Marshal(strings.Join(texts, "")); err == nil {
-			return joined
-		}
-	}
-	return parts[len(parts)-1]
 }

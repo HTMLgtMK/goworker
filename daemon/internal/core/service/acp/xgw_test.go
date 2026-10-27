@@ -28,20 +28,33 @@ import (
 
 // fakeStartCall / fakeCancelCall / fakeApprovalCall 是 source 层收到的调用记录。
 type fakeStartCall struct {
-	SessionID string
-	Input     string
-	RequestID string
+	SessionID    string
+	ConnectionID string
+	Input        string
+	RequestID    string
 }
 
 type fakeCancelCall struct {
-	SessionID string
-	RunID     string
+	SessionID    string
+	ConnectionID string
+	RunID        string
 }
 
 type fakeApprovalCall struct {
-	SessionID string
-	RequestID string
-	Decision  hitl.Decision
+	SessionID    string
+	ConnectionID string
+	RequestID    string
+	Decision     hitl.Decision
+}
+
+// errFakeLeaseLost mirror runcontrol.go 的 ErrControlLeaseLost(第三轮评审 I4
+// fencing):接管/释放/未持有的连接在 source 侧被拒。文案含 control lease,
+// wire 面 -32000 断言(wantXGWError + Contains)复用同一关键词。
+var errFakeLeaseLost = errors.New("control lease not held by the caller")
+
+// fakeLeaseLostErr 构造 fencing 拒绝错误(调用方在持 f.mu 时或单线程 setup 用)。
+func fakeLeaseLostErr(sessionID, connectionID string) error {
+	return fmt.Errorf("fakeRunControl: session %q: connection %q: %w", sessionID, connectionID, errFakeLeaseLost)
 }
 
 // fakeRunControl 是 model.RunControlSource 的脚本化 fake(内嵌 fakeSessionSource
@@ -49,7 +62,10 @@ type fakeApprovalCall struct {
 // requestID 重试返回原 runID 与当前状态快照(建模 P5-6 承诺,不起跑)。
 // approvalOwner 是服务端记录的审批归属(C1 修复建模:mirror runcontrol.go——
 // 未知 requestID → ErrApprovalUnknown 语义;归属会话与调用方声明不一致 → 越权
-// 拒绝),由用例按 wire 会话 id 预置。
+// 拒绝),由用例按 wire 会话 id 预置。第三轮评审 I4 起,控制类操作
+// (StartRun/CancelRun/ResolveApproval)mirror 生产的 fencing 契约:先校验
+// connectionID 持有该会话的 lease(未持有/被接管 → errFakeLeaseLost),校验
+// 通过才落账——接管的 AcquireControl 同锁(f.mu),镜像「校验后不可能被接管」。
 type fakeRunControl struct {
 	*fakeSessionSource
 
@@ -92,9 +108,13 @@ func newFakeRunControl() *fakeRunControl {
 	}
 }
 
-func (f *fakeRunControl) StartRun(sessionID, input, requestID string) (string, string, error) {
+func (f *fakeRunControl) StartRun(sessionID, connectionID, input, requestID string) (string, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// fencing mirror:lease 校验先行,未持有一律拒绝(见 fakeRunControl 注释)。
+	if connectionID == "" || f.leases[sessionID] != connectionID {
+		return "", "", fakeLeaseLostErr(sessionID, connectionID)
+	}
 	if runID, ok := f.runByReq[requestID]; ok {
 		// 幂等命中:P5-6 契约=返回原 runID 与其「当前」状态快照。fake 固定
 		// 建模快照已推进到 running,与首次的 queued 可辨,供透传断言。
@@ -103,7 +123,7 @@ func (f *fakeRunControl) StartRun(sessionID, input, requestID string) (string, s
 	f.nextRun++
 	runID := fmt.Sprintf("run-%d", f.nextRun)
 	f.runByReq[requestID] = runID
-	f.startCalls = append(f.startCalls, fakeStartCall{SessionID: sessionID, Input: input, RequestID: requestID})
+	f.startCalls = append(f.startCalls, fakeStartCall{SessionID: sessionID, ConnectionID: connectionID, Input: input, RequestID: requestID})
 	// P5-8:「先 StartRun 产事件」的 fake 建模——经真 EventHub.Publish 产出
 	// 三条 key 事件(durable-first 路径,内存 journal 同步落账),活动 run 快照
 	// 置为 running。
@@ -129,10 +149,13 @@ func (f *fakeRunControl) StartRun(sessionID, input, requestID string) (string, s
 	return runID, "queued", nil
 }
 
-func (f *fakeRunControl) CancelRun(sessionID, runID string) error {
+func (f *fakeRunControl) CancelRun(sessionID, connectionID, runID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.cancelCalls = append(f.cancelCalls, fakeCancelCall{SessionID: sessionID, RunID: runID})
+	if connectionID == "" || f.leases[sessionID] != connectionID {
+		return fakeLeaseLostErr(sessionID, connectionID)
+	}
+	f.cancelCalls = append(f.cancelCalls, fakeCancelCall{SessionID: sessionID, ConnectionID: connectionID, RunID: runID})
 	return nil
 }
 
@@ -149,14 +172,19 @@ func (f *fakeRunControl) PendingApprovals(sessionID string) ([]model.PendingAppr
 	return nil, nil
 }
 
-// ResolveApproval mirror runcontrol.go 的 C1 契约(归属三段校验的 source 侧):
-// resolveErr 脚本化失败优先;未知 requestID → ErrApprovalUnknown 语义;归属会话
-// 与调用方声明不一致 → 越权拒绝(服务端记录为准,不信客户端声明);匹配才记账。
-func (f *fakeRunControl) ResolveApproval(sessionID, requestID string, decision hitl.Decision) error {
+// ResolveApproval mirror runcontrol.go 的 C1 契约 + 第三轮评审 I4 fencing(归属
+// 三段校验的 source 侧,fencing 后四步同锁原子):resolveErr 脚本化失败优先;
+// lease 校验(未持有/被接管 → errFakeLeaseLost);未知 requestID →
+// ErrApprovalUnknown 语义;归属会话与调用方声明不一致 → 越权拒绝(服务端记录
+// 为准,不信客户端声明);匹配才记账。
+func (f *fakeRunControl) ResolveApproval(sessionID, connectionID, requestID string, decision hitl.Decision) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.resolveErr != nil {
 		return f.resolveErr
+	}
+	if connectionID == "" || f.leases[sessionID] != connectionID {
+		return fakeLeaseLostErr(sessionID, connectionID)
 	}
 	owner, ok := f.approvalOwner[requestID]
 	if !ok {
@@ -165,7 +193,7 @@ func (f *fakeRunControl) ResolveApproval(sessionID, requestID string, decision h
 	if owner != sessionID {
 		return fmt.Errorf("approval %q belongs to session %q, not %q", requestID, owner, sessionID)
 	}
-	f.approvals = append(f.approvals, fakeApprovalCall{SessionID: sessionID, RequestID: requestID, Decision: decision})
+	f.approvals = append(f.approvals, fakeApprovalCall{SessionID: sessionID, ConnectionID: connectionID, RequestID: requestID, Decision: decision})
 	return nil
 }
 
@@ -556,7 +584,7 @@ func TestXGWReplayIntegrityForwarding(t *testing.T) {
 
 	// attach 面:注错 journal → key 事件发布失败 → hub 置 incomplete(粘滞),
 	// attach 响应显式携带。Subscribe 仍可建立(err journal 读面恒空)。
-	badHub := runtimeagent.NewEventHub("sess-store-1", &errEventJournal{})
+	badHub := mustNewEventHub(t, "sess-store-1", &errEventJournal{})
 	if err := badHub.Publish(runtimeagent.IngressEvent{
 		RunID: "run-1", Type: session.EventToolCall, Payload: json.RawMessage(`"c"`),
 	}); err == nil {
@@ -589,7 +617,7 @@ func TestXGWReplayIntegrityForwarding(t *testing.T) {
 // 后的 wire 形状)按会话过守卫;fake 的服务端归属预置 req-9 → sid。
 func TestXGWApprovalRespondForwardsDecision(t *testing.T) {
 	frc := newFakeRunControl()
-	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
+	hub := mustNewEventHub(t, "sess-store-1", &memEventJournal{})
 	frc.mu.Lock()
 	frc.attachHub = hub
 	frc.mu.Unlock()
@@ -699,7 +727,7 @@ func TestXGWApprovalRespondForwardsDecision(t *testing.T) {
 // 直接应答他会话审批。
 func TestXGWApprovalCrossSessionOwnership(t *testing.T) {
 	frc := newFakeRunControl()
-	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
+	hub := mustNewEventHub(t, "sess-store-1", &memEventJournal{})
 	frc.mu.Lock()
 	frc.attachHub = hub
 	frc.mu.Unlock()
@@ -994,11 +1022,11 @@ func (j *memEventJournal) ReadEvents(afterSeq uint64) ([]session.EventRecord, er
 	return out, nil
 }
 
-func (j *memEventJournal) SeqRange() (earliest, latest uint64, ok bool) {
+func (j *memEventJournal) SeqRange() (earliest, latest uint64, ok bool, err error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if len(j.recs) == 0 {
-		return 0, 0, false
+		return 0, 0, false, nil
 	}
 	earliest, latest = j.recs[0].Seq, j.recs[0].Seq
 	for _, rec := range j.recs[1:] {
@@ -1009,13 +1037,14 @@ func (j *memEventJournal) SeqRange() (earliest, latest uint64, ok bool) {
 			latest = rec.Seq
 		}
 	}
-	return earliest, latest, true
+	return earliest, latest, true, nil
 }
 
 // errEventJournal 是注错 journal(I4 测试面):AppendEvent 一律失败(模拟磁盘
-// 故障),读面恒空——SeqRange ok=false(空历史播种,不触发 Unknown)、
-// ReadEvents 空(Subscribe/attach 可正常建立),专供 replayIntegrity 的失败
-// 置位路径。编译期断言同 memEventJournal。
+// 故障),读面恒空——SeqRange (0,0,false,nil)(诚实空历史播种,不触发 Unknown,
+// 也不触发 I3 的 NewEventHub 拒绝——本 stub 的注错面只在写侧)、ReadEvents 空
+// (Subscribe/attach 可正常建立),专供 replayIntegrity 的失败置位路径。编译期
+// 断言同 memEventJournal。
 var _ runtimeagent.EventJournal = (*errEventJournal)(nil)
 
 type errEventJournal struct{}
@@ -1024,7 +1053,18 @@ func (j *errEventJournal) AppendEvent(session.EventRecord) error { return errors
 
 func (j *errEventJournal) ReadEvents(uint64) ([]session.EventRecord, error) { return nil, nil }
 
-func (j *errEventJournal) SeqRange() (uint64, uint64, bool) { return 0, 0, false }
+func (j *errEventJournal) SeqRange() (uint64, uint64, bool, error) { return 0, 0, false, nil }
+
+// mustNewEventHub 是测试构造助手:NewEventHub 失败即 Fatal(成功路径 stub 的
+// SeqRange 不会注错;I3 的播种失败路径由 runcontrol/agent 侧专测覆盖)。
+func mustNewEventHub(t *testing.T, sessionID string, j runtimeagent.EventJournal) *runtimeagent.EventHub {
+	t.Helper()
+	hub, err := runtimeagent.NewEventHub(sessionID, j)
+	if err != nil {
+		t.Fatalf("NewEventHub(%s): %v", sessionID, err)
+	}
+	return hub
+}
 
 // xgwEventLog 收集客户端收到的 x-goworker/session/events 通知:原始 params 解回
 // session.SessionEvent,同时钉住「SessionEvent 原样 JSON」的双向往返与蛇形键
@@ -1068,7 +1108,7 @@ func (l *xgwEventLog) snapshot() (events []session.SessionEvent, raws, bad []str
 func newAttachStack(t *testing.T) (*xgwStack, *runtimeagent.EventHub) {
 	t.Helper()
 	frc := newFakeRunControl()
-	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
+	hub := mustNewEventHub(t, "sess-store-1", &memEventJournal{})
 	frc.mu.Lock()
 	frc.attachHub = hub
 	frc.mu.Unlock()
@@ -1245,13 +1285,13 @@ func TestXGWSessionAttachCursorExpired(t *testing.T) {
 // TestXGWSessionAttachControlTakeover(P5-8 Observe/Control;I3 后同会话接管):
 // attach(mode=control) 经 wire 获取该会话 lease(空闲获取 tookOver 省略);
 // 第二连接对**同一会话** attach(mode=control) 显式接管(tookOver=true 回显);
-// 接管后原 holder 的 approval/respond 被 requireControl(req.SessionID) 拒绝
-// (其对该会话的 lease 已易主),新 holder 可用;lease 易主不断原 holder 的事
+// 接管后原 holder 的 approval/respond 被 source 侧的 lease 守卫拒绝(第三轮
+// 评审 I4 fencing:其对该会话的 lease 已易主,校验与提交同临界区),新 holder 可用;lease 易主不断原 holder 的事
 // 件流。跨会话互不影响由 TestXGWSessionAttachControlPerSession 单独覆盖(I3:
 // 接管只发生在同一会话上)。
 func TestXGWSessionAttachControlTakeover(t *testing.T) {
 	frc := newFakeRunControl()
-	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
+	hub := mustNewEventHub(t, "sess-store-1", &memEventJournal{})
 	frc.mu.Lock()
 	frc.attachHub = hub
 	frc.mu.Unlock()
@@ -1337,7 +1377,7 @@ func TestXGWSessionAttachControlTakeover(t *testing.T) {
 // sidA,对 sidB 的 run/start 被拒,反之亦然;各连接的观察流照常。
 func TestXGWSessionAttachControlPerSession(t *testing.T) {
 	frc := newFakeRunControl()
-	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
+	hub := mustNewEventHub(t, "sess-store-1", &memEventJournal{})
 	frc.mu.Lock()
 	frc.attachHub = hub
 	frc.mu.Unlock()
@@ -1399,7 +1439,7 @@ func TestXGWSessionAttachControlPerSession(t *testing.T) {
 }
 
 // TestXGWSessionAttachObserveCannotRespond(P5-8 observe 面):mode=observe
-// 不动 lease,approval/respond 被 requireControl 拒绝(-32000)且不触达 source;
+// 不动 lease,approval/respond 被 source 侧 lease 守卫拒绝(-32000)且不触达 source;
 // 观察流本身正常(observe=只读观察面,总方案 §7.4)。
 func TestXGWSessionAttachObserveCannotRespond(t *testing.T) {
 	stack, hub := newAttachStack(t)
@@ -1606,7 +1646,7 @@ func TestXGWHandlerCloseReclaimsSubscriptions(t *testing.T) {
 // 候选,B 的 approval/respond 同样被拒)。
 func TestXGWSessionAttachFailureKeepsSubscriptionAndLease(t *testing.T) {
 	frc := newFakeRunControl()
-	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
+	hub := mustNewEventHub(t, "sess-store-1", &memEventJournal{})
 	frc.mu.Lock()
 	frc.attachHub = hub
 	frc.mu.Unlock()
@@ -1763,23 +1803,23 @@ func TestXGWSessionAttachConcurrentSinglePump(t *testing.T) {
 	}
 }
 
-// TestXGWSessionAttachCloseCommitBarrier(I2 修复验收,commitHook 确定性交错,
-// 不用 time.Sleep):attach 的提交段内(h.mu 已释放的插桩窗口)同步跑生产
-// Close → 提交段二次确认 closed → attach 被拒。复现评审 I2 的 Close/Attach
-// 竞态:修复前该窗口内 attach 会照常换入订阅、启动泵并 AcquireControl——连接
-// 关闭后复活订阅与 lease。断言四件事:attach 报错;订阅未复活(表空、泵未
-// 启动,负向无投递是结构事实,不做宽限睡眠断言);lease 未获取(HoldControl
-// 恒 false);closed 置位后后续 attach 一律拒绝。
+// TestXGWSessionAttachCloseCommitBarrier(I2 修复验收,preCommitHook 确定性
+// 交错,不用 time.Sleep):钩子挂在 Subscribe 成功与提交临界区之间的真实锁外
+// 边界(生产可达窗口),同步跑生产 Close → 提交段 closed 检查命中 → attach 被
+// 拒。复现评审 I2 的 Close/Attach 竞态:修复前该窗口内 attach 会照常换入订阅、
+// 启动泵并 AcquireControl——连接关闭后复活订阅与 lease。断言四件事:attach
+// 报错;订阅未复活(表空、泵未启动,负向无投递是结构事实,不做宽限睡眠断言);
+// lease 未获取(HoldControl 恒 false);closed 置位后后续 attach 一律拒绝。
 func TestXGWSessionAttachCloseCommitBarrier(t *testing.T) {
 	stack, _ := newAttachStack(t)
 	sid := stack.initAndNew(t)
 
 	stack.handler.mu.Lock()
-	stack.handler.commitHook = func() { stack.handler.Close() }
+	stack.handler.preCommitHook = func() { stack.handler.Close() }
 	stack.handler.mu.Unlock()
 
 	_, err := stack.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"})
-	rpcErr := wantXGWError(t, "attach racing Close inside its commit", err)
+	rpcErr := wantXGWError(t, "attach racing Close before its commit", err)
 	if !strings.Contains(rpcErr.Message, "closed") {
 		t.Fatalf("attach-after-close message = %q, want closed mention", rpcErr.Message)
 	}
@@ -1810,9 +1850,11 @@ func TestXGWSessionAttachCloseCommitBarrier(t *testing.T) {
 // detach 并发时,终态订阅/lease 状态符合 h.mu 内操作序——attach 提交段(换表
 // +取 lease)与 detach(摘表+还 lease)各自单事务,以 h.mu 全序,后者完整胜出:
 // 要么订阅存活且 lease 在手(attach 段在后),要么表空且 lease 空闲(detach 段
-// 在后);被换下/被摘除的订阅句柄一律已 stop(无未登记泵)。第一段用 commitHook
-// 把生产 detach 确定性插进 attach 提交段中间(detach 的 mu 操作序严格在后 →
-// attach 让位);第二段并发轰 attach(control)+detach(control) 断言不变式。
+// 在后);被换下/被摘除的订阅句柄一律已 stop(无未登记泵)。第一段用
+// preCommitHook 把生产 detach 确定性插在 attach#2 的 Subscribe 之后、提交临界
+// 区之前(真实锁外边界)——detach 的 mu 操作序严格在前 → attach#2 正常提交
+// 获胜(终态:新订阅存活且 lease 在手);第二段并发轰 attach(control)+
+// detach(control) 断言不变式。
 func TestXGWSessionAttachDetachConcurrentLifecycle(t *testing.T) {
 	stack, hub := newAttachStack(t)
 	sid := stack.initAndNew(t)
@@ -1830,40 +1872,38 @@ func TestXGWSessionAttachDetachConcurrentLifecycle(t *testing.T) {
 		t.Fatal("attach #1 left no subscription")
 	}
 
-	// —— 确定性段:commitHook 内跑生产 detach(control),其 h.mu 段严格晚于
-	// attach#2 的换表 → detach 是全序最后一方 → attach#2 被顶替拒绝,终态为空。
+	// —— 确定性段:preCommitHook 内跑生产 detach(control),其 h.mu 段严格早于
+	// attach#2 的提交临界区 → detach 是全序前一方 → attach#2 正常提交获胜
+	//(终态:新订阅存活、lease 由 attach#2 取得),被 detach 收掉的 sub1 已停。
 	detachParams, err := json.Marshal(XSessionDetachParams{SessionID: sid, Mode: XAttachModeControl})
 	if err != nil {
 		t.Fatalf("marshal detach params: %v", err)
 	}
 	stack.handler.mu.Lock()
-	stack.handler.commitHook = func() {
+	stack.handler.preCommitHook = func() {
 		if _, err := stack.handler.xgwSessionDetach(context.Background(), detachParams); err != nil {
-			t.Errorf("detach inside commit hook: %v", err)
+			t.Errorf("detach inside pre-commit hook: %v", err)
 		}
 	}
 	stack.handler.mu.Unlock()
 	_, err = stack.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"})
-	if err == nil {
-		t.Fatal("attach overtaken by a detach inside its commit must be rejected")
-	}
-	if rpcErr := wantXGWError(t, "attach overtaken by detach", err); !strings.Contains(rpcErr.Message, "superseded") {
-		t.Fatalf("overtaken attach message = %q, want superseded mention", rpcErr.Message)
+	if err != nil {
+		t.Fatalf("attach after a pre-commit detach must commit: %v", err)
 	}
 	stack.handler.mu.Lock()
-	stack.handler.commitHook = nil
+	stack.handler.preCommitHook = nil
 	rest := len(stack.handler.subs)
 	stack.handler.mu.Unlock()
-	if rest != 0 {
-		t.Fatalf("subscriptions after detach-wins interleave = %d, want 0", rest)
+	if rest != 1 {
+		t.Fatalf("subscriptions after detach-then-attach = %d, want exactly 1 (the new attach)", rest)
 	}
-	if stack.runs.HoldControl(sid, stack.handler.connectionID) {
-		t.Fatal("detach inside the commit window must leave the lease free")
+	if !stack.runs.HoldControl(sid, stack.handler.connectionID) {
+		t.Fatal("attach that linearizes after the detach must hold the lease")
 	}
 	select {
 	case <-sub1.done:
 	default:
-		t.Fatal("the displaced subscription must be stopped when the attach yields")
+		t.Fatal("the detached subscription (sub1) must be stopped")
 	}
 
 	// —— 并发段:attach(control) 与 detach(control) 同会话并发,断言终态
@@ -1955,7 +1995,7 @@ func TestXGWSessionAttachDetachConcurrentLifecycle(t *testing.T) {
 // currentRun=null。
 func TestXGWSessionAttachCrossConnectionCurrentRun(t *testing.T) {
 	frc := newFakeRunControl()
-	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
+	hub := mustNewEventHub(t, "sess-store-1", &memEventJournal{})
 	frc.mu.Lock()
 	frc.attachHub = hub
 	frc.mu.Unlock()
@@ -1995,5 +2035,119 @@ func TestXGWSessionAttachCrossConnectionCurrentRun(t *testing.T) {
 	}
 	if fields["currentRun"] != nil {
 		t.Fatalf("attach own-session currentRun = %v, want null (no active run)", fields["currentRun"])
+	}
+}
+
+// TestXGWControlFencingTakeoverStorm(第三轮评审 I4 修复验收,wire 面):接管后
+// 原 holder 的 run/start、run/cancel、approval/respond 全部 -32000(control
+// lease)且 source 计数不再增长(fencing:lease 校验内移 source,与提交原子,
+// fake 以同构 lease 校验镜像生产契约)。基线(start/cancel/respond 各成功一次,
+// 审批恰好送达一次)先行,B 显式接管后,A 的操作与 B 的并发接管/释放交错轰炸
+// ——被接管的旧持有者在任意交错下都无法再落地控制操作,接管前已提交的审批
+// 恰好一次(approvals 恒 1)。
+func TestXGWControlFencingTakeoverStorm(t *testing.T) {
+	frc := newFakeRunControl()
+	frc.mu.Lock()
+	frc.attachHub = mustNewEventHub(t, "sess-store-1", &memEventJournal{})
+	frc.mu.Unlock()
+	stackA := newXGWStack(t, nil, frc)
+	stackB := newXGWStack(t, nil, frc)
+	t.Cleanup(stackA.handler.Close)
+	t.Cleanup(stackB.handler.Close)
+	sid := stackA.initAndNew(t)
+
+	// A attach(control) 持照;预置审批归属(服务端记录 req-storm → sid)。
+	if _, err := stackA.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"}); err != nil {
+		t.Fatalf("attach A control: %v", err)
+	}
+	frc.mu.Lock()
+	frc.approvalOwner["req-storm"] = sid
+	frc.mu.Unlock()
+
+	// 接管前基线:start/cancel/respond 各成功一次。
+	raw, err := stackA.callRaw(t, XMethodRunStart, map[string]any{
+		"sessionId": sid, "input": "storm", "requestId": "storm-run",
+	})
+	if err != nil {
+		t.Fatalf("baseline run/start: %v", err)
+	}
+	var started map[string]any
+	if err := json.Unmarshal(raw, &started); err != nil {
+		t.Fatalf("decode baseline run/start result %s: %v", raw, err)
+	}
+	runID, _ := started["runId"].(string)
+	if _, err := stackA.callRaw(t, XMethodRunCancel, map[string]any{"sessionId": sid, "runId": runID}); err != nil {
+		t.Fatalf("baseline run/cancel: %v", err)
+	}
+	if _, err := stackA.callRaw(t, XMethodApprovalRespond, map[string]any{
+		"sessionId": sid, "requestId": "req-storm",
+		"decision": map[string]any{"interrupt_id": "req-storm", "type": "approve"},
+	}); err != nil {
+		t.Fatalf("baseline approval/respond: %v", err)
+	}
+	frc.mu.Lock()
+	baseStarts, baseCancels, baseApprovals := len(frc.startCalls), len(frc.cancelCalls), len(frc.approvals)
+	frc.mu.Unlock()
+	if baseStarts != 1 || baseCancels != 1 || baseApprovals != 1 {
+		t.Fatalf("baseline source calls = start:%d cancel:%d approve:%d, want 1/1/1", baseStarts, baseCancels, baseApprovals)
+	}
+
+	// B 显式接管(确定性先行,风暴前提:lease 此刻起永不再回到 conn-A)。
+	fields, err := stackB.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"})
+	if err != nil {
+		t.Fatalf("attach B control: %v", err)
+	}
+	if fields["tookOver"] != true {
+		t.Fatalf("attach B tookOver = %v, want true (explicit takeover)", fields["tookOver"])
+	}
+
+	// 风暴:A 轰三类操作(全栈 wire),B 并发反复接管/释放(lease 在 conn-B 与
+	// 空闲之间翻转)。断言:A 的每个操作一律 -32000 + control lease 文案。
+	const iters = 30
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { // B:lease 翻转(直接 source 面,并发修改被操作对象的守卫前提)
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			frc.AcquireControl(sid, stackB.handler.connectionID)
+			frc.ReleaseControl(sid, stackB.handler.connectionID)
+		}
+	}()
+	go func() { // A:控制操作轰炸(被接管后的全部控制操作必须明确失败)
+		defer wg.Done()
+		assertWireLeaseLost := func(what string, iter int, err error) {
+			if err == nil {
+				t.Errorf("iteration %d: %s from the evicted holder must fail", iter, what)
+				return
+			}
+			var rpcErr *protocol.RPCError
+			if !errors.As(err, &rpcErr) || rpcErr.Code != xgwErrorCode || !strings.Contains(rpcErr.Message, "control lease") {
+				t.Errorf("iteration %d: %s from the evicted holder err = %v, want -32000 control lease", iter, what, err)
+			}
+		}
+		for i := 0; i < iters; i++ {
+			_, errS := stackA.callRaw(t, XMethodRunStart, map[string]any{
+				"sessionId": sid, "input": "storm", "requestId": "storm-run",
+			})
+			assertWireLeaseLost("run/start", i, errS)
+			_, errC := stackA.callRaw(t, XMethodRunCancel, map[string]any{"sessionId": sid, "runId": runID})
+			assertWireLeaseLost("run/cancel", i, errC)
+			_, errR := stackA.callRaw(t, XMethodApprovalRespond, map[string]any{
+				"sessionId": sid, "requestId": "req-storm",
+				"decision": map[string]any{"interrupt_id": "req-storm", "type": "approve"},
+			})
+			assertWireLeaseLost("approval/respond", i, errR)
+		}
+	}()
+	wg.Wait()
+
+	// 终态:source 三类计数与基线一致——风暴期的全部拒绝零副作用,接管前已
+	// 提交的审批恰好一次(approvals 恒 1)。
+	frc.mu.Lock()
+	gotStarts, gotCancels, gotApprovals := len(frc.startCalls), len(frc.cancelCalls), len(frc.approvals)
+	frc.mu.Unlock()
+	if gotStarts != baseStarts || gotCancels != baseCancels || gotApprovals != baseApprovals {
+		t.Fatalf("source calls after storm = start:%d cancel:%d approve:%d, want baseline %d/%d/%d (风暴拒绝零副作用)",
+			gotStarts, gotCancels, gotApprovals, baseStarts, baseCancels, baseApprovals)
 	}
 }

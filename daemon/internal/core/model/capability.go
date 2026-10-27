@@ -111,12 +111,18 @@ type PendingApprovalInfo struct {
 // ReleaseConnection 释放该连接全部租约）、后到连接对同一会话显式接管
 // （tookOver=true + slog 审计）。
 type RunControlSource interface {
-	// StartRun 提交一次后台 Run 并立即返回 (runID, 提交时状态)。requestID 是
-	// 与 JSON-RPC id 不同的幂等键，按 (sessionID, requestID) 组合寻址（I5）：
+	// StartRun 提交一次后台 Run 并立即返回 (runID, 提交时状态)。connectionID
+	// 是调用方连接句柄(fencing,第三轮评审 I4):实现必须把「lease 校验
+	// (lease[sessionID] == connectionID,未持有→明确错误)」与操作提交合并进
+	// 服务端受保护临界区(与 AcquireControl 同锁)——校验通过后不可能被并发
+	// 接管,接管后旧持有者的控制操作一律拒绝。requestID 是与 JSON-RPC id 不同的
+	// 幂等键，按 (sessionID, requestID) 组合寻址（I5）：
 	// 重试同键同 Input 返回原 runID 与其当前状态，不重复起跑；同键不同 Input
 	// （含跨会话同 requestID 不同 Input）返回显式冲突错误。
-	StartRun(sessionID, input, requestID string) (runID, state string, err error)
-	CancelRun(sessionID, runID string) error
+	StartRun(sessionID, connectionID, input, requestID string) (runID, state string, err error)
+	// CancelRun 取消一个后台 Run(connectionID fencing 同 StartRun:lease 校验与
+	// 取消提交在同一受保护临界区内原子完成,接管后旧持有者一律拒绝)。
+	CancelRun(sessionID, connectionID, runID string) error
 	// RunStatus 返回 run 当前状态、会话事件流的 latest seq（游标描述，非游标
 	// 授权——客户端只有真正应用了对应事件才能推进本地游标）与回放完整性三态
 	// replayIntegrity（I4：eventsComplete 布尔的替代，取 runtimeagent 的
@@ -129,12 +135,15 @@ type RunControlSource interface {
 	// PendingApprovals 返回会话未过期审批快照（daemon 侧扁平结构，避免
 	// model→agent 类型泄漏）。未知会话/无审批返回空切片。
 	PendingApprovals(sessionID string) ([]PendingApprovalInfo, error)
-	// ResolveApproval 投递一笔审批决策(C1 修复:归属三段校验):先以服务端
+	// ResolveApproval 投递一笔审批决策(C1 修复:归属三段校验;第三轮评审 I4:
+	// fencing——connectionID 的 lease 校验、归属校验与 Resolve 提交在实现侧
+	// 同一受保护临界区内原子完成,接管与决策提交不可交错):先以服务端
 	// 记录的审批归属为准(ApprovalOwner)——归属不存在(未知 requestID)或归属
 	// 会话与 sessionID 不一致(越权,即便调用方持有其他会话的 control lease)
-	// 一律拒绝,绝不信任客户端声明;匹配才投递,首个有效决策获胜,迟到/重复
+	// 一律拒绝,绝不信任客户端声明;未持有该会话 lease 的连接(含被接管的旧
+	// 持有者)在提交前即被拒绝;匹配才投递,首个有效决策获胜,迟到/重复
 	// 决策返回错误。
-	ResolveApproval(sessionID, requestID string, decision hitl.Decision) error
+	ResolveApproval(sessionID, connectionID, requestID string, decision hitl.Decision) error
 	// Attach 返回会话事件枢纽与当前 latest seq（P5-8 的 attach 面消费；本步
 	// 落签名与实现——EnsureHub 使「重启后 attach 时 hub 未建」的缺口关闭）。
 	Attach(sessionID string) (hub *runtimeagent.EventHub, latest uint64, err error)

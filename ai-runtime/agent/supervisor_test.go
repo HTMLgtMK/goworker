@@ -454,6 +454,87 @@ func TestStartRunRejectsWhenQueuedJournalFails(t *testing.T) {
 	waitHandle(t, h2)
 }
 
+// TestStartRunRejectsWhenEventHubSeedingFails(第三轮评审 I3 修复验收,I1 断言
+// 形态):EventJournal.SeqRange 播种(Journal 读取)失败 → ⑥ bindEvents/
+// NewEventHub 失败 → StartRun 显式拒绝,pending/active 无痕清退——绝不带着
+// 「看似健康」的 hub(旧形态把读取失败当空历史:replayIntegrity 报 complete 且
+// seq 从 1 重起,与既有记录冲突)进入执行。无痕断言四件套(同
+// TestStartRunRejectsWhenQueuedJournalFails):
+//   - 错误链包裹底层原因(errors.Is),零值 RunHandle;
+//   - active 已清退 + pending 令牌已归还:恢复播种后同会话重提成功(确定性,
+//     容量 1 探针);
+//   - provider 未开工:被拒 run 的 execute 从未启动;
+//   - journal 恰含 ⑤ 的 queued 接受记录、无终态/事件记录(接受点在先,残留的
+//     queued 记录由恢复扫描按「无终态」诚实标 interrupted)。
+func TestStartRunRejectsWhenEventHubSeedingFails(t *testing.T) {
+	m := NewSessionManager(WithRunLimits(1, 1)) // pending 容量 1:令牌守恒的探针
+	defer m.Close()
+
+	sj := &stubRunJournal{}
+	cause := errors.New("runs dir unreadable")
+	ej := &stubEventJournal{seqRangeErr: cause}
+	started := make(chan struct{})
+	pv := &gatedProvider{
+		replies: []string{"reply"},
+		starts:  []chan struct{}{started},
+		release: nil, // 不挂起:被调用即返回
+	}
+	s := NewSession(SessionDeps{
+		Config:   runtimeconfig.Default(),
+		AuditDir: "",
+		CollectTools: func(*sandbox.Config) []core.Tool {
+			return nil
+		},
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			return pv, nil
+		},
+		Store:      &fakeConversationStore{},
+		RunJournal: sj,
+		RunEvents:  ej,
+	})
+	rt := NewSessionRuntime("hub-seed-reject", s)
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// 注错提交:拒绝 + 错误链 + 零句柄。
+	h, err := m.StartRun("hub-seed-reject", RunRequest{Input: "q"}, testRunCallbacks(&strings.Builder{}))
+	if err == nil {
+		t.Fatal("StartRun with failing hub seeding = nil, want error(I3:绝不返回看似健康的 run)")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("StartRun error chain = %v, want wrap of underlying %v", err, cause)
+	}
+	if h != (RunHandle{}) {
+		t.Fatalf("rejected StartRun returned handle %+v, want zero value(拒绝绝不携带句柄)", h)
+	}
+
+	// 无痕:active 清退、provider 未开工(execute 未启动)、journal 无终态/事件
+	// 记录(queued 接受记录已在,见上)。
+	if act := rt.Active(); act != nil {
+		t.Fatalf("active after rejected StartRun = %+v, want nil(记账已无痕清退)", act)
+	}
+	select {
+	case <-started:
+		t.Fatal("provider started for a rejected run(execute 不得已启动)")
+	case <-time.After(100 * time.Millisecond):
+	}
+	recs := sj.snapshot()
+	if len(recs) != 1 || recs[0].State != string(RunQueued) {
+		t.Fatalf("journal records after rejected StartRun = %+v, want exactly the queued accept record(无终态/事件记录)", recs)
+	}
+
+	// 恢复播种后同会话重提成功 = active 清退(不撞 ErrRunActive)与 pending 令牌
+	// 归还(容量 1 不撞 ErrTooManyPending)的联合证明;随后走完正常生命周期。
+	ej.seqRangeErr = nil
+	h2, err := m.StartRun("hub-seed-reject", RunRequest{Input: "q2"}, testRunCallbacks(&strings.Builder{}))
+	if err != nil {
+		t.Fatalf("StartRun after seeding recovery = %v, want nil(failed wiring left residue: pending token or active)", err)
+	}
+	waitStarted(t, started)
+	waitHandle(t, h2)
+}
+
 // ---------------------------------------------------------------------------
 // P2-6:CancelRun + 排队取消路径(总方案第十一节 TestCancelIsolation → 本步)。
 //

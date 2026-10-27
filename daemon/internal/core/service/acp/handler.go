@@ -61,9 +61,10 @@ type FrontendHandler struct {
 	// 建议四)。leaseMu 是 source 侧叶锁(runcontrol.go),不回调 handler、不取
 	// h.mu,嵌套单向 h.mu→leaseMu,Close 侧同向,无环;其余临界区仍互不嵌套。
 	//
-	// C1 修复清退了旧的 controlSessions 候选集:approval/respond 的守卫按 wire
-	// 携带的 sessionId 逐会话询问 source 的 HoldControl(requireControl),权威
-	// 归属再由 source 按 requestID 校验,handler 无需本地簿记。
+	// C1 修复清退了旧的 controlSessions 候选集:approval/respond 的会话归属
+	// 守卫在 source 侧按服务端记录校验(第三轮评审 I4 起 run/start|cancel 的
+	// lease 守卫同样内移 source,与操作提交同临界区原子完成),handler 无需
+	// 本地簿记。
 	subs map[string]*xgwSubscription
 
 	// closed 是 I2 的连接生命周期屏障:Close 在 h.mu 内置位,此后 attach 的提交
@@ -72,13 +73,14 @@ type FrontendHandler struct {
 	// Close 的「closed 置位 + 清表」同以 h.mu 串行,二者必有一个全序)。
 	closed bool
 
-	// commitHook 是 attach 提交段的测试钩子(第二轮评审 I2 验收,仅测试注入,
-	// 生产恒 nil):在换入新订阅句柄之后、closed 二次确认之前同步调用,此时
-	// h.mu 已释放——钩子内可跑 Close/detach(它们需要取 h.mu,持锁调用会自锁)。
-	// 测试用它在提交完成前确定性插入 Close/detach,复现评审的并发窗口;钩子
-	// 返回后的二次确认把插桩期间发生的状态变化收束为显式拒绝。nil 时提交段是
-	// 单临界区,无插桩窗口。
-	commitHook func()
+	// preCommitHook 是 attach 的测试钩子(第三轮评审 I2 验收,仅测试注入,
+	// 生产恒 nil):在 hub.Subscribe 成功返回之后、进入提交临界区(h.mu)之前
+	// 同步调用。该间隙是生产真实存在的锁外边界——Close/detach 可在此并发发生,
+	// 钩子内跑 Close/detach(它们需要 h.mu,此时本 goroutine 未持锁,不会自锁)
+	// 复现的正是生产可达的交错;提交临界区本身保持纯原子(无中途解锁)。钩子
+	// 须在无并发 attach 运行时设置/清除(测试串行段使用),避免钩子字段自身的
+	// 读写竞争。
+	preCommitHook func()
 
 	mu         sync.Mutex
 	promptable map[string]struct{} // 可 prompt 集合：session/new 与当前会话 load 记入

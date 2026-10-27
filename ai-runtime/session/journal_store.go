@@ -195,13 +195,18 @@ func (s *RunJournalStore) ReadEvents(afterSeq uint64) ([]EventRecord, error) {
 // SessionID 过滤与 ReadEvents 同源（P5-3：播种游标与回放同源，构造期快照的
 // sessionID，比对在 visit 回调消费侧完成，见 ReadEvents 注释）——混存文件中
 // 他 incarnation 的 seq 不参与播种，否则游标窗口会被异 id 区间拉宽。
-// 空 runs/ 或无任何事件记录 → ok=false。扫描 I/O 错误（runs/ 存在但不可读等）
-// 同样返回 ok=false 并 warn——本签名无 error 出参（agent 侧 EventJournal 接口
-// 形状，P3-2 定稿），播种方拿到 false 以「从零开始」处理，真实 I/O 故障会在
-// 随后的 AppendEvent/ReadEvents 以错误显式上抛，此处不静默放大。
-func (s *RunJournalStore) SeqRange() (earliest, latest uint64, ok bool) {
+//
+// 返回语义（第三轮评审 I3 定稿的四出参形状：空历史与读取失败必须可辨，绝不把
+// I/O 故障降级为「空历史」——旧形态下 NewEventHub 会把读取失败当作空历史,
+// replayIntegrity 报 complete 且 seq 从 1 重起,与既有记录冲突）：
+//   - 空 runs/ 或无任何事件记录 → (0,0,false,nil)；
+//   - 扫描 I/O 错误（runs/ 不可读、单文件解析失败等）→ (0,0,false,err)，错误
+//     原样上抛、不再降级 warn——agent 侧 EventJournal 接口同步改形（I3），调用
+//     方 NewEventHub 据此拒绝创建 hub（持久化会话的播种失败显式上抛，绝不创建
+//     看似健康的 hub）。ok=true 时 err 恒 nil。
+func (s *RunJournalStore) SeqRange() (earliest, latest uint64, ok bool, err error) {
 	first := true
-	err := s.walkEventRecords(func(rec EventRecord) {
+	err = s.walkEventRecords(func(rec EventRecord) {
 		if rec.SessionID != s.sessionID {
 			return // 他 incarnation 段（P5-3：过滤在消费侧，扫描侧零逻辑）
 		}
@@ -218,10 +223,9 @@ func (s *RunJournalStore) SeqRange() (earliest, latest uint64, ok bool) {
 		}
 	})
 	if err != nil {
-		slog.Warn("session: seq range scan failed", "session", s.sessionID, "err", err)
-		return 0, 0, false
+		return 0, 0, false, fmt.Errorf("session: run journal store %s: seq range: %w", s.sessionID, err)
 	}
-	return earliest, latest, !first
+	return earliest, latest, !first, nil
 }
 
 // LastRunState 返回某 run 的末条 state 记录(P5-6):daemon 侧 RunControlSource
@@ -231,8 +235,9 @@ func (s *RunJournalStore) SeqRange() (earliest, latest uint64, ok bool) {
 //
 // 文件不存在(run 无 journal 或纯内存宿主)→ ok=false;解析失败/无 state 记录
 // 同样 ok=false——本方法无 error 出参(plan P5-6 签名),读方 RunStatus 把
-// false 归一为 run-not-found 语义;真实 I/O 故障的降级与 SeqRange 同型(宁缺
-// 记录勿放大, AppendEvent/ReadEvents 的后续显式错误仍可观测)。坏行跳过策略
+// false 归一为 run-not-found 语义;真实 I/O 故障在此降级为 ok=false 是 RunStatus
+// 观测面的既有取舍(宁缺记录勿放大, AppendEvent/ReadEvents 的后续显式错误仍
+// 可观测;SeqRange 的 I3 错误上抛定稿不适用于本签名)。坏行跳过策略
 // 同 loadStateRecords(scanJSONL)。runID 经 validRunID 校验(防 traversal,与
 // OpenRunJournal 同款),非法 id → ok=false。
 //

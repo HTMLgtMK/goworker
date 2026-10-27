@@ -158,11 +158,17 @@ func (f *xgwLiveControl) requireCurrent(sessionID string) error {
 	return nil
 }
 
-// StartRun mirror runcontrol.go:current 校验 → 幂等表命中短路(返回原 runID
-// 与当前状态快照)→ manager.StartRun(空回调后台提交)→ 记账。
-func (f *xgwLiveControl) StartRun(sessionID, input, requestID string) (string, string, error) {
+// StartRun mirror runcontrol.go(current 校验 → fencing:lease 校验与提交同锁,
+// 第三轮评审 I4):幂等表命中短路(返回原 runID 与当前状态快照)→
+// manager.StartRun(空回调后台提交)→ 记账。
+func (f *xgwLiveControl) StartRun(sessionID, connectionID, input, requestID string) (string, string, error) {
 	if err := f.requireCurrent(sessionID); err != nil {
 		return "", "", err
+	}
+	f.leaseMu.Lock()
+	defer f.leaseMu.Unlock()
+	if connectionID == "" || f.leases[sessionID] != connectionID {
+		return "", "", fmt.Errorf("xgwLiveControl: session %q: connection %q: %w", sessionID, connectionID, errFakeLeaseLost)
 	}
 	f.reqMu.Lock()
 	defer f.reqMu.Unlock()
@@ -185,10 +191,16 @@ func (f *xgwLiveControl) StartRun(sessionID, input, requestID string) (string, s
 	return h.RunID, string(h.State()), nil
 }
 
-// CancelRun mirror runcontrol.go:直转 manager(未知 run → ErrRunNotFound)。
-func (f *xgwLiveControl) CancelRun(sessionID, runID string) error {
+// CancelRun mirror runcontrol.go(fencing 同 StartRun):直转 manager(未知 run
+// → ErrRunNotFound)。
+func (f *xgwLiveControl) CancelRun(sessionID, connectionID, runID string) error {
 	if err := f.requireCurrent(sessionID); err != nil {
 		return err
+	}
+	f.leaseMu.Lock()
+	defer f.leaseMu.Unlock()
+	if connectionID == "" || f.leases[sessionID] != connectionID {
+		return fmt.Errorf("xgwLiveControl: session %q: connection %q: %w", sessionID, connectionID, errFakeLeaseLost)
 	}
 	return f.m.CancelRun(f.sid, runID)
 }
@@ -251,14 +263,21 @@ func (f *xgwLiveControl) PendingApprovals(sessionID string) ([]model.PendingAppr
 	return out, nil
 }
 
-// ResolveApproval mirror runcontrol.go 的 C1 契约(归属三段校验的 source 侧):
-// wire 会话声明先过 requireCurrent(本 shim 的会话路由锚点),归属按服务端
+// ResolveApproval mirror runcontrol.go 的 C1 契约 + 第三轮评审 I4 fencing(四步
+// 同锁原子):wire 会话声明先过 requireCurrent(本 shim 的会话路由锚点),随后
+// leaseMu 临界区内完成「lease 校验 + 归属校验 + Resolve 提交」——归属按服务端
 // 记录(ApprovalOwner)与 runtime id(f.sid)校验——比较用 runtime id 而非
-// wire 原串,与生产 runcontrol.go 的寻址模型一致;未知 requestID →
-// ErrApprovalUnknown 语义,归属不符 → 越权拒绝;匹配才直转 manager。
-func (f *xgwLiveControl) ResolveApproval(sessionID, requestID string, decision hitl.Decision) error {
+// wire 原串,与生产 runcontrol.go 的寻址模型一致;未持有 lease(含被接管的旧
+// 持有者)→ errFakeLeaseLost,未知 requestID → ErrApprovalUnknown 语义,归属
+// 不符 → 越权拒绝;匹配才直转 manager。
+func (f *xgwLiveControl) ResolveApproval(sessionID, connectionID, requestID string, decision hitl.Decision) error {
 	if err := f.requireCurrent(sessionID); err != nil {
 		return err
+	}
+	f.leaseMu.Lock()
+	defer f.leaseMu.Unlock()
+	if connectionID == "" || f.leases[sessionID] != connectionID {
+		return fmt.Errorf("xgwLiveControl: session %q: connection %q: %w", sessionID, connectionID, errFakeLeaseLost)
 	}
 	owner, ok := f.m.ApprovalOwner(requestID)
 	if !ok {
@@ -271,7 +290,7 @@ func (f *xgwLiveControl) ResolveApproval(sessionID, requestID string, decision h
 }
 
 // Attach mirror runcontrol.go:current 校验 → rt.EnsureHub(遗留③解法:attach
-// 即建,含 SeqRange 播种)→ (hub, latest)。
+// 即建,含 SeqRange 播种;I3:播种失败显式上抛)→ (hub, latest)。
 func (f *xgwLiveControl) Attach(sessionID string) (*runtimeagent.EventHub, uint64, error) {
 	if err := f.requireCurrent(sessionID); err != nil {
 		return nil, 0, err
@@ -280,7 +299,10 @@ func (f *xgwLiveControl) Attach(sessionID string) (*runtimeagent.EventHub, uint6
 	if rt == nil {
 		return nil, 0, errors.New("xgwLiveControl: no active runtime")
 	}
-	hub := rt.EnsureHub()
+	hub, err := rt.EnsureHub()
+	if err != nil {
+		return nil, 0, fmt.Errorf("xgwLiveControl: ensure event hub: %w", err)
+	}
 	if hub == nil {
 		return nil, 0, fmt.Errorf("xgwLiveControl: event stream not enabled for session %q", sessionID)
 	}
@@ -671,11 +693,10 @@ func TestXGWIntegrationBackgroundRunEventsAndIdempotency(t *testing.T) {
 
 	// ③ afterSeq 断点续传:以 assistant.message_finalized(key 事件,不进合并
 	// 缓冲)的 seq 为已确认游标重新 attach → 恰好补齐 (cursor, latest] =
-	// [run.finished] 一条,无缺无重。不以 seq=1 续传:回放侧的合并 delta 记录
-	// 按「一条记录一条 ToSeq 事件」塌缩交付(P3-1 契约;I2lite 起 FromSeq 随
-	// 记录上 wire 作范围声明,交付粒度仍是每记录一条 ToSeq 事件),(1, latest]
-	// 内的 usage.progress 合并段不逐条重放——断点续传的客户端契约是「游标后
-	// 事件不缺终段」,对 delta 合并段以 ToSeq 为准。
+	// [run.finished] 一条,无缺无重。不以 seq=1 续传:回放侧的合并 delta 批次
+	// 记录已展开为原始 per-seq 事件(CR3-I1;wire 上单条/批次不可区分),游标
+	// 之后的批次部分按各自 seq 逐条重放、游标之前的部分不重发——本用例的
+	// (1, latest] 内 usage.progress 合并段均 <= 游标,恰补一条 run.finished。
 	before := log.count()
 	resumeFrom := uint64(events[idxFinal].Seq)
 	resumeWant := len(events) - int(resumeFrom) // = 1(run.finished)
@@ -885,11 +906,10 @@ func TestXGWIntegrationApprovalAfterReconnect(t *testing.T) {
 	}
 
 	// 双连接同流:B 的订阅(attach afterSeq=0:回放历史 + live 续传)与 A 并存
-	// (多观察者;观察/控制分离)。回放侧的合并 delta 记录按「一条记录一条
-	// ToSeq 事件」塌缩交付(P3-1 契约;I2lite 起 FromSeq 随记录上 wire 作范围
-	// 声明,交付粒度不变),逐条全等只对 attach 点之后的实时段成立:B 的
-	// Seq>bAttachLatest 段与 A 的同段逐条对齐,且两流末位 seq/类型一致(同一
-	// 会话游标)、B 全流 seq 严格递增。
+	// (多观察者;观察/控制分离)。回放侧的合并 delta 批次记录已展开为原始
+	// per-seq 事件(CR3-I1,实时与回放形状一致),逐条全等对 B 的全流成立:
+	// B 的 Seq>bAttachLatest 段与 A 的同段逐条对齐,且两流末位 seq/类型一致
+	// (同一会话游标)、B 全流 seq 严格递增。
 	waitFor(t, "B receives the same stream", func() bool {
 		eventsB, _, badB := logB.snapshot()
 		return len(badB) == 0 && len(eventsB) > 0 && eventsB[len(eventsB)-1].Seq == lastSeq

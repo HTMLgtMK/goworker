@@ -94,7 +94,9 @@ type AgentPlugin struct {
 	// controlLeases 是 sessionID → connectionID 租约表,本机信任、每会话至多
 	// 一个持有者(两连接各控各会话互不影响)、断开即释放(P5-7 handler.Close 经
 	// ReleaseConnection 释放该连接全部租约)、后到连接对同一会话显式接管
-	// (tookOver=true + slog.Info 审计)。独立小锁,不与 mu/reqMu/manager 锁
+	// (tookOver=true + slog.Info 审计)。第三轮评审 I4 起 fenced 控制操作在本锁
+	// 临界区内原子完成「lease 校验 + 提交」(fencing):嵌套取 reqMu 与 manager
+	// 内部锁,锁序 leaseMu→reqMu→manager 单向(runcontrol.go 文件头);不与 mu
 	// 嵌套。惰性建表(AcquireControl 首写时 make),读侧 nil map 取值安全。
 	leaseMu       sync.Mutex
 	controlLeases map[string]string

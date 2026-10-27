@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,15 +21,22 @@ import (
 //     顺序钩子断言 journal 先于广播(plan 原文),并用 gate 阻塞把「落盘未
 //     完成 ⇒ 不广播」变成可轮询的确定断言;
 //   - TestDeltaMergeWindow:50ms 窗内 100 条 text.delta → journal 恰 1 条
-//     合并记录(Seq=最后一条、FromSeq=第一条),订阅者仍逐条收到 100 条
+//     批次记录(Seq=最后一条、FromSeq=第一条,payload 为 DeltaBatch JSON,
+//     per-part seq+payload 按序保留),订阅者仍逐条收到 100 条
 //     (实时不合并,P3-0 契约表第 3 行)。
 //
-// 修复验收(CR6):
-//   - TestSubscribeReplayCarriesFromSeq(I2lite):回放透传合并记录的 FromSeq
-//     范围声明(批量/单条可辨),实时逐事件 FromSeq 恒 0;
+// 修复验收(CR6/CR3-I1):
+//   - TestSubscribeReplayExpandsDeltaBatch(CR3-I1):回放把合并批次展开为
+//     原始 per-seq 事件,实时与回放形状彻底一致(wire 无 FromSeq/批量语义,
+//     SessionEvent 已无该字段——编译期钉死);
+//   - TestReplayResumeInsideInterleavedDeltaBatch(CR3-I1 核心交错实例):
+//     游标落在合并批次 seq 区间内部时,断点恢复不重复、不丢失;
 //   - TestEventHubReplayIntegrity(I4):完整性三态——空历史/纯内存 → Complete、
 //     播种自非空 journal → Unknown、key 落盘失败/合并 flush 失败 → Incomplete
-//     且粘滞永不复位(含「失败后成功发布不翻回」与 Unknown → Incomplete 单向)。
+//     且粘滞永不复位(含「失败后成功发布不翻回」与 Unknown → Incomplete 单向);
+//   - TestNewEventHubPropagatesSeqRangeError(第三轮评审 I3):SeqRange 播种
+//     注错 → NewEventHub 返回 (nil, err) 显式上抛,绝不创建「看似健康」的 hub
+//     (旧形态把读取失败当空历史:complete 且 seq 从 1 重起,与旧记录冲突)。
 //
 // P3-3 读侧(plan P3-3「新增测试」):
 //   - TestAttachReplayNoGap(总方案第十一节 → 本步):Replay+Live 原子切换的
@@ -44,10 +50,24 @@ import (
 // 编译期断言:测试桩满足 EventJournal 消费面。
 var _ EventJournal = (*stubEventJournal)(nil)
 
+// mustNewEventHub 是测试构造助手:NewEventHub 失败即 Fatal(成功路径 stub 的
+// SeqRange 不会注错;播种失败的专测直接调 NewEventHub 断言 (nil, err),
+// TestNewEventHubPropagatesSeqRangeError)。
+func mustNewEventHub(t *testing.T, sessionID string, j EventJournal) *EventHub {
+	t.Helper()
+	hub, err := NewEventHub(sessionID, j)
+	if err != nil {
+		t.Fatalf("NewEventHub(%s): %v", sessionID, err)
+	}
+	return hub
+}
+
 // stubEventJournal 是 EventJournal 的内存测试桩:成功追加的记录按序收进 recs;
 // appendErr 非 nil 时注入 AppendEvent 持续失败(记录不收);failFirst > 0 时
 // 接下来 N 次 AppendEvent 注错后自愈(粘滞性验收用——验证「失败后成功发布不
-// 翻回」,需要失败与成功在同一个 stub 上先后发生)。另带两个顺序断言装置:
+// 翻回」,需要失败与成功在同一个 stub 上先后发生);seqRangeErr 非 nil 时注入
+// SeqRange 播种失败(I3:NewEventHub 显式拒绝创建,TestNewEventHubPropagatesSeqRangeError)。
+// 另带两个顺序断言装置:
 //   - order(顺序钩子,plan「以 stub 里的顺序钩子断言」):非 nil 时每次成功
 //     追加向共享顺序日志记 "journal:<type>",与订阅者读侧记的 "sub:<type>"
 //     同池比对——durable-first ⇒ journal 条目恒先于 sub 条目;
@@ -55,10 +75,11 @@ var _ EventJournal = (*stubEventJournal)(nil)
 //     关闭,把「落盘进行中」变成测试可轮询的确定状态(而非依赖调度运气)。
 //     gate/entered 构造期赋值只读,无并发写。
 type stubEventJournal struct {
-	mu        sync.Mutex
-	recs      []session.EventRecord
-	appendErr error
-	failFirst int
+	mu          sync.Mutex
+	recs        []session.EventRecord
+	appendErr   error
+	failFirst   int
+	seqRangeErr error
 
 	order   *orderLog
 	gate    chan struct{}
@@ -100,13 +121,16 @@ func (j *stubEventJournal) ReadEvents(afterSeq uint64) ([]session.EventRecord, e
 	return out, nil
 }
 
-func (j *stubEventJournal) SeqRange() (earliest, latest uint64, ok bool) {
+func (j *stubEventJournal) SeqRange() (earliest, latest uint64, ok bool, err error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if len(j.recs) == 0 {
-		return 0, 0, false
+	if j.seqRangeErr != nil {
+		return 0, 0, false, j.seqRangeErr
 	}
-	return j.recs[0].Seq, j.recs[len(j.recs)-1].Seq, true
+	if len(j.recs) == 0 {
+		return 0, 0, false, nil
+	}
+	return j.recs[0].Seq, j.recs[len(j.recs)-1].Seq, true, nil
 }
 
 func (j *stubEventJournal) snapshot() []session.EventRecord {
@@ -190,7 +214,7 @@ func waitEntered(t *testing.T, entered <-chan struct{}) {
 // 不重复」);key 事件落盘 seq 与广播 seq 同源。
 func TestEventHubSeqMonotonicAcrossRuns(t *testing.T) {
 	jr := &stubEventJournal{}
-	hub := NewEventHub("seq-test", jr)
+	hub := mustNewEventHub(t, "seq-test", jr)
 	defer hub.Close()
 	ch := hub.addTestSub()
 
@@ -268,7 +292,7 @@ func TestEventHubSeqMonotonicAcrossRuns(t *testing.T) {
 func TestKeyEventDurableFirst(t *testing.T) {
 	t.Run("AppendErrorSuppressesBroadcast", func(t *testing.T) {
 		jr := &stubEventJournal{appendErr: errors.New("fsync boom")}
-		hub := NewEventHub("durable-err", jr)
+		hub := mustNewEventHub(t, "durable-err", jr)
 		defer hub.Close()
 		hub.BeginRun("run-e")
 		ch := hub.addTestSub()
@@ -292,7 +316,7 @@ func TestKeyEventDurableFirst(t *testing.T) {
 	t.Run("JournalCompletesBeforeBroadcast", func(t *testing.T) {
 		log := &orderLog{}
 		jr := &stubEventJournal{order: log, gate: make(chan struct{}), entered: make(chan struct{})}
-		hub := NewEventHub("durable-ok", jr)
+		hub := mustNewEventHub(t, "durable-ok", jr)
 		defer hub.Close()
 		hub.BeginRun("run-o")
 		ch := hub.addTestSub()
@@ -341,29 +365,27 @@ func TestKeyEventDurableFirst(t *testing.T) {
 	})
 }
 
-// TestDeltaMergeWindow:50ms 窗内 100 条 text.delta → 持久化恰 1 条合并记录
-// (Seq=最后一条、FromSeq=第一条,P3-1 合并契约),订阅者仍逐条收到 100 条
+// TestDeltaMergeWindow:50ms 窗内 100 条 text.delta → 持久化恰 1 条批次记录
+// (Seq=最后一条、FromSeq=第一条,payload 为 DeltaBatch JSON 且 per-part
+// seq+payload 按序保留,CR3-I1 合并契约),订阅者仍逐条收到 100 条
 // (实时广播不合并,per-event seq)。100 次发布的耗时远小于 50ms 窗,定时器
 // 未及触发,EndRun 收口即唯一 flush 点。
 func TestDeltaMergeWindow(t *testing.T) {
 	jr := &stubEventJournal{}
-	hub := NewEventHub("merge-win", jr)
+	hub := mustNewEventHub(t, "merge-win", jr)
 	defer hub.Close()
 	hub.BeginRun("run-m")
 	ch := hub.addTestSub()
 
 	const n = 100
-	var wantText strings.Builder
 	for i := 0; i < n; i++ {
-		tok := fmt.Sprintf("t%d", i)
-		payload, err := json.Marshal(tok)
+		payload, err := json.Marshal(fmt.Sprintf("t%d", i))
 		if err != nil {
 			t.Fatalf("marshal token #%d: %v", i, err)
 		}
 		if err := hub.Publish(IngressEvent{RunID: "run-m", Type: session.EventTextDelta, Payload: payload}); err != nil {
 			t.Fatalf("Publish delta #%d: %v", i, err)
 		}
-		wantText.WriteString(tok)
 	}
 	firstSeq, lastSeq := uint64(1), hub.LatestSeq()
 	if lastSeq != n {
@@ -380,7 +402,7 @@ func TestDeltaMergeWindow(t *testing.T) {
 	}
 	requireNoEvent(t, ch) // 恰 100 条,无多余投递
 
-	// 持久化侧:恰 1 条合并记录(无任何逐条落盘)。
+	// 持久化侧:恰 1 条批次记录(无任何逐条落盘)。
 	recs := jr.snapshot()
 	if len(recs) != 1 {
 		t.Fatalf("journal records = %d, want exactly 1 merged record", len(recs))
@@ -395,33 +417,47 @@ func TestDeltaMergeWindow(t *testing.T) {
 	if rec.RunID != "run-m" || rec.SessionID != "merge-win" {
 		t.Fatalf("merged record = {session:%q run:%q}, want {merge-win, run-m}", rec.SessionID, rec.RunID)
 	}
-	// 聚合 payload(文档化行为):窗内 token 字符串全部拼接。
-	var gotText string
-	if err := json.Unmarshal(rec.Payload, &gotText); err != nil {
-		t.Fatalf("merged payload %s is not a JSON string: %v", rec.Payload, err)
+	// 批次 payload(DeltaBatch JSON,CR3-I1 文档化行为):窗内 100 个事件按序
+	// 保留 per-part seq+payload 边界——合并只压缩记录条数,不压缩事件边界。
+	var batch DeltaBatch
+	if err := json.Unmarshal(rec.Payload, &batch); err != nil {
+		t.Fatalf("merged payload %s is not a DeltaBatch: %v", rec.Payload, err)
 	}
-	if gotText != wantText.String() {
-		t.Fatalf("merged payload = %q, want concatenated %q", gotText, wantText.String())
+	if len(batch.Events) != n {
+		t.Fatalf("batch events = %d, want %d", len(batch.Events), n)
+	}
+	for i, part := range batch.Events {
+		wantTok := fmt.Sprintf("t%d", i)
+		if part.Seq != uint64(i+1) {
+			t.Fatalf("batch part #%d seq = %d, want %d(per-part seq 按序保留)", i, part.Seq, i+1)
+		}
+		var got string
+		if err := json.Unmarshal(part.Payload, &got); err != nil {
+			t.Fatalf("batch part #%d payload %s is not a JSON string: %v", i, part.Payload, err)
+		}
+		if got != wantTok {
+			t.Fatalf("batch part #%d payload = %q, want %q", i, got, wantTok)
+		}
 	}
 }
 
-// TestSubscribeReplayCarriesFromSeq(I2lite 修复验收):合并记录的范围声明上
-// wire——Subscribe 回放把持久化记录的 FromSeq 透传进 SessionEvent,客户端可
-// 区分批量与单条:
-//   - 回放侧:50ms 窗收口的 text.delta 合并记录 → 一条 SessionEvent{Seq=3,
-//     FromSeq=1}(批量);逐事件 key 记录 → FromSeq=0(单条);
-//   - 实时侧:订阅后 live 投递的逐事件 FromSeq 恒 0(省略);
-//   - 游标语义不变:回放方仍按 Seq=ToSeq 推进(FromSeq 只是范围声明)。
+// TestSubscribeReplayExpandsDeltaBatch(CR3-I1 修复验收):回放把合并批次展开
+// 为原始 per-seq 事件——实时与回放形状彻底一致:
+//   - 回放侧:3 条 text.delta 的合并批次 [1..3] → 3 条逐事件(seq 1/2/3),
+//     随后的 tool_call(seq 4)单条记录原样产出;
+//   - 实时侧:live 投递逐事件,与回放同形状(wire 无 FromSeq/范围声明——
+//     SessionEvent 已无该字段,编译期即钉死);
+//   - 游标以逐事件 Seq 推进,无批量语义。
 //
 // 订阅晚于全部发布:无并发发布面,回放快照确定;订阅后另发一条 delta 验证
 // live 侧粒度,收尾关闭由 defer 的 hub.Close 承担(pump 随 Close 退出)。
-func TestSubscribeReplayCarriesFromSeq(t *testing.T) {
+func TestSubscribeReplayExpandsDeltaBatch(t *testing.T) {
 	jr := &stubEventJournal{}
-	hub := NewEventHub("fromseq-wire", jr)
+	hub := mustNewEventHub(t, "batch-expand", jr)
 	defer hub.Close()
 	hub.BeginRun("run-fs")
 
-	// 3 条 text.delta → EndRun 收口为一条合并记录 [1..3];再逐条 key 事件(seq 4)。
+	// 3 条 text.delta → EndRun 收口为一条批次记录 [1..3];再逐条 key 事件(seq 4)。
 	for i := 0; i < 3; i++ {
 		if err := hub.Publish(IngressEvent{RunID: "run-fs", Type: session.EventTextDelta, Payload: json.RawMessage(`"d"`)}); err != nil {
 			t.Fatalf("Publish delta #%d: %v", i, err)
@@ -436,26 +472,164 @@ func TestSubscribeReplayCarriesFromSeq(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-	// 回放:恰 2 条(一条合并 + 一条逐条),FromSeq 可辨批量与单条。
-	ev1 := recvEvent(t, ch)
-	if ev1.Seq != 3 || ev1.FromSeq != 1 || ev1.Type != session.EventTextDelta {
-		t.Fatalf("replay #1 = {seq:%d from:%d type:%s}, want {seq:3 from:1 text.delta}(合并记录的范围声明)", ev1.Seq, ev1.FromSeq, ev1.Type)
-	}
-	ev2 := recvEvent(t, ch)
-	if ev2.Seq != 4 || ev2.FromSeq != 0 || ev2.Type != session.EventToolCall {
-		t.Fatalf("replay #2 = {seq:%d from:%d type:%s}, want {seq:4 from:0 tool_call}(单条记录无范围声明)", ev2.Seq, ev2.FromSeq, ev2.Type)
+	// 回放:恰 4 条逐事件(批次展开 3 条 + key 单条 1 条),seq 连续。
+	for i := 1; i <= 4; i++ {
+		ev := recvEvent(t, ch)
+		wantType := session.EventTextDelta
+		if i == 4 {
+			wantType = session.EventToolCall
+		}
+		if ev.Seq != uint64(i) || ev.Type != wantType {
+			t.Fatalf("replay #%d = {seq:%d type:%s}, want {seq:%d %s}(批次展开为 per-seq 事件)", i, ev.Seq, ev.Type, i, wantType)
+		}
 	}
 	requireNoEvent(t, ch) // 回放快照止于注册点 latest=4
 
-	// 实时侧:live 投递逐事件,FromSeq 恒 0。
+	// 实时侧:live 投递逐事件,与回放同形状。
 	if err := hub.Publish(IngressEvent{RunID: "run-fs", Type: session.EventTextDelta, Payload: json.RawMessage(`"e"`)}); err != nil {
 		t.Fatalf("Publish live delta: %v", err)
 	}
-	ev3 := recvEvent(t, ch)
-	if ev3.Seq != 5 || ev3.FromSeq != 0 {
-		t.Fatalf("live event = {seq:%d from:%d}, want {seq:5 from:0}(实时逐事件无范围声明)", ev3.Seq, ev3.FromSeq)
+	ev := recvEvent(t, ch)
+	if ev.Seq != 5 || ev.Type != session.EventTextDelta {
+		t.Fatalf("live event = {seq:%d type:%s}, want {seq:5 text.delta}(实时逐事件)", ev.Seq, ev.Type)
 	}
 	requireNoEvent(t, ch)
+}
+
+// TestReplayResumeInsideInterleavedDeltaBatch(CR3-I1 核心验收,评审 §三 I1 的
+// 101-104 交错实例):key 事件落在合并窗 seq 区间内部时,游标停在批次中间的
+// 断点恢复必须不重复、不丢失:
+//
+//	101 text.delta "A" ┐
+//	102 tool_call      │ 102 逐条落盘(key);101/103/104 合并为批次记录
+//	103 text.delta "B" │ [FromSeq=101..Seq=104](批次只含 text 的 3 个 part)
+//	104 text.delta "C" ┘
+//
+// 各 afterSeq 的期望恢复面(逐事件、精确到 seq):
+//   - afterSeq=100:101"A" 102 103"B" 104"C"(全量:批次展开 + key 单条);
+//   - afterSeq=101:102 103"B" 104"C"(101 不重复);
+//   - afterSeq=102:103"B" 104"C"(核心断言:批次头部被跳过——"A" 不重复、
+//     "B"/"C" 不丢失,评审指出的重复/丢失场景);
+//   - afterSeq=103:104"C"。
+func TestReplayResumeInsideInterleavedDeltaBatch(t *testing.T) {
+	// buildHub 构造交错流并收口(EndRun flush 批次);预置历史 seq=100(key 事件,
+	// 模拟上游游标,使交错流落在 101-104)。每次调用全新 stub + 全新 hub,
+	// 各 afterSeq 场景互不干扰。
+	buildHub := func(t *testing.T) (*EventHub, *stubEventJournal) {
+		t.Helper()
+		jr := &stubEventJournal{}
+		if err := jr.AppendEvent(session.EventRecord{
+			SessionID: "resume-mid", RunID: "run-old",
+			Type: session.EventRunStarted, Seq: 100, Time: time.Now(),
+		}); err != nil {
+			t.Fatalf("seed journal: %v", err)
+		}
+		hub := mustNewEventHub(t, "resume-mid", jr)
+		t.Cleanup(func() { hub.Close() })
+		hub.BeginRun("run-rr")
+		pub := func(typ, payload string) {
+			t.Helper()
+			if err := hub.Publish(IngressEvent{RunID: "run-rr", Type: typ, Payload: json.RawMessage(payload)}); err != nil {
+				t.Fatalf("Publish %s: %v", typ, err)
+			}
+		}
+		pub(session.EventTextDelta, `"A"`)    // 101
+		pub(session.EventToolCall, `"toolX"`) // 102 key:逐条落盘,打断 text 窗
+		pub(session.EventTextDelta, `"B"`)    // 103
+		pub(session.EventTextDelta, `"C"`)    // 104
+		hub.EndRun()                          // 收口:text 批次 [101..104] 落盘
+		return hub, jr
+	}
+
+	// 存储面形状断言:种子 + tool_call 单条(102)+ text 批次 [101..104],
+	// 批次内按序保留 3 个 per-part {seq,payload}。
+	hub, jr := buildHub(t)
+	if got := hub.LatestSeq(); got != 104 {
+		t.Fatalf("LatestSeq = %d, want 104", got)
+	}
+	recs := jr.snapshot()
+	if len(recs) != 3 {
+		t.Fatalf("journal records = %d, want 3(种子 + tool_call 单条 + text 批次)", len(recs))
+	}
+	batchRec := recs[2]
+	if batchRec.Type != session.EventTextDelta || batchRec.FromSeq != 101 || batchRec.Seq != 104 {
+		t.Fatalf("batch record = {type:%s from:%d seq:%d}, want {text.delta 101 104}", batchRec.Type, batchRec.FromSeq, batchRec.Seq)
+	}
+	var batch DeltaBatch
+	if err := json.Unmarshal(batchRec.Payload, &batch); err != nil {
+		t.Fatalf("batch payload %s is not a DeltaBatch: %v", batchRec.Payload, err)
+	}
+	wantParts := []struct {
+		seq     uint64
+		payload string
+	}{{101, "A"}, {103, "B"}, {104, "C"}}
+	if len(batch.Events) != len(wantParts) {
+		t.Fatalf("batch parts = %d, want %d(102 的 tool_call 不属于 text 批次)", len(batch.Events), len(wantParts))
+	}
+	for i, w := range wantParts {
+		var got string
+		if batch.Events[i].Seq != w.seq {
+			t.Fatalf("batch part #%d seq = %d, want %d", i, batch.Events[i].Seq, w.seq)
+		}
+		if err := json.Unmarshal(batch.Events[i].Payload, &got); err != nil || got != w.payload {
+			t.Fatalf("batch part #%d payload = %s, want %q", i, batch.Events[i].Payload, w.payload)
+		}
+	}
+
+	// 恢复矩阵:每个 afterSeq 一个全新 hub,订阅后只收回放(无并发发布,
+	// 快照确定),逐条断言 seq/类型/payload,再断言无多余投递。
+	cases := []struct {
+		afterSeq uint64
+		want     []struct {
+			seq     uint64
+			typ     string
+			payload string // 仅 text.delta 断言;tool_call 填 ""
+		}
+	}{
+		{100, []struct {
+			seq     uint64
+			typ     string
+			payload string
+		}{{101, session.EventTextDelta, "A"}, {102, session.EventToolCall, ""}, {103, session.EventTextDelta, "B"}, {104, session.EventTextDelta, "C"}}},
+		{101, []struct {
+			seq     uint64
+			typ     string
+			payload string
+		}{{102, session.EventToolCall, ""}, {103, session.EventTextDelta, "B"}, {104, session.EventTextDelta, "C"}}},
+		{102, []struct {
+			seq     uint64
+			typ     string
+			payload string
+		}{{103, session.EventTextDelta, "B"}, {104, session.EventTextDelta, "C"}}},
+		{103, []struct {
+			seq     uint64
+			typ     string
+			payload string
+		}{{104, session.EventTextDelta, "C"}}},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("afterSeq=%d", tc.afterSeq), func(t *testing.T) {
+			hub, _ := buildHub(t)
+			ch, err := hub.Subscribe(context.Background(), tc.afterSeq)
+			if err != nil {
+				t.Fatalf("Subscribe(afterSeq=%d): %v", tc.afterSeq, err)
+			}
+			for i, w := range tc.want {
+				ev := recvEvent(t, ch)
+				if ev.Seq != w.seq || ev.Type != w.typ {
+					t.Fatalf("afterSeq=%d resumed #%d = {seq:%d type:%s}, want {seq:%d %s}", tc.afterSeq, i, ev.Seq, ev.Type, w.seq, w.typ)
+				}
+				if w.payload != "" {
+					var got string
+					if err := json.Unmarshal(ev.Payload, &got); err != nil || got != w.payload {
+						t.Fatalf("afterSeq=%d resumed seq %d payload = %s, want %q", tc.afterSeq, ev.Seq, ev.Payload, w.payload)
+					}
+				}
+			}
+			// 无重复:恢复面恰好是期望集合(101 的 "A" 在 afterSeq>=101 时绝不重放)。
+			requireNoEvent(t, ch)
+		})
+	}
 }
 
 // TestEventHubReplayIntegrity(I4 修复验收):回放完整性三态的播种与粘滞置位——
@@ -468,7 +642,7 @@ func TestSubscribeReplayCarriesFromSeq(t *testing.T) {
 //     任何三态(只有失败路径是写点)。
 func TestEventHubReplayIntegrity(t *testing.T) {
 	t.Run("FreshEmptyJournalComplete", func(t *testing.T) {
-		hub := NewEventHub("fresh-journal", &stubEventJournal{})
+		hub := mustNewEventHub(t, "fresh-journal", &stubEventJournal{})
 		defer hub.Close()
 		if got := hub.ReplayIntegrity(); got != ReplayIntegrityComplete {
 			t.Fatalf("fresh hub on empty journal replayIntegrity = %q, want %q", got, ReplayIntegrityComplete)
@@ -476,7 +650,7 @@ func TestEventHubReplayIntegrity(t *testing.T) {
 	})
 
 	t.Run("PureInMemoryComplete", func(t *testing.T) {
-		hub := NewEventHub("fresh-mem", nil)
+		hub := mustNewEventHub(t, "fresh-mem", nil)
 		defer hub.Close()
 		if got := hub.ReplayIntegrity(); got != ReplayIntegrityComplete {
 			t.Fatalf("pure in-memory hub replayIntegrity = %q, want %q", got, ReplayIntegrityComplete)
@@ -491,7 +665,7 @@ func TestEventHubReplayIntegrity(t *testing.T) {
 				t.Fatalf("seed journal seq %d: %v", seq, err)
 			}
 		}
-		hub := NewEventHub("seeded", jr)
+		hub := mustNewEventHub(t, "seeded", jr)
 		defer hub.Close()
 		if got := hub.LatestSeq(); got != 2 {
 			t.Fatalf("LatestSeq = %d, want 2(播种自既有历史)", got)
@@ -512,7 +686,7 @@ func TestEventHubReplayIntegrity(t *testing.T) {
 		// failFirst=1:首次 AppendEvent 注错、其后自愈——验证「失败后的成功
 		// 发布不翻回」的粘滞语义(I4:失败是「曾经发生」的单调事实)。
 		jr := &stubEventJournal{failFirst: 1}
-		hub := NewEventHub("sticky-key", jr)
+		hub := mustNewEventHub(t, "sticky-key", jr)
 		defer hub.Close()
 		hub.BeginRun("run-i")
 		if got := hub.ReplayIntegrity(); got != ReplayIntegrityComplete {
@@ -535,7 +709,7 @@ func TestEventHubReplayIntegrity(t *testing.T) {
 
 	t.Run("DeltaFlushFailure", func(t *testing.T) {
 		jr := &stubEventJournal{appendErr: errors.New("disk full")}
-		hub := NewEventHub("incomplete-delta", jr)
+		hub := mustNewEventHub(t, "incomplete-delta", jr)
 		defer hub.Close()
 		hub.BeginRun("run-j")
 		// delta 发布不落盘(进合并缓冲):Publish 成功,标记仍 Complete。
@@ -562,7 +736,7 @@ func TestEventHubReplayIntegrity(t *testing.T) {
 			t.Fatalf("seed journal: %v", err)
 		}
 		jr.failFirst = 1
-		hub := NewEventHub("seeded-2", jr)
+		hub := mustNewEventHub(t, "seeded-2", jr)
 		defer hub.Close()
 		if got := hub.ReplayIntegrity(); got != ReplayIntegrityUnknown {
 			t.Fatalf("seeded hub replayIntegrity = %q, want %q", got, ReplayIntegrityUnknown)
@@ -576,6 +750,38 @@ func TestEventHubReplayIntegrity(t *testing.T) {
 	})
 }
 
+// TestNewEventHubPropagatesSeqRangeError(第三轮评审 I3 修复验收):SeqRange
+// 播种注错(Journal 读取失败)→ NewEventHub 返回 (nil, err) 显式上抛——
+//   - 错误链包裹底层原因(errors.Is 可判);
+//   - hub 恒为 nil:绝不创建「看似健康」的 hub(旧形态把读取失败降级为空历史:
+//     replayIntegrity 报 complete 且 seq 从 1 重起,与既有记录冲突);
+//   - 失败构造零副作用:同一 stub 恢复后可正常构造,空历史诚实报 Complete。
+func TestNewEventHubPropagatesSeqRangeError(t *testing.T) {
+	cause := errors.New("runs dir unreadable")
+	jr := &stubEventJournal{seqRangeErr: cause}
+	hub, err := NewEventHub("i3-seed-err", jr)
+	if err == nil {
+		t.Fatal("NewEventHub with failing SeqRange = nil error, want error(读取失败绝不当作空历史)")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("NewEventHub err = %v, want wrap of %v", err, cause)
+	}
+	if hub != nil {
+		t.Fatalf("NewEventHub with failing SeqRange returned %+v, want nil(绝不创建看似健康的 hub)", hub)
+	}
+
+	// 恢复播种后同一 stub 构造成功(失败不缓存、可重试),空历史照旧 Complete。
+	jr.seqRangeErr = nil
+	hub2 := mustNewEventHub(t, "i3-seed-err", jr)
+	defer hub2.Close()
+	if got := hub2.ReplayIntegrity(); got != ReplayIntegrityComplete {
+		t.Fatalf("recovered hub replayIntegrity = %q, want %q(空历史诚实报 complete)", got, ReplayIntegrityComplete)
+	}
+	if got := hub2.LatestSeq(); got != 0 {
+		t.Fatalf("recovered hub LatestSeq = %d, want 0(空历史从零起算)", got)
+	}
+}
+
 // ── P3-3:Subscribe Replay+Live 原子切换(防 Race A/B)+ ErrCursorExpired ────
 
 // TestAttachReplayNoGap(总方案第十一节 → P3-3):单 hub,N 轮
@@ -583,12 +789,10 @@ func TestEventHubReplayIntegrity(t *testing.T) {
 // 随机 fromSeq(含 0、含注册时 latest)Subscribe,各收集到 Close;断言每个
 // 订阅者收到的 seq 严格覆盖 (fromSeq, finalLatest] 无缺口无重复。
 //
-// 记账口径(plan 原文「合并记录按 Seq 记账、FromSeq 只作范围声明」):收到的
-// 每个 SessionEvent 以其 Seq 定位 journal 记录——命中合并记录(Seq=ToSeq、
-// FromSeq>0)按 [FromSeq..Seq] 展开计入覆盖,未命中(实时逐事件广播的
-// delta/key)按单点计入。展开不会掩盖真缺口:实时收到某合并窗末事件的订阅者
-// 必然订阅早于窗起点(否则订阅时的 flush 会把整窗并进它的回放),窗内其余
-// seq 也经实时逐条送达;「无重复」由收到流严格递增独立钉死,不依赖展开。
+// 记账口径(CR3-I1 起):回放已把合并批次展开为原始 per-seq 事件,实时与回放
+// 同形状——收到的每个 SessionEvent 恰计入其自身 Seq,不再按合并记录范围展开
+// (展开记账在批次时代反而可能掩盖批次内部的缺段:收到批次末 seq 即误认为
+// 整窗已覆盖)。「无重复」由收到流严格递增独立钉死。
 //
 // 时序收口:Close 前先轮询等全部订阅者抵达 finalLatest(10s 上界)——Close
 // 断开订阅者,提前 Close 会截断在途投递使覆盖断言失真;fromSeq==finalLatest
@@ -596,7 +800,7 @@ func TestEventHubReplayIntegrity(t *testing.T) {
 // 失败可复现,且 rand.Rand 非并发安全)。
 func TestAttachReplayNoGap(t *testing.T) {
 	jr := &stubEventJournal{}
-	hub := NewEventHub("replay-nogap", jr)
+	hub := mustNewEventHub(t, "replay-nogap", jr)
 	defer hub.Close()
 
 	const (
@@ -755,16 +959,8 @@ func TestAttachReplayNoGap(t *testing.T) {
 		}
 	}
 
-	// journal 记账表:rec.Seq → 覆盖范围(合并记录 [FromSeq..Seq],逐条 [Seq..Seq])。
-	coverage := map[uint64][2]uint64{}
-	for _, rec := range jr.snapshot() {
-		lo := rec.Seq
-		if rec.FromSeq > 0 && rec.FromSeq < lo {
-			lo = rec.FromSeq
-		}
-		coverage[rec.Seq] = [2]uint64{lo, rec.Seq}
-	}
-	if len(coverage) == 0 {
+	// journal 非空(事件确实落盘;逐事件记账不再需要记录面的覆盖展开表)。
+	if len(jr.snapshot()) == 0 {
 		t.Fatal("journal has no event records")
 	}
 
@@ -781,20 +977,16 @@ func TestAttachReplayNoGap(t *testing.T) {
 			}
 		}
 
-		// 严格覆盖 (fromSeq, finalLatest]:按 Seq 记账、FromSeq 范围声明展开。
+		// 严格覆盖 (fromSeq, finalLatest]:CR3-I1 起回放已展开为 per-seq 事件,
+		// 收到的每个 SessionEvent 恰计入其自身 Seq——不再按合并记录范围展开
+		// (展开记账可能掩盖批次内部缺段:收到批次末 seq 即误认为整窗覆盖)。
 		covered := make([]bool, finalLatest+1)
 		for _, sq := range seqs {
 			if sq > finalLatest {
 				t.Errorf("sub %s: received seq %d beyond final latest %d", s.name, sq, finalLatest)
 				continue
 			}
-			lo, hi := sq, sq
-			if rg, ok := coverage[sq]; ok {
-				lo, hi = rg[0], rg[1]
-			}
-			for x := lo; x <= hi && x <= finalLatest; x++ {
-				covered[x] = true
-			}
+			covered[sq] = true
 		}
 		for x := s.from + 1; x <= finalLatest; x++ {
 			if !covered[x] {
@@ -824,7 +1016,7 @@ func TestAttachReplayNoGap(t *testing.T) {
 func TestSubscribeCursorExpired(t *testing.T) {
 	t.Run("AheadOfLatest", func(t *testing.T) {
 		jr := &stubEventJournal{}
-		hub := NewEventHub("cursor-ahead", jr)
+		hub := mustNewEventHub(t, "cursor-ahead", jr)
 		defer hub.Close()
 		hub.BeginRun("run-c")
 		if err := hub.Publish(IngressEvent{RunID: "run-c", Type: session.EventToolCall, Payload: json.RawMessage(`"c"`)}); err != nil {
@@ -855,7 +1047,7 @@ func TestSubscribeCursorExpired(t *testing.T) {
 				t.Fatalf("seed journal seq %d: %v", seq, err)
 			}
 		}
-		hub := NewEventHub("cursor-old", jr)
+		hub := mustNewEventHub(t, "cursor-old", jr)
 		defer hub.Close()
 		if got := hub.EarliestSeq(); got != 3 {
 			t.Fatalf("EarliestSeq = %d, want 3", got)
@@ -879,7 +1071,7 @@ func TestSubscribeCursorExpired(t *testing.T) {
 
 // TestSubscribeAfterClose:Close 后 Subscribe 一律拒绝(plan P3-3 ①)。
 func TestSubscribeAfterClose(t *testing.T) {
-	hub := NewEventHub("sub-closed", nil) // 纯内存 hub 走同一拒绝路径
+	hub := mustNewEventHub(t, "sub-closed", nil) // 纯内存 hub 走同一拒绝路径
 	if err := hub.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -892,7 +1084,7 @@ func TestSubscribeAfterClose(t *testing.T) {
 // 退出,hub.subs 不残留(内部计数断言,LatestSeq 看不到订阅者),订阅通道
 // 关闭(消费方 range 语义的断线告知)。
 func TestSubscribeCtxCancelCleansUp(t *testing.T) {
-	hub := NewEventHub("sub-cancel", nil) // 纯内存:无回放,直入 live 等待
+	hub := mustNewEventHub(t, "sub-cancel", nil) // 纯内存:无回放,直入 live 等待
 	defer hub.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())

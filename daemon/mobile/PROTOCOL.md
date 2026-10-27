@@ -68,7 +68,7 @@ run 生命周期）以持久化游标暴露给任意连接——断线重连不�
 | `x-goworker/session/attach` | 请求 | `{sessionId, afterSeq, mode?}` | `{currentRun, latestSeq, replayIntegrity, tookOver?}` | `mode:"control"` 获取/接管；observe 不动 lease |
 | `x-goworker/session/detach` | 请求 | `{sessionId, mode?}` | `{detached}` | `mode:"control"` 归还（仅持有者本人有效） |
 | `x-goworker/approval/respond` | 请求 | `{sessionId, requestId, decision}` | `{accepted}` | **必须持有**（声明的 `sessionId` 的 lease） |
-| `x-goworker/session/events` | **服务端通知** | `SessionEvent`（原样 JSON，蛇形键；合并记录带 `from_seq`） | — | attach 建立订阅后下行；observe/control 均可收 |
+| `x-goworker/session/events` | **服务端通知** | `SessionEvent`（原样 JSON，蛇形键；逐事件投递） | — | attach 建立订阅后下行；observe/control 均可收 |
 
 - **`state` 取值**：`queued` / `running` / `waiting_input`（HITL 等审批）/
   `waiting_capability`（设备工具等重绑）/ `completed` / `failed` /
@@ -83,7 +83,9 @@ run 生命周期）以持久化游标暴露给任意连接——断线重连不�
   `queued`），不等 LLM 完成；后续进展经 `x-goworker/session/events` 或
   run/get 观察。
 - **错误约定**：沿用 -32000 + 明确文案（不新增标准错误码）。无 control
-  lease → `"x-goworker: control lease held by another connection ..."`；
+  lease → 文案含 `control lease`（lease 校验与操作提交在 daemon 侧同一
+  受保护临界区内原子完成——接管后旧持有者的 run/start|cancel、
+  approval/respond 一律拒绝，不存在「校验通过后被接管仍落地」的窗口）；
   游标超前 → 文案含 `cursor expired`；未知 run → 文案含 `not found`。
 
 ### Observe / Control（多客户端控制权限）
@@ -153,27 +155,20 @@ control lease **按会话记账**（拍板②原文「每会话至多一个 cont
   prompt 在飞时 run/start 返回 -32000（同会话单活动 Run）。同步入口与后台
   入口靠同一把会话执行权互斥，不存在并发写会话。
 
-### 事件批量语义（SessionEvent.from_seq 与游标推进）
+### 事件语义（逐事件投递与断点恢复）
 
-`x-goworker/session/events` 下行的每条 `SessionEvent` 按 `from_seq` 字段区分
-单条与批量（实现侧事实源：`ai-runtime/session/journal.go` 的 SessionEvent
-注释、`ai-runtime/agent/event_hub.go` 的回放注释）：
+`x-goworker/session/events` 下行的每条 `SessionEvent` 均为**单条逐事件**形状：
+`seq` 即该事件自身序号，wire 上单条与批次不可区分，不存在批量/聚合形态
+（实现侧事实源：`ai-runtime/session/journal.go` 的 SessionEvent 注释、
+`ai-runtime/agent/event_hub.go` 的回放注释）。高频 delta（`text.delta` /
+`thinking.delta` / `usage.progress`）在**持久化侧**按窗（50ms/4KB）合并为批次
+记录以压缩落盘条数，但批次只存在于存储面——服务端回放时把批次展开为原始
+per-seq 事件后逐条下行，与实时流形状完全一致。
 
-- **`from_seq` 缺省（=0）= 单条事件**：`seq` 即该事件自身序号。实时流恒为
-  单条（逐事件投递）；回放流中的关键事件（tool_call / permission.* /
-  assistant.message_finalized / run.*）与未进合并窗的 delta 也是单条。
-- **`from_seq > 0` = 批量聚合事件**：高频 delta（`text.delta` /
-  `thinking.delta` / `usage.progress`）在持久化侧按窗（50ms/4KB）合并——
-  `seq` = 区间末事件序号，`from_seq` = 区间首事件序号，payload 为窗内逐事件
-  payload 的**聚合结果**：文本类 = 窗内全部增量的拼接字符串（客户端按批量
-  语义一次性还原窗内文本），对象类（usage.progress）= 窗内最后一条 payload
-  （最终状态）。
-- **游标以实际收到的事件 `seq` 逐条推进，不得假设区间内没有其他类型事件**：
-  合并窗按类型分桶，而关键事件在发布时逐条落盘，其 `seq` 可能落在某个合并窗
-  的 `[from_seq..seq]` 区间之间——回放流里区间边界之间会出现其他类型的单条
-  记录（回放按 `seq` 升序）。范围声明只描述本条聚合记录自身的覆盖范围，不是
-  「区间内仅此一条」的承诺；客户端逐事件按 `seq` 记账游标（批量记录推进到其
-  `seq`），禁止按区间端点或 `latestSeq` 批量前移。
+- **游标以实际收到的每条事件 `seq` 逐条推进**；禁止按 `latestSeq` 批量前移。
+- **断点恢复精确到 seq**：断线重连 `attach(afterSeq=N)` 时，服务端重放所有
+  `seq > N` 的事件——合并批次内 `seq > N` 的部分逐条重发、`seq <= N` 的部分
+  不再重发，不重复、不丢失（游标停在批次中间也能精确续传）。
 
 ### 交互示例（对齐总方案 §7，键名为 daemon 实际 wire 形状）
 

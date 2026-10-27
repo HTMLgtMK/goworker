@@ -110,10 +110,10 @@ func (r *SessionRuntime) DeclareCWD(cwd string, err error) {
 }
 
 // bindEvents 惰性创建并返回本 runtime 的 EventHub(P3-4):journal 非 nil 才创建,
-// 否则返回 nil(未启用,SessionDeps.RunEvents=nil 的宿主/同步路径零事件)。创建
-// 恰好一次,后续 StartRun 复用同一 hub——EventHub 的 Seq 是会话维度游标,跨 run
+// 否则返回 (nil, nil)(未启用,SessionDeps.RunEvents=nil 的宿主/同步路径零事件)。
+// 创建恰好一次,后续 StartRun 复用同一 hub——EventHub 的 Seq 是会话维度游标,跨 run
 // 不重置(event_hub.go 语义契约),复用即游标连续的前提。调用点只有 StartRun
-// 同步段;RecordRun 不经此处(同步路径行为零变化)。
+// 同步段与 EnsureHub;RecordRun 不经此处(同步路径行为零变化)。
 //
 // 并发论证(plan P3-4「hub 创建一次,后续复用」):
 //   - 创建点唯一(StartRun 同步段),而同会话的第二 StartRun 在 active 占位检查
@@ -125,22 +125,28 @@ func (r *SessionRuntime) DeclareCWD(cwd string, err error) {
 //     二次确认写入(双重检查)。两把锁无嵌套:rt.mu 释放后才进 NewEventHub
 //     (hub.mu 由 hub 自持,不回触 rt.mu),无锁环;极端竞态下(前提被未来改动
 //     破坏)最坏结果是多造一个被丢弃的 hub——构造只读不写,丢弃无副作用;
+//   - 构造失败(第三轮评审 I3:SeqRange 播种的 Journal I/O 错误)→ (nil, err)
+//     原样上抛,不写 r.events(下次调用可重试),调用方 StartRun/EnsureHub 显式
+//     拒绝——绝不返回看似健康的 hub,也不把失败缓存成永久状态;
 //   - 与 Manager.Close 的 closeEvents(P3-5)的交集:Close 的次序是「先等全部
 //     在途 run 终态,再逐 runtime closeEvents」,而 bindEvents 只发生在 StartRun
 //     同步段——Close 置 closed 后 StartRun 在 ① 即被拒,二者无并发窗口;events
 //     字段的全部读写都在 rt.mu 内。
-func (r *SessionRuntime) bindEvents(sessionID string, journal EventJournal) *EventHub {
+func (r *SessionRuntime) bindEvents(sessionID string, journal EventJournal) (*EventHub, error) {
 	if journal == nil {
-		return nil
+		return nil, nil
 	}
 	r.mu.Lock()
 	if hub := r.events; hub != nil {
 		r.mu.Unlock()
-		return hub
+		return hub, nil
 	}
 	r.mu.Unlock()
 
-	hub := NewEventHub(sessionID, journal) // SeqRange 扫描在 rt.mu 外(锁内不做文件 I/O)
+	hub, err := NewEventHub(sessionID, journal) // SeqRange 扫描在 rt.mu 外(锁内不做文件 I/O)
+	if err != nil {
+		return nil, err
+	}
 
 	r.mu.Lock()
 	if r.events == nil {
@@ -149,7 +155,7 @@ func (r *SessionRuntime) bindEvents(sessionID string, journal EventJournal) *Eve
 		hub = r.events // 双重检查:极端竞态下以先创建者为准,丢弃后造者
 	}
 	r.mu.Unlock()
-	return hub
+	return hub, nil
 }
 
 // eventHub 返回本 runtime 的 EventHub(未启用或尚未有 StartRun 时为 nil)。读侧
@@ -177,8 +183,10 @@ func (r *SessionRuntime) Hub() *EventHub {
 // journal 来源:经 Session deps 读(本方法在 rt.mu 内快照 r.session,取
 // sess.deps.RunEvents 后交 bindEvents)——与 StartRun ⑥ 的
 // rt.bindEvents(sessionID, sess.deps.RunEvents) 同一来源、同一形状,不新增
-// runtime 字段。会话未绑定(sess == nil)或 RunEvents 未接线(nil)时返回 nil,
-// 由调用方诚实报错(P5-8:「RunEvents 未接线/纯内存 → 诚实错误」)。
+// runtime 字段。返回语义:会话未绑定(sess == nil)或 RunEvents 未接线(nil)
+// 时返回 (nil, nil),由调用方诚实报错(P5-8:「RunEvents 未接线/纯内存 → 诚实
+// 错误」);hub 构造失败(第三轮评审 I3:SeqRange 播种的 Journal I/O 错误)→
+// (nil, err) 原样上抛,调用方诚实报错,绝不返回看似健康的 hub。
 //
 // 并发论证:与 bindEvents 同构——rt.mu 内快照 session 后立即释放,构造(含
 // SeqRange 磁盘扫描)在 rt.mu 外(锁内不做文件 I/O 纪律),bindEvents 内部
@@ -186,12 +194,12 @@ func (r *SessionRuntime) Hub() *EventHub {
 // (先等在途 run 终态、置 closed 拒绝后续 StartRun)覆盖,Attach 若在 Close
 // 后到达,拿到的是已 Close 的 hub(Subscribe/Publish 一律 ErrHubClosed,可
 // 观测)或 nil,无新锁面。
-func (r *SessionRuntime) EnsureHub() *EventHub {
+func (r *SessionRuntime) EnsureHub() (*EventHub, error) {
 	r.mu.Lock()
 	sess := r.session
 	r.mu.Unlock()
 	if sess == nil {
-		return nil
+		return nil, nil
 	}
 	return r.bindEvents(r.ID, sess.deps.RunEvents)
 }

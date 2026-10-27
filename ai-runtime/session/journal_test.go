@@ -13,6 +13,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -586,8 +587,8 @@ func TestSeqRangeSeedsFromDisk(t *testing.T) {
 	jst := NewRunJournalStore(repo, s)
 
 	// ① 空 runs/。
-	if e, l, ok := jst.SeqRange(); ok {
-		t.Fatalf("SeqRange on empty runs/ = (%d,%d,true), want ok=false", e, l)
+	if e, l, ok, err := jst.SeqRange(); err != nil || ok {
+		t.Fatalf("SeqRange on empty runs/ = (%d,%d,%v,err=%v), want (0,0,false,nil)", e, l, ok, err)
 	}
 
 	run1 := "run-1000-1"
@@ -596,16 +597,16 @@ func TestSeqRangeSeedsFromDisk(t *testing.T) {
 	if err := jst.AppendState(RunStateRecord{Kind: "state", SessionID: sid, RunID: run1, State: "running", At: at}); err != nil {
 		t.Fatalf("AppendState: %v", err)
 	}
-	if e, l, ok := jst.SeqRange(); ok {
-		t.Fatalf("SeqRange with state-only file = (%d,%d,true), want ok=false", e, l)
+	if e, l, ok, err := jst.SeqRange(); err != nil || ok {
+		t.Fatalf("SeqRange with state-only file = (%d,%d,%v,err=%v), want (0,0,false,nil)", e, l, ok, err)
 	}
 
 	// ③ 非连续 seq：min/max 单遍扫描。
 	for _, seq := range []uint64{5, 3, 7} {
 		mustAppendEvent(t, jst, sid, run1, EventTextDelta, seq, 0, at, `"x"`)
 	}
-	if e, l, ok := jst.SeqRange(); !ok || e != 3 || l != 7 {
-		t.Fatalf("SeqRange = (%d,%d,%v), want (3,7,true)", e, l, ok)
+	if e, l, ok, err := jst.SeqRange(); err != nil || !ok || e != 3 || l != 7 {
+		t.Fatalf("SeqRange = (%d,%d,%v,err=%v), want (3,7,true,nil)", e, l, ok, err)
 	}
 
 	// ④ 重启模拟：终态收口（关句柄）→ repo.Close → 新 Repository + 新聚合实例。
@@ -625,8 +626,8 @@ func TestSeqRangeSeedsFromDisk(t *testing.T) {
 		t.Fatalf("repo2.Open: %v", err)
 	}
 	jst2 := NewRunJournalStore(repo2, st2)
-	if e, l, ok := jst2.SeqRange(); !ok || e != 3 || l != 7 {
-		t.Fatalf("SeqRange after restart = (%d,%d,%v), want (3,7,true) (播种来自磁盘)", e, l, ok)
+	if e, l, ok, err := jst2.SeqRange(); err != nil || !ok || e != 3 || l != 7 {
+		t.Fatalf("SeqRange after restart = (%d,%d,%v,err=%v), want (3,7,true,nil) (播种来自磁盘)", e, l, ok, err)
 	}
 	got, err := jst2.ReadEvents(3)
 	if err != nil {
@@ -634,6 +635,41 @@ func TestSeqRangeSeedsFromDisk(t *testing.T) {
 	}
 	if seqs := eventSeqs(got); !uint64sEqual(seqs, []uint64{5, 7}) {
 		t.Fatalf("ReadEvents(3) after restart = %v, want [5 7]", seqs)
+	}
+}
+
+// TestSeqRangeScanError 钉死 SeqRange 的 I3 错误语义：扫描 I/O 失败 →
+// (0,0,false,err) 显式上抛,绝不降级为「空历史」(旧形态 warn + ok=false 会把
+// 读取失败当空历史,NewEventHub 报 complete 且 seq 从 1 重起)。runs/ 被同名
+// 普通文件占据 → os.ReadDir 返回 ENOTDIR(非 IsNotExist,walkEventRecords 的
+// 空扫描豁免不命中),扫描显式失败。
+func TestSeqRangeScanError(t *testing.T) {
+	ctx := context.Background()
+	root := tempDir(t)
+	repo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	s, err := repo.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	jst := NewRunJournalStore(repo, s)
+
+	if err := os.WriteFile(filepath.Join(s.dir, "runs"), []byte("not a dir"), 0o600); err != nil {
+		t.Fatalf("occupy runs path with a regular file: %v", err)
+	}
+	e, l, ok, err := jst.SeqRange()
+	if err == nil {
+		t.Fatal("SeqRange with unreadable runs/ = nil error, want error(I3:扫描失败显式上抛)")
+	}
+	if ok || e != 0 || l != 0 {
+		t.Fatalf("SeqRange with unreadable runs/ = (%d,%d,%v), want (0,0,false)", e, l, ok)
+	}
+	if !strings.Contains(err.Error(), "scan runs dir") {
+		t.Fatalf("SeqRange err = %v, want walk-side scan context (session: ... scan runs dir ...)", err)
 	}
 }
 
@@ -703,8 +739,8 @@ func TestEventTailRecovery(t *testing.T) {
 	}
 
 	// SeqRange 同样容忍坏尾行：(1,2,true)。
-	if e, l, ok := jst.SeqRange(); !ok || e != 1 || l != 2 {
-		t.Fatalf("SeqRange with bad tail = (%d,%d,%v), want (1,2,true)", e, l, ok)
+	if e, l, ok, err := jst.SeqRange(); err != nil || !ok || e != 1 || l != 2 {
+		t.Fatalf("SeqRange with bad tail = (%d,%d,%v,err=%v), want (1,2,true,nil)", e, l, ok, err)
 	}
 
 	// 文件未被读取路径截断（尾修复归 MarkInterruptedRuns，读取方只容忍）。
@@ -799,8 +835,8 @@ func TestReadEventsFiltersBySessionID(t *testing.T) {
 	}
 
 	// SeqRange：播种游标与回放同源——(1,5,true)；异 id seq 2/4/6 不参与播种。
-	if e, l, ok := jst.SeqRange(); !ok || e != 1 || l != 5 {
-		t.Fatalf("SeqRange = (%d,%d,%v), want (1,5,true) (异 id seq 不参与播种)", e, l, ok)
+	if e, l, ok, err := jst.SeqRange(); err != nil || !ok || e != 1 || l != 5 {
+		t.Fatalf("SeqRange = (%d,%d,%v,err=%v), want (1,5,true,nil) (异 id seq 不参与播种)", e, l, ok, err)
 	}
 
 	// 前置自证：混入数据确在磁盘上（剔除是读取侧行为，不是写入失败）——

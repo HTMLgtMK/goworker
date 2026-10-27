@@ -19,15 +19,17 @@ import (
 //
 // control lease(V1 宿主授权简化形,拍板②原文「每会话至多一个 control 持有
 // 者」;I3 修正后按会话维度记账,两连接各控各会话互不影响):run/start|cancel
-// 要求请求方连接持有**被操作会话**(请求 sessionId)的 lease(requireControl);
-// approval/respond 的 wire 入参带 sessionId(C1 修复,wire 变更:协议未发布
-// 可直接改),守卫同样按被操作会话判(requireControl(req.SessionID),推翻旧
-// 「持有任意会话 lease 即放行」的退化形——那允许连接 A 应答会话 B 的审批);
-// 授权的最终事实源是服务端记录的审批归属(source 侧 ResolveApproval 按
-// requestID 查归属会话并校验,不信客户端声明);run/get 是只读观察面,不要求。
-// lease 的获取/归还入口是 attach/detach(mode=control):attach(control) 获取
-// 或显式接管(tookOver 回显,I4:订阅建立成功后才变更控制权),detach(control)
-// 按会话归还,断连经 Close 的 ReleaseConnection 强制归还该连接全部租约。
+// 与 approval/respond 要求请求方连接持有**被操作会话**(请求 sessionId)的
+// lease。第三轮评审 I4 起,该守卫不再是 handler 侧的先行检查(requireControl
+// 已删除,校验内移 source)——四处调用点透传 h.connectionID,source 侧在受
+// 保护临界区(leaseMu,与接管 AcquireControl 同锁)内原子完成「lease 校验 +
+// 操作提交」(fencing):校验通过后到提交完成之间不可能被接管,接管后旧持有者
+// 的控制操作一律明确失败。授权的最终事实源是服务端记录的审批归属(source 侧
+// ResolveApproval 按 requestID 查归属会话并校验,不信客户端声明);run/get 是
+// 只读观察面,不要求。lease 的获取/归还入口是 attach/detach(mode=control):
+// attach(control) 获取或显式接管(tookOver 回显,I4:订阅建立成功后才变更控制
+// 权),detach(control) 按会话归还,断连经 Close 的 ReleaseConnection 强制归还
+// 该连接全部租约。
 //
 // 行为变化声明(P5-7/P5-8):新协议面(增量能力,非破坏)。标准 6 方法与
 // session/update/request_permission 逐字不动;不调用 x- 方法的旧客户端零感知;
@@ -99,24 +101,12 @@ func registerXGWMethods(server *aiacp.Server, handler aiacp.SessionHandler) {
 	server.Handle(XMethodSessionDetach, fh.xgwSessionDetach)
 }
 
-// requireControl 断言本连接当前持有 sessionID 的 control lease(I3:守卫按
-// 被操作会话授权——run/start|cancel 的被操作会话就是请求的 sessionId,持有
-// 其他会话的 lease 不构成对本会话的授权;C1 修复后 approval/respond 同样按
-// wire 携带的 sessionId 判,不再有「持有至少一个会话的 lease 即放行」的退化
-// 形)。当前持有者身份不经接口暴露(model.RunControlSource 只有 Hold 判等),
-// 错误文案回显请求方自身 connectionID(见 xgwControlLeaseError)。调用方必须
-// 先确认 h.runs != nil。
-func (h *FrontendHandler) requireControl(sessionID string) error {
-	if h.runs.HoldControl(sessionID, h.connectionID) {
-		return nil
-	}
-	return xgwControlLeaseError(h.connectionID)
-}
-
-// xgwRunStart 处理 x-goworker/run/start:require control → runs.StartRun。
-// requestId 幂等记账完全在 source 层(P5-6:同 requestID 重试返回原 runID 与
-// 当前状态);协议面只负责 requestId 非空守卫(幂等契约的前提,见
-// XRunStartParams)与错误码归一。ctx 不下发:StartRun 无 ctx 参数(后台 Run
+// xgwRunStart 处理 x-goworker/run/start:runs.StartRun(req.SessionID,
+// h.connectionID, …)——第三轮评审 I4 起 lease 守卫内移 source,与提交在同一
+// 受保护临界区内原子完成(fencing),未持有 lease / 被接管的旧持有者在提交前
+// 即被明确拒绝。requestId 幂等记账完全在 source 层(P5-6:同 requestID 重试
+// 返回原 runID 与当前状态);协议面只负责 requestId 非空守卫(幂等契约的前提,
+// 见 XRunStartParams)与错误码归一。ctx 不下发:StartRun 无 ctx 参数(后台 Run
 // 与调用方生命周期解耦,P2P3 §6),连接断开不影响已提交的 Run。
 func (h *FrontendHandler) xgwRunStart(_ context.Context, params json.RawMessage) (any, error) {
 	if h.runs == nil {
@@ -129,10 +119,7 @@ func (h *FrontendHandler) xgwRunStart(_ context.Context, params json.RawMessage)
 	if req.RequestID == "" {
 		return nil, xgwError("%s: requestId is required (idempotency key)", XMethodRunStart)
 	}
-	if err := h.requireControl(req.SessionID); err != nil {
-		return nil, err
-	}
-	runID, state, err := h.runs.StartRun(req.SessionID, req.Input, req.RequestID)
+	runID, state, err := h.runs.StartRun(req.SessionID, h.connectionID, req.Input, req.RequestID)
 	if err != nil {
 		return nil, xgwError("%s: %v", XMethodRunStart, err)
 	}
@@ -159,7 +146,8 @@ func (h *FrontendHandler) xgwRunGet(_ context.Context, params json.RawMessage) (
 	return XRunGetResult{State: state, LatestSeq: latestSeq, ReplayIntegrity: replayIntegrity}, nil
 }
 
-// xgwRunCancel 处理 x-goworker/run/cancel:require control → runs.CancelRun。
+// xgwRunCancel 处理 x-goworker/run/cancel:runs.CancelRun(req.SessionID,
+// h.connectionID, …)——fencing 同 run/start(第三轮评审 I4,校验内移 source)。
 // accepted=true 仅表示取消请求已被接受;Run 的实际终态异步收敛(经 run/get
 // 或 session/events 观察),本响应不等待。
 func (h *FrontendHandler) xgwRunCancel(_ context.Context, params json.RawMessage) (any, error) {
@@ -170,26 +158,24 @@ func (h *FrontendHandler) xgwRunCancel(_ context.Context, params json.RawMessage
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, xgwError("%s: invalid params: %v", XMethodRunCancel, err)
 	}
-	if err := h.requireControl(req.SessionID); err != nil {
-		return nil, err
-	}
-	if err := h.runs.CancelRun(req.SessionID, req.RunID); err != nil {
+	if err := h.runs.CancelRun(req.SessionID, h.connectionID, req.RunID); err != nil {
 		return nil, xgwError("%s: %v", XMethodRunCancel, err)
 	}
 	return XRunCancelResult{Accepted: true}, nil
 }
 
-// xgwApprovalRespond 处理 x-goworker/approval/respond(C1 修复后两段守卫):
-//  1. handler 侧 requireControl(req.SessionID)——按 wire 声明的会话判 control
-//     lease,与 run/start|cancel 同一守卫形(按会话判,不再遍历候选集);
-//  2. decision wire 形状白名单映射(xgwDecisionFromWire,零值 type 严禁放行);
-//  3. source 侧 ResolveApproval(req.SessionID, req.RequestID, decision)——按
-//     requestID 查服务端记录的审批归属并校验归属会话一致(「服务端记录为准,
-//     不信客户端声明」:连接若持有声明的 lease 但审批归属别的会话,在此被拒)。
+// xgwApprovalRespond 处理 x-goworker/approval/respond(C1 修复 + 第三轮评审 I4
+// fencing 后的两段守卫):
+//  1. decision wire 形状白名单映射(xgwDecisionFromWire,零值 type 严禁放行);
+//  2. source 侧 ResolveApproval(req.SessionID, h.connectionID, req.RequestID,
+//     decision)——lease 校验(fencing:与归属校验、决策提交在同一受保护临界区
+//     内原子完成,接管后旧持有者一律拒绝)、审批归属校验(按 requestID 查服务
+//     端记录的归属并校验归属会话一致——「服务端记录为准,不信客户端声明」:
+//     连接若持有声明的 lease 但审批归属别的会话,同样被拒)三步原子。
 //
 // requestID 寻址与「首个有效决策获胜」语义在 source 层(P4-1 ApprovalManager.
-// Resolve);归属会话校验的三段序(路由→归属→越权)见 runcontrol.go 的
-// ResolveApproval 注释。
+// Resolve);归属会话校验的五步序(路由→lease→归属→越权→提交)见 runcontrol.go
+// 的 ResolveApproval 注释。
 func (h *FrontendHandler) xgwApprovalRespond(_ context.Context, params json.RawMessage) (any, error) {
 	if h.runs == nil {
 		return nil, xgwNotAvailableError(XMethodApprovalRespond)
@@ -198,14 +184,11 @@ func (h *FrontendHandler) xgwApprovalRespond(_ context.Context, params json.RawM
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, xgwError("%s: invalid params: %v", XMethodApprovalRespond, err)
 	}
-	if err := h.requireControl(req.SessionID); err != nil {
-		return nil, err
-	}
 	decision, err := xgwDecisionFromWire(req.Decision)
 	if err != nil {
 		return nil, err
 	}
-	if err := h.runs.ResolveApproval(req.SessionID, req.RequestID, decision); err != nil {
+	if err := h.runs.ResolveApproval(req.SessionID, h.connectionID, req.RequestID, decision); err != nil {
 		return nil, xgwError("%s: %v", XMethodApprovalRespond, err)
 	}
 	return XApprovalRespondResult{Accepted: true}, nil
@@ -224,13 +207,13 @@ func (h *FrontendHandler) xgwApprovalRespond(_ context.Context, params json.RawM
 //	收泵)→ mode=control 才 AcquireControl(接管;同持有者重复 acquire 幂等)。
 //	订阅表更新与 control lease 获取同临界区(评审 I2 建议四的事务语义):二者
 //	对并发 detach/Close 要么整体先提交、要么整体被拒,不存在「订阅已死而
-//	lease 复活」的中间态。commitHook 非 nil(仅测试注入)时在换入后、二次确认
-//	前释放 h.mu 同步调用(钩子内可跑 Close/detach——它们需要 h.mu,持锁调用
-//	会自锁),返回后重取 h.mu 做 closed 二次确认与「被顶替」检查,任一命中 →
-//	同失败清理(表内按指针身份摘除刚建订阅 + cancel 收 SDK 订阅 + 收被换下的
-//	旧泵),本请求零提交。锁外:收被换下的旧泵 → 起新泵。
-//	C1 修复后 approval/respond 的守卫按 wire sessionId 逐会话询问
-//	source 的 HoldControl,无需 handler 侧候选集簿记(旧 controlSessions 已清退)。
+//	lease 复活」的中间态;提交临界区保持纯原子,无中途解锁。测试钩子
+//	(preCommitHook,仅测试注入)挂在 Subscribe 成功与提交临界区之间的锁外
+//	边界——该窗口生产真实存在(Close/detach 可并发插入),钩子复现的交错即
+//	生产可达;生产恒 nil。锁外:收被换下的旧泵 → 起新泵。
+//	C1 修复后 approval/respond 的会话归属授权在 source 侧按服务端记录校验
+//	(第三轮评审 I4 起 lease 守卫同样内移 source,与提交原子);无需 handler
+//	侧候选集簿记(旧 controlSessions 已清退)。
 //
 //	closed 屏障(I2,评审的 Close/Attach 竞态):Close 在 h.mu 内置位 closed 并
 //	清空订阅表,本提交段与之同锁串行——要么提交段先入(其订阅与 lease 随后
@@ -284,11 +267,19 @@ func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMes
 		cancel()
 		return nil, xgwError("%s: %v", XMethodSessionAttach, err)
 	}
+	// 测试钩子(第三轮评审 I2):挂在 Subscribe 成功与提交临界区之间的真实锁外
+	// 边界——此处 Close/detach 并发插入即生产可达交错;钩子内跑 Close/detach
+	//(它们取 h.mu,本 goroutine 未持锁,不会自锁)。生产恒 nil;提交临界区
+	// 内的 closed 检查负责把钩子期间发生的状态变化收束为显式拒绝。
+	if h.preCommitHook != nil {
+		h.preCommitHook()
+	}
 
 	// 提交阶段(I2 生命周期屏障):closed 检查 → 换入新句柄 → (control)取
 	// lease,同一 h.mu 临界区内完成——对并发 detach/Close 是单事务:表内恒恰一
-	// 「现任」句柄,且订阅提交与 lease 获取同生同死。commitHook 非 nil(仅测试
-	// 注入)时在此释放 h.mu 同步插桩,返回后二次确认(见下)。
+	// 「现任」句柄,且订阅提交与 lease 获取同生同死。临界区纯原子,无中途解锁
+	//(第三轮评审 I2:提交中途释放锁的测试插桩验证的是生产不存在的分支,钩子
+	// 已迁移到 Subscribe 与本临界区之间的真实锁外边界)。
 	sub := &xgwSubscription{cancel: cancel, done: make(chan struct{})}
 	h.mu.Lock()
 	if h.closed {
@@ -304,34 +295,6 @@ func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMes
 	}
 	old := h.subs[req.SessionID]
 	h.subs[req.SessionID] = sub
-	if h.commitHook != nil {
-		// 测试插桩窗口:h.mu 已释放,钩子内可同步跑 Close/detach(它们需要
-		// h.mu,持锁调用会自锁)。生产恒 nil,此窗口不存在,提交段保持单临界区
-		//(并发 attach 的原子换入语义不因插桩路径改变)。
-		h.mu.Unlock()
-		h.commitHook()
-		h.mu.Lock()
-		// 二次确认(插桩期间的交错收束):closed 置位,或刚换入的句柄已被并发
-		// detach 摘除/并发 attach 顶替(表内不再是本句柄)→ 本请求零提交,同
-		// 失败清理:表内按指针身份摘除(closed 路径 Close 的清表通常已先行)、
-		// cancel 收掉 SDK 订阅、收掉被本请求换下的旧泵(mu 操作序在后的一方
-		// 胜出:被顶替即让位,绝不把已被摘除的订阅再按「已提交」启动泵)。
-		if h.closed || h.subs[req.SessionID] != sub {
-			supersededOnly := !h.closed
-			if cur, ok := h.subs[req.SessionID]; ok && cur == sub {
-				delete(h.subs, req.SessionID)
-			}
-			h.mu.Unlock()
-			cancel()
-			if old != nil {
-				old.stop()
-			}
-			if supersededOnly {
-				return nil, xgwError("%s: attach superseded by a concurrent detach or re-attach", XMethodSessionAttach)
-			}
-			return nil, xgwError("%s: connection closed", XMethodSessionAttach)
-		}
-	}
 	// 控制权变更与订阅提交同一临界区(I4:订阅准备成功后才 Acquire/接管,失败
 	// 路径绝不夺走原持有者的 lease;I2:closed 置位后一律拒绝,Close 返回后
 	// 不会有新的 lease 获取——AcquireControl 内部取 source 的 leaseMu,锁序

@@ -90,7 +90,10 @@ func (h RunHandle) Wait(ctx context.Context) (RunResult, error) {
 // 为注定拒绝的提交探测会话状态);同会话已有 Run(在跑或排队)→ ErrRunActive;
 // 会话未绑定 → ErrSessionNotBound;queued 接受记录持久化失败 → ErrRunJournalWrite
 // (I1 修复,包裹底层 journal 错误——「接受并持久化登记」是 run/start 返回的
-// 前提,写失败即拒绝启动,pending/active 记账无痕清退,绝不返回句柄)。
+// 前提,写失败即拒绝启动,pending/active 记账无痕清退,绝不返回句柄);
+// 事件 hub 接线失败(EventJournal.SeqRange 播种 I/O 错误,I3 修复,包裹底层
+// 错误)→ 同款无痕清退后显式拒绝——绝不返回携带「看似健康 hub」的句柄
+// (queued 接受记录已在,由恢复扫描标 interrupted,诚实可观测)。
 func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallbacks) (RunHandle, error) {
 	// ① manager 查找:m.mu 内快照 closed 与 runtime 后立即释放(锁内不做等待)。
 	m.mu.RLock()
@@ -185,7 +188,24 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	// 路径完全不经此处(行为零变化)。tee 包装(cb = teeRunCallbacks)已下移到
 	// ⑦.6:P4-2 的审批回退(⑦.5)须先于 tee——tee 检测 cb.Decide 非 nil 才包
 	// permission.requested/resolved,次序颠倒会漏掉审批事件对。
-	hub := rt.bindEvents(sessionID, sess.deps.RunEvents)
+	//
+	// I3 修复:hub 构造失败(EventJournal.SeqRange 播种的 Journal I/O 错误)→
+	// 显式上抛,pending/active 无痕清退(与 ⑤ 的 I1 清退同款:rt.mu 内身份校验
+	// 清 active + 锁外归还 ③ 预留的 pending 令牌),绝不带着缺失/重起的 hub 进入
+	// 执行(事件流从 Seq=1 重起会与既有记录冲突)。此刻 run 尚未 begin——未
+	// transition、未派生 runCtx(cancel 未写入)、execute 未启动;但 ⑤ 的 queued
+	// 接受记录已 durable-first 落盘(接受点在先):残留的 queued 记录由恢复扫描按
+	// 「无终态」诚实标记 interrupted,无任何终态/事件记录。
+	hub, err := rt.bindEvents(sessionID, sess.deps.RunEvents)
+	if err != nil {
+		rt.mu.Lock()
+		if rt.active == run {
+			rt.active = nil
+		}
+		rt.mu.Unlock()
+		<-m.pending // ③ 预留的令牌原路归还(锁外,同 ②/⑤ 的拒绝路径)
+		return RunHandle{}, fmt.Errorf("agent: start run %s in session %s: %w", run.ID, sessionID, err)
+	}
 	if hub != nil {
 		hub.BeginRun(run.ID)
 	}
@@ -555,9 +575,9 @@ func teeToken(hub *EventHub, runID string, tok core.Token) {
 //   - key 事件降级为 null payload 仍发布:边界标记(定稿/审批对)的价值在
 //     「事件存在」——回放游标的推进锚点与生命周期边界不能因载荷损失而丢失;
 //     null 是合法 JSON 载荷,EventRecord 落盘/广播语义完整;
-//   - delta 直接跳过:null payload 会污染合并聚合——aggregateDeltaPayload 把
-//     非字符串窗退化为「窗内末条」,一个 null 会顶掉窗内真实文本段(重放侧
-//     还原出错误内容),宁缺勿错。
+//   - delta 直接跳过:该事件实时侧本就未广播(null payload 的 delta 无信息
+//     量),跳过使实时与回放一致地不存在该事件——CR3-I1 起合并批次按 per-part
+//     原样保留 payload,不存在聚合退化问题,宁缺勿噪。
 //
 // 实际上两条路径均不可达:Token/hitl 结构/UsageEvent 均为纯数据类型,marshal
 // 恒成功;分支只为「未来字段引入不可 marshal 类型」兜底。Publish 失败(key 事件

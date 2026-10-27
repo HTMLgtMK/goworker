@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,9 +41,10 @@ func waitForRunStatus(t *testing.T, p *AgentPlugin, sid, runID, want string) (st
 }
 
 // TestStartRunThroughPlugin(P5-6):经插件 StartRun 提交后台 Run → 轮询
-// RunStatus 至 completed(与持有 RunHandle.Wait 等价的完成观测);未注册的
-// sessionID → 明确错误(C3 后按 sessionRuntime 多会话路由,任意未注册 id 在
-// 路由层诚实失败,ErrSessionNotFound 语义)。
+// RunStatus 至 completed(与持有 RunHandle.Wait 等价的完成观测);未持 lease 的
+// 连接 → ErrControlLeaseLost(第三轮评审 I4 fencing);未注册的 sessionID →
+// 明确错误(C3 后按 sessionRuntime 多会话路由,任意未注册 id 在路由层诚实失败,
+// ErrSessionNotFound 语义——路由先于 lease 校验)。
 func TestStartRunThroughPlugin(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	cfg.Session.Enabled = false
@@ -51,7 +53,15 @@ func TestStartRunThroughPlugin(t *testing.T) {
 	p := newAgentPluginP(hub, fixedProvider{content: "bg-done"})
 	sid := p.CurrentSessionID() // 纯内存形态为空串,经 sessionRuntime 的 current 回退寻址当前会话
 
-	runID, state, err := p.StartRun(sid, "hello", "req-start-1")
+	// fencing(第三轮评审 I4):未持有 lease 的连接一律拒绝。
+	if _, _, err := p.StartRun(sid, "conn-other", "hello", "req-fenced"); !errors.Is(err, ErrControlLeaseLost) {
+		t.Fatalf("StartRun without lease err = %v, want ErrControlLeaseLost", err)
+	}
+	if p.AcquireControl(sid, "conn-A") {
+		t.Fatal("test setup: fresh acquire must not report takeover")
+	}
+
+	runID, state, err := p.StartRun(sid, "conn-A", "hello", "req-start-1")
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
@@ -72,8 +82,9 @@ func TestStartRunThroughPlugin(t *testing.T) {
 	}
 	waitForRunStatus(t, p, sid, runID, string(runtimeagent.RunCompleted))
 
-	// 未注册的 sessionID → 明确错误(非 current-only 拒绝:同 id 或空串仍可达)。
-	if _, _, err := p.StartRun("not-a-registered-session", "x", "req-start-2"); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
+	// 未注册的 sessionID → 明确错误(非 current-only 拒绝:同 id 或空串仍可达;
+	// 路由先于 lease 校验,ErrSessionNotFound 语义不受 fencing 影响)。
+	if _, _, err := p.StartRun("not-a-registered-session", "conn-A", "x", "req-start-2"); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
 		t.Fatalf("StartRun with unknown sessionID err = %v, want ErrSessionNotFound", err)
 	}
 }
@@ -110,8 +121,9 @@ func TestRequestIdempotency(t *testing.T) {
 	hub, _ := testHub(cfg)
 	p := newAgentPluginP(hub, fixedProvider{content: "idem"})
 	sid := p.CurrentSessionID()
+	p.AcquireControl(sid, "conn-A") // fencing(第三轮评审 I4):控制操作须持 lease
 
-	id1, st1, err := p.StartRun(sid, "q", "req-dup")
+	id1, st1, err := p.StartRun(sid, "conn-A", "q", "req-dup")
 	if err != nil {
 		t.Fatalf("StartRun #1: %v", err)
 	}
@@ -121,7 +133,7 @@ func TestRequestIdempotency(t *testing.T) {
 
 	// 同 requestID 重试:首个 run 可能仍在跑(返回原 runID 幂等短路)或已完成
 	// (返回原 runID + 终态快照)——两种时序都必须同 runID、无错误。
-	id2, st2, err := p.StartRun(sid, "q", "req-dup")
+	id2, st2, err := p.StartRun(sid, "conn-A", "q", "req-dup")
 	if err != nil {
 		t.Fatalf("StartRun retry: %v", err)
 	}
@@ -136,7 +148,7 @@ func TestRequestIdempotency(t *testing.T) {
 
 	// 等首个 run 终态后再用不同 requestID:必须起新 run,不复用。
 	waitForRunStatus(t, p, sid, id1, string(runtimeagent.RunCompleted))
-	id3, _, err := p.StartRun(sid, "q", "req-other")
+	id3, _, err := p.StartRun(sid, "conn-A", "q", "req-other")
 	if err != nil {
 		t.Fatalf("StartRun #3: %v", err)
 	}
@@ -309,7 +321,8 @@ func TestAttachEnsureHubAndJournalStatus(t *testing.T) {
 	}
 
 	// ② 后台 Run 完成 → RunStatus 经 journal 路径返回 completed + latestSeq>0。
-	runID, _, err := p.StartRun(sid, "hello", "req-journal")
+	p.AcquireControl(sid, "conn-A") // fencing(第三轮评审 I4):控制操作须持 lease
+	runID, _, err := p.StartRun(sid, "conn-A", "hello", "req-journal")
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
@@ -333,6 +346,124 @@ func TestAttachEnsureHubAndJournalStatus(t *testing.T) {
 	if _, _, _, err := p.RunStatus(sid, "run-1-1"); err == nil {
 		t.Fatal("RunStatus with unknown runID should fail")
 	}
+}
+
+// failingSeedJournal 是 EventJournal 注错 stub(第三轮评审 I3 测试面):seedErr
+// 非 nil 时 SeqRange 注错(模拟 Journal 读取失败),置 nil 恢复;AppendEvent/
+// ReadEvents 走内存面。
+type failingSeedJournal struct {
+	mu      sync.Mutex
+	seedErr error
+	recs    []session.EventRecord
+}
+
+var _ runtimeagent.EventJournal = (*failingSeedJournal)(nil)
+
+func (j *failingSeedJournal) AppendEvent(rec session.EventRecord) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.recs = append(j.recs, rec)
+	return nil
+}
+
+func (j *failingSeedJournal) ReadEvents(afterSeq uint64) ([]session.EventRecord, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var out []session.EventRecord
+	for _, rec := range j.recs {
+		if rec.Seq > afterSeq {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
+}
+
+func (j *failingSeedJournal) SeqRange() (earliest, latest uint64, ok bool, err error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.seedErr != nil {
+		return 0, 0, false, j.seedErr
+	}
+	if len(j.recs) == 0 {
+		return 0, 0, false, nil
+	}
+	earliest, latest = j.recs[0].Seq, j.recs[0].Seq
+	for _, rec := range j.recs[1:] {
+		if rec.Seq < earliest {
+			earliest = rec.Seq
+		}
+		if rec.Seq > latest {
+			latest = rec.Seq
+		}
+	}
+	return earliest, latest, true, nil
+}
+
+// TestEnsureHubSeedErrorPropagates(第三轮评审 I3 修复验收,daemon 面):会话
+// deps.RunEvents 的 SeqRange 播种失败 → Attach(rt.EnsureHub)与 StartRun(
+// manager.StartRun ⑥ bindEvents)显式报错——绝不返回看似健康的 hub 或句柄;
+// StartRun 拒绝后零残留(active 已清、幂等表未记账),恢复播种后重提成功
+// (pending/active 无残留的联合证明,同 I1 断言形态)。
+func TestEnsureHubSeedErrorPropagates(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	cfg.Session.Enabled = false
+	cfg.Memory.Enabled = false
+	hub, _ := testHub(cfg)
+	p := newAgentPluginP(hub, fixedProvider{content: "bg-i3"})
+	sid := p.CurrentSessionID() // 纯内存形态为空串,sessionRuntime 的 current 回退寻址
+
+	// 注入播种注错的 EventJournal 并按会话边界重建(SessionDeps 值拷贝,必须
+	// refresh 传导进 runtime 的 session deps)。
+	cause := errors.New("runs dir unreadable")
+	ej := &failingSeedJournal{seedErr: cause}
+	p.deps.RunEvents = ej
+	p.refreshSession()
+
+	// Attach:EnsureHub → NewEventHub 播种失败 → 显式错误,无 hub。
+	evHub, _, err := p.Attach(sid)
+	if err == nil {
+		t.Fatal("Attach with failing SeqRange = nil error, want error(I3:绝不返回看似健康的 hub)")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("Attach err = %v, want wrap of %v", err, cause)
+	}
+	if evHub != nil {
+		t.Fatalf("Attach returned hub %+v, want nil", evHub)
+	}
+
+	// StartRun:lease 照常(fencing 校验与播种无关),manager.StartRun ⑥ 接线
+	// 失败 → 拒绝 + 空 runID。
+	p.AcquireControl(sid, "conn-A")
+	runID, _, err := p.StartRun(sid, "conn-A", "hello", "req-i3-seed")
+	if err == nil {
+		t.Fatal("StartRun with failing SeqRange = nil error, want error(I3)")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("StartRun err = %v, want wrap of %v", err, cause)
+	}
+	if runID != "" {
+		t.Fatalf("rejected StartRun returned runID %q, want empty", runID)
+	}
+
+	// 无残留:active 已清、幂等表未记账(被拒提交不得入表)。
+	if act := p.sessionRuntime(sid).Active(); act != nil {
+		t.Fatalf("active after rejected StartRun = %+v, want nil", act)
+	}
+	p.reqMu.Lock()
+	_, tracked := p.runRequests[requestKey(p.sessionRuntime(sid).ID, "req-i3-seed")]
+	p.reqMu.Unlock()
+	if tracked {
+		t.Fatal("idempotency table recorded a rejected run(拒绝路径不得入表)")
+	}
+
+	// 恢复播种后重提成功 = active 清退与 pending 令牌归还没有残留的联合证明;
+	// 随后走完正常生命周期。
+	ej.seedErr = nil
+	runID2, _, err := p.StartRun(sid, "conn-A", "hello-2", "req-i3-retry")
+	if err != nil {
+		t.Fatalf("StartRun after seeding recovery = %v, want nil(failed wiring left residue)", err)
+	}
+	waitForRunStatus(t, p, sid, runID2, string(runtimeagent.RunCompleted))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -424,8 +555,11 @@ func TestCrossSessionRunControl(t *testing.T) {
 	p := newPersistedPlugin(t, gated)
 	sidA := p.CurrentSessionID()
 
+	// fencing(第三轮评审 I4):两连接各持各会话的 lease。
+	p.AcquireControl(sidA, "conn-A")
+
 	// A 的后台 run 提交并等它真实开工(started 关闭 ⇒ run.started 事件已发布)。
-	runA, _, err := p.StartRun(sidA, "hello-A", "req-cross-A")
+	runA, _, err := p.StartRun(sidA, "conn-A", "hello-A", "req-cross-A")
 	if err != nil {
 		t.Fatalf("StartRun(A): %v", err)
 	}
@@ -469,7 +603,7 @@ func TestCrossSessionRunControl(t *testing.T) {
 	}
 
 	// CancelRun(A) 作用于 A:取消被接受,A 的 run 收敛 cancelled。
-	if err := p.CancelRun(sidA, runA); err != nil {
+	if err := p.CancelRun(sidA, "conn-A", runA); err != nil {
 		t.Fatalf("CancelRun(A, runA): %v", err)
 	}
 	close(gated.release) // 闸门放行兜底:provider 返回后 execute 层按 runCtx 归一取消态
@@ -480,8 +614,9 @@ func TestCrossSessionRunControl(t *testing.T) {
 		t.Fatal("RunStatus(B, runA) must not find session A's run")
 	}
 
-	// B 的控制面不受影响:B 正常起跑并完成。
-	runB, _, err := p.StartRun(sidB, "world-B", "req-cross-B")
+	// B 的控制面不受影响:B 正常起跑并完成(持自己的 lease)。
+	p.AcquireControl(sidB, "conn-B")
+	runB, _, err := p.StartRun(sidB, "conn-B", "world-B", "req-cross-B")
 	if err != nil {
 		t.Fatalf("StartRun(B): %v", err)
 	}
@@ -495,9 +630,10 @@ func TestCrossSessionRunControl(t *testing.T) {
 func TestCrossSessionRequestIdempotency(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "idem-A"})
 	sidA := p.CurrentSessionID()
+	p.AcquireControl(sidA, "conn-A") // fencing(第三轮评审 I4):控制操作须持 lease
 
 	// A 用 req-x 提交并等终态:后续判定不被 queued/running 时序干扰。
-	runA, _, err := p.StartRun(sidA, "payload-A", "req-x")
+	runA, _, err := p.StartRun(sidA, "conn-A", "payload-A", "req-x")
 	if err != nil {
 		t.Fatalf("StartRun(A): %v", err)
 	}
@@ -508,7 +644,8 @@ func TestCrossSessionRequestIdempotency(t *testing.T) {
 
 	// 第二轮评审 I5:B 用同 requestId、不同 Input → 独立起跑成功(幂等作用域
 	// 是会话),拿到自己的新 run,绝不误返 A 的 run。
-	runB, _, err := p.StartRun(sidB, "payload-B", "req-x")
+	p.AcquireControl(sidB, "conn-B")
+	runB, _, err := p.StartRun(sidB, "conn-B", "payload-B", "req-x")
 	if err != nil {
 		t.Fatalf("StartRun(B, same requestID, different input): %v", err)
 	}
@@ -518,7 +655,7 @@ func TestCrossSessionRequestIdempotency(t *testing.T) {
 	waitForRunStatus(t, p, sidB, runB, string(runtimeagent.RunCompleted))
 
 	// A 的 run 不受 B 提交影响:同键同 Input 幂等返回原 runID 与终态快照。
-	id2, st2, err := p.StartRun(sidA, "payload-A", "req-x")
+	id2, st2, err := p.StartRun(sidA, "conn-A", "payload-A", "req-x")
 	if err != nil {
 		t.Fatalf("StartRun(A, same requestID, same input): %v", err)
 	}
@@ -528,11 +665,11 @@ func TestCrossSessionRequestIdempotency(t *testing.T) {
 
 	// 同会话(B)同 requestID(req-x):同 Input 幂等返回原 runID;不同 Input →
 	// ErrRequestConflict(上轮 I5 的 Input 指纹校验收窄到同键范围)。
-	id3, _, err := p.StartRun(sidB, "payload-B", "req-x")
+	id3, _, err := p.StartRun(sidB, "conn-B", "payload-B", "req-x")
 	if err != nil || id3 != runB {
 		t.Fatalf("same-key retry = (%q, %v), want (%q, nil)", id3, err, runB)
 	}
-	if _, _, err := p.StartRun(sidB, "payload-B-changed", "req-x"); !errors.Is(err, ErrRequestConflict) {
+	if _, _, err := p.StartRun(sidB, "conn-B", "payload-B-changed", "req-x"); !errors.Is(err, ErrRequestConflict) {
 		t.Fatalf("same-session same-key different-input err = %v, want ErrRequestConflict", err)
 	}
 }
@@ -548,6 +685,10 @@ func TestCrossSessionApprovalOwnership(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "approval-A"})
 	sidA := p.CurrentSessionID()
 	sidB := newPersistedSession(t, p, fixedProvider{content: "approval-B"})
+	// fencing(第三轮评审 I4):两连接各持各会话的 lease(① 声明 sidA、②③④⑤
+	// 声明 sidB 的调用形,均以持照连接发起)。
+	p.AcquireControl(sidA, "conn-A")
+	p.AcquireControl(sidB, "conn-B")
 
 	// 会话 B 的待决审批:直接经 SDK 审批管理面注册(归属 sidB),模拟 B 的
 	// run 命中 HITL(decideFunc → ApprovalManager.Wait 的落账形态)。
@@ -577,7 +718,7 @@ func TestCrossSessionApprovalOwnership(t *testing.T) {
 
 	// ① 越权:声明 sidA 应答归属 sidB 的审批 → ErrApprovalOwnership,审批不被
 	// 消费(归属原样,后续归属会话本人仍可应答)。
-	err := p.ResolveApproval(sidA, "req-b-1", hitl.Decision{Type: hitl.DecisionApprove})
+	err := p.ResolveApproval(sidA, "conn-A", "req-b-1", hitl.Decision{Type: hitl.DecisionApprove})
 	if !errors.Is(err, ErrApprovalOwnership) {
 		t.Fatalf("ResolveApproval(sidA, B's approval) err = %v, want ErrApprovalOwnership", err)
 	}
@@ -586,12 +727,12 @@ func TestCrossSessionApprovalOwnership(t *testing.T) {
 	}
 
 	// ② 未知 requestID → ErrApprovalUnknown 语义的明确错误。
-	if err := p.ResolveApproval(sidB, "req-missing", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, runtimeagent.ErrApprovalUnknown) {
+	if err := p.ResolveApproval(sidB, "conn-B", "req-missing", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, runtimeagent.ErrApprovalUnknown) {
 		t.Fatalf("ResolveApproval(unknown requestID) err = %v, want ErrApprovalUnknown", err)
 	}
 
 	// ③ 归属会话本人应答 → 成功,决策送达 Wait(首个有效决策获胜)。
-	if err := p.ResolveApproval(sidB, "req-b-1", hitl.Decision{Type: hitl.DecisionApprove, Message: "go"}); err != nil {
+	if err := p.ResolveApproval(sidB, "conn-B", "req-b-1", hitl.Decision{Type: hitl.DecisionApprove, Message: "go"}); err != nil {
 		t.Fatalf("ResolveApproval(sidB, own approval): %v", err)
 	}
 	select {
@@ -605,12 +746,13 @@ func TestCrossSessionApprovalOwnership(t *testing.T) {
 
 	// ④ resolved 后归属仍可查(滞留条目,宽限窗内):迟到决策报
 	// ErrApprovalResolved 而非归属错误/未知——归属校验不得提前吞掉迟到语义。
-	if err := p.ResolveApproval(sidB, "req-b-1", hitl.Decision{Type: hitl.DecisionReject}); !errors.Is(err, runtimeagent.ErrApprovalResolved) {
+	if err := p.ResolveApproval(sidB, "conn-B", "req-b-1", hitl.Decision{Type: hitl.DecisionReject}); !errors.Is(err, runtimeagent.ErrApprovalResolved) {
 		t.Fatalf("late ResolveApproval err = %v, want ErrApprovalResolved", err)
 	}
 
-	// ⑤ 未知会话 → 路由层 ErrSessionNotFound(在归属校验之前诚实失败)。
-	if err := p.ResolveApproval("bogus-session", "req-b-1", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
+	// ⑤ 未知会话 → 路由层 ErrSessionNotFound(在 lease/归属校验之前诚实失败;
+	// fencing 的路由序见 StartRun/ResolveApproval 注释)。
+	if err := p.ResolveApproval("bogus-session", "conn-B", "req-b-1", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
 		t.Fatalf("ResolveApproval(unknown session) err = %v, want ErrSessionNotFound", err)
 	}
 }
@@ -627,9 +769,10 @@ func TestActiveRunNonCurrentSession(t *testing.T) {
 	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
 	p := newPersistedPlugin(t, gated)
 	sidA := p.CurrentSessionID()
+	p.AcquireControl(sidA, "conn-A") // fencing(第三轮评审 I4):控制操作须持 lease
 
 	// A 的后台 run 提交并等它真实开工(started 关闭 ⇒ run 已 running)。
-	runA, _, err := p.StartRun(sidA, "hello-A", "req-active-A")
+	runA, _, err := p.StartRun(sidA, "conn-A", "hello-A", "req-active-A")
 	if err != nil {
 		t.Fatalf("StartRun(A): %v", err)
 	}
@@ -671,5 +814,157 @@ func TestActiveRunNonCurrentSession(t *testing.T) {
 	waitForRunStatus(t, p, sidA, runA, string(runtimeagent.RunCompleted))
 	if _, _, ok := p.ActiveRun(sidA); ok {
 		t.Fatal("ActiveRun(A) after the run completed = ok=true, want false (active cleared)")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 第三轮评审 I4 修复验收(fencing):lease 校验与控制操作提交的原子性——校验
+// 内移 source、与提交同处 leaseMu 临界区(接管 AcquireControl 同锁)。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestControlFencingTakeoverStorm(第三轮评审 I4 修复验收):A 持 lease,
+// 「A 的 ResolveApproval/StartRun/CancelRun」与「B AcquireControl 接管」并发
+// 轰炸。断言:操作开始时已观察到接管 → 该操作必返回 ErrControlLeaseLost
+// (fencing 生效:校验通过后到提交完成之间不可能被接管);风暴落定后 A 的全部
+// 控制操作一律 ErrControlLeaseLost;接管前基线提交的审批决策恰好送达一次,
+// 风暴期的应答要么接管前成功(送达恰好一次,Manager 单次投递保证)要么被
+// fencing 拒绝,绝不出现第二条。
+func TestControlFencingTakeoverStorm(t *testing.T) {
+	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
+	p := newPersistedPlugin(t, gated)
+	sid := p.CurrentSessionID()
+
+	// 预置两笔待决审批(归属 sid,建模 run 命中 HITL 的 ApprovalManager.Wait
+	// 落账形态):req-storm-1 由接管前基线消费(「接管前已提交的审批恰好一次」),
+	// req-storm-2 供风暴期 A 反复应答(接管后必须全被 fencing 拒绝)。
+	mgr := p.manager.Approvals()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	decided1 := make(chan hitl.Decision, 1)
+	decided2 := make(chan hitl.Decision, 1)
+	mkReq := func(id string) *hitl.InterruptRequest {
+		return &hitl.InterruptRequest{
+			ID:        id,
+			ToolName:  "bash",
+			Command:   `{"cmd":"ls"}`,
+			CreatedAt: time.Now(),
+			ExpiresAt: time.Now().Add(30 * time.Second),
+		}
+	}
+	go func() { decided1 <- mgr.Wait(ctx, sid, "run-storm", mkReq("req-storm-1")) }()
+	go func() { decided2 <- mgr.Wait(ctx, sid, "run-storm", mkReq("req-storm-2")) }()
+	waitApproval := func(id string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, ok := p.manager.ApprovalOwner(id); ok {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("approval %s never registered with the manager", id)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	waitApproval("req-storm-1")
+	waitApproval("req-storm-2")
+
+	// A 持 lease(空闲获取)。
+	if p.AcquireControl(sid, "conn-A") {
+		t.Fatal("test setup: fresh acquire must not report takeover")
+	}
+
+	// —— 接管前基线:三类控制操作各成功一次,审批决策恰好送达一次 ——
+	runID, _, err := p.StartRun(sid, "conn-A", "storm", "req-storm-run")
+	if err != nil {
+		t.Fatalf("pre-takeover StartRun: %v", err)
+	}
+	select {
+	case <-gated.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background run did not start in time")
+	}
+	if err := p.ResolveApproval(sid, "conn-A", "req-storm-1", hitl.Decision{Type: hitl.DecisionApprove}); err != nil {
+		t.Fatalf("pre-takeover ResolveApproval: %v", err)
+	}
+	select {
+	case d := <-decided1:
+		if d.Type != hitl.DecisionApprove || d.InterruptID != "req-storm-1" {
+			t.Fatalf("delivered decision = %+v, want approve for req-storm-1", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("approval decision not delivered")
+	}
+	if err := p.CancelRun(sid, "conn-A", runID); err != nil {
+		t.Fatalf("pre-takeover CancelRun: %v", err)
+	}
+	close(gated.release) // 已取消,兜底放行(provider 的 ctx.Done 分支先命中)
+
+	// —— 接管风暴:B 反复接管+释放(制造「conn-B 持有 / 空闲」翻转,A 永非
+	// 持有者);A 并发反复三类控制操作。A 每个操作前快照接管标志:已观察到接管
+	// (B 的 tookOver=true 已返回 ⇒ leaseMu 内 A 的租约已被夺走)→ 操作必返回
+	// ErrControlLeaseLost;未观察到的窗口内成功/业务错误(ErrApprovalResolved、
+	// ErrRunNotFound)/并发接管皆可,由落定后的终态断言收束。
+	var takenOver atomic.Bool
+	const iters = 100
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { // B:接管风暴
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			if p.AcquireControl(sid, "conn-B") {
+				takenOver.Store(true)
+			}
+			p.ReleaseControl(sid, "conn-B")
+		}
+	}()
+	go func() { // A:控制操作轰炸
+		defer wg.Done()
+		assertFenced := func(op string, observedOver bool, err error) {
+			if !observedOver {
+				return // 接管未观察到的窗口:交由终态断言收束
+			}
+			if !errors.Is(err, ErrControlLeaseLost) {
+				t.Errorf("%s after observed takeover err = %v, want ErrControlLeaseLost (fencing)", op, err)
+			}
+		}
+		for i := 0; i < iters; i++ {
+			over := takenOver.Load()
+			_, _, errS := p.StartRun(sid, "conn-A", "storm", "req-storm-run")
+			assertFenced("StartRun", over, errS)
+
+			over = takenOver.Load()
+			errR := p.ResolveApproval(sid, "conn-A", "req-storm-2", hitl.Decision{Type: hitl.DecisionApprove})
+			assertFenced("ResolveApproval", over, errR)
+
+			over = takenOver.Load()
+			errC := p.CancelRun(sid, "conn-A", runID)
+			assertFenced("CancelRun", over, errC)
+		}
+	}()
+	wg.Wait()
+
+	// —— 终态断言(风暴落定,B 的末次操作是释放 ⇒ lease 空闲,A 非持有者):
+	// fencing 的确定性收束,A 的全部控制操作一律明确错误 ——
+	if _, _, err := p.StartRun(sid, "conn-A", "storm", "req-storm-run"); !errors.Is(err, ErrControlLeaseLost) {
+		t.Fatalf("post-storm StartRun err = %v, want ErrControlLeaseLost", err)
+	}
+	if err := p.ResolveApproval(sid, "conn-A", "req-storm-2", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, ErrControlLeaseLost) {
+		t.Fatalf("post-storm ResolveApproval err = %v, want ErrControlLeaseLost", err)
+	}
+	if err := p.CancelRun(sid, "conn-A", runID); !errors.Is(err, ErrControlLeaseLost) {
+		t.Fatalf("post-storm CancelRun err = %v, want ErrControlLeaseLost", err)
+	}
+
+	// 接管前已提交的审批恰好一次:req-storm-1 的决策已在基线送达;风暴期 A 对
+	// req-storm-2 的应答要么接管前成功(决策随 Resolve 内联进缓冲通道,至多
+	// 一条——Manager 单次投递),要么被 fencing 拒绝(零送达)。wg.Wait 后
+	// 非阻塞取数即终态,无需宽限等待。
+	select {
+	case d := <-decided2:
+		if d.Type != hitl.DecisionApprove {
+			t.Fatalf("storm-period delivered decision = %+v, want approve", d)
+		}
+	default: // 零送达:A 的风暴应答全部发生在接管后(fencing 拒绝)——同样合法
 	}
 }

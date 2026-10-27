@@ -33,10 +33,16 @@ import (
 //     requestID 并发重试的严格幂等(第二个等待者持锁后命中表,不再撞
 //     ErrRunActive);
 //   - leaseMu 只护 controlLeases 租约表(sessionID → connectionID,I3 修正后的
-//     per-session control lease);不与本插件 mu/reqMu/manager 锁嵌套,无锁环。
-//     跨层嵌套唯一一处:daemon 的 xgw 面(I2 生命周期屏障)在 handler 的 h.mu
-//     临界区内调用 Acquire/ReleaseControl——锁序 h.mu→leaseMu 单向(leaseMu
-//     是叶锁,绝不回调 handler、不取 h.mu),Close 侧同向,无环;
+//     per-session control lease)。第三轮评审 I4 起,fenced 控制操作
+//     (StartRun/CancelRun/ResolveApproval)在 leaseMu 临界区内完成「lease 校验
+//     + 操作提交」的原子合并(fencing):接管 AcquireControl 亦取 leaseMu,
+//     校验通过后到提交完成之间不可能被接管。嵌套取 reqMu(幂等表)与 manager
+//     内部锁(m.mu/rt.mu/approvals.mu,均只做快照或缓冲投递,不阻塞等待),
+//     锁序 leaseMu→reqMu→manager 单向(reqMu 各临界区与 manager 各路径绝不取
+//     leaseMu,无环);不与本插件 mu 嵌套。跨层嵌套唯一一处:daemon 的 xgw 面
+//     (I2 生命周期屏障)在 handler 的 h.mu 临界区内调用 Acquire/ReleaseControl
+//     ——锁序 h.mu→leaseMu 单向(leaseMu 是叶锁,绝不回调 handler、不取 h.mu),
+//     Close 侧同向,无环;
 //   - 其余方法(manager.StartRun/CancelRun、rt.Active/Hub、Approvals、
 //     Capabilities)的并发面由 SDK 侧既有锁序承担,本层不做新共享状态。
 
@@ -138,6 +144,17 @@ var ErrRequestConflict = errors.New("request id conflict: the idempotency key wa
 // C1 的攻击面:持有任意会话 lease 的连接曾可应答他会话的审批)。
 var ErrApprovalOwnership = errors.New("approval ownership mismatch: the approval belongs to a different session")
 
+// ErrControlLeaseLost 是控制操作 fencing 的拒绝 sentinel(第三轮评审 I4 修复):
+// 调用方声明的 connectionID 在校验时刻不持有该会话的 control lease(从未持有、
+// 已被接管或已释放)。控制类操作(StartRun/CancelRun/ResolveApproval)把 lease
+// 校验合并进 leaseMu 提交临界区——与接管 AcquireControl 同锁,「校验通过 →
+// 提交」之间不可能发生接管,旧持有者绝无法在失权后落地控制操作。
+var ErrControlLeaseLost = errors.New("control lease not held by the caller")
+
+func controlLeaseLostErr(sessionID, connectionID string) error {
+	return fmt.Errorf("agent: session %q: connection %q: %w", sessionID, connectionID, ErrControlLeaseLost)
+}
+
 func requestConflictErr(requestID string) error {
 	return fmt.Errorf("agent: requestID %q: %w", requestID, ErrRequestConflict)
 }
@@ -193,12 +210,20 @@ func (p *AgentPlugin) runJournalStore() *session.RunJournalStore {
 	return nil
 }
 
-// StartRun 实现 RunControlSource(P5-6;C3/I5 修正):多会话路由 → 幂等表命中
+// StartRun 实现 RunControlSource(P5-6;C3/I5 修正;第三轮评审 I4 fencing):多
+// 会话路由 → **leaseMu 临界区内原子完成「lease 校验 + 提交」** → 幂等表命中
 // 短路/冲突拒绝 → 注册表不变量修复 → 空回调后台提交。
 //
 //   - 路由(C3):sessionRuntime 按 sessionID 定位 runtime(不限 current),
 //     StartRun 用该 rt——其 Session 自带本会话边界注入的 deps,journal/hub/
 //     conversation 天然按会话隔离;nil → sessionNotFoundErr。
+//   - fencing(第三轮评审 I4):lease 校验与提交合并进同一 leaseMu 临界区——
+//     接管的 AcquireControl 同样取 leaseMu,校验通过后到提交完成之间不可能被
+//     接管,旧持有者绝无法在失权后落地 run/start。未持有(从未持有/已被接管/
+//     已释放)→ ErrControlLeaseLost 的明确错误。reqMu(幂等表)嵌套在内(锁序
+//     leaseMu→reqMu 单向,见文件头);manager.StartRun 同步段含一次 journal
+//     fsync,持 leaseMu 期间可接受——控制操作低频,attach 提交段对 leaseMu 的
+//     等待只被推迟 μs~ms 级。
 //   - 幂等(I5;第二轮评审 I5 收窄):requestID 非空时,幂等键是 (sessionID,
 //     requestID) 组合(requestKey),表存提交时 RunHandle + input sha256 指纹。
 //     命中同键:同 Input → 返回原 runID 与其当前状态(RunHandle.State() 的实时
@@ -217,10 +242,17 @@ func (p *AgentPlugin) runJournalStore() *session.RunJournalStore {
 //     决策经 ResolveApproval 跨连接投递。
 //   - 返回的 state 是提交时快照(manager.StartRun 同步段落盘 queued 记录后
 //     durable-first 返回,恒为 queued)。
-func (p *AgentPlugin) StartRun(sessionID, input, requestID string) (string, string, error) {
+func (p *AgentPlugin) StartRun(sessionID, connectionID, input, requestID string) (string, string, error) {
 	rt := p.sessionRuntime(sessionID)
 	if rt == nil {
 		return "", "", sessionNotFoundErr(sessionID)
+	}
+
+	// fencing(第三轮评审 I4):lease 校验与提交同一 leaseMu 临界区(见上)。
+	p.leaseMu.Lock()
+	defer p.leaseMu.Unlock()
+	if !p.holdLeaseLocked(sessionID, connectionID) {
+		return "", "", controlLeaseLostErr(sessionID, connectionID)
 	}
 
 	p.reqMu.Lock()
@@ -286,16 +318,23 @@ func (p *AgentPlugin) lookupTrackedRun(sessionID, runID string) (runtimeagent.Ru
 	return runtimeagent.RunHandle{}, false
 }
 
-// CancelRun 实现 RunControlSource(P5-6;C3 修正):多会话路由 → 不变量修复 →
-// 直转 manager。manager 的拒绝语义原样上抛:未知 run → ErrRunNotFound;同步
-// RecordRun 路径的 run 无 cancel → ErrRunNotCancellable(其取消入口是调用方
-// 请求 ctx,P2-6 契约)。不变量修复的必要性:current 会话的 runtime 在同 id
-// 重建窗口(纯内存 /new)下可能未在册,同步 run 活跃其上时不经修复会被误报
-// ErrRunNotFound;跨会话路由的 runtime 本就来自注册表,修复为幂等空操作。
-func (p *AgentPlugin) CancelRun(sessionID, runID string) error {
+// CancelRun 实现 RunControlSource(P5-6;C3 修正;第三轮评审 I4 fencing):多会话
+// 路由 → leaseMu 临界区内原子完成「lease 校验 + 取消提交」→ 直转 manager(与
+// StartRun 同构的 fencing:校验通过后不可能被接管,未持有 → ErrControlLeaseLost)。
+// manager 的拒绝语义原样上抛:未知 run → ErrRunNotFound;同步 RecordRun 路径的
+// run 无 cancel → ErrRunNotCancellable(其取消入口是调用方请求 ctx,P2-6 契约)。
+// 不变量修复的必要性:current 会话的 runtime 在同 id 重建窗口(纯内存 /new)下
+// 可能未在册,同步 run 活跃其上时不经修复会被误报 ErrRunNotFound;跨会话路由的
+// runtime 本就来自注册表,修复为幂等空操作。
+func (p *AgentPlugin) CancelRun(sessionID, connectionID, runID string) error {
 	rt := p.sessionRuntime(sessionID)
 	if rt == nil {
 		return sessionNotFoundErr(sessionID)
+	}
+	p.leaseMu.Lock()
+	defer p.leaseMu.Unlock()
+	if !p.holdLeaseLocked(sessionID, connectionID) {
+		return controlLeaseLostErr(sessionID, connectionID)
 	}
 	p.registerCurrentRuntime(rt)
 	return p.manager.CancelRun(rt.ID, runID)
@@ -349,7 +388,12 @@ func (p *AgentPlugin) RunStatus(sessionID, runID string) (string, uint64, string
 		if !ok {
 			return "", 0, replayIntegrity, fmt.Errorf("agent: run %q: %w", runID, runtimeagent.ErrRunNotFound)
 		}
-		_, latest, _ := js.SeqRange()
+		_, latest, _, err := js.SeqRange()
+		if err != nil {
+			// I3:扫描失败显式上抛,不把读取失败静默降级为 latest=0(游标是
+			// 「仅描述」,描述不可信时诚实报错优于编造一个看似合法的 0)。
+			return "", 0, replayIntegrity, fmt.Errorf("agent: run %q: seq range: %w", runID, err)
+		}
 		return rec.State, latest, replayIntegrity, nil
 	}
 
@@ -399,25 +443,34 @@ func flattenPendingApprovals(pending []runtimeagent.PendingApproval) []model.Pen
 	return out
 }
 
-// ResolveApproval 实现 RunControlSource(P5-6;C1 修复:审批归属三段校验,推翻
-// 旧契约「requestID 全局寻址、无需会话校验」——control lease 已按会话隔离
-// (I3),审批授权必须绑定目标会话,否则持任意会话 lease 的连接可应答他会话
-// 的审批):
+// ResolveApproval 实现 RunControlSource(P5-6;C1 修复:审批归属三段校验;第三轮
+// 评审 I4 fencing——lease 校验 + 归属校验 + Resolve 提交三步在同一 leaseMu 临界
+// 区内原子完成,推翻旧契约「requestID 全局寻址、无需会话校验」——control lease
+// 已按会话隔离(I3),审批授权必须绑定目标会话,否则持任意会话 lease 的连接可
+// 应答他会话的审批;接管与决策提交不可交错,被接管的旧持有者绝无法提交审批):
 //  1. 路由:sessionRuntime 按 sessionID 定位 runtime(与 PendingApprovals 同一
 //     寻址模型:内部比较用 rt.ID 而非调用方原串——审批的 SessionID 归属是
 //     StartRun 传入的 runtime id,纯内存降级下为 "current" 而调用方寻址空串),
 //     nil → sessionNotFoundErr;
-//  2. 归属:manager.ApprovalOwner(requestID) 查服务端记录的真实归属,不存在
+//  2. lease(fencing):leaseMu 临界区内校验 connectionID 持有该会话的租约,
+//     未持有 → ErrControlLeaseLost(接管 AcquireControl 同锁,校验后到提交间
+//     不可能被接管);
+//  3. 归属:manager.ApprovalOwner(requestID) 查服务端记录的真实归属,不存在
 //     (从未注册/已过宽限窗被清扫)→ 包裹 ErrApprovalUnknown 的明确错误;
-//  3. 越权:归属会话 != rt.ID → 包裹 ErrApprovalOwnership 的越权错误(「服务端
+//  4. 越权:归属会话 != rt.ID → 包裹 ErrApprovalOwnership 的越权错误(「服务端
 //     记录为准,不信客户端声明」);
-//  4. 匹配 → 直转 manager.ResolveApproval:首个有效决策获胜,迟到/重复 →
+//  5. 匹配 → 直转 manager.ResolveApproval:首个有效决策获胜,迟到/重复 →
 //     ErrApprovalResolved(sentinel 语义见 approval.go),错误原样上抛由协议面
-//     映射 -32000。
-func (p *AgentPlugin) ResolveApproval(sessionID, requestID string, decision hitl.Decision) error {
+//     映射 -32000。②③④⑤ 同临界区:归属校验与提交之间无 TOCTOU 窗口。
+func (p *AgentPlugin) ResolveApproval(sessionID, connectionID, requestID string, decision hitl.Decision) error {
 	rt := p.sessionRuntime(sessionID)
 	if rt == nil {
 		return sessionNotFoundErr(sessionID)
+	}
+	p.leaseMu.Lock()
+	defer p.leaseMu.Unlock()
+	if !p.holdLeaseLocked(sessionID, connectionID) {
+		return controlLeaseLostErr(sessionID, connectionID)
 	}
 	owner, ok := p.manager.ApprovalOwner(requestID)
 	if !ok {
@@ -433,14 +486,19 @@ func (p *AgentPlugin) ResolveApproval(sessionID, requestID string, decision hitl
 // 路由 → rt.EnsureHub()——遗留③「重启后 attach 时 hub 未建」的解法,attach
 // 即建(含 SeqRange 磁盘播种,游标续接既有历史;hub 由被路由会话自己的
 // deps.RunEvents 供给,事件流天然按会话隔离);RunEvents 未接线/纯内存 →
-// 诚实错误(P5-8 起映射 -32000,客户端指引 session/load)。latest 是当前事件
-// 流位置:仅描述,客户端不得跳游标(总方案 §7 :586-589,P5-10 写入 PROTOCOL.md)。
+// 诚实错误(P5-8 起映射 -32000,客户端指引 session/load);hub 构造失败
+// (第三轮评审 I3:SeqRange 播种的 Journal I/O 错误)→ 错误原样上抛——绝不
+// 返回看似健康的 hub。latest 是当前事件流位置:仅描述,客户端不得跳游标
+// (总方案 §7 :586-589,P5-10 写入 PROTOCOL.md)。
 func (p *AgentPlugin) Attach(sessionID string) (*runtimeagent.EventHub, uint64, error) {
 	rt := p.sessionRuntime(sessionID)
 	if rt == nil {
 		return nil, 0, sessionNotFoundErr(sessionID)
 	}
-	hub := rt.EnsureHub()
+	hub, err := rt.EnsureHub()
+	if err != nil {
+		return nil, 0, fmt.Errorf("agent: session %q: ensure event hub: %w", sessionID, err)
+	}
 	if hub == nil {
 		return nil, 0, fmt.Errorf("agent: event stream not enabled for session %q (persistence disabled)", sessionID)
 	}
@@ -511,15 +569,23 @@ func (p *AgentPlugin) ReleaseControl(sessionID, connectionID string) {
 	}
 }
 
-// HoldControl 实现 RunControlSource(I3 后按会话判定):connectionID 当前是否
-// 持有 sessionID 的 control lease。nil map 取值安全(零值 "")。
-func (p *AgentPlugin) HoldControl(sessionID, connectionID string) bool {
+// holdLeaseLocked 是 lease 校验的内移形态(fencing,第三轮评审 I4;调用方必须
+// 已持 leaseMu):connectionID 非空且当前持有 sessionID 的租约。fenced 控制操作
+// (StartRun/CancelRun/ResolveApproval)与 HoldControl 共用同一判定,保证守卫
+// 语义与守卫执行点永不漂移;nil map 取值安全(零值 "")。
+func (p *AgentPlugin) holdLeaseLocked(sessionID, connectionID string) bool {
 	if connectionID == "" {
 		return false
 	}
+	return p.controlLeases[sessionID] == connectionID
+}
+
+// HoldControl 实现 RunControlSource(I3 后按会话判定):connectionID 当前是否
+// 持有 sessionID 的 control lease。
+func (p *AgentPlugin) HoldControl(sessionID, connectionID string) bool {
 	p.leaseMu.Lock()
 	defer p.leaseMu.Unlock()
-	return p.controlLeases[sessionID] == connectionID
+	return p.holdLeaseLocked(sessionID, connectionID)
 }
 
 // ReleaseConnection 实现 RunControlSource(I3 新增断连收口):释放 connectionID
