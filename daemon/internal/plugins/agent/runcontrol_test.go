@@ -819,7 +819,8 @@ func TestActiveRunNonCurrentSession(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 第三轮评审 I4 修复验收(fencing):lease 校验与控制操作提交的原子性——校验
-// 内移 source、与提交同处 leaseMu 临界区(接管 AcquireControl 同锁)。
+// 内移 source、与提交同处本会话 guard.mu 临界区(接管 AcquireControl 同锁;
+// DE2-I1 后锁粒度=会话,跨会话互不阻塞)。
 // ─────────────────────────────────────────────────────────────────────────────
 
 // TestControlFencingTakeoverStorm(第三轮评审 I4 修复验收):A 持 lease,
@@ -902,7 +903,7 @@ func TestControlFencingTakeoverStorm(t *testing.T) {
 
 	// —— 接管风暴:B 反复接管+释放(制造「conn-B 持有 / 空闲」翻转,A 永非
 	// 持有者);A 并发反复三类控制操作。A 每个操作前快照接管标志:已观察到接管
-	// (B 的 tookOver=true 已返回 ⇒ leaseMu 内 A 的租约已被夺走)→ 操作必返回
+	// (B 的 tookOver=true 已返回 ⇒ 本会话 guard 内 A 的租约已被夺走)→ 操作必返回
 	// ErrControlLeaseLost;未观察到的窗口内成功/业务错误(ErrApprovalResolved、
 	// ErrRunNotFound)/并发接管皆可,由落定后的终态断言收束。
 	var takenOver atomic.Bool
@@ -967,4 +968,184 @@ func TestControlFencingTakeoverStorm(t *testing.T) {
 		}
 	default: // 零送达:A 的风暴应答全部发生在接管后(fencing 拒绝)——同样合法
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 第四轮评审 DE2-I1/DE2-M1 修复验收:per-session fencing guard——①确定性
+// fencing(无竞态依赖,接管后旧持有者的三类控制操作必被拒);②跨会话独立
+// (某会话 StartRun 同步段的 journal fsync 挂起不再阻塞其他会话的控制面)。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestControlFencingDeterministicTakeover(DE2-M1 修复验收):纯顺序、零
+// goroutine 的确定性 fencing 断言——风暴测试(TestControlFencingTakeoverStorm)
+// 的「接管先于操作」由 goroutine 调度决定,本测试把时序钉死:A 空闲获取 →
+// A 未释放时 B 接管(tookOver=true)→ A 的 StartRun/ResolveApproval/CancelRun
+// 全部 ErrControlLeaseLost。fencing 校验先于幂等表/审批归属/manager 存在性判
+// 定(请求ID 未记账、审批不存在、run 不存在都不影响拒绝语义),且被拒的
+// StartRun 不得入幂等表。
+func TestControlFencingDeterministicTakeover(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	cfg.Session.Enabled = false
+	cfg.Memory.Enabled = false
+	hub, _ := testHub(cfg)
+	p := newAgentPluginP(hub, fixedProvider{content: "fence-det"})
+	sid := p.CurrentSessionID() // 纯内存形态为空串,是合法租约键(见 AcquireControl 注释)
+
+	// ① A 空闲获取:非接管。
+	if p.AcquireControl(sid, "conn-A") {
+		t.Fatal("fresh acquire must not report takeover")
+	}
+
+	// ② A 未释放时 B 接管:tookOver=true,持有权从 A 移到 B。
+	if !p.AcquireControl(sid, "conn-B") {
+		t.Fatal("acquire while conn-A holds the lease must report tookOver=true")
+	}
+	if p.HoldControl(sid, "conn-A") {
+		t.Fatal("previous holder must lose the lease after the deterministic takeover")
+	}
+	if !p.HoldControl(sid, "conn-B") {
+		t.Fatal("taker must hold the lease after the deterministic takeover")
+	}
+
+	// ③ A 的三类控制操作全部 ErrControlLeaseLost:守卫拒绝先于一切提交判定。
+	if _, _, err := p.StartRun(sid, "conn-A", "fenced", "req-det"); !errors.Is(err, ErrControlLeaseLost) {
+		t.Fatalf("fenced StartRun err = %v, want ErrControlLeaseLost", err)
+	}
+	if err := p.ResolveApproval(sid, "conn-A", "req-det-approval", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, ErrControlLeaseLost) {
+		t.Fatalf("fenced ResolveApproval err = %v, want ErrControlLeaseLost", err)
+	}
+	if err := p.CancelRun(sid, "conn-A", "run-det"); !errors.Is(err, ErrControlLeaseLost) {
+		t.Fatalf("fenced CancelRun err = %v, want ErrControlLeaseLost", err)
+	}
+
+	// ④ 被拒的 StartRun 不得入幂等表(拒绝发生在 reqMu 临界区之前)。
+	p.reqMu.Lock()
+	_, tracked := p.runRequests[requestKey(p.sessionRuntime(sid).ID, "req-det")]
+	p.reqMu.Unlock()
+	if tracked {
+		t.Fatal("fenced StartRun recorded an idempotency entry (拒绝路径不得入表)")
+	}
+}
+
+// gatedRunJournal 是 RunStateJournal 闸门包装(DE2-I1 修复验收的确定性接缝,
+// 挂在生产真实存在的 journal 写点上,非测试专用执行分支):首个 AppendState
+// (StartRun 同步段 ⑤ 的 queued 记录 durable-first,含 journal fsync)挂起在
+// release 上,模拟本会话慢盘;close(release) 后透传内嵌的真实 store——
+// queued/running/completed 记录照常落账,RunStatus 的 journal 权威分支不受影
+// 响。entered 在进入 AppendState 时关闭,给测试一个确定性的「已进入同步段写
+// 点(此刻 guard 必被本会话 StartRun 持有)」信号。
+type gatedRunJournal struct {
+	*session.RunJournalStore
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+var _ runtimeagent.RunStateJournal = (*gatedRunJournal)(nil)
+
+func (j *gatedRunJournal) AppendState(rec session.RunStateRecord) error {
+	j.once.Do(func() { close(j.entered) })
+	<-j.release
+	return j.RunJournalStore.AppendState(rec)
+}
+
+// TestCrossSessionStartRunNotBlockedByFsync(DE2-I1 修复验收):会话 A 的
+// StartRun 停在同步段 journal 写点(guard 持有中,fsync 挂起)期间——
+// ① 会话 B 的 AcquireControl/StartRun 照常完成(per-session guard:慢盘不再
+// 跨会话串行;修复前全局 leaseMu 会把 A 的慢 fsync 放大为 B 的控制面卡顿);
+// ② B 对 A 会话的接管在 A 提交完成前无法插入(校验+提交同临界区,fencing 在
+// guard 锁内线性化——确定性断言,不依赖调度);③ 放行后 A 的提交完成、接管
+// 随后发生,且 A 已提交的后台 Run 不被接管撤销(DE2-I2 语义)、两会话的 run
+// 各自收敛 completed。
+func TestCrossSessionStartRunNotBlockedByFsync(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "cross-fsync"})
+	sidA := p.CurrentSessionID()
+
+	// 会话 A 的 Run journal 换成闸门包装(内嵌真实 store,事件面 RunEvents 不
+	// 动):refreshSession 重建 current runtime,新会话本体吃进闸门 journal。
+	real := p.runJournalStore()
+	if real == nil {
+		t.Fatal("session A has no run journal store (persistence disabled?)")
+	}
+	gated := &gatedRunJournal{
+		RunJournalStore: real,
+		entered:         make(chan struct{}),
+		release:         make(chan struct{}),
+	}
+	p.deps.RunJournal = gated
+	p.refreshSession()
+	if got := p.CurrentSessionID(); got != sidA {
+		t.Fatalf("refreshSession changed session id = %q, want %q", got, sidA)
+	}
+
+	if p.AcquireControl(sidA, "conn-A") {
+		t.Fatal("test setup: fresh acquire must not report takeover")
+	}
+
+	// A 的 StartRun 提交后停在同步段写点(guard 持有中)。
+	startedA := make(chan struct{}, 1)
+	var startErrA error
+	var runA string
+	go func() {
+		id, _, err := p.StartRun(sidA, "conn-A", "slow-A", "req-fsync-A")
+		runA, startErrA = id, err
+		close(startedA)
+	}()
+	select {
+	case <-gated.entered:
+	case <-startedA:
+		t.Fatalf("StartRun(A) returned (%q, %v) before entering the queued-record write", runA, startErrA)
+	case <-time.After(5 * time.Second):
+		t.Fatal("StartRun(A) never reached the queued-record journal write")
+	}
+
+	// ① 跨会话独立:A 挂起期间,B 的控制面照常(先建会话 B 再获取/提交)。
+	sidB := newPersistedSession(t, p, fixedProvider{content: "fast-B"})
+	if p.AcquireControl(sidB, "conn-B") {
+		t.Fatal("acquire on idle session B must not report takeover (A 的慢 fsync 不得牵连 B)")
+	}
+	runB, _, err := p.StartRun(sidB, "conn-B", "fast-B", "req-fsync-B")
+	if err != nil {
+		t.Fatalf("StartRun(B) while A's fsync is stuck: %v (跨会话控制操作被串行化,DE2-I1 回归)", err)
+	}
+
+	// ② fencing 线性化(确定性):A 持 guard 提交期间,B 对会话 A 的接管无法
+	// 插入。接管 goroutine 在放行前不得完成——若完成即 fencing 破洞(校验与
+	// 提交不在同一临界区)。
+	takeover := make(chan bool, 1)
+	go func() { takeover <- p.AcquireControl(sidA, "conn-B") }()
+	select {
+	case <-takeover:
+		t.Fatal("takeover of session A completed while conn-A's fenced commit is still in flight (guard 未覆盖提交段)")
+	case <-time.After(100 * time.Millisecond):
+		// 仍在等待 A 的 guard:线性化语义成立(接管被挡在提交临界区外)。
+	}
+
+	// ③ 放行 A 的 fsync:A 的提交完成,接管随后发生;DE2-I2:接管只影响后续
+	// 控制操作,不撤销已成功提交的后台 Run。
+	close(gated.release)
+	select {
+	case <-startedA:
+		if startErrA != nil {
+			t.Fatalf("StartRun(A) after release: %v", startErrA)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StartRun(A) did not return after the fsync gate was released")
+	}
+	select {
+	case took := <-takeover:
+		if !took {
+			t.Fatal("takeover after conn-A's commit completed must report tookOver=true")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("takeover of session A did not complete after the fenced commit finished")
+	}
+	if p.HoldControl(sidA, "conn-A") {
+		t.Fatal("conn-A must lose session A's lease after the takeover")
+	}
+
+	// 收束:A 的 run 不受接管影响继续完成;B 的 run 正常完成(两会话事件面/
+	// journal 各自隔离,RunStatus 走各自会话的 journal 权威分支)。
+	waitForRunStatus(t, p, sidA, runA, string(runtimeagent.RunCompleted))
+	waitForRunStatus(t, p, sidB, runB, string(runtimeagent.RunCompleted))
 }

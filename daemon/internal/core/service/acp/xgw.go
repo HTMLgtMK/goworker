@@ -22,8 +22,9 @@ import (
 // 与 approval/respond 要求请求方连接持有**被操作会话**(请求 sessionId)的
 // lease。第三轮评审 I4 起,该守卫不再是 handler 侧的先行检查(requireControl
 // 已删除,校验内移 source)——四处调用点透传 h.connectionID,source 侧在受
-// 保护临界区(leaseMu,与接管 AcquireControl 同锁)内原子完成「lease 校验 +
-// 操作提交」(fencing):校验通过后到提交完成之间不可能被接管,接管后旧持有者
+// 保护临界区(本会话 session guard.mu,DE2-I1 后按会话分锁,与接管
+// AcquireControl 同锁)内原子完成「lease 校验 + 操作提交」(fencing):校验通过
+// 后到提交完成之间不可能被接管,接管后旧持有者
 // 的控制操作一律明确失败。授权的最终事实源是服务端记录的审批归属(source 侧
 // ResolveApproval 按 requestID 查归属会话并校验,不信客户端声明);run/get 是
 // 只读观察面,不要求。lease 的获取/归还入口是 attach/detach(mode=control):
@@ -237,8 +238,9 @@ func (h *FrontendHandler) xgwApprovalRespond(_ context.Context, params json.RawM
 //
 // 并发与锁:subs 表在 h.mu 内;runs.Attach 与 hub.Subscribe 在锁外(各自内部
 // 锁序见 P5-6/event_hub.go,与 h.mu 无嵌套),提交段的 AcquireControl 在 h.mu
-// 内嵌套取 source 的 leaseMu(单向 h.mu→leaseMu,Close 侧同向,见 FrontendHandler
-// subs 字段注释);泵退出自清仅短暂取 h.mu 做指针身份判重。
+// 内嵌套取被操作会话的 source 侧 session guard(单向 h.mu→session guard,
+// Close 侧同向,见 FrontendHandler subs 字段注释);泵退出自清仅短暂取 h.mu
+// 做指针身份判重。
 func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMessage) (any, error) {
 	if h.runs == nil {
 		return nil, xgwNotAvailableError(XMethodSessionAttach)
@@ -297,8 +299,8 @@ func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMes
 	h.subs[req.SessionID] = sub
 	// 控制权变更与订阅提交同一临界区(I4:订阅准备成功后才 Acquire/接管,失败
 	// 路径绝不夺走原持有者的 lease;I2:closed 置位后一律拒绝,Close 返回后
-	// 不会有新的 lease 获取——AcquireControl 内部取 source 的 leaseMu,锁序
-	// h.mu→leaseMu 单向,与 Close 侧同向,无环)。
+	// 不会有新的 lease 获取——AcquireControl 内部取 source 侧本会话的 session
+	// guard,锁序 h.mu→session guard 单向,与 Close 侧同向,无环)。
 	tookOver := false
 	if mode == XAttachModeControl {
 		tookOver = h.runs.AcquireControl(req.SessionID, h.connectionID)
@@ -425,7 +427,8 @@ func (h *FrontendHandler) xgwSessionDetach(_ context.Context, params json.RawMes
 // P5-9:runs.UnbindCapabilities(h.connectionID)——断连解绑客户端工具能力。
 //
 // I2 生命周期屏障:closed 置位与清表在同一 h.mu 临界区先行,lease 归还
-// (leaseMu)在后——锁序 h.mu→leaseMu 单向,与 attach 提交段/detach 同向,无环。
+// (ReleaseConnection 扫 source 侧 session guard)在后——锁序 h.mu→session
+// guard 单向,与 attach 提交段/detach 同向,无环。
 // 二者与 attach 提交段以 h.mu 全序:attach 先提交 → 其订阅在表内被本函数
 // stop、其 lease 被 ReleaseConnection 归还;Close 先入 → closed 置位,attach
 // 的提交段一律拒绝。Close 返回之后不会再发生新的订阅提交或 lease 获取

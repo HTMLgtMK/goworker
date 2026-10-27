@@ -55,11 +55,13 @@ type FrontendHandler struct {
 	// 至多一订阅(重复 attach 先 cancel 旧泵再建新);泵退出自清按句柄指针身份
 	// 判重,换代/断连(Close)统一回收。与 promptable/readOnly 共用 h.mu。
 	//
-	// 锁序(I2 生命周期屏障后):h.mu 临界区内会嵌套调用 source 的 leaseMu——
-	// attach 提交段的 AcquireControl 与 detach 的 ReleaseControl 都与订阅表
-	// 更新放在同一临界区(订阅表更新与 control lease 操作的事务语义,评审 I2
-	// 建议四)。leaseMu 是 source 侧叶锁(runcontrol.go),不回调 handler、不取
-	// h.mu,嵌套单向 h.mu→leaseMu,Close 侧同向,无环;其余临界区仍互不嵌套。
+	// 锁序(I2 生命周期屏障后;DE2-I1 后 source 侧是按会话 fencing guard):
+	// h.mu 临界区内会嵌套调用 source 的 session guard——attach 提交段的
+	// AcquireControl 与 detach 的 ReleaseControl 都与订阅表更新放在同一临界区
+	// (订阅表更新与 control lease 操作的事务语义,评审 I2 建议四)。guard.mu
+	// 是 source 侧叶锁(runcontrol.go,每会话一把),不回调 handler、不取
+	// h.mu,嵌套单向 h.mu→session guard,Close 侧同向,无环;其余临界区仍互
+	// 不嵌套。
 	//
 	// C1 修复清退了旧的 controlSessions 候选集:approval/respond 的会话归属
 	// 守卫在 source 侧按服务端记录校验(第三轮评审 I4 起 run/start|cancel 的

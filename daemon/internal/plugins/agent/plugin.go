@@ -83,23 +83,34 @@ type AgentPlugin struct {
 	// runRequests 记 (sessionID, requestID) 组合键 → 提交时返回的 RunHandle +
 	// input sha256 指纹(重试同键同 Input 返回原 runID 与其当前状态;同键不同
 	// Input 显式冲突,跨会话同 requestID 不同 Input 同样冲突),requestOrder 是
-	// 环形逐出队列(容量 4096,防无界)。持有临界区覆盖 manager.StartRun 同步段
-	// ——同会话第二 run 本就被 ErrRunActive 串行,锁的额外代价可忽略,换来同
-	// requestID 并发重试的严格幂等。
+	// 环形逐出队列(容量 4096,防无界)。DE2-I1 后 reqMu 只护表读写(查表/记账,
+	// 短临界区、无 I/O)——不再覆盖 manager.StartRun 同步段(旧形态会让某会话的
+	// journal fsync 经这把全局锁串行化所有会话的 StartRun);并发同 requestID 重
+	// 试的严格幂等由本会话 guard 串行保证(同键必经同一会话 guard,见
+	// runcontrol.go 文件头)。
 	reqMu        sync.Mutex
 	runRequests  map[string]trackedRun
 	requestOrder []string
-	// leaseMu 保护 controlLeases(P5-6 control lease,V1 宿主授权简化形,拍板②
-	// 原文「每会话至多一个 control 持有者」;I3 修正后按会话维度记账):
-	// controlLeases 是 sessionID → connectionID 租约表,本机信任、每会话至多
-	// 一个持有者(两连接各控各会话互不影响)、断开即释放(P5-7 handler.Close 经
-	// ReleaseConnection 释放该连接全部租约)、后到连接对同一会话显式接管
-	// (tookOver=true + slog.Info 审计)。第三轮评审 I4 起 fenced 控制操作在本锁
-	// 临界区内原子完成「lease 校验 + 提交」(fencing):嵌套取 reqMu 与 manager
-	// 内部锁,锁序 leaseMu→reqMu→manager 单向(runcontrol.go 文件头);不与 mu
-	// 嵌套。惰性建表(AcquireControl 首写时 make),读侧 nil map 取值安全。
-	leaseMu       sync.Mutex
-	controlLeases map[string]string
+	// guardsMu 只护 controlGuards 表的 get-or-create(第四轮评审 DE2-I1 修复:
+	// 全局 leaseMu + controlLeases 租约表 → 按会话 fencing guard,P5-6 control
+	// lease,V1 宿主授权简化形,拍板②原文「每会话至多一个 control 持有者」;
+	// I3 修正后按会话维度记账):controlGuards 是 sessionID → *sessionControlGuard
+	// (runcontrol.go:mu 是本会话控制操作的线性化临界区,holder 是当前持有者
+	// connectionID)。本机信任、每会话至多一个持有者(两连接各控各会话互不影响)、
+	// 断开即释放(P5-7 handler.Close 经 ReleaseConnection 释放该连接全部租约)、
+	// 后到连接对同一会话显式接管(tookOver=true + slog.Info 审计)。第三轮评审
+	// I4 起 fenced 控制操作在**本会话 guard.mu** 临界区内原子完成「lease 校验 +
+	// 提交」(fencing);DE2-I1 后锁粒度是会话——某会话 manager.StartRun 同步段
+	// 的 journal fsync 只占住本会话 guard,不再跨会话互斥(旧全局 leaseMu 会被
+	// 单会话慢盘放大为全 daemon 控制面卡顿)。嵌套取 reqMu 与 manager 内部锁,
+	// 锁序 guard.mu→reqMu→manager 单向(runcontrol.go 文件头);不与 mu 嵌套;
+	// guardsMu 与 guard.mu 无嵌套(ReleaseConnection 先快照再逐个锁)。guardsMu
+	// 自身是叶锁(仅 controlGuard/snapshotControlGuards 取,临界区无 I/O 无回
+	// 调)。guard 条目只增不删(与会话注册表同生命周期量级,单条目仅互斥锁+一
+	// 个字符串;删除须与并发控制操作同步,徒增 fencing 复杂度)。惰性建表
+	// (controlGuard 首用时 make)。
+	guardsMu      sync.Mutex
+	controlGuards map[string]*sessionControlGuard
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。

@@ -106,6 +106,15 @@ control lease **按会话记账**（拍板②原文「每会话至多一个 cont
   的 `sessionId` 声明审批归属会话，daemon 再按服务端记录的审批归属（审批注册
   时落账的会话）校验两者一致——**服务端记录为准，不信客户端声明**：声明别的
   会话（即便持有其 lease）应答本会话审批 → -32000 越权拒绝，审批不被消费。
+- **接管只影响后续控制操作，不撤销已成功启动的后台 AgentRun**（DE2-I2）：control
+  lease 授权的是**控制操作的提交时刻**，不是 Run 的持续所有权——旧控制者已成功
+  启动的 run 继续执行至终态，不随接管自动取消；新控制者作为当前 lease 持有者经
+  run/get 观察、attach 订阅其事件流、run/cancel 接管管理（是否取消由新控制者
+  **显式决定**，前端不得假设接管即停旧 Run）。测试佐证：
+  `TestControlFencingTakeoverStorm` 与 `TestCrossSessionStartRunNotBlockedByFsync`
+  （daemon/internal/plugins/agent/runcontrol_test.go——前者钉死接管后旧持有者的
+  StartRun/ResolveApproval/CancelRun 一律拒绝；后者断言已提交的后台 Run 在接管后
+  继续收敛 completed、不被撤销）。
 - V1 采用本机信任的宿主授权（单用户 daemon，无账号体系）：不做 lease 过期
   与授权协商；**断开连接即释放该连接全部会话的 lease**（审批不悬死在已死
   连接上）；`detach` `mode:"control"` 按会话主动归还。权限检查全部在 daemon
