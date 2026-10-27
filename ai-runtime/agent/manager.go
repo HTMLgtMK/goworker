@@ -225,6 +225,16 @@ func (m *SessionManager) ResolveApproval(requestID string, decision hitl.Decisio
 	return m.approvals.Resolve(requestID, decision)
 }
 
+// ApprovalOwner 返回 requestID 的服务端记录审批归属(P4-2,ApprovalManager.Owner
+// 的直转包装):归属是审批注册(Wait)时落账的 SessionID+RunID,非连接——已
+// resolved 的滞留条目在 approvalResolvedRetention 宽限窗内仍可查。daemon C1
+// 修复的权威事实源:x-goworker/approval/respond 的归属校验以此为准,不信任
+// 客户端声明的 sessionId;未知 requestID(从未存在或已过宽限窗被清扫)→
+// ok=false。
+func (m *SessionManager) ApprovalOwner(requestID string) (string, bool) {
+	return m.approvals.Owner(requestID)
+}
+
 // contextOf 返回宿主生命周期 ctx(包内访问器):StartRun(P2-5)以它为父派生
 // runCtx——Run 的生命周期归宿主而非单个请求,连接断开不影响后台 Run。不导出:
 // P2 无包外消费者(导出面留给 P5 前端接入时再定)。

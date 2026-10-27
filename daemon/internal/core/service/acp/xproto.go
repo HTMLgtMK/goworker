@@ -18,7 +18,7 @@ const (
 	XMethodRunStart        = "x-goworker/run/start"        // {sessionId,input,requestId} → {runId,state}
 	XMethodRunGet          = "x-goworker/run/get"          // {sessionId,runId} → {state,result?,latestSeq}
 	XMethodRunCancel       = "x-goworker/run/cancel"       // {sessionId,runId} → {accepted}
-	XMethodApprovalRespond = "x-goworker/approval/respond" // {requestId,decision} → {accepted}
+	XMethodApprovalRespond = "x-goworker/approval/respond" // {sessionId,requestId,decision} → {accepted}
 	XMethodSessionAttach   = "x-goworker/session/attach"   // P5-8
 	XMethodSessionDetach   = "x-goworker/session/detach"   // P5-8
 	XMethodSessionEvents   = "x-goworker/session/events"   // 服务端通知(P5-8,Send only)
@@ -58,14 +58,17 @@ type XRunGetParams struct {
 // (总方案 §7)。result 字段对齐总方案 wire 形状(run 终态结果文本);P5-6
 // 的 RunStatus 不产生 result,本步恒省略(omitempty),run 结果面在后续
 // step 接通 RunResult 时补齐——诚实收缩,不发明第二事实源。
-// eventsComplete(I6lite)恒显式携带(true/false 都在,无 omitempty——false 是
-// 告警态,若缺席客户端将无从区分「完整」与「未知」):false = 本进程纪元内
-// 发生过事件落盘失败,回放可能缺段,不得当完整历史消费。
+// replayIntegrity(I4)恒显式携带(无 omitempty,三态字符串都上 wire):取值
+// complete/unknown/incomplete(runtimeagent.ReplayIntegrity* 常量)——
+// complete = 本进程未观察到写侧失败且无可疑历史;unknown = journal 有跨进程
+// 纪元的既有历史,完整性不可验证;incomplete = 本进程发生过事件落盘失败(key
+// 事件 durable-first 拒绝/合并 delta flush 失败),粘滞永不复位。非 complete
+// = 回放可能缺段,客户端不得把收到的事件当完整历史。
 type XRunGetResult struct {
-	State          string `json:"state"`
-	Result         string `json:"result,omitempty"`
-	LatestSeq      uint64 `json:"latestSeq"`
-	EventsComplete bool   `json:"eventsComplete"`
+	State           string `json:"state"`
+	Result          string `json:"result,omitempty"`
+	LatestSeq       uint64 `json:"latestSeq"`
+	ReplayIntegrity string `json:"replayIntegrity"`
 }
 
 // XRunCancelParams 是 x-goworker/run/cancel 的入参。
@@ -92,10 +95,15 @@ type XApprovalDecision struct {
 	Message     string `json:"message,omitempty"`
 }
 
-// XApprovalRespondParams 是 x-goworker/approval/respond 的入参。requestId
+// XApprovalRespondParams 是 x-goworker/approval/respond 的入参。sessionId 是
+// 审批归属会话的调用方声明(C1 修复,wire 变更——协议未发布可直接改,推翻总方
+// 案 §7 的 {requestId, decision} 形状):handler 以它判 control lease(按会话
+// 判,不再「持有任意会话 lease 即放行」),服务端再按 requestID 查询审批注册
+// 表的真实归属校验两者一致——以服务端记录为准,不信客户端声明。requestId
 // 寻址待决审批(PendingApprovalInfo.RequestID / PendingApproval 契约的
 // req-N 命名空间),与 run/start 的 requestId 是两个命名空间(§6 风险 6)。
 type XApprovalRespondParams struct {
+	SessionID string            `json:"sessionId"`
 	RequestID string            `json:"requestId"`
 	Decision  XApprovalDecision `json:"decision"`
 }
@@ -140,16 +148,17 @@ type XSessionAttachRun struct {
 // attach 时刻会话事件流的位置快照,**仅描述当前位置,客户端不得跳游标**——
 // 只有真正应用了对应事件才能推进本地 cursor(总方案 §7 :586-589);订阅注册
 // 水位可能高于本值(attach 与 Subscribe 之间发布的事件由 live 侧续传),客户端
-// 按逐事件 seq 记账,不据此批量前移。eventsComplete(I6lite)恒显式携带:
-// attach 时刻事件流的完整性快照——false = 本进程纪元内发生过事件落盘失败
-// (key 事件 durable-first 拒绝/合并 delta flush 失败,标记永不复位),回放
-// 可能缺段,客户端据此判断回放完整性。tookOver 仅 mode=control 且接管了他连接
-// 的 lease 时为 true(其余省略)。
+// 按逐事件 seq 记账,不据此批量前移。replayIntegrity(I4)恒显式携带:attach
+// 时刻事件流的回放完整性三态(complete/unknown/incomplete,语义见
+// XRunGetResult 注释)——unknown = 跨进程纪元的既有历史不可验证,incomplete =
+// 本进程发生过事件落盘失败(标记粘滞永不复位),两者都不得把收到的事件当
+// 完整历史。tookOver 仅 mode=control 且接管了他连接的 lease 时为 true(其余
+// 省略)。
 type XSessionAttachResult struct {
-	CurrentRun     *XSessionAttachRun `json:"currentRun"`
-	LatestSeq      uint64             `json:"latestSeq"`
-	EventsComplete bool               `json:"eventsComplete"`
-	TookOver       bool               `json:"tookOver,omitempty"`
+	CurrentRun      *XSessionAttachRun `json:"currentRun"`
+	LatestSeq       uint64             `json:"latestSeq"`
+	ReplayIntegrity string             `json:"replayIntegrity"`
+	TookOver        bool               `json:"tookOver,omitempty"`
 }
 
 // XSessionDetachParams 是 x-goworker/session/detach 的入参。mode 与 attach 同

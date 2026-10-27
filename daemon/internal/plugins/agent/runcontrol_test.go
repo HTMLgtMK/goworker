@@ -10,6 +10,7 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/ai-runtime/session"
 )
 
@@ -335,7 +336,8 @@ func TestAttachEnsureHubAndJournalStatus(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// C3+I5 修复验收(GPT 评审):多会话路由 + 跨会话 requestId 幂等。
+// C3+I5 修复验收(GPT 评审):多会话路由 + requestId 组合键幂等(第二轮评审
+// I5 收窄:幂等作用域是会话,跨会话冲突扫描已删)。
 // ─────────────────────────────────────────────────────────────────────────────
 
 // gatedProvider 是 daemon 侧测试的闸门 provider:首轮 Chat 关闭 started(测试
@@ -486,10 +488,10 @@ func TestCrossSessionRunControl(t *testing.T) {
 	waitForRunStatus(t, p, sidB, runB, string(runtimeagent.RunCompleted))
 }
 
-// TestCrossSessionRequestIdempotency(I5 修复验收):A 与 B 用同 requestId 不同
-// Input → B 返回显式 conflict 而非误返 A 的 run;同键同 Input(current 已切走,
-// A 的重试按 sessionID 路由)→ 幂等返回原 runID;B 自己的键同 Input 幂等、
-// 不同 Input 冲突。
+// TestCrossSessionRequestIdempotency(I5 修复验收,第二轮评审 I5 收窄到会话作用
+// 域):A 与 B 用同 requestId、不同 Input 各自启动 → 均成功、互不影响(跨会话
+// 冲突扫描已删,各自局部递增 requestID 的两客户端不再互相拒绝);同会话同
+// requestID:同 Input 幂等返回原 runID/state,不同 Input → conflict。
 func TestCrossSessionRequestIdempotency(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "idem-A"})
 	sidA := p.CurrentSessionID()
@@ -504,17 +506,18 @@ func TestCrossSessionRequestIdempotency(t *testing.T) {
 	// 会话边界:current 切到 B。
 	sidB := newPersistedSession(t, p, fixedProvider{content: "idem-B"})
 
-	// I5:B 用同 requestId、不同 Input → conflict 错误,绝不返回 A 的 run。
-	id, _, err := p.StartRun(sidB, "payload-B", "req-x")
-	if !errors.Is(err, ErrRequestConflict) {
-		t.Fatalf("StartRun(B, same requestID, different input) err = %v, want ErrRequestConflict", err)
+	// 第二轮评审 I5:B 用同 requestId、不同 Input → 独立起跑成功(幂等作用域
+	// 是会话),拿到自己的新 run,绝不误返 A 的 run。
+	runB, _, err := p.StartRun(sidB, "payload-B", "req-x")
+	if err != nil {
+		t.Fatalf("StartRun(B, same requestID, different input): %v", err)
 	}
-	if id != "" {
-		t.Fatalf("conflicting cross-session submit returned runID %q (must not be A's run %q)", id, runA)
+	if runB == runA {
+		t.Fatal("StartRun(B, req-x) returned session A's run (组合键失效)")
 	}
+	waitForRunStatus(t, p, sidB, runB, string(runtimeagent.RunCompleted))
 
-	// 同键同 Input(current 已切到 B,A 的重试按 sessionID 路由)→ 幂等返回
-	// 原 runID 与其终态快照。
+	// A 的 run 不受 B 提交影响:同键同 Input 幂等返回原 runID 与终态快照。
 	id2, st2, err := p.StartRun(sidA, "payload-A", "req-x")
 	if err != nil {
 		t.Fatalf("StartRun(A, same requestID, same input): %v", err)
@@ -523,17 +526,150 @@ func TestCrossSessionRequestIdempotency(t *testing.T) {
 		t.Fatalf("idempotent retry = (%q, %q), want (%q, completed)", id2, st2, runA)
 	}
 
-	// B 自己的键:同键同 Input 幂等返回;同键不同 Input 冲突。
-	id3, _, err := p.StartRun(sidB, "payload-B1", "req-y")
+	// 同会话(B)同 requestID(req-x):同 Input 幂等返回原 runID;不同 Input →
+	// ErrRequestConflict(上轮 I5 的 Input 指纹校验收窄到同键范围)。
+	id3, _, err := p.StartRun(sidB, "payload-B", "req-x")
+	if err != nil || id3 != runB {
+		t.Fatalf("same-key retry = (%q, %v), want (%q, nil)", id3, err, runB)
+	}
+	if _, _, err := p.StartRun(sidB, "payload-B-changed", "req-x"); !errors.Is(err, ErrRequestConflict) {
+		t.Fatalf("same-session same-key different-input err = %v, want ErrRequestConflict", err)
+	}
+}
+
+// TestCrossSessionApprovalOwnership(C1 修复验收,真实 RunControlSource 实现):
+// 服务端记录的审批归属是授权事实源——会话 B 挂起的审批,由声明 sidA 的调用方
+// 应答 → ErrApprovalOwnership 越权拒绝(即便 sidA 是真实注册会话)且审批不被
+// 消费;归属会话本人应答 → 成功且决策送达 Wait;resolved 后归属仍可查(滞留
+// 条目),迟到决策报 ErrApprovalResolved 而非归属错误/未知;未知 requestID →
+// ErrApprovalUnknown;未知会话 → 路由层 ErrSessionNotFound。修复前 Resolve
+// 按 requestID 全局寻址直接投递,无任何归属校验。
+func TestCrossSessionApprovalOwnership(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "approval-A"})
+	sidA := p.CurrentSessionID()
+	sidB := newPersistedSession(t, p, fixedProvider{content: "approval-B"})
+
+	// 会话 B 的待决审批:直接经 SDK 审批管理面注册(归属 sidB),模拟 B 的
+	// run 命中 HITL(decideFunc → ApprovalManager.Wait 的落账形态)。
+	mgr := p.manager.Approvals()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	decided := make(chan hitl.Decision, 1)
+	go func() {
+		decided <- mgr.Wait(ctx, sidB, "run-b", &hitl.InterruptRequest{
+			ID:        "req-b-1",
+			ToolName:  "bash",
+			Command:   `{"cmd":"ls"}`,
+			CreatedAt: time.Now(),
+			ExpiresAt: time.Now().Add(30 * time.Second),
+		})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := p.manager.ApprovalOwner("req-b-1"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("approval req-b-1 never registered with the manager")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// ① 越权:声明 sidA 应答归属 sidB 的审批 → ErrApprovalOwnership,审批不被
+	// 消费(归属原样,后续归属会话本人仍可应答)。
+	err := p.ResolveApproval(sidA, "req-b-1", hitl.Decision{Type: hitl.DecisionApprove})
+	if !errors.Is(err, ErrApprovalOwnership) {
+		t.Fatalf("ResolveApproval(sidA, B's approval) err = %v, want ErrApprovalOwnership", err)
+	}
+	if owner, ok := p.manager.ApprovalOwner("req-b-1"); !ok || owner != sidB {
+		t.Fatalf("ownership after rejected respond = (%q, %v), want (%q, true) (被拒决策不得消费审批)", owner, ok, sidB)
+	}
+
+	// ② 未知 requestID → ErrApprovalUnknown 语义的明确错误。
+	if err := p.ResolveApproval(sidB, "req-missing", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, runtimeagent.ErrApprovalUnknown) {
+		t.Fatalf("ResolveApproval(unknown requestID) err = %v, want ErrApprovalUnknown", err)
+	}
+
+	// ③ 归属会话本人应答 → 成功,决策送达 Wait(首个有效决策获胜)。
+	if err := p.ResolveApproval(sidB, "req-b-1", hitl.Decision{Type: hitl.DecisionApprove, Message: "go"}); err != nil {
+		t.Fatalf("ResolveApproval(sidB, own approval): %v", err)
+	}
+	select {
+	case d := <-decided:
+		if d.Type != hitl.DecisionApprove || d.InterruptID != "req-b-1" {
+			t.Fatalf("Wait decision = %+v, want approve for req-b-1", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not return after ResolveApproval")
+	}
+
+	// ④ resolved 后归属仍可查(滞留条目,宽限窗内):迟到决策报
+	// ErrApprovalResolved 而非归属错误/未知——归属校验不得提前吞掉迟到语义。
+	if err := p.ResolveApproval(sidB, "req-b-1", hitl.Decision{Type: hitl.DecisionReject}); !errors.Is(err, runtimeagent.ErrApprovalResolved) {
+		t.Fatalf("late ResolveApproval err = %v, want ErrApprovalResolved", err)
+	}
+
+	// ⑤ 未知会话 → 路由层 ErrSessionNotFound(在归属校验之前诚实失败)。
+	if err := p.ResolveApproval("bogus-session", "req-b-1", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
+		t.Fatalf("ResolveApproval(unknown session) err = %v, want ErrSessionNotFound", err)
+	}
+}
+
+// TestActiveRunNonCurrentSession(第二轮评审 I1 修复验收):Session A 的后台
+// run 在途时创建 Session B(current 切到 B,A 的 runtime 保留在册)——
+// ActiveRun(A) 必须返回 A 自己的在途快照 (runA, running, true)(修复前
+// requireCurrentSession 对非 current 会话恒 ok=false,attach 响应的
+// currentRun=null 与「A 确有在途 run」的事实不符);对照:B 无在途 run →
+// false;未知会话 → false;A 的 run 终态后 active 清空 → ActiveRun(A) 归位
+// false。ActiveRun 的快照即 attach 响应 currentRun 字段的事实源(wire 面转发
+// 契约由 service/acp 的 TestXGWSessionAttachCrossConnectionCurrentRun 钉住)。
+func TestActiveRunNonCurrentSession(t *testing.T) {
+	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
+	p := newPersistedPlugin(t, gated)
+	sidA := p.CurrentSessionID()
+
+	// A 的后台 run 提交并等它真实开工(started 关闭 ⇒ run 已 running)。
+	runA, _, err := p.StartRun(sidA, "hello-A", "req-active-A")
 	if err != nil {
-		t.Fatalf("StartRun(B, req-y): %v", err)
+		t.Fatalf("StartRun(A): %v", err)
 	}
-	waitForRunStatus(t, p, sidB, id3, string(runtimeagent.RunCompleted))
-	id4, _, err := p.StartRun(sidB, "payload-B1", "req-y")
-	if err != nil || id4 != id3 {
-		t.Fatalf("same-key retry = (%q, %v), want (%q, nil)", id4, err, id3)
+	select {
+	case <-gated.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background run did not start in time")
 	}
-	if _, _, err := p.StartRun(sidB, "payload-B1-changed", "req-y"); !errors.Is(err, ErrRequestConflict) {
-		t.Fatalf("same-key different-input err = %v, want ErrRequestConflict", err)
+
+	// 会话边界:current 切到 B(A 的 runtime 保留在册)。
+	sidB := newPersistedSession(t, p, fixedProvider{content: "bg-B"})
+	if got := p.CurrentSessionID(); got != sidB {
+		t.Fatalf("CurrentSessionID = %q, want %q (B)", got, sidB)
+	}
+
+	// I1:非 current 会话的在途快照可达,且就是 A 的那个 run。
+	runID, state, ok := p.ActiveRun(sidA)
+	if !ok {
+		t.Fatal("ActiveRun(non-current session with in-flight run) = ok=false, want true")
+	}
+	if runID != runA {
+		t.Fatalf("ActiveRun(A) runID = %q, want %q", runID, runA)
+	}
+	if state != string(runtimeagent.RunRunning) {
+		t.Fatalf("ActiveRun(A) state = %q, want %q", state, runtimeagent.RunRunning)
+	}
+
+	// 对照:B 无在途 run → false;未知会话 → false(快照观察,非错误)。
+	if _, _, ok := p.ActiveRun(sidB); ok {
+		t.Fatal("ActiveRun(B) with no run = ok=true, want false")
+	}
+	if _, _, ok := p.ActiveRun("bogus-session"); ok {
+		t.Fatal("ActiveRun(unknown session) = ok=true, want false")
+	}
+
+	// A 的 run 终态后 active 清空:ActiveRun(A) 归位 false(active 语义与
+	// RunStatus 的 active 分支同源)。
+	close(gated.release)
+	waitForRunStatus(t, p, sidA, runA, string(runtimeagent.RunCompleted))
+	if _, _, ok := p.ActiveRun(sidA); ok {
+		t.Fatal("ActiveRun(A) after the run completed = ok=true, want false (active cleared)")
 	}
 }

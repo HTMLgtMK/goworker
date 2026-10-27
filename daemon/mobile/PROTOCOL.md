@@ -63,11 +63,11 @@ run 生命周期）以持久化游标暴露给任意连接——断线重连不�
 | 方法 | 方向 | 入参 | 响应 | control lease |
 |---|---|---|---|---|
 | `x-goworker/run/start` | 请求 | `{sessionId, input, requestId}` | `{runId, state}` | **必须持有** |
-| `x-goworker/run/get` | 请求 | `{sessionId, runId}` | `{state, result?, latestSeq, eventsComplete}` | 不需要（只读观察面） |
+| `x-goworker/run/get` | 请求 | `{sessionId, runId}` | `{state, result?, latestSeq, replayIntegrity}` | 不需要（只读观察面） |
 | `x-goworker/run/cancel` | 请求 | `{sessionId, runId}` | `{accepted}` | **必须持有** |
-| `x-goworker/session/attach` | 请求 | `{sessionId, afterSeq, mode?}` | `{currentRun, latestSeq, eventsComplete, tookOver?}` | `mode:"control"` 获取/接管；observe 不动 lease |
+| `x-goworker/session/attach` | 请求 | `{sessionId, afterSeq, mode?}` | `{currentRun, latestSeq, replayIntegrity, tookOver?}` | `mode:"control"` 获取/接管；observe 不动 lease |
 | `x-goworker/session/detach` | 请求 | `{sessionId, mode?}` | `{detached}` | `mode:"control"` 归还（仅持有者本人有效） |
-| `x-goworker/approval/respond` | 请求 | `{requestId, decision}` | `{accepted}` | **必须持有**（至少一个会话的 lease） |
+| `x-goworker/approval/respond` | 请求 | `{sessionId, requestId, decision}` | `{accepted}` | **必须持有**（声明的 `sessionId` 的 lease） |
 | `x-goworker/session/events` | **服务端通知** | `SessionEvent`（原样 JSON，蛇形键；合并记录带 `from_seq`） | — | attach 建立订阅后下行；observe/control 均可收 |
 
 - **`state` 取值**：`queued` / `running` / `waiting_input`（HITL 等审批）/
@@ -99,9 +99,11 @@ control lease **按会话记账**（拍板②原文「每会话至多一个 cont
   `tookOver:true`，daemon 侧记 slog 审计日志）。attach 的准备阶段
   （会话/游标校验与订阅建立）失败时 lease 与既有订阅原样保持——接管只在
   订阅建立成功后提交。
-- run/start|cancel 守卫**被操作会话**：请求 `sessionId` 的 lease 持有者才
-  被授权（持有其他会话的 lease 不构成授权）；`approval/respond` 的入参无
-  `sessionId`，守卫为「持有至少一个会话的 lease」。
+- run/start|cancel 与 approval/respond 守卫**被操作会话**：请求 `sessionId`
+  的 lease 持有者才被授权（持有其他会话的 lease 不构成授权）。approval/respond
+  的 `sessionId` 声明审批归属会话，daemon 再按服务端记录的审批归属（审批注册
+  时落账的会话）校验两者一致——**服务端记录为准，不信客户端声明**：声明别的
+  会话（即便持有其 lease）应答本会话审批 → -32000 越权拒绝，审批不被消费。
 - V1 采用本机信任的宿主授权（单用户 daemon，无账号体系）：不做 lease 过期
   与授权协商；**断开连接即释放该连接全部会话的 lease**（审批不悬死在已死
   连接上）；`detach` `mode:"control"` 按会话主动归还。权限检查全部在 daemon
@@ -112,17 +114,19 @@ control lease **按会话记账**（拍板②原文「每会话至多一个 cont
 - `attach {sessionId, afterSeq}` **原子建立「回放 + 实时」订阅**：先重放
   `(afterSeq, latest]` 的持久化事件，再无缝续上此后实时产生的事件——无缺、
   无重、无乱序。`afterSeq` 是客户端已确认游标（0 = 从保留最早开始）。
-- **`eventsComplete` 是回放完整性信号**（attach 响应与 run/get 响应均携带，
-  显式 true/false）：daemon 本进程纪元内发生过事件落盘失败（关键事件
-  durable-first 拒绝，或高频 delta 合并落盘失败——重放缺 delta 段）时为
-  `false` 且不因后续成功翻回；客户端据此判断回放完整性，`false` 时**不得把
-  收到的事件当完整历史**（等待新一轮 run 或按 0 重放后自行核对终态）。
-- **`SessionEvent.from_seq` 区分批量与单条**（回放侧增量合并的 wire 声明）：
-  高频 delta（`text.delta`/`thinking.delta`/`usage.progress`）实时逐事件下行
-  （`from_seq` 省略），持久化侧按窗合并——断线重连回放到合并记录时该字段
-  `>0`，声明本条覆盖 `[from_seq..seq]` 的连续区间（`seq` 即区间末事件，游标
-  仍按 `seq` 推进）；`from_seq` 缺省 = 单条事件。文本类合并记录的 payload 是
-  窗内全部增量的拼接字符串，客户端按批量语义还原内容。
+- **`replayIntegrity` 是回放完整性三态**（attach 响应与 run/get 响应均携带，
+  取值 `complete` / `unknown` / `incomplete`；I4 修正后替代旧 `eventsComplete`
+  布尔——布尔在 daemon 重启后失真：旧纪元的落盘失败不延续，新进程恒报「完
+  整」）：
+  - `complete` = daemon 本进程未观察到任何事件写侧失败，且无可疑历史（空
+    历史/纯内存）——本进程观察面即全部；
+  - `unknown` = journal 存在跨进程纪元的既有历史（daemon 重启后 attach 到旧
+    会话即此形态），旧纪元内是否发生过落盘失败无从验证——诚实优先，客户端
+    按「可能缺段」消费或按 `afterSeq:0` 全量重放后自行核对终态；
+  - `incomplete` = 本进程发生过事件落盘失败（关键事件 durable-first 拒绝，
+    或高频 delta 合并落盘失败——重放缺 delta 段），粘滞标记，不因后续成功
+    翻回。
+  非 `complete` 时**不得把收到的事件当完整历史**。
 - **响应的 `latestSeq` 仅描述 attach 时刻事件流的位置，不是游标授权**：
   客户端不得把本地游标直接跳到 latestSeq——只有真正应用了对应事件之后，
   才能按逐事件 `seq` 推进本地 cursor。
@@ -138,14 +142,38 @@ control lease **按会话记账**（拍板②原文「每会话至多一个 cont
   **诚实失败**：-32000（文案含 `session not found`），归档历史走
   `session/load` 只读重放。分工：`session/load` = 历史对话重放，
   `x-goworker/session/attach` = 事件游标（Replay+Live）。`requestId` 幂等键
-  按 (sessionId, requestId) 组合寻址：同键同 input 重试返回原 run；同键不同
-  input（含跨会话复用同一 requestId）返回 -32000 显式冲突。
+  按 (sessionId, requestId) 组合寻址，幂等作用域是**会话**：同会话同键同
+  input 重试返回原 run、同键不同 input 返回 -32000 显式冲突；不同会话各自
+  局部递增的 requestId 互不影响（跨会话复用同一 requestId 是两个独立操作，
+  组合键保证绝不误返他会话的 run）。
 - 同连接重复 attach 同一会话 = **换代**：旧订阅收掉、按本次 afterSeq 重建，
   每连接每会话至多一条事件流；`detach` 或断连收掉订阅。
 - **与标准方法的共存语义**：后台 Run 运行期间，任何连接的标准
   `session/prompt` 会阻塞等待该 Run 结束（排队，不报 busy 错误）；反之标准
   prompt 在飞时 run/start 返回 -32000（同会话单活动 Run）。同步入口与后台
   入口靠同一把会话执行权互斥，不存在并发写会话。
+
+### 事件批量语义（SessionEvent.from_seq 与游标推进）
+
+`x-goworker/session/events` 下行的每条 `SessionEvent` 按 `from_seq` 字段区分
+单条与批量（实现侧事实源：`ai-runtime/session/journal.go` 的 SessionEvent
+注释、`ai-runtime/agent/event_hub.go` 的回放注释）：
+
+- **`from_seq` 缺省（=0）= 单条事件**：`seq` 即该事件自身序号。实时流恒为
+  单条（逐事件投递）；回放流中的关键事件（tool_call / permission.* /
+  assistant.message_finalized / run.*）与未进合并窗的 delta 也是单条。
+- **`from_seq > 0` = 批量聚合事件**：高频 delta（`text.delta` /
+  `thinking.delta` / `usage.progress`）在持久化侧按窗（50ms/4KB）合并——
+  `seq` = 区间末事件序号，`from_seq` = 区间首事件序号，payload 为窗内逐事件
+  payload 的**聚合结果**：文本类 = 窗内全部增量的拼接字符串（客户端按批量
+  语义一次性还原窗内文本），对象类（usage.progress）= 窗内最后一条 payload
+  （最终状态）。
+- **游标以实际收到的事件 `seq` 逐条推进，不得假设区间内没有其他类型事件**：
+  合并窗按类型分桶，而关键事件在发布时逐条落盘，其 `seq` 可能落在某个合并窗
+  的 `[from_seq..seq]` 区间之间——回放流里区间边界之间会出现其他类型的单条
+  记录（回放按 `seq` 升序）。范围声明只描述本条聚合记录自身的覆盖范围，不是
+  「区间内仅此一条」的承诺；客户端逐事件按 `seq` 记账游标（批量记录推进到其
+  `seq`），禁止按区间端点或 `latestSeq` 批量前移。
 
 ### 交互示例（对齐总方案 §7，键名为 daemon 实际 wire 形状）
 
@@ -159,8 +187,8 @@ control lease **按会话记账**（拍板②原文「每会话至多一个 cont
 
 ```json
 → {"jsonrpc":"2.0","id":2,"method":"x-goworker/session/attach","params":{"sessionId":"session-A","afterSeq":120,"mode":"control"}}
-← {"jsonrpc":"2.0","id":2,"result":{"currentRun":{"runId":"run-001","state":"waiting_input"},"latestSeq":145,"tookOver":true}}
-→ {"jsonrpc":"2.0","id":3,"method":"x-goworker/approval/respond","params":{"requestId":"req-7","decision":{"interrupt_id":"req-7","type":"approve"}}}
+← {"jsonrpc":"2.0","id":2,"result":{"currentRun":{"runId":"run-001","state":"waiting_input"},"latestSeq":145,"replayIntegrity":"unknown","tookOver":true}}
+→ {"jsonrpc":"2.0","id":3,"method":"x-goworker/approval/respond","params":{"sessionId":"session-A","requestId":"req-7","decision":{"interrupt_id":"req-7","type":"approve"}}}
 ← {"jsonrpc":"2.0","id":3,"result":{"accepted":true}}
 ```
 
@@ -361,7 +389,8 @@ daemon 侧已全部实现并有协议级集成测试覆盖（`xgw_integration_te
 2. **后台 Run 与审批应答（`run/start` / `approval/respond`）**：run/start 携带
    客户端生成的 `requestId`（幂等键，重试复用同一值）；HITL 决策可从
    `permission.requested` 事件取 `id` 经 `approval/respond` 应答（attach
-   `mode:"control"` 后），或继续走标准 `session/request_permission` 同步应答
+   `mode:"control"` 后；请求须带 `sessionId` = 审批归属会话，见「x-goworker
+   扩展协议」节方法表），或继续走标准 `session/request_permission` 同步应答
    ——两条路都在，按 UI 形态选。
 3. **断连等待文案**：设备工具断连后 run 会停在 `waiting_capability` 等待重绑
    （默认 45s，见「系统能力工具」节），UI 需要新的等待/失败文案与状态展示；

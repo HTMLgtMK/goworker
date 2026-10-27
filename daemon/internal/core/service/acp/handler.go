@@ -53,19 +53,32 @@ type FrontendHandler struct {
 
 	// subs 是本连接的会话订阅表(P5-8):sessionID → 订阅回收句柄,每连接每会话
 	// 至多一订阅(重复 attach 先 cancel 旧泵再建新);泵退出自清按句柄指针身份
-	// 判重,换代/断连(Close)统一回收。与 promptable/readOnly 共用 h.mu:各
-	// 临界区互不嵌套、均为叶锁,无锁环。
+	// 判重,换代/断连(Close)统一回收。与 promptable/readOnly 共用 h.mu。
+	//
+	// 锁序(I2 生命周期屏障后):h.mu 临界区内会嵌套调用 source 的 leaseMu——
+	// attach 提交段的 AcquireControl 与 detach 的 ReleaseControl 都与订阅表
+	// 更新放在同一临界区(订阅表更新与 control lease 操作的事务语义,评审 I2
+	// 建议四)。leaseMu 是 source 侧叶锁(runcontrol.go),不回调 handler、不取
+	// h.mu,嵌套单向 h.mu→leaseMu,Close 侧同向,无环;其余临界区仍互不嵌套。
+	//
+	// C1 修复清退了旧的 controlSessions 候选集:approval/respond 的守卫按 wire
+	// 携带的 sessionId 逐会话询问 source 的 HoldControl(requireControl),权威
+	// 归属再由 source 按 requestID 校验,handler 无需本地簿记。
 	subs map[string]*xgwSubscription
 
-	// controlSessions 是本连接以 mode=control 成功 attach 过的会话集合(I3,
-	// per-session control lease):approval/respond 的 wire 入参没有 sessionId
-	// (总方案 §7:{requestId, decision}),「必须持有 control lease」的守卫在该
-	// 方法上退化为「持有至少一个会话的 lease」——本集合是 handler 侧的候选集,
-	// 权威判定仍经 source 的 HoldControl(逐会话询问,接管易主后旧候选自然
-	// 落空)。attach(control) 成功记入(I4 两阶段:订阅建立成功才记)、
-	// detach(control) 移除、Close 清空;detach(observe) 不移除(observe 归还
-	// 的是订阅不是 lease,P5-8 契约)。与 subs 共用 h.mu(叶锁,无锁环)。
-	controlSessions map[string]bool
+	// closed 是 I2 的连接生命周期屏障:Close 在 h.mu 内置位,此后 attach 的提交
+	// 段一律拒绝——Close 返回之后不会再发生新的订阅提交或 control lease 获取
+	// (不复活订阅与 lease;评审 I2 的 Close/Attach 竞态:attach 的提交段与
+	// Close 的「closed 置位 + 清表」同以 h.mu 串行,二者必有一个全序)。
+	closed bool
+
+	// commitHook 是 attach 提交段的测试钩子(第二轮评审 I2 验收,仅测试注入,
+	// 生产恒 nil):在换入新订阅句柄之后、closed 二次确认之前同步调用,此时
+	// h.mu 已释放——钩子内可跑 Close/detach(它们需要取 h.mu,持锁调用会自锁)。
+	// 测试用它在提交完成前确定性插入 Close/detach,复现评审的并发窗口;钩子
+	// 返回后的二次确认把插桩期间发生的状态变化收束为显式拒绝。nil 时提交段是
+	// 单临界区,无插桩窗口。
+	commitHook func()
 
 	mu         sync.Mutex
 	promptable map[string]struct{} // 可 prompt 集合：session/new 与当前会话 load 记入

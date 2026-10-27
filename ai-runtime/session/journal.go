@@ -70,6 +70,13 @@ const eventKind = "event"
 // 跨 Run 不重复）；Seq 记「记录末事件序号」，合并记录（FromSeq>0）声明覆盖
 // [FromSeq..Seq] 的连续区间且 Seq=ToSeq——回放方推进游标到 Seq，范围声明消除
 // 「缺口歧义」（总方案第五节「实时与重放相同事件序号语义」）。
+//
+// FromSeq 批量语义（I6 定稿，与 agent 侧 event_hub.go 的回放注释、PROTOCOL.md
+// 「事件批量语义」小节同文）：FromSeq==0 = 单条事件；FromSeq>0 = 批量聚合事件
+// （Seq=区间末、FromSeq=区间首、payload 为聚合结果）。批量是**按 Type 分桶**
+// 的产物：只覆盖同型 delta 的区间，区间内可能穿插逐条落盘的其他类型事件记录
+// ——消费方（回放客户端）游标以实际收到的每条记录 Seq 推进，不得假设
+// [FromSeq..Seq] 区间内没有其他类型事件。
 type EventRecord struct {
 	Kind      string          `json:"kind"`       // 恒 "event"（AppendEvent 强制，存储层不变量）
 	SessionID string          `json:"session_id"` // 诊断字段（勘察修正 I，同 RunStateRecord.SessionID）
@@ -89,6 +96,16 @@ type EventRecord struct {
 // 合并粒度的差异（I2）由范围声明显式化，不再与「单条事件恰逢游标」不可辨。
 // EventHub.Publish 把 IngressEvent 包成本类型后既广播又落盘（P3-2，实时侧
 // FromSeq=0），Subscribe 的回放转换透传持久化记录的 FromSeq（P3-3）。
+//
+// 协议批量语义（I6 定稿，PROTOCOL.md「事件批量语义」小节的实现侧事实源）：
+//   - FromSeq==0 = 单条事件（seq 即该事件自身序号）；
+//   - FromSeq>0 = 批量聚合事件：Seq=区间末事件序号、FromSeq=区间首事件序号，
+//     payload 为窗内逐事件 payload 的聚合结果（文本类 delta=拼接字符串，对象类
+//     =窗内末条，agent 侧 aggregateDeltaPayload 的文档化行为）；
+//   - 客户端游标以实际收到的每条事件 Seq 推进（回放方推进到 Seq=ToSeq），
+//     **不得假设 [FromSeq..Seq] 区间内没有其他类型事件**——key 事件逐条落盘，
+//     可与合并窗区间交错；范围声明不是「区间内仅此一条」的承诺，游标授权永远
+//     以逐事件 Seq 为准。
 type SessionEvent struct {
 	SessionID string          `json:"session_id"`
 	RunID     string          `json:"run_id"`

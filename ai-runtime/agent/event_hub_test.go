@@ -28,8 +28,9 @@ import (
 // 修复验收(CR6):
 //   - TestSubscribeReplayCarriesFromSeq(I2lite):回放透传合并记录的 FromSeq
 //     范围声明(批量/单条可辨),实时逐事件 FromSeq 恒 0;
-//   - TestEventHubEventsIncompleteFlag(I6lite):key 落盘失败/合并 flush 失败
-//     置位完整性标记(EventsComplete false,永不复位)。
+//   - TestEventHubReplayIntegrity(I4):完整性三态——空历史/纯内存 → Complete、
+//     播种自非空 journal → Unknown、key 落盘失败/合并 flush 失败 → Incomplete
+//     且粘滞永不复位(含「失败后成功发布不翻回」与 Unknown → Incomplete 单向)。
 //
 // P3-3 读侧(plan P3-3「新增测试」):
 //   - TestAttachReplayNoGap(总方案第十一节 → 本步):Replay+Live 原子切换的
@@ -44,7 +45,9 @@ import (
 var _ EventJournal = (*stubEventJournal)(nil)
 
 // stubEventJournal 是 EventJournal 的内存测试桩:成功追加的记录按序收进 recs;
-// appendErr 非 nil 时注入 AppendEvent 失败(记录不收)。另带两个顺序断言装置:
+// appendErr 非 nil 时注入 AppendEvent 持续失败(记录不收);failFirst > 0 时
+// 接下来 N 次 AppendEvent 注错后自愈(粘滞性验收用——验证「失败后成功发布不
+// 翻回」,需要失败与成功在同一个 stub 上先后发生)。另带两个顺序断言装置:
 //   - order(顺序钩子,plan「以 stub 里的顺序钩子断言」):非 nil 时每次成功
 //     追加向共享顺序日志记 "journal:<type>",与订阅者读侧记的 "sub:<type>"
 //     同池比对——durable-first ⇒ journal 条目恒先于 sub 条目;
@@ -55,6 +58,7 @@ type stubEventJournal struct {
 	mu        sync.Mutex
 	recs      []session.EventRecord
 	appendErr error
+	failFirst int
 
 	order   *orderLog
 	gate    chan struct{}
@@ -70,6 +74,10 @@ func (j *stubEventJournal) AppendEvent(rec session.EventRecord) error {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.failFirst > 0 {
+		j.failFirst--
+		return errors.New("transient fsync boom")
+	}
 	if j.appendErr != nil {
 		return j.appendErr
 	}
@@ -450,33 +458,78 @@ func TestSubscribeReplayCarriesFromSeq(t *testing.T) {
 	requireNoEvent(t, ch)
 }
 
-// TestEventHubEventsIncompleteFlag(I6lite 修复验收):事件完整性标记的单调置位
-// ——stub journal 注错 → Publish 失败 → EventsComplete()==false,且永不复位:
-//   - key 事件落盘失败(durable-first 拒绝):Publish 返回错误 + 标记置位;
-//   - 合并 delta flush 失败:Publish 本身成功(delta 不逐条落盘),EndRun 收口
-//     的 flush 失败后标记置位——降级语义不变(执行不受阻),但完整性事实被记账;
-//   - 置位后成功的发布不翻回(单调「曾经失败」,健康 hub 对照 true)。
-func TestEventHubEventsIncompleteFlag(t *testing.T) {
-	t.Run("KeyEventAppendFailure", func(t *testing.T) {
-		jr := &stubEventJournal{appendErr: errors.New("fsync boom")}
-		hub := NewEventHub("incomplete-key", jr)
+// TestEventHubReplayIntegrity(I4 修复验收):回放完整性三态的播种与粘滞置位——
+//   - 播种:全新空 journal / 纯内存 hub → Complete(本进程观察面即全部);
+//     播种自非空 journal(既有历史)→ Unknown(跨进程纪元完整性不可验证,
+//     诚实优先,绝不把不可验证的历史报告为完整);
+//   - 置位:stub journal 注错 → key 落盘失败 → Incomplete;注错自愈后的成功
+//     发布不翻回(粘滞,永不复位);合并 delta flush 失败同样置位;
+//   - 方向单调:Unknown 播种后遇失败 → Incomplete 一去不返;成功发布不改变
+//     任何三态(只有失败路径是写点)。
+func TestEventHubReplayIntegrity(t *testing.T) {
+	t.Run("FreshEmptyJournalComplete", func(t *testing.T) {
+		hub := NewEventHub("fresh-journal", &stubEventJournal{})
+		defer hub.Close()
+		if got := hub.ReplayIntegrity(); got != ReplayIntegrityComplete {
+			t.Fatalf("fresh hub on empty journal replayIntegrity = %q, want %q", got, ReplayIntegrityComplete)
+		}
+	})
+
+	t.Run("PureInMemoryComplete", func(t *testing.T) {
+		hub := NewEventHub("fresh-mem", nil)
+		defer hub.Close()
+		if got := hub.ReplayIntegrity(); got != ReplayIntegrityComplete {
+			t.Fatalf("pure in-memory hub replayIntegrity = %q, want %q", got, ReplayIntegrityComplete)
+		}
+	})
+
+	t.Run("SeededFromNonEmptyJournalUnknown", func(t *testing.T) {
+		// 预置历史 [1..2](模拟上一进程纪元的落盘产物)→ 新 hub 播种 Unknown。
+		jr := &stubEventJournal{}
+		for seq := uint64(1); seq <= 2; seq++ {
+			if err := jr.AppendEvent(session.EventRecord{SessionID: "seeded", RunID: "run-old", Type: session.EventToolCall, Seq: seq, Time: time.Now()}); err != nil {
+				t.Fatalf("seed journal seq %d: %v", seq, err)
+			}
+		}
+		hub := NewEventHub("seeded", jr)
+		defer hub.Close()
+		if got := hub.LatestSeq(); got != 2 {
+			t.Fatalf("LatestSeq = %d, want 2(播种自既有历史)", got)
+		}
+		if got := hub.ReplayIntegrity(); got != ReplayIntegrityUnknown {
+			t.Fatalf("seeded hub replayIntegrity = %q, want %q(跨纪元完整性不可验证)", got, ReplayIntegrityUnknown)
+		}
+		// 本纪元的成功发布不改变 Unknown(只有失败路径是写点)。
+		if err := hub.Publish(IngressEvent{RunID: "run-new", Type: session.EventToolCall, Payload: json.RawMessage(`"c"`)}); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		if got := hub.ReplayIntegrity(); got != ReplayIntegrityUnknown {
+			t.Fatalf("replayIntegrity after healthy publish = %q, want %q(成功发布不改变三态)", got, ReplayIntegrityUnknown)
+		}
+	})
+
+	t.Run("KeyEventAppendFailureStickyIncomplete", func(t *testing.T) {
+		// failFirst=1:首次 AppendEvent 注错、其后自愈——验证「失败后的成功
+		// 发布不翻回」的粘滞语义(I4:失败是「曾经发生」的单调事实)。
+		jr := &stubEventJournal{failFirst: 1}
+		hub := NewEventHub("sticky-key", jr)
 		defer hub.Close()
 		hub.BeginRun("run-i")
-		if got := hub.EventsComplete(); !got {
-			t.Fatal("fresh hub EventsComplete = false, want true")
+		if got := hub.ReplayIntegrity(); got != ReplayIntegrityComplete {
+			t.Fatalf("fresh hub replayIntegrity = %q, want %q", got, ReplayIntegrityComplete)
 		}
 		if err := hub.Publish(IngressEvent{RunID: "run-i", Type: session.EventToolCall, Payload: json.RawMessage(`"c"`)}); err == nil {
 			t.Fatal("Publish key event with failing journal = nil, want error")
 		}
-		if got := hub.EventsComplete(); got {
-			t.Fatal("EventsComplete after failed key publish = true, want false(落盘失败已置位)")
+		if got := hub.ReplayIntegrity(); got != ReplayIntegrityIncomplete {
+			t.Fatalf("replayIntegrity after failed key publish = %q, want %q(落盘失败置位)", got, ReplayIntegrityIncomplete)
 		}
-		// 后续成功的发布不翻回:标记是单调的「曾经失败」事实。
-		if err := hub.Publish(IngressEvent{RunID: "run-i", Type: session.EventToolResult, Payload: json.RawMessage(`"r"`)}); err == nil {
-			t.Fatal("second publish with still-failing journal = nil, want error")
+		// 注错自愈后的成功发布不翻回:标记粘滞。
+		if err := hub.Publish(IngressEvent{RunID: "run-i", Type: session.EventToolResult, Payload: json.RawMessage(`"r"`)}); err != nil {
+			t.Fatalf("Publish after journal recovery: %v", err)
 		}
-		if got := hub.EventsComplete(); got {
-			t.Fatal("EventsComplete flipped back to true, want false(永不复位)")
+		if got := hub.ReplayIntegrity(); got != ReplayIntegrityIncomplete {
+			t.Fatalf("replayIntegrity flipped after successful publish = %q, want %q(永不复位)", got, ReplayIntegrityIncomplete)
 		}
 	})
 
@@ -485,19 +538,40 @@ func TestEventHubEventsIncompleteFlag(t *testing.T) {
 		hub := NewEventHub("incomplete-delta", jr)
 		defer hub.Close()
 		hub.BeginRun("run-j")
-		// delta 发布不落盘(进合并缓冲):Publish 成功,标记仍 true。
+		// delta 发布不落盘(进合并缓冲):Publish 成功,标记仍 Complete。
 		if err := hub.Publish(IngressEvent{RunID: "run-j", Type: session.EventTextDelta, Payload: json.RawMessage(`"d"`)}); err != nil {
 			t.Fatalf("Publish delta: %v", err)
 		}
-		if got := hub.EventsComplete(); !got {
-			t.Fatal("EventsComplete before flush = false, want true(flush 未发生,无失败证据)")
+		if got := hub.ReplayIntegrity(); got != ReplayIntegrityComplete {
+			t.Fatalf("replayIntegrity before flush = %q, want %q(flush 未发生,无失败证据)", got, ReplayIntegrityComplete)
 		}
 		hub.EndRun() // 收口 flush 撞注错:降级 warn,标记置位
-		if got := hub.EventsComplete(); got {
-			t.Fatal("EventsComplete after failed delta flush = true, want false(重放缺 delta 段)")
+		if got := hub.ReplayIntegrity(); got != ReplayIntegrityIncomplete {
+			t.Fatalf("replayIntegrity after failed delta flush = %q, want %q(重放缺 delta 段)", got, ReplayIntegrityIncomplete)
 		}
 		if recs := jr.snapshot(); len(recs) != 0 {
-			t.Fatalf("journal records = %d, want 0(注错未落盘,缺段由标记显式暴露)", len(recs))
+			t.Fatalf("journal records = %d, want 0(注错未落盘,缺段由三态显式暴露)", len(recs))
+		}
+	})
+
+	t.Run("SeededThenFailureIncomplete", func(t *testing.T) {
+		// Unknown 播种后的失败 → Incomplete(置位方向单调:Complete/Unknown →
+		// Incomplete 一去不返)。种子先落(消费掉零次注错),再开 failFirst。
+		jr := &stubEventJournal{}
+		if err := jr.AppendEvent(session.EventRecord{SessionID: "seeded-2", RunID: "run-old", Type: session.EventToolCall, Seq: 9, Time: time.Now()}); err != nil {
+			t.Fatalf("seed journal: %v", err)
+		}
+		jr.failFirst = 1
+		hub := NewEventHub("seeded-2", jr)
+		defer hub.Close()
+		if got := hub.ReplayIntegrity(); got != ReplayIntegrityUnknown {
+			t.Fatalf("seeded hub replayIntegrity = %q, want %q", got, ReplayIntegrityUnknown)
+		}
+		if err := hub.Publish(IngressEvent{RunID: "run-new", Type: session.EventToolCall, Payload: json.RawMessage(`"c"`)}); err == nil {
+			t.Fatal("Publish key event with failing journal = nil, want error")
+		}
+		if got := hub.ReplayIntegrity(); got != ReplayIntegrityIncomplete {
+			t.Fatalf("replayIntegrity = %q, want %q(Unknown → Incomplete 单向)", got, ReplayIntegrityIncomplete)
 		}
 	})
 }

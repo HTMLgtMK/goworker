@@ -39,6 +39,7 @@ type fakeCancelCall struct {
 }
 
 type fakeApprovalCall struct {
+	SessionID string
 	RequestID string
 	Decision  hitl.Decision
 }
@@ -46,27 +47,39 @@ type fakeApprovalCall struct {
 // fakeRunControl 是 model.RunControlSource 的脚本化 fake(内嵌 fakeSessionSource
 // 补齐 SessionSource 面,供工厂 type-assert 命中)。幂等:runByReq 记账,同
 // requestID 重试返回原 runID 与当前状态快照(建模 P5-6 承诺,不起跑)。
+// approvalOwner 是服务端记录的审批归属(C1 修复建模:mirror runcontrol.go——
+// 未知 requestID → ErrApprovalUnknown 语义;归属会话与调用方声明不一致 → 越权
+// 拒绝),由用例按 wire 会话 id 预置。
 type fakeRunControl struct {
 	*fakeSessionSource
 
-	mu          sync.Mutex
-	leases      map[string]string // sessionID → connectionID(I3 per-session 租约)
-	startCalls  []fakeStartCall   // 仅真实新起跑;幂等命中不记
-	runByReq    map[string]string
-	cancelCalls []fakeCancelCall
-	approvals   []fakeApprovalCall
-	released    []string
-	statusFn    func(sessionID, runID string) (string, uint64, bool, error) // 缺省 running/42/true
-	resolveErr  error                                                       // ResolveApproval 脚本化失败
-	nextRun     int
+	mu            sync.Mutex
+	leases        map[string]string // sessionID → connectionID(I3 per-session 租约)
+	startCalls    []fakeStartCall   // 仅真实新起跑;幂等命中不记
+	runByReq      map[string]string
+	cancelCalls   []fakeCancelCall
+	approvals     []fakeApprovalCall
+	approvalOwner map[string]string // requestID → 归属会话(服务端记录)
+	released      []string
+	statusFn      func(sessionID, runID string) (string, uint64, string, error) // 缺省 running/42/complete
+	resolveErr    error                                                         // ResolveApproval 脚本化失败
+	nextRun       int
 
 	// P5-8 附加面:attachHub 配置后,StartRun 在其上产出 3 条 key 事件(建模
 	// 「StartRun 产事件」,事件经真 EventHub 的 Publish 路径)并把活动 run 快照
 	// 置为 (run-N, running) 供 ActiveRun 返回;attachErr 脚本化 Attach 失败。
-	attachHub   *runtimeagent.EventHub
-	attachErr   error
-	curRunID    string
-	curRunState string
+	// I1 修正后 ActiveRun 按会话路由,fake 同型按会话记账(mirror runcontrol.go:
+	// 每会话各自的活动快照,StartRun 置账、本 fake 不清账——快照观察面,对照
+	// 会话查不到即 null)。
+	attachHub  *runtimeagent.EventHub
+	attachErr  error
+	activeRuns map[string]fakeActiveRun
+}
+
+// fakeActiveRun 是 fakeRunControl 按会话记账的活动 run 快照(ActiveRun 返回值)。
+type fakeActiveRun struct {
+	runID string
+	state string
 }
 
 func newFakeRunControl() *fakeRunControl {
@@ -74,6 +87,8 @@ func newFakeRunControl() *fakeRunControl {
 		fakeSessionSource: &fakeSessionSource{},
 		runByReq:          map[string]string{},
 		leases:            map[string]string{},
+		approvalOwner:     map[string]string{},
+		activeRuns:        map[string]fakeActiveRun{},
 	}
 }
 
@@ -109,8 +124,7 @@ func (f *fakeRunControl) StartRun(sessionID, input, requestID string) (string, s
 				panic("fakeRunControl: publish scripted event: " + err.Error())
 			}
 		}
-		f.curRunID = runID
-		f.curRunState = "running"
+		f.activeRuns[sessionID] = fakeActiveRun{runID: runID, state: "running"}
 	}
 	return runID, "queued", nil
 }
@@ -122,26 +136,36 @@ func (f *fakeRunControl) CancelRun(sessionID, runID string) error {
 	return nil
 }
 
-func (f *fakeRunControl) RunStatus(sessionID, runID string) (string, uint64, bool, error) {
+func (f *fakeRunControl) RunStatus(sessionID, runID string) (string, uint64, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.statusFn != nil {
 		return f.statusFn(sessionID, runID)
 	}
-	return "running", 42, true, nil
+	return "running", 42, runtimeagent.ReplayIntegrityComplete, nil
 }
 
 func (f *fakeRunControl) PendingApprovals(sessionID string) ([]model.PendingApprovalInfo, error) {
 	return nil, nil
 }
 
-func (f *fakeRunControl) ResolveApproval(requestID string, decision hitl.Decision) error {
+// ResolveApproval mirror runcontrol.go 的 C1 契约(归属三段校验的 source 侧):
+// resolveErr 脚本化失败优先;未知 requestID → ErrApprovalUnknown 语义;归属会话
+// 与调用方声明不一致 → 越权拒绝(服务端记录为准,不信客户端声明);匹配才记账。
+func (f *fakeRunControl) ResolveApproval(sessionID, requestID string, decision hitl.Decision) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.resolveErr != nil {
 		return f.resolveErr
 	}
-	f.approvals = append(f.approvals, fakeApprovalCall{RequestID: requestID, Decision: decision})
+	owner, ok := f.approvalOwner[requestID]
+	if !ok {
+		return fmt.Errorf("approval %q: %w", requestID, runtimeagent.ErrApprovalUnknown)
+	}
+	if owner != sessionID {
+		return fmt.Errorf("approval %q belongs to session %q, not %q", requestID, owner, sessionID)
+	}
+	f.approvals = append(f.approvals, fakeApprovalCall{SessionID: sessionID, RequestID: requestID, Decision: decision})
 	return nil
 }
 
@@ -158,15 +182,17 @@ func (f *fakeRunControl) Attach(sessionID string) (*runtimeagent.EventHub, uint6
 	return f.attachHub, f.attachHub.LatestSeq(), nil
 }
 
-// ActiveRun(P5-8 测试面):StartRun 在 attachHub 配置下置的活动 run 快照;
-// 无活动 run → ok=false(建模 currentRun=null)。
+// ActiveRun(P5-8 测试面;I1 修正后按会话路由,fake 同型 mirror runcontrol.go):
+// StartRun 在 attachHub 配置下按会话置的活动 run 快照;该会话无活动 run →
+// ok=false(建模 currentRun=null,非错误)。
 func (f *fakeRunControl) ActiveRun(sessionID string) (string, string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.curRunID == "" {
+	ar, ok := f.activeRuns[sessionID]
+	if !ok {
 		return "", "", false
 	}
-	return f.curRunID, f.curRunState, true
+	return ar.runID, ar.state, true
 }
 
 // AcquireControl / ReleaseControl / HoldControl / ReleaseConnection(I3
@@ -412,7 +438,7 @@ func TestXGWRequiresControlLease(t *testing.T) {
 		{"run/start", XMethodRunStart, map[string]any{"sessionId": sid, "input": "x", "requestId": "r1"}},
 		{"run/cancel", XMethodRunCancel, map[string]any{"sessionId": sid, "runId": "run-1"}},
 		{"approval/respond", XMethodApprovalRespond, map[string]any{
-			"requestId": "req-1", "decision": map[string]any{"interrupt_id": "req-1", "type": "approve"},
+			"sessionId": sid, "requestId": "req-1", "decision": map[string]any{"interrupt_id": "req-1", "type": "approve"},
 		}},
 	} {
 		_, err := stack.callRaw(t, tc.method, tc.params)
@@ -445,6 +471,11 @@ func TestXGWRequiresControlLease(t *testing.T) {
 	if fields["state"] != "running" || fields["latestSeq"] != float64(42) {
 		t.Fatalf("run/get result = %s, want {state:running,latestSeq:42}", raw)
 	}
+	// replayIntegrity(I4)三态上 wire:fake 缺省无失败证据 → complete,恒显式
+	// 携带(run/get 响应面,I4 老字段 eventsComplete 的替换)。
+	if fields["replayIntegrity"] != runtimeagent.ReplayIntegrityComplete {
+		t.Fatalf("run/get replayIntegrity = %v, want %q", fields["replayIntegrity"], runtimeagent.ReplayIntegrityComplete)
+	}
 }
 
 // TestXGWRunGetAndCancelForwarding(P5-7 转发面):run/get 透传 source 的状态
@@ -457,8 +488,8 @@ func TestXGWRunGetAndCancelForwarding(t *testing.T) {
 
 	// source 错误(如 ErrRunNotFound 语义)→ -32000 + 文案透传。
 	stack.runs.mu.Lock()
-	stack.runs.statusFn = func(string, string) (string, uint64, bool, error) {
-		return "", 0, true, fmt.Errorf("run %q: %w", "run-x", errors.New("not found"))
+	stack.runs.statusFn = func(string, string) (string, uint64, string, error) {
+		return "", 0, runtimeagent.ReplayIntegrityComplete, fmt.Errorf("run %q: %w", "run-x", errors.New("not found"))
 	}
 	stack.runs.mu.Unlock()
 	_, err := stack.callRaw(t, XMethodRunGet, map[string]any{"sessionId": sid, "runId": "run-x"})
@@ -494,12 +525,68 @@ func TestXGWRunGetAndCancelForwarding(t *testing.T) {
 	}
 }
 
+// TestXGWReplayIntegrityForwarding(I4 验收):回放完整性三态在 daemon 两个响应
+// 面的 wire 断言(老字段 eventsComplete 布尔 → replayIntegrity 三态字符串):
+//   - run/get:source RunStatus 返回的三态原样透传(此处脚本 incomplete,模拟
+//     本进程发生过 key 事件落盘失败/合并 flush 失败的粘滞态);
+//   - attach:真 EventHub 的 replayIntegrity 上 wire——注错 journal 的 key 事件
+//     发布失败 → incomplete(粘滞),响应显式携带;complete 面由
+//     TestXGWSessionAttachReplayNoGap(健康 hub)覆盖。
+func TestXGWReplayIntegrityForwarding(t *testing.T) {
+	frc := newFakeRunControl()
+	stack := newXGWStack(t, nil, frc)
+	sid := stack.initAndNew(t)
+	stack.runs.mu.Lock()
+	stack.runs.statusFn = func(string, string) (string, uint64, string, error) {
+		return "running", 7, runtimeagent.ReplayIntegrityIncomplete, nil
+	}
+	stack.runs.mu.Unlock()
+	raw, err := stack.callRaw(t, XMethodRunGet, map[string]any{"sessionId": sid, "runId": "run-1"})
+	if err != nil {
+		t.Fatalf("run/get: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("decode run/get result %s: %v", raw, err)
+	}
+	if fields["replayIntegrity"] != runtimeagent.ReplayIntegrityIncomplete {
+		t.Fatalf("run/get replayIntegrity = %v, want %q(source 三态原样透传)",
+			fields["replayIntegrity"], runtimeagent.ReplayIntegrityIncomplete)
+	}
+
+	// attach 面:注错 journal → key 事件发布失败 → hub 置 incomplete(粘滞),
+	// attach 响应显式携带。Subscribe 仍可建立(err journal 读面恒空)。
+	badHub := runtimeagent.NewEventHub("sess-store-1", &errEventJournal{})
+	if err := badHub.Publish(runtimeagent.IngressEvent{
+		RunID: "run-1", Type: session.EventToolCall, Payload: json.RawMessage(`"c"`),
+	}); err == nil {
+		t.Fatal("setup: publish key event on failing journal = nil, want error")
+	}
+	if got := badHub.ReplayIntegrity(); got != runtimeagent.ReplayIntegrityIncomplete {
+		t.Fatalf("setup: hub replayIntegrity = %q, want %q", got, runtimeagent.ReplayIntegrityIncomplete)
+	}
+	frc2 := newFakeRunControl()
+	frc2.mu.Lock()
+	frc2.attachHub = badHub
+	frc2.mu.Unlock()
+	stack2 := newXGWStack(t, nil, frc2)
+	sid2 := stack2.initAndNew(t)
+	fields2, err := stack2.attachRaw(t, map[string]any{"sessionId": sid2, "afterSeq": 0})
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if fields2["replayIntegrity"] != runtimeagent.ReplayIntegrityIncomplete {
+		t.Fatalf("attach replayIntegrity = %v, want %q(注错 journal 的粘滞三态上 wire)",
+			fields2["replayIntegrity"], runtimeagent.ReplayIntegrityIncomplete)
+	}
+}
+
 // TestXGWApprovalRespondForwardsDecision(P5-7 审批面):decision wire 形状
 // (interrupt_id/type,与 hitl.Decision JSON 同形)白名单映射转发;未知/空
 // type 一律 -32000 且绝不触达 source(零值 DecisionType 穿透中间件=放行,
 // 映射的失败方向必须是拒绝);source 错误归一 -32000。持照走生产路径
-// attach(mode=control)(I3 后 approval/respond 的守卫候选集来自 control
-// attach,直接经 source 持照不经 handler,守卫无从建立候选)。
+// attach(mode=control) 建立 sid 的 lease,respond 携带 sessionId(C1 修复
+// 后的 wire 形状)按会话过守卫;fake 的服务端归属预置 req-9 → sid。
 func TestXGWApprovalRespondForwardsDecision(t *testing.T) {
 	frc := newFakeRunControl()
 	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
@@ -508,13 +595,18 @@ func TestXGWApprovalRespondForwardsDecision(t *testing.T) {
 	frc.mu.Unlock()
 	stack := newXGWStack(t, nil, frc)
 	sid := stack.initAndNew(t)
+	frc.mu.Lock()
+	frc.approvalOwner["req-9"] = sid
+	frc.mu.Unlock()
 	if _, err := stack.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"}); err != nil {
 		t.Fatalf("attach control: %v", err)
 	}
 
 	respond := func(t *testing.T, decision map[string]any) (json.RawMessage, error) {
 		t.Helper()
-		return stack.callRaw(t, XMethodApprovalRespond, map[string]any{"requestId": "req-9", "decision": decision})
+		return stack.callRaw(t, XMethodApprovalRespond, map[string]any{
+			"sessionId": sid, "requestId": "req-9", "decision": decision,
+		})
 	}
 
 	raw, err := respond(t, map[string]any{"interrupt_id": "req-9", "type": "approve"})
@@ -559,6 +651,9 @@ func TestXGWApprovalRespondForwardsDecision(t *testing.T) {
 		if approvals[i].RequestID != "req-9" {
 			t.Fatalf("approval[%d] requestID = %q, want req-9", i, approvals[i].RequestID)
 		}
+		if approvals[i].SessionID != sid {
+			t.Fatalf("approval[%d] sessionID = %q, want wire sessionId %q (wire→source 转发保真)", i, approvals[i].SessionID, sid)
+		}
 		if approvals[i].Decision.Type != tc.wantType {
 			t.Fatalf("approval[%d] type = %q, want %q", i, approvals[i].Decision.Type, tc.wantType)
 		}
@@ -591,6 +686,109 @@ func TestXGWApprovalRespondForwardsDecision(t *testing.T) {
 	rpcErr := wantXGWError(t, "approval/respond source error", err)
 	if !strings.Contains(rpcErr.Message, "approval resolved") {
 		t.Fatalf("source error message = %q, want passthrough", rpcErr.Message)
+	}
+}
+
+// TestXGWApprovalCrossSessionOwnership(C1 修复验收):A 控制会话 A、B 控制会话
+// B,B 会话有挂起审批(服务端记录归属 sidB)时——A 声明 sidB 应答 → handler 守卫
+// 按 wire sessionId 判 lease 拒绝(A 不持 sidB 的 lease,不触达 source);A 声明
+// 自己控制的 sidA 应答 B 的审批 → handler 守卫放行但 source 按服务端记录的归属
+// 拒绝(「服务端记录为准,不信客户端声明」,审批不被消费);A/B 各自应答本会话
+// 的审批 → 成功且 source 收到的会话归属与 wire 声明一致;未知 requestID → 明确
+// 错误。修复前 requireControlForApproval 的「持有任意会话 lease 即放行」允许 ①
+// 直接应答他会话审批。
+func TestXGWApprovalCrossSessionOwnership(t *testing.T) {
+	frc := newFakeRunControl()
+	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
+	frc.mu.Lock()
+	frc.attachHub = hub
+	frc.mu.Unlock()
+	stackA := newXGWStack(t, nil, frc)
+	stackB := newXGWStack(t, nil, frc)
+	t.Cleanup(stackA.handler.Close)
+	t.Cleanup(stackB.handler.Close)
+	sidA := stackA.initAndNew(t)
+	sidB := stackB.initAndNew(t)
+
+	// 服务端记录的审批归属(建模 SDK ApprovalManager.Wait 的落账):req-A 归属
+	// 会话 A、req-B 归属会话 B。
+	frc.mu.Lock()
+	frc.approvalOwner["req-A"] = sidA
+	frc.approvalOwner["req-B"] = sidB
+	frc.mu.Unlock()
+
+	// A 控制 sidA、B 控制 sidB(经 attach(control) 走生产获取路径)。
+	if _, err := stackA.attachRaw(t, map[string]any{"sessionId": sidA, "afterSeq": 0, "mode": "control"}); err != nil {
+		t.Fatalf("attach A control: %v", err)
+	}
+	if _, err := stackB.attachRaw(t, map[string]any{"sessionId": sidB, "afterSeq": 0, "mode": "control"}); err != nil {
+		t.Fatalf("attach B control: %v", err)
+	}
+
+	respond := func(s *xgwStack, declaredSession, requestID string) error {
+		t.Helper()
+		_, err := s.callRaw(t, XMethodApprovalRespond, map[string]any{
+			"sessionId": declaredSession, "requestId": requestID,
+			"decision": map[string]any{"interrupt_id": requestID, "type": "approve"},
+		})
+		return err
+	}
+
+	// ① A 声明 sidB 应答 B 的审批:handler 守卫按会话判 lease → -32000
+	// (control lease),不触达 source。
+	if err := respond(stackA, sidB, "req-B"); err == nil {
+		t.Fatal("respond declaring session B from A's connection must be rejected")
+	} else if rpcErr := wantXGWError(t, "cross-session respond (handler guard)", err); !strings.Contains(rpcErr.Message, "control lease") {
+		t.Fatalf("cross-session respond message = %q, want control lease mention", rpcErr.Message)
+	}
+
+	// ② A 声明自己控制的 sidA 应答 B 的审批:handler 守卫放行(真持 sidA 的
+	// lease),source 归属校验拒绝(越权,非 lease 文案)。
+	if err := respond(stackA, sidA, "req-B"); err == nil {
+		t.Fatal("respond for session B's approval declaring session A must be rejected by the ownership check")
+	} else if rpcErr := wantXGWError(t, "cross-session respond (ownership)", err); strings.Contains(rpcErr.Message, "control lease") || !strings.Contains(rpcErr.Message, "belongs to session") {
+		t.Fatalf("ownership rejection message = %q, want belongs-to-session text (非 lease 文案)", rpcErr.Message)
+	}
+
+	// ③ 未知 requestID → source 明确错误透传 -32000。
+	if err := respond(stackA, sidA, "req-missing"); err == nil {
+		t.Fatal("respond for unknown requestID must fail")
+	} else if rpcErr := wantXGWError(t, "unknown requestID", err); !strings.Contains(rpcErr.Message, "not found") {
+		t.Fatalf("unknown requestID message = %q, want not-found text", rpcErr.Message)
+	}
+
+	// ④⑤ 各自应答本会话的审批 → 成功。
+	raw, err := stackA.callRaw(t, XMethodApprovalRespond, map[string]any{
+		"sessionId": sidA, "requestId": "req-A",
+		"decision": map[string]any{"interrupt_id": "req-A", "type": "approve"},
+	})
+	if err != nil {
+		t.Fatalf("respond for own session's approval: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil || fields["accepted"] != true {
+		t.Fatalf("own-approval respond result = %s (%v), want {accepted:true}", raw, err)
+	}
+	if _, err := stackB.callRaw(t, XMethodApprovalRespond, map[string]any{
+		"sessionId": sidB, "requestId": "req-B",
+		"decision": map[string]any{"interrupt_id": "req-B", "type": "approve"},
+	}); err != nil {
+		t.Fatalf("respond from B for its own approval: %v", err)
+	}
+
+	// 转发保真:到达 source 的决策恰好两笔(④⑤),会话归属与 wire 声明一致;
+	// ①②③ 的拒绝零副作用。
+	frc.mu.Lock()
+	approvals := append([]fakeApprovalCall(nil), frc.approvals...)
+	frc.mu.Unlock()
+	if len(approvals) != 2 {
+		t.Fatalf("source approvals = %d, want 2 (越权/未知拒绝不得触达 source)", len(approvals))
+	}
+	if approvals[0].SessionID != sidA || approvals[0].RequestID != "req-A" {
+		t.Fatalf("approval[0] = %+v, want {session:sidA, requestID:req-A}", approvals[0])
+	}
+	if approvals[1].SessionID != sidB || approvals[1].RequestID != "req-B" {
+		t.Fatalf("approval[1] = %+v, want {session:sidB, requestID:req-B}", approvals[1])
 	}
 }
 
@@ -814,6 +1012,20 @@ func (j *memEventJournal) SeqRange() (earliest, latest uint64, ok bool) {
 	return earliest, latest, true
 }
 
+// errEventJournal 是注错 journal(I4 测试面):AppendEvent 一律失败(模拟磁盘
+// 故障),读面恒空——SeqRange ok=false(空历史播种,不触发 Unknown)、
+// ReadEvents 空(Subscribe/attach 可正常建立),专供 replayIntegrity 的失败
+// 置位路径。编译期断言同 memEventJournal。
+var _ runtimeagent.EventJournal = (*errEventJournal)(nil)
+
+type errEventJournal struct{}
+
+func (j *errEventJournal) AppendEvent(session.EventRecord) error { return errors.New("fsync boom") }
+
+func (j *errEventJournal) ReadEvents(uint64) ([]session.EventRecord, error) { return nil, nil }
+
+func (j *errEventJournal) SeqRange() (uint64, uint64, bool) { return 0, 0, false }
+
 // xgwEventLog 收集客户端收到的 x-goworker/session/events 通知:原始 params 解回
 // session.SessionEvent,同时钉住「SessionEvent 原样 JSON」的双向往返与蛇形键
 // 线上形状;解码失败记入 bad(断言零解码失败,通知 handler 内不 panic——ai-acp
@@ -899,8 +1111,9 @@ func handlerSubCount(h *FrontendHandler) int {
 // TestXGWSessionAttachReplayNoGap(P5-8 主路径):先经协议面 run/start 产事件
 // (fake 在真 EventHub 上产出 seq 1..3)→ 后 attach afterSeq=0 → 客户端收齐
 // (0, latest] 无重无缺,Replay+Live 无缝续上 attach 后发布的事件;响应形状
-// {currentRun,latestSeq,eventsComplete}(tookOver 省略)、事件线上形状 =
-// SessionEvent 原样 JSON(蛇形键,总方案 §7 报文)。
+// {currentRun,latestSeq,replayIntegrity}(tookOver 省略,I4 起 eventsComplete
+// 布尔改三态字符串)、事件线上形状 = SessionEvent 原样 JSON(蛇形键,总方案 §7
+// 报文)。
 func TestXGWSessionAttachReplayNoGap(t *testing.T) {
 	stack, hub := newAttachStack(t)
 	sid := stack.initAndNew(t)
@@ -928,10 +1141,11 @@ func TestXGWSessionAttachReplayNoGap(t *testing.T) {
 		t.Fatalf("attach: %v", err)
 	}
 	if len(fields) != 3 {
-		t.Fatalf("attach result = %v, want exactly currentRun+latestSeq+eventsComplete keys", fields)
+		t.Fatalf("attach result = %v, want exactly currentRun+latestSeq+replayIntegrity keys", fields)
 	}
-	if fields["eventsComplete"] != true {
-		t.Fatalf("attach eventsComplete = %v, want true(健康 hub 无失败证据)", fields["eventsComplete"])
+	if fields["replayIntegrity"] != runtimeagent.ReplayIntegrityComplete {
+		t.Fatalf("attach replayIntegrity = %v, want %q(健康 hub 无失败证据、无历史播种)",
+			fields["replayIntegrity"], runtimeagent.ReplayIntegrityComplete)
 	}
 	cur, ok := fields["currentRun"].(map[string]any)
 	if !ok || cur["runId"] != "run-1" || cur["state"] != "running" {
@@ -1031,10 +1245,10 @@ func TestXGWSessionAttachCursorExpired(t *testing.T) {
 // TestXGWSessionAttachControlTakeover(P5-8 Observe/Control;I3 后同会话接管):
 // attach(mode=control) 经 wire 获取该会话 lease(空闲获取 tookOver 省略);
 // 第二连接对**同一会话** attach(mode=control) 显式接管(tookOver=true 回显);
-// 接管后原 holder 的 approval/respond 被 requireControlForApproval 拒绝(其
-// controlSessions 候选经 source 逐会话判等落空),新 holder 可用;lease 易主
-// 不断原 holder 的事件流。跨会话互不影响由 TestXGWSessionAttachControlPerSession
-// 单独覆盖(I3:接管只发生在同一会话上)。
+// 接管后原 holder 的 approval/respond 被 requireControl(req.SessionID) 拒绝
+// (其对该会话的 lease 已易主),新 holder 可用;lease 易主不断原 holder 的事
+// 件流。跨会话互不影响由 TestXGWSessionAttachControlPerSession 单独覆盖(I3:
+// 接管只发生在同一会话上)。
 func TestXGWSessionAttachControlTakeover(t *testing.T) {
 	frc := newFakeRunControl()
 	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
@@ -1081,7 +1295,7 @@ func TestXGWSessionAttachControlTakeover(t *testing.T) {
 
 	// 原 holder 的 approval/respond 被拒(-32000,control lease),不触达 source。
 	_, err = stackA.callRaw(t, XMethodApprovalRespond, map[string]any{
-		"requestId": "req-1", "decision": map[string]any{"interrupt_id": "req-1", "type": "approve"},
+		"sessionId": sid, "requestId": "req-1", "decision": map[string]any{"interrupt_id": "req-1", "type": "approve"},
 	})
 	rpcErr := wantXGWError(t, "respond from evicted holder", err)
 	if !strings.Contains(rpcErr.Message, "control lease") {
@@ -1094,9 +1308,12 @@ func TestXGWSessionAttachControlTakeover(t *testing.T) {
 		t.Fatalf("source approvals after evicted respond = %d, want 0", got)
 	}
 
-	// 新 holder 的 respond 照常转发。
+	// 新 holder 的 respond 照常转发(服务端归属预置 req-1 → sid)。
+	frc.mu.Lock()
+	frc.approvalOwner["req-1"] = sid
+	frc.mu.Unlock()
 	raw, err := stackB.callRaw(t, XMethodApprovalRespond, map[string]any{
-		"requestId": "req-1", "decision": map[string]any{"interrupt_id": "req-1", "type": "approve"},
+		"sessionId": sid, "requestId": "req-1", "decision": map[string]any{"interrupt_id": "req-1", "type": "approve"},
 	})
 	if err != nil {
 		t.Fatalf("respond from new holder: %v", err)
@@ -1202,7 +1419,7 @@ func TestXGWSessionAttachObserveCannotRespond(t *testing.T) {
 	}
 
 	_, err = stack.callRaw(t, XMethodApprovalRespond, map[string]any{
-		"requestId": "req-1", "decision": map[string]any{"interrupt_id": "req-1", "type": "approve"},
+		"sessionId": sid, "requestId": "req-1", "decision": map[string]any{"interrupt_id": "req-1", "type": "approve"},
 	})
 	rpcErr := wantXGWError(t, "respond from observe connection", err)
 	if !strings.Contains(rpcErr.Message, "control lease") {
@@ -1445,12 +1662,15 @@ func TestXGWSessionAttachFailureKeepsSubscriptionAndLease(t *testing.T) {
 		t.Fatalf("failed connection's subscriptions = %d, want 0", n)
 	}
 
-	// B 的 approval/respond 被拒(无 lease、controlSessions 无候选);A 的
-	// approval/respond 照常(lease 完好)。
+	// B 的 approval/respond 被拒(无该会话 lease);A 的 approval/respond 照常
+	// (lease 完好,服务端归属预置 req-1 → sid)。
+	frc.mu.Lock()
+	frc.approvalOwner["req-1"] = sid
+	frc.mu.Unlock()
 	respond := func(s *xgwStack) error {
 		t.Helper()
 		_, err := s.callRaw(t, XMethodApprovalRespond, map[string]any{
-			"requestId": "req-1", "decision": map[string]any{"interrupt_id": "req-1", "type": "approve"},
+			"sessionId": sid, "requestId": "req-1", "decision": map[string]any{"interrupt_id": "req-1", "type": "approve"},
 		})
 		return err
 	}
@@ -1540,5 +1760,240 @@ func TestXGWSessionAttachConcurrentSinglePump(t *testing.T) {
 	}
 	if probes != 1 {
 		t.Fatalf("probe event (seq 4) delivered %d times, want exactly 1 (no zombie pump)", probes)
+	}
+}
+
+// TestXGWSessionAttachCloseCommitBarrier(I2 修复验收,commitHook 确定性交错,
+// 不用 time.Sleep):attach 的提交段内(h.mu 已释放的插桩窗口)同步跑生产
+// Close → 提交段二次确认 closed → attach 被拒。复现评审 I2 的 Close/Attach
+// 竞态:修复前该窗口内 attach 会照常换入订阅、启动泵并 AcquireControl——连接
+// 关闭后复活订阅与 lease。断言四件事:attach 报错;订阅未复活(表空、泵未
+// 启动,负向无投递是结构事实,不做宽限睡眠断言);lease 未获取(HoldControl
+// 恒 false);closed 置位后后续 attach 一律拒绝。
+func TestXGWSessionAttachCloseCommitBarrier(t *testing.T) {
+	stack, _ := newAttachStack(t)
+	sid := stack.initAndNew(t)
+
+	stack.handler.mu.Lock()
+	stack.handler.commitHook = func() { stack.handler.Close() }
+	stack.handler.mu.Unlock()
+
+	_, err := stack.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"})
+	rpcErr := wantXGWError(t, "attach racing Close inside its commit", err)
+	if !strings.Contains(rpcErr.Message, "closed") {
+		t.Fatalf("attach-after-close message = %q, want closed mention", rpcErr.Message)
+	}
+
+	// 订阅未复活:表空(泵未启动,Close 的清表已先行摘除)。
+	if n := handlerSubCount(stack.handler); n != 0 {
+		t.Fatalf("subscriptions after attach lost to Close = %d, want 0", n)
+	}
+	// lease 未获取:提交段在二次确认处让位,AcquireControl 未达;Close 的
+	// ReleaseConnection 也不会被后续路径复活。
+	if stack.runs.HoldControl(sid, stack.handler.connectionID) {
+		t.Fatal("attach must not acquire the lease once Close won the race")
+	}
+
+	// closed 置位后 attach 一律拒绝(不复活订阅与 lease)。
+	if _, err := stack.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"}); err == nil {
+		t.Fatal("attach after Close must be rejected unconditionally")
+	}
+	if n := handlerSubCount(stack.handler); n != 0 {
+		t.Fatalf("subscriptions after post-close attach = %d, want 0", n)
+	}
+	if stack.runs.HoldControl(sid, stack.handler.connectionID) {
+		t.Fatal("post-close attach must not acquire the lease either")
+	}
+}
+
+// TestXGWSessionAttachDetachConcurrentLifecycle(I2 修复验收):attach 与
+// detach 并发时,终态订阅/lease 状态符合 h.mu 内操作序——attach 提交段(换表
+// +取 lease)与 detach(摘表+还 lease)各自单事务,以 h.mu 全序,后者完整胜出:
+// 要么订阅存活且 lease 在手(attach 段在后),要么表空且 lease 空闲(detach 段
+// 在后);被换下/被摘除的订阅句柄一律已 stop(无未登记泵)。第一段用 commitHook
+// 把生产 detach 确定性插进 attach 提交段中间(detach 的 mu 操作序严格在后 →
+// attach 让位);第二段并发轰 attach(control)+detach(control) 断言不变式。
+func TestXGWSessionAttachDetachConcurrentLifecycle(t *testing.T) {
+	stack, hub := newAttachStack(t)
+	sid := stack.initAndNew(t)
+	log := &xgwEventLog{}
+	stack.client.HandleNotification(XMethodSessionEvents, log.handle)
+
+	// attach#1 建立订阅与 lease,供确定性段验证「被换下者随让位一并收泵」。
+	if _, err := stack.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"}); err != nil {
+		t.Fatalf("attach #1: %v", err)
+	}
+	stack.handler.mu.Lock()
+	sub1 := stack.handler.subs[sid]
+	stack.handler.mu.Unlock()
+	if sub1 == nil {
+		t.Fatal("attach #1 left no subscription")
+	}
+
+	// —— 确定性段:commitHook 内跑生产 detach(control),其 h.mu 段严格晚于
+	// attach#2 的换表 → detach 是全序最后一方 → attach#2 被顶替拒绝,终态为空。
+	detachParams, err := json.Marshal(XSessionDetachParams{SessionID: sid, Mode: XAttachModeControl})
+	if err != nil {
+		t.Fatalf("marshal detach params: %v", err)
+	}
+	stack.handler.mu.Lock()
+	stack.handler.commitHook = func() {
+		if _, err := stack.handler.xgwSessionDetach(context.Background(), detachParams); err != nil {
+			t.Errorf("detach inside commit hook: %v", err)
+		}
+	}
+	stack.handler.mu.Unlock()
+	_, err = stack.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"})
+	if err == nil {
+		t.Fatal("attach overtaken by a detach inside its commit must be rejected")
+	}
+	if rpcErr := wantXGWError(t, "attach overtaken by detach", err); !strings.Contains(rpcErr.Message, "superseded") {
+		t.Fatalf("overtaken attach message = %q, want superseded mention", rpcErr.Message)
+	}
+	stack.handler.mu.Lock()
+	stack.handler.commitHook = nil
+	rest := len(stack.handler.subs)
+	stack.handler.mu.Unlock()
+	if rest != 0 {
+		t.Fatalf("subscriptions after detach-wins interleave = %d, want 0", rest)
+	}
+	if stack.runs.HoldControl(sid, stack.handler.connectionID) {
+		t.Fatal("detach inside the commit window must leave the lease free")
+	}
+	select {
+	case <-sub1.done:
+	default:
+		t.Fatal("the displaced subscription must be stopped when the attach yields")
+	}
+
+	// —— 并发段:attach(control) 与 detach(control) 同会话并发,断言终态
+	// 不变式:订阅存活 ⇔ lease 在手;存活句柄未 stop;被换下句柄必已 stop。
+	var prev *xgwSubscription
+	for i := 0; i < 30; i++ {
+		var attErr, detErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, attErr = stack.callRaw(t, XMethodSessionAttach, map[string]any{
+				"sessionId": sid, "afterSeq": 0, "mode": "control",
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			_, detErr = stack.callRaw(t, XMethodSessionDetach, map[string]any{
+				"sessionId": sid, "mode": "control",
+			})
+		}()
+		wg.Wait()
+		if attErr != nil || detErr != nil {
+			t.Fatalf("iteration %d: attach=%v detach=%v", i, attErr, detErr)
+		}
+		stack.handler.mu.Lock()
+		sub := stack.handler.subs[sid]
+		stack.handler.mu.Unlock()
+		held := stack.runs.HoldControl(sid, stack.handler.connectionID)
+		if (sub != nil) != held {
+			t.Fatalf("iteration %d: subscription present=%v but lease held=%v (订阅与 lease 必须同生同死)", i, sub != nil, held)
+		}
+		if sub != nil {
+			select {
+			case <-sub.done:
+				t.Fatalf("iteration %d: surviving subscription must not be stopped", i)
+			default:
+			}
+		}
+		if prev != nil && prev != sub {
+			select {
+			case <-prev.done:
+			default:
+				t.Fatalf("iteration %d: displaced subscription not stopped", i)
+			}
+		}
+		prev = sub
+	}
+
+	// 终局僵尸泵检查:并发结束后若仍留存活订阅,发布探测事件必须恰好投递一次
+	// (无未登记泵在投递);表空则无泵存活,结构性无投递,不发布。
+	stack.handler.mu.Lock()
+	final := stack.handler.subs[sid]
+	stack.handler.mu.Unlock()
+	if final != nil {
+		probeSeq := hub.LatestSeq() + 1
+		publishHubEvent(t, hub, "run-1", session.EventToolResult)
+		waitFor(t, "final probe delivery", func() bool {
+			events, _, _ := log.snapshot()
+			for _, ev := range events {
+				if ev.Seq == probeSeq {
+					return true
+				}
+			}
+			return false
+		})
+		events, _, bad := log.snapshot()
+		if len(bad) > 0 {
+			t.Fatalf("notification decode failures: %v", bad)
+		}
+		probes := 0
+		for _, ev := range events {
+			if ev.Seq == probeSeq {
+				probes++
+			}
+		}
+		if probes != 1 {
+			t.Fatalf("final probe (seq %d) delivered %d times, want exactly 1 (no zombie pump)", probeSeq, probes)
+		}
+	}
+}
+
+// TestXGWSessionAttachCrossConnectionCurrentRun(I1 修复验收,wire 面):会话 A
+// 有在途 run 时,另一连接(其当前会话是 B)对 A 的 attach 响应 currentRun 非
+// null 且为 A 的在途快照——评审 I1 的场景「Session A: Run 在后台执行;Client
+// attach(A) → 响应不得 currentRun=null」。协议面忠实转发 source 的 ActiveRun
+// (按会话路由),source 侧 current-only 回归在 runcontrol_test.go 的
+// TestActiveRunNonCurrentSession;对照:B 对无在途 run 的 sidB attach →
+// currentRun=null。
+func TestXGWSessionAttachCrossConnectionCurrentRun(t *testing.T) {
+	frc := newFakeRunControl()
+	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
+	frc.mu.Lock()
+	frc.attachHub = hub
+	frc.mu.Unlock()
+	stackA := newXGWStack(t, nil, frc)
+	stackB := newXGWStack(t, nil, frc)
+	t.Cleanup(stackA.handler.Close)
+	t.Cleanup(stackB.handler.Close)
+	sidA := stackA.initAndNew(t)
+	sidB := stackB.initAndNew(t)
+
+	// A:attach(control) 持照 → run/start 产事件,并把 A 的活动 run 快照置为
+	// (run-1, running)。
+	if _, err := stackA.attachRaw(t, map[string]any{"sessionId": sidA, "afterSeq": 0, "mode": "control"}); err != nil {
+		t.Fatalf("attach A control: %v", err)
+	}
+	if _, err := stackA.callRaw(t, XMethodRunStart, map[string]any{
+		"sessionId": sidA, "input": "x", "requestId": "r1",
+	}); err != nil {
+		t.Fatalf("run/start on A: %v", err)
+	}
+
+	// B attach sidA(B 的当前会话是 sidB,sidA 是它的「非当前会话」):
+	// currentRun 非 null 且为 A 的在途快照。
+	fields, err := stackB.attachRaw(t, map[string]any{"sessionId": sidA, "afterSeq": 0, "mode": "observe"})
+	if err != nil {
+		t.Fatalf("attach B on session A: %v", err)
+	}
+	cur, ok := fields["currentRun"].(map[string]any)
+	if !ok || cur["runId"] != "run-1" || cur["state"] != "running" {
+		t.Fatalf("attach B currentRun = %v, want {runId:run-1,state:running}(非当前会话的在途 run 必须如实上报)", fields["currentRun"])
+	}
+
+	// 对照:B attach 自己的 sidB(无在途 run)→ currentRun=null。
+	fields, err = stackB.attachRaw(t, map[string]any{"sessionId": sidB, "afterSeq": 0, "mode": "observe"})
+	if err != nil {
+		t.Fatalf("attach B on own session: %v", err)
+	}
+	if fields["currentRun"] != nil {
+		t.Fatalf("attach own-session currentRun = %v, want null (no active run)", fields["currentRun"])
 	}
 }

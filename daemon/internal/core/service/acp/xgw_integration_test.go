@@ -195,23 +195,24 @@ func (f *xgwLiveControl) CancelRun(sessionID, runID string) error {
 
 // RunStatus mirror runcontrol.go 纯内存两分支:rt.Active() 命中 → 实时快照;
 // 幂等表按 runID 反查 → 终态保留快照。latestSeq 取 hub(会话维度游标);
-// eventsComplete(I6lite)取 hub.EventsComplete(),hub 未建 → true(无失败证据)。
-func (f *xgwLiveControl) RunStatus(sessionID, runID string) (string, uint64, bool, error) {
+// replayIntegrity(I4)取 hub.ReplayIntegrity(),hub 未建 → complete(无事件
+// 流即无「不完整回放」可言,同生产 runcontrol.go 的 nil-hub 分支)。
+func (f *xgwLiveControl) RunStatus(sessionID, runID string) (string, uint64, string, error) {
 	if err := f.requireCurrent(sessionID); err != nil {
-		return "", 0, true, err
+		return "", 0, runtimeagent.ReplayIntegrityComplete, err
 	}
 	rt := f.m.Get(f.sid)
 	if rt == nil {
-		return "", 0, true, errors.New("xgwLiveControl: no active runtime")
+		return "", 0, runtimeagent.ReplayIntegrityComplete, errors.New("xgwLiveControl: no active runtime")
 	}
 	latest := uint64(0)
-	eventsComplete := true
+	replayIntegrity := runtimeagent.ReplayIntegrityComplete
 	if hub := rt.Hub(); hub != nil {
 		latest = hub.LatestSeq()
-		eventsComplete = hub.EventsComplete()
+		replayIntegrity = hub.ReplayIntegrity()
 	}
 	if run := rt.Active(); run != nil && run.ID == runID {
-		return string(run.State()), latest, eventsComplete, nil
+		return string(run.State()), latest, replayIntegrity, nil
 	}
 	f.reqMu.Lock()
 	var h runtimeagent.RunHandle
@@ -224,9 +225,9 @@ func (f *xgwLiveControl) RunStatus(sessionID, runID string) (string, uint64, boo
 	}
 	f.reqMu.Unlock()
 	if tracked {
-		return string(h.State()), latest, eventsComplete, nil
+		return string(h.State()), latest, replayIntegrity, nil
 	}
-	return "", 0, eventsComplete, fmt.Errorf("xgwLiveControl: run %q: %w", runID, runtimeagent.ErrRunNotFound)
+	return "", 0, replayIntegrity, fmt.Errorf("xgwLiveControl: run %q: %w", runID, runtimeagent.ErrRunNotFound)
 }
 
 // PendingApprovals mirror runcontrol.go:manager 审批快照 → model 扁平结构。
@@ -250,8 +251,22 @@ func (f *xgwLiveControl) PendingApprovals(sessionID string) ([]model.PendingAppr
 	return out, nil
 }
 
-// ResolveApproval mirror runcontrol.go:直转 manager(首个有效决策获胜)。
-func (f *xgwLiveControl) ResolveApproval(requestID string, decision hitl.Decision) error {
+// ResolveApproval mirror runcontrol.go 的 C1 契约(归属三段校验的 source 侧):
+// wire 会话声明先过 requireCurrent(本 shim 的会话路由锚点),归属按服务端
+// 记录(ApprovalOwner)与 runtime id(f.sid)校验——比较用 runtime id 而非
+// wire 原串,与生产 runcontrol.go 的寻址模型一致;未知 requestID →
+// ErrApprovalUnknown 语义,归属不符 → 越权拒绝;匹配才直转 manager。
+func (f *xgwLiveControl) ResolveApproval(sessionID, requestID string, decision hitl.Decision) error {
+	if err := f.requireCurrent(sessionID); err != nil {
+		return err
+	}
+	owner, ok := f.m.ApprovalOwner(requestID)
+	if !ok {
+		return fmt.Errorf("xgwLiveControl: approval %q: %w", requestID, runtimeagent.ErrApprovalUnknown)
+	}
+	if owner != f.sid {
+		return fmt.Errorf("xgwLiveControl: approval %q belongs to session %q, not %q", requestID, owner, f.sid)
+	}
 	return f.m.ResolveApproval(requestID, decision)
 }
 
@@ -272,7 +287,10 @@ func (f *xgwLiveControl) Attach(sessionID string) (*runtimeagent.EventHub, uint6
 	return hub, hub.LatestSeq(), nil
 }
 
-// ActiveRun mirror runcontrol.go:current 会话的 rt.Active() 快照直转。
+// ActiveRun mirror runcontrol.go 的快照观察面。I1 修正后生产按 sessionRuntime
+// 多会话路由;本 shim 只注册一个 runtime 且 wire sessionId 与 runtime 键分立,
+// 会话寻址锚在 current(SetSession 写入)——单一 runtime 世界里这就是
+// 「定位 runtime,nil → ok=false」的等价形,行为不变,仅注释分叉说明。
 func (f *xgwLiveControl) ActiveRun(sessionID string) (string, string, bool) {
 	if err := f.requireCurrent(sessionID); err != nil {
 		return "", "", false
@@ -774,7 +792,7 @@ func TestXGWIntegrationApprovalAfterReconnect(t *testing.T) {
 	// 接管后原 holder 的 approval/respond 被拒(-32000,lease 在 daemon 侧
 	// 强制,不依赖前端 UI 自律),且不触达审批管理面。
 	_, err = stackA.liveCallRaw(t, XMethodApprovalRespond, map[string]any{
-		"requestId": req.ID, "decision": map[string]any{"interrupt_id": req.ID, "type": "approve"},
+		"sessionId": sid, "requestId": req.ID, "decision": map[string]any{"interrupt_id": req.ID, "type": "approve"},
 	})
 	rpcErr := wantXGWError(t, "respond from evicted holder", err)
 	if !strings.Contains(rpcErr.Message, "control lease") {
@@ -786,7 +804,7 @@ func TestXGWIntegrationApprovalAfterReconnect(t *testing.T) {
 
 	// 新 holder 应答 approve → 审批链路打通,run 真实完成(工具真实执行)。
 	raw, err = stackB.liveCallRaw(t, XMethodApprovalRespond, map[string]any{
-		"requestId": req.ID, "decision": map[string]any{"interrupt_id": req.ID, "type": "approve"},
+		"sessionId": sid, "requestId": req.ID, "decision": map[string]any{"interrupt_id": req.ID, "type": "approve"},
 	})
 	if err != nil {
 		t.Fatalf("respond from new holder: %v", err)

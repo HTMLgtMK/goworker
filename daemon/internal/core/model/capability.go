@@ -118,24 +118,32 @@ type RunControlSource interface {
 	StartRun(sessionID, input, requestID string) (runID, state string, err error)
 	CancelRun(sessionID, runID string) error
 	// RunStatus 返回 run 当前状态、会话事件流的 latest seq（游标描述，非游标
-	// 授权——客户端只有真正应用了对应事件才能推进本地游标）与事件流完整性
-	// （I6lite：eventsComplete=false = 本进程纪元内发生过事件落盘失败——key
-	// 事件 durable-first 拒绝或合并 delta flush 失败，回放可能缺段，客户端不得
-	// 把不完整事件当完整历史；无事件流/无失败证据时为 true）。
-	RunStatus(sessionID, runID string) (state string, latestSeq uint64, eventsComplete bool, err error)
+	// 授权——客户端只有真正应用了对应事件才能推进本地游标）与回放完整性三态
+	// replayIntegrity（I4：eventsComplete 布尔的替代，取 runtimeagent 的
+	// ReplayIntegrityComplete/Unknown/Incomplete——"complete"=本进程未观察到
+	// 写侧失败且无可疑历史；"unknown"=journal 有跨进程纪元的既有历史，完整性
+	// 不可验证，诚实优先；"incomplete"=本进程发生过 key 事件落盘失败或合并
+	// delta flush 失败，粘滞永不复位。非 complete 都不得把收到的事件当完整
+	// 历史；无事件流/无失败证据时为 complete）。
+	RunStatus(sessionID, runID string) (state string, latestSeq uint64, replayIntegrity string, err error)
 	// PendingApprovals 返回会话未过期审批快照（daemon 侧扁平结构，避免
 	// model→agent 类型泄漏）。未知会话/无审批返回空切片。
 	PendingApprovals(sessionID string) ([]PendingApprovalInfo, error)
-	// ResolveApproval 投递一笔审批决策：首个有效决策获胜；未知 requestID 或
-	// 迟到/重复决策返回错误。
-	ResolveApproval(requestID string, decision hitl.Decision) error
+	// ResolveApproval 投递一笔审批决策(C1 修复:归属三段校验):先以服务端
+	// 记录的审批归属为准(ApprovalOwner)——归属不存在(未知 requestID)或归属
+	// 会话与 sessionID 不一致(越权,即便调用方持有其他会话的 control lease)
+	// 一律拒绝,绝不信任客户端声明;匹配才投递,首个有效决策获胜,迟到/重复
+	// 决策返回错误。
+	ResolveApproval(sessionID, requestID string, decision hitl.Decision) error
 	// Attach 返回会话事件枢纽与当前 latest seq（P5-8 的 attach 面消费；本步
 	// 落签名与实现——EnsureHub 使「重启后 attach 时 hub 未建」的缺口关闭）。
 	Attach(sessionID string) (hub *runtimeagent.EventHub, latest uint64, err error)
 	// ActiveRun 返回会话当前活动 Run 的 (runID, state) 快照（P5-8 attach 响应
 	// 的 currentRun 字段消费；RunControlSource 在 P5-6 未备该访问器，P5-8 按
-	// 响应契约最小补齐——RunStatus 需 runID 寻址，无法充当）。无活动 Run、无
-	// runtime 或非 current 会话 → ok=false（currentRun=null，非错误）。
+	// 响应契约最小补齐——RunStatus 需 runID 寻址，无法充当）。无活动 Run 或无
+	// runtime（未注册/已收口）→ ok=false（currentRun=null，非错误）。第二轮
+	// 评审 I1 修正：按 sessionID 多会话路由（与其他路由入口同一身份模型），
+	// 非 current 会话返回其自身的在途快照而非恒 null。
 	ActiveRun(sessionID string) (runID, state string, ok bool)
 	// AcquireControl 获取 (sessionID, connectionID) 的 control lease：该会话
 	// 空闲→占用并返回 false；他人持有→显式接管（返回 true，slog.Info 审计）；

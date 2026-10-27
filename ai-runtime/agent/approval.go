@@ -185,6 +185,24 @@ func (m *ApprovalManager) Resolve(requestID string, decision hitl.Decision) erro
 	return nil
 }
 
+// Owner 返回 requestID 的服务端记录审批归属(daemon C1 修复的权威事实源):
+// requestID 在表(含已 resolved 的滞留条目——归属在 resolved 后仍需可查,让
+// 「首个有效决策获胜」窗口内的越权校验与迟到决策语义都能对上归属会话;条目
+// 保留策略 approvalResolvedRetention 已有)→ 返回 (归属 SessionID, true);
+// 从未存在或已过宽限窗被惰性清扫逐出 → ("", false)。只读、不清扫:过期条目
+// 的逐出时机仍内嵌在 Wait/Resolve/Pending 入口,本方法不改既有清扫纪律——
+// 宽限窗外的条目在此报 not found,与 Resolve 对同键的 ErrApprovalUnknown 是
+// 同一 map 上的同一可见性。
+func (m *ApprovalManager) Owner(requestID string) (sessionID string, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.pending[requestID]
+	if !ok {
+		return "", false
+	}
+	return entry.pa.SessionID, true
+}
+
 // sweepResolvedExpiredLocked 逐出「已 resolved 且已过期超过
 // approvalResolvedRetention 宽限窗」的滞留条目(P4 评审 issue3:生产中
 // Pending 可能从不被调——客户端的事实源是 permission.requested 事件流,

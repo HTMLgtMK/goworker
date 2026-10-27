@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
@@ -34,7 +33,10 @@ import (
 //     requestID 并发重试的严格幂等(第二个等待者持锁后命中表,不再撞
 //     ErrRunActive);
 //   - leaseMu 只护 controlLeases 租约表(sessionID → connectionID,I3 修正后的
-//     per-session control lease);不与 mu/reqMu/manager 锁嵌套,无锁环;
+//     per-session control lease);不与本插件 mu/reqMu/manager 锁嵌套,无锁环。
+//     跨层嵌套唯一一处:daemon 的 xgw 面(I2 生命周期屏障)在 handler 的 h.mu
+//     临界区内调用 Acquire/ReleaseControl——锁序 h.mu→leaseMu 单向(leaseMu
+//     是叶锁,绝不回调 handler、不取 h.mu),Close 侧同向,无环;
 //   - 其余方法(manager.StartRun/CancelRun、rt.Active/Hub、Approvals、
 //     Capabilities)的并发面由 SDK 侧既有锁序承担,本层不做新共享状态。
 
@@ -63,22 +65,9 @@ const defaultCapabilityWaitTimeout = 45 * time.Second
 // 明确失败文本」语义无声劣化,故显式降级 + warn)。
 const maxCapabilityWaitTimeout = 55 * time.Second
 
-// requireCurrentSession 校验 sessionID 是当前会话。C3 修复(GPT 评审)后仅剩
-// ActiveRun(P5-8 的 currentRun 快照访问器)消费:run/start|status|cancel、
-// attach 与 approval/list 已全部改为按 sessionRuntime(sessionID) 多会话路由;
-// ActiveRun 的「非 current → ok=false → attach 响应 currentRun=null」语义保持
-// 不变(非错误,快照观察,见其函数注释)。纯内存降级(无 store)下
-// CurrentSessionID() 为空串,调用方传空串即匹配——降级形态的会话句柄本就是
-// 空,与 CurrentSessionID 的既有语义一致。
-func (p *AgentPlugin) requireCurrentSession(sessionID string) error {
-	if current := p.CurrentSessionID(); sessionID != current {
-		return fmt.Errorf("agent: session %q is not the current session %q (only the currentRun snapshot stays current-only)", sessionID, current)
-	}
-	return nil
-}
-
 // sessionRuntime 是 C3 修复后的多会话路由解析点(GPT 评审 C3:run/start|status|
-// cancel、attach 与 approval/list 不再限 current,推翻 P4P5 plan 拍板⑤的
+// cancel、attach、approval/list 与 ActiveRun(第二轮评审 I1 修正)不再限
+// current,推翻 P4P5 plan 拍板⑤的
 // V1-current-only——多 Session 控制面是总方案的最终目标):按 sessionID 定位
 // runtime,nil → 调用方报 sessionNotFoundErr(ErrSessionNotFound 语义;/new 已
 // 收口的旧 id 与任意未注册 id 在此诚实失败,归档历史走既有 session/load 只读
@@ -137,10 +126,17 @@ func (p *AgentPlugin) sessionJournalStore(rt *runtimeagent.SessionRuntime) *sess
 	return session.NewRunJournalStore(p.repo, st)
 }
 
-// ErrRequestConflict 是 requestId 幂等冲突 sentinel(I5):同一幂等键重试、或
-// 同一 requestID 跨会话误用,但 Input 指纹与首提不同——诚实拒绝,绝不静默
-// 复用原 Run 或另起新 run。
+// ErrRequestConflict 是 requestId 幂等冲突 sentinel(I5;第二轮评审 I5 收窄到
+// 会话作用域):同一幂等键(同 sessionID+requestID)重试但 Input 指纹与首提
+// 不同——诚实拒绝,绝不静默复用原 Run 或另起新 run。
 var ErrRequestConflict = errors.New("request id conflict: the idempotency key was already submitted with a different input")
+
+// ErrApprovalOwnership 是审批越权 sentinel(第二轮评审 C1 修复):决策声明的
+// sessionID 与服务端记录的审批归属会话不一致。授权以服务端记录为准、绝不信任
+// 客户端声明——归属在 SDK 审批管理面 Wait 注册时落账(SessionID+RunID 非连接),
+// 即便调用方真持有其他会话的 control lease 也不放行(跨会话审批越权是本轮
+// C1 的攻击面:持有任意会话 lease 的连接曾可应答他会话的审批)。
+var ErrApprovalOwnership = errors.New("approval ownership mismatch: the approval belongs to a different session")
 
 func requestConflictErr(requestID string) error {
 	return fmt.Errorf("agent: requestID %q: %w", requestID, ErrRequestConflict)
@@ -203,16 +199,16 @@ func (p *AgentPlugin) runJournalStore() *session.RunJournalStore {
 //   - 路由(C3):sessionRuntime 按 sessionID 定位 runtime(不限 current),
 //     StartRun 用该 rt——其 Session 自带本会话边界注入的 deps,journal/hub/
 //     conversation 天然按会话隔离;nil → sessionNotFoundErr。
-//   - 幂等(I5):requestID 非空时,幂等键是 (sessionID, requestID) 组合
-//     (requestKey),表存提交时 RunHandle + input sha256 指纹。命中同键:同
-//     Input → 返回原 runID 与其当前状态(RunHandle.State() 的实时快照,终态
-//     保留),不重复起跑;不同 Input → ErrRequestConflict 显式冲突,绝不静默
-//     复用。组合键未命中但同一 requestID 已在任一会话按不同 Input 记账 → 同样
-//     冲突(跨会话 token 误用守护:「A+req 与 B+req 是两个不同操作」不该各自
-//     静默起跑,更不容许误返 A 的 run)。空 requestID 不记账(幂等键缺失,每次
-//     新起跑)。命中/冲突判定与记录同持 reqMu,并发同 requestID 重试严格幂等
-//     (见文件头)。边界:本表是进程内存量,重启清零,只提供进程内幂等;跨重启
-//     幂等需持久化该映射(V1 不做)。
+//   - 幂等(I5;第二轮评审 I5 收窄):requestID 非空时,幂等键是 (sessionID,
+//     requestID) 组合(requestKey),表存提交时 RunHandle + input sha256 指纹。
+//     命中同键:同 Input → 返回原 runID 与其当前状态(RunHandle.State() 的实时
+//     快照,终态保留),不重复起跑;不同 Input → ErrRequestConflict 显式冲突,
+//     绝不静默复用。requestID 的唯一性只在同一会话的幂等作用域内成立——跨会话
+//     冲突扫描已删除(第二轮评审 I5:两客户端各自局部递增 requestID 不再互相
+//     拒绝;组合键本身已防「B 误返 A 的 run」)。空 requestID 不记账(幂等键
+//     缺失,每次新起跑)。命中/冲突判定与记录同持 reqMu,并发同 requestID 重试
+//     严格幂等(见文件头)。边界:本表是进程内存量,重启清零,只提供进程内幂
+//     等;跨重启幂等需持久化该映射(V1 不做)。
 //   - 回调全 nil(runtimeagent.RunCallbacks{}):事件采集由 supervisor 的 tee
 //     自行供给(C2 修复:teeRunCallbacks 在 hub 非 nil 时对 nil 的 EmitToken/
 //     Publish 装上事件映射版,不再依赖调用方回调)——真实 token/tool_call/最终
@@ -243,9 +239,6 @@ func (p *AgentPlugin) StartRun(sessionID, input, requestID string) (string, stri
 			}
 			return tr.handle.RunID, string(tr.handle.State()), nil
 		}
-		if p.requestIDConflicts(requestID, fp) {
-			return "", "", requestConflictErr(requestID)
-		}
 	}
 
 	p.registerCurrentRuntime(rt)
@@ -257,20 +250,6 @@ func (p *AgentPlugin) StartRun(sessionID, input, requestID string) (string, stri
 		p.recordRequestID(key, h, fp)
 	}
 	return h.RunID, string(h.State()), nil
-}
-
-// requestIDConflicts 报告同一 requestID 是否已按不同 Input 指纹记账(调用方
-// 必须持 reqMu;组合键的精确命中由调用方先行处理,这里只兜跨会话误用:组合键
-// 未命中但 requestID 已在别的会话按不同 Input 使用)。后缀匹配扫描 O(表容量),
-// 仅新 requestID 首提时发生,容量 4096 下代价可忽略。
-func (p *AgentPlugin) requestIDConflicts(requestID string, fp [sha256.Size]byte) bool {
-	suffix := "\x00" + requestID
-	for key, tr := range p.runRequests {
-		if strings.HasSuffix(key, suffix) && tr.inputHash != fp {
-			return true
-		}
-	}
-	return false
 }
 
 // recordRequestID 记录一笔幂等键 → RunHandle + input 指纹,并按容量环形逐出最
@@ -322,8 +301,9 @@ func (p *AgentPlugin) CancelRun(sessionID, runID string) error {
 	return p.manager.CancelRun(rt.ID, runID)
 }
 
-// RunStatus 实现 RunControlSource(P5-6;C3/I6lite 修正):多会话路由 → run 当前
-// 状态 + 该会话事件流 latest seq + 事件流完整性。观测面三分支,按权威序:
+// RunStatus 实现 RunControlSource(P5-6;C3/I6lite 修正,I4 起完整性字段改三态
+// replayIntegrity):多会话路由 → run 当前状态 + 该会话事件流 latest seq +
+// 回放完整性三态。观测面三分支,按权威序:
 //  1. rt.Active() 命中 runID(在跑/排队)→ AgentRun.State() 实时快照;latestSeq
 //     取 hub.LatestSeq()(会话维度游标,P3-0 契约);
 //  2. 该会话自己的 RunJournalStore.LastRunState(已终态,active 已清):journal
@@ -336,22 +316,24 @@ func (p *AgentPlugin) CancelRun(sessionID, runID string) error {
 //     是唯一观测面(按路由会话过滤);持久化模式不回退——journal 覆盖本会话
 //     全部 run,miss 即未找到,不发明第二事实源。
 //
-// eventsComplete(I6lite)三分支同源:rt.Hub() 存在时取 hub.EventsComplete()
-// (本进程纪元内任何 key 事件落盘失败/合并 delta flush 失败 → false,永不复位
-// ——hub 是会话级单例,标记覆盖其上产生的全部 run,不只被查询的这一个);
-// hub 为 nil(未启用 RunEvents/尚无 StartRun)→ true——无事件流即无「不完整
-// 回放」可言,标记只携带失败证据、不发明完整性承诺。
+// replayIntegrity(I4)三分支同源:rt.Hub() 存在时取 hub.ReplayIntegrity()
+// (三态:本进程纪元内任何 key 事件落盘失败/合并 delta flush 失败 → Incomplete,
+// 粘滞永不复位——hub 是会话级单例,标记覆盖其上产生的全部 run,不只被查询的
+// 这一个;journal 播种发现既有历史 → Unknown,跨进程纪元的完整性不可验证,
+// 诚实优先;空历史/纯内存 → Complete);hub 为 nil(未启用 RunEvents/尚无
+// StartRun)→ Complete——无事件流即无「不完整回放」可言,该取值只携带失败
+// 证据、不发明完整性承诺(I4 前身 I6lite 的同款语义,仅布尔改三态)。
 //
 // 未命中 → 包裹 runtimeagent.ErrRunNotFound 的错误(P5-7 协议面映射 -32000)。
-func (p *AgentPlugin) RunStatus(sessionID, runID string) (string, uint64, bool, error) {
+func (p *AgentPlugin) RunStatus(sessionID, runID string) (string, uint64, string, error) {
 	rt := p.sessionRuntime(sessionID)
 	if rt == nil {
-		return "", 0, true, sessionNotFoundErr(sessionID)
+		return "", 0, runtimeagent.ReplayIntegrityComplete, sessionNotFoundErr(sessionID)
 	}
 
-	eventsComplete := true
+	replayIntegrity := runtimeagent.ReplayIntegrityComplete
 	if hub := rt.Hub(); hub != nil {
-		eventsComplete = hub.EventsComplete()
+		replayIntegrity = hub.ReplayIntegrity()
 	}
 
 	if run := rt.Active(); run != nil && run.ID == runID {
@@ -359,16 +341,16 @@ func (p *AgentPlugin) RunStatus(sessionID, runID string) (string, uint64, bool, 
 		if hub := rt.Hub(); hub != nil {
 			latest = hub.LatestSeq()
 		}
-		return string(run.State()), latest, eventsComplete, nil
+		return string(run.State()), latest, replayIntegrity, nil
 	}
 
 	if js := p.sessionJournalStore(rt); js != nil {
 		rec, ok := js.LastRunState(runID)
 		if !ok {
-			return "", 0, eventsComplete, fmt.Errorf("agent: run %q: %w", runID, runtimeagent.ErrRunNotFound)
+			return "", 0, replayIntegrity, fmt.Errorf("agent: run %q: %w", runID, runtimeagent.ErrRunNotFound)
 		}
 		_, latest, _ := js.SeqRange()
-		return rec.State, latest, eventsComplete, nil
+		return rec.State, latest, replayIntegrity, nil
 	}
 
 	p.reqMu.Lock()
@@ -379,9 +361,9 @@ func (p *AgentPlugin) RunStatus(sessionID, runID string) (string, uint64, bool, 
 		if hub := rt.Hub(); hub != nil {
 			latest = hub.LatestSeq()
 		}
-		return string(h.State()), latest, eventsComplete, nil
+		return string(h.State()), latest, replayIntegrity, nil
 	}
-	return "", 0, eventsComplete, fmt.Errorf("agent: run %q: %w", runID, runtimeagent.ErrRunNotFound)
+	return "", 0, replayIntegrity, fmt.Errorf("agent: run %q: %w", runID, runtimeagent.ErrRunNotFound)
 }
 
 // PendingApprovals 实现 RunControlSource(P5-6;C3 修正):多会话路由 → manager
@@ -417,11 +399,33 @@ func flattenPendingApprovals(pending []runtimeagent.PendingApproval) []model.Pen
 	return out
 }
 
-// ResolveApproval 实现 RunControlSource(P5-6):直转 manager(ApprovalManager.
-// Resolve 的直转包装)。错误原样上抛:未知 requestID → ErrApprovalUnknown;
-// 迟到/重复决策 → ErrApprovalResolved(首个有效决策获胜,P4-1 语义)。
-// requestID 全局寻址(审批归属 SessionID+RunID 非连接),无需 current 校验。
-func (p *AgentPlugin) ResolveApproval(requestID string, decision hitl.Decision) error {
+// ResolveApproval 实现 RunControlSource(P5-6;C1 修复:审批归属三段校验,推翻
+// 旧契约「requestID 全局寻址、无需会话校验」——control lease 已按会话隔离
+// (I3),审批授权必须绑定目标会话,否则持任意会话 lease 的连接可应答他会话
+// 的审批):
+//  1. 路由:sessionRuntime 按 sessionID 定位 runtime(与 PendingApprovals 同一
+//     寻址模型:内部比较用 rt.ID 而非调用方原串——审批的 SessionID 归属是
+//     StartRun 传入的 runtime id,纯内存降级下为 "current" 而调用方寻址空串),
+//     nil → sessionNotFoundErr;
+//  2. 归属:manager.ApprovalOwner(requestID) 查服务端记录的真实归属,不存在
+//     (从未注册/已过宽限窗被清扫)→ 包裹 ErrApprovalUnknown 的明确错误;
+//  3. 越权:归属会话 != rt.ID → 包裹 ErrApprovalOwnership 的越权错误(「服务端
+//     记录为准,不信客户端声明」);
+//  4. 匹配 → 直转 manager.ResolveApproval:首个有效决策获胜,迟到/重复 →
+//     ErrApprovalResolved(sentinel 语义见 approval.go),错误原样上抛由协议面
+//     映射 -32000。
+func (p *AgentPlugin) ResolveApproval(sessionID, requestID string, decision hitl.Decision) error {
+	rt := p.sessionRuntime(sessionID)
+	if rt == nil {
+		return sessionNotFoundErr(sessionID)
+	}
+	owner, ok := p.manager.ApprovalOwner(requestID)
+	if !ok {
+		return fmt.Errorf("agent: approval %q: %w", requestID, runtimeagent.ErrApprovalUnknown)
+	}
+	if owner != rt.ID {
+		return fmt.Errorf("agent: approval %q belongs to session %q, not %q: %w", requestID, owner, rt.ID, ErrApprovalOwnership)
+	}
 	return p.manager.ResolveApproval(requestID, decision)
 }
 
@@ -443,17 +447,18 @@ func (p *AgentPlugin) Attach(sessionID string) (*runtimeagent.EventHub, uint64, 
 	return hub, hub.LatestSeq(), nil
 }
 
-// ActiveRun 实现 RunControlSource(P5-8):current 会话的 rt.Active() 快照直转,
-// 与 RunStatus 的 active 分支同源(同一观察点)。语义:非 current 会话/无
-// runtime/无活动 run → ok=false——attach 响应的 currentRun=null 不是错误。
-// C3 修正后这是五个路由方法之外唯一保留 current 语义的访问器(attach 响应的
-// currentRun 快照对跨会话 attach 保持 current-only,如实报 null 而非误报);
-// Attach 才是会话路由的权威校验面,本访问器只做快照观察。
+// ActiveRun 实现 RunControlSource(P5-8;第二轮评审 I1 修正):sessionRuntime
+// 多会话路由 → rt.Active() 快照直转,与 RunStatus 的 active 分支同源(同一观察
+// 点)。语义:无 runtime(未注册//new 已收口)或无活动 run → ok=false——attach
+// 响应的 currentRun=null 不是错误。I1 修正前这里经 requireCurrentSession 把非
+// current 会话一律报 ok=false:attach 已按会话路由成功,响应却 currentRun=null,
+// 与「该会话确有在途 run」的事实不符(重连客户端靠该快照立即得知在途 Run);
+// 修正后与 run/start|status|cancel、attach、approval/list 同一身份模型——全部
+// 路由入口经 sessionRuntime 定位 runtime,不再有 current-only 例外(纯内存降级
+// 下空串寻址回落 current runtime,见 sessionRuntime 第 1 步)。本访问器只做
+// 快照观察,Attach 才是会话路由的权威校验面。
 func (p *AgentPlugin) ActiveRun(sessionID string) (string, string, bool) {
-	if err := p.requireCurrentSession(sessionID); err != nil {
-		return "", "", false
-	}
-	rt := p.currentSession()
+	rt := p.sessionRuntime(sessionID)
 	if rt == nil {
 		return "", "", false
 	}
@@ -470,8 +475,8 @@ func (p *AgentPlugin) ActiveRun(sessionID string) (string, string, bool) {
 // holder,返回 true 并 slog.Info 审计——「权限检查必须在 Daemon 侧完成」,
 // 总方案 §7.4 :610);同持有者重复 acquire → false(非接管)。空 connectionID
 // 拒绝(P5-7 工厂恒发非空 crypto/rand hex;防御空串与「空闲」不可辨)。
-// sessionID 允许空串:纯内存降级形态的会话句柄本就是空(runcontrol.go 头
-// requireCurrentSession 注释),空串是合法租约键。
+// sessionID 允许空串:纯内存降级形态的会话句柄本就是空(CurrentSessionID()
+// 为空串,sessionRuntime 的空串回退以 current 为寻址目标),空串是合法租约键。
 func (p *AgentPlugin) AcquireControl(sessionID, connectionID string) bool {
 	if connectionID == "" {
 		return false

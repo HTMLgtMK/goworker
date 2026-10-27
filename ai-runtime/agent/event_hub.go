@@ -27,15 +27,16 @@ import (
 //   - 关键事件必须持久化且 durable-first(P3-0 表第 2 行):IsKeyEvent 的 9 类
 //     事件在 mu 内 journal fsync 成功后才广播,失败不广播、返回错误——总方案
 //     第五节「持久化写入失败不能继续把事件当作可恢复事件正常广播」;失败同时
-//     置位 eventsIncomplete(I6lite,永不复位);
+//     把 replayIntegrity 置为 Incomplete(I4 三态,粘滞永不复位);
 //   - 高频 delta 合并落盘(P3-0 表第 3 行):3 类 delta 先逐事件实时广播
 //     (per-event seq),再进 50ms/4KB 合并窗,按 Type 分桶合并为一条
 //     [FromSeq..Seq] 记录(合并记录 Seq=ToSeq、FromSeq 声明范围,P3-1 契约;
 //     I2lite 起范围声明随回放透传上 wire);合并落盘失败仅 warn——重放缺 delta
 //     段可接受,assistant.message_finalized 兜底定稿(降级语义,P3-0 表第 7 行
-//     的对偶面),失败同样置位 eventsIncomplete:执行结果与事件完整性是两个
-//     独立状态,后者经 EventsComplete()/attach 与 run/get 的 eventsComplete
-//     字段向客户端显式暴露(I6 的最小面),不把不完整事件当完整历史;
+//     的对偶面),失败同样置 Incomplete:执行结果与事件完整性是两个独立状态,
+//     后者经 ReplayIntegrity()/attach 与 run/get 的 replayIntegrity 字段向
+//     客户端显式暴露(I4 三态,替代旧 eventsComplete 布尔),不把不完整事件
+//     当完整历史、也不能把「未观察到失败」谎报为「历史完整」;
 //   - 慢订阅者背压(P3-0 表第 8 行):fan-out 非阻塞投递,缓冲满即断开该订阅者
 //     (delete + close(sub.live)),绝不阻塞 AgentRun 执行与其他订阅者;重连从
 //     游标补齐属 P3-3 的 Subscribe。
@@ -85,6 +86,24 @@ const (
 	deltaFlushInterval = 50 * time.Millisecond
 	deltaFlushBytes    = 4 << 10
 	subscriberBuffer   = 256
+)
+
+// ReplayIntegrity 三态常量(I4,第二轮评审:eventsComplete 布尔在进程重启后
+// 失真——旧纪元的落盘失败不延续到新 hub,布尔恒 true 把「未观察到失败」谎报
+// 为「历史完整」):会话事件流回放完整性的显式协议信号,daemon wire 的
+// replayIntegrity 字段直接携带这三个字符串值。语义按 hub 的观察边界定义:
+//
+//   - Complete:本 hub 实例自创建以来未发生任何写侧失败,且没有需要跨进程纪元
+//     继承的历史——空历史/纯内存 hub,本进程观察面即全部,「完整」可证;
+//   - Unknown:journal 播种发现既有历史(SeqRange ok)——旧纪元的完整性事实
+//     无法在本进程验证(旧 hub 的失败标记不持久化,I4 的核心批评),诚实优先,
+//     绝不把不可验证的历史报告为完整;客户端按「可能缺段」消费或按 0 全量重放;
+//   - Incomplete:本 hub 纪元内发生 key 事件落盘失败或合并 delta flush 失败,
+//     重放确定缺段——粘滞(见 replayIntegrity 字段注释),永不复位。
+const (
+	ReplayIntegrityComplete   = "complete"
+	ReplayIntegrityUnknown    = "unknown"
+	ReplayIntegrityIncomplete = "incomplete"
 )
 
 // hubSub 是一个已注册的订阅者(live 广播直投端)。watermark 是注册点的
@@ -151,15 +170,18 @@ type EventHub struct {
 	earliest uint64
 	latest   uint64
 
-	// eventsIncomplete 是事件流完整性标记(I6lite 修复,GPT 评审 I6 的最小面):
-	// 任何 key 事件落盘失败(Publish 的 durable-first 拒绝)或合并 delta flush
-	// 失败(重放缺 delta 段)即置 true 且**永不复位**——置位是单调的「曾经失败」
-	// 事实,不因后续成功发布翻回:客户端据此判断回放完整性(attach 响应与
-	// run/get 的 eventsComplete 字段,经 EventsComplete() 读出),不把不完整
-	// 事件当完整历史。执行结果与事件完整性是两个独立状态(I6):本标记只记账
-	// 后者,不改变任何终态化路径。hub 重建(进程重启)后标记不延续——新 hub
-	// 只为本进程纪元的发布记账,跨纪元的完整性属 journal 读取面(I7 范畴)。
-	eventsIncomplete bool
+	// replayIntegrity 是回放完整性三态(I4,替代旧 eventsIncomplete 布尔——
+	// 布尔在 hub 重建后失真:旧纪元失败不延续,新 hub 恒「完整」谎报)。构造期
+	// 播种:journal 既有历史(SeqRange ok)→ Unknown(跨纪元完整性不可验证,
+	// 诚实优先);空历史/纯内存 → Complete(本进程观察面即全部)。此后唯一写
+	// 点是失败路径:任何 key 事件落盘失败(Publish 的 durable-first 拒绝)或
+	// 合并 delta flush 失败 → Incomplete,且**永不复位**(粘滞)——「曾经失败」
+	// 是单调事实,后续成功发布不翻回,置位方向单调(Complete/Unknown →
+	// Incomplete 一去不返)故无条件赋值即粘滞,无需额外守卫。客户端经
+	// ReplayIntegrity()/attach 与 run/get 的 replayIntegrity 字段读出,据此
+	// 判断回放完整性(Complete 之外都不得把收到的事件当完整历史)。执行结果与
+	// 事件完整性是两个独立状态(I6):本标记只记账后者,不改变任何终态化路径。
+	replayIntegrity string
 
 	// subs 是订阅者表(键=nextSubID 自增号);fan-out 与断开都在 mu 内。
 	subs      map[uint64]*hubSub
@@ -184,22 +206,27 @@ type EventHub struct {
 	done chan struct{}
 }
 
-// NewEventHub 创建事件枢纽并播种游标:j 非 nil 时经 SeqRange 读既有保留历史
-// 的 [earliest..latest](磁盘扫描;扫描失败由 RunJournalStore.SeqRange 降级为
-// ok=false 并 warn,journal_store.go——按「从零开始」处理,真实 I/O 故障会在
-// 随后的 AppendEvent/ReadEvents 显式上抛),seq=latest+1 续接分配;j 为 nil 时
-// latest=0、seq=1(纯内存 hub 从 1 起算)。
+// NewEventHub 创建事件枢纽并播种游标与完整性三态:j 非 nil 时经 SeqRange 读
+// 既有保留历史的 [earliest..latest](磁盘扫描;扫描失败由 RunJournalStore.
+// SeqRange 降级为 ok=false 并 warn,journal_store.go——按「从零开始」处理,
+// 真实 I/O 故障会在随后的 AppendEvent/ReadEvents 显式上抛),seq=latest+1 续接
+// 分配;j 为 nil 时 latest=0、seq=1(纯内存 hub 从 1 起算)。完整性播种(I4):
+// 有既有历史(ok)→ Unknown——历史产生于旧进程纪元,其间的落盘失败无从在本
+// 进程验证,诚实报 Unknown 绝不谎报完整;空历史/纯内存 → Complete——本进程
+// 观察面即全部,此后的失败由写侧置 Incomplete。
 func NewEventHub(sessionID string, j EventJournal) *EventHub {
 	h := &EventHub{
-		sessionID: sessionID,
-		subs:      make(map[uint64]*hubSub),
-		journal:   j,
-		deltaBuf:  make(map[string]*pendingDelta),
-		done:      make(chan struct{}),
+		sessionID:       sessionID,
+		subs:            make(map[uint64]*hubSub),
+		journal:         j,
+		deltaBuf:        make(map[string]*pendingDelta),
+		replayIntegrity: ReplayIntegrityComplete,
+		done:            make(chan struct{}),
 	}
 	if j != nil {
 		if earliest, latest, ok := j.SeqRange(); ok {
 			h.earliest, h.latest = earliest, latest
+			h.replayIntegrity = ReplayIntegrityUnknown
 		}
 	}
 	h.seq = h.latest + 1
@@ -295,10 +322,10 @@ func (h *EventHub) Publish(ev IngressEvent) error {
 				Payload:   ev.Payload,
 			}
 			if err := h.journal.AppendEvent(rec); err != nil {
-				// I6lite:落盘失败置位完整性标记(永不复位)——run 的执行结果
+				// I4:落盘失败置 Incomplete(粘滞永不复位)——run 的执行结果
 				// 与事件完整性是两个独立状态,本置位不改 Publish 的失败上抛
 				// 语义(不广播、错误原样)。
-				h.eventsIncomplete = true
+				h.replayIntegrity = ReplayIntegrityIncomplete
 				return fmt.Errorf("agent: event hub: append key event %s seq %d: %w", ev.Type, seq, err)
 			}
 		}
@@ -331,15 +358,17 @@ func (h *EventHub) EarliestSeq() uint64 {
 	return h.earliest
 }
 
-// EventsComplete 报告自 hub 创建以来的事件流是否完整(I6lite,eventsIncomplete
-// 的对偶读面):从未发生 key 事件落盘失败或合并 delta flush 失败时为 true;一旦
-// 发生恒为 false(标记永不复位——失败是「曾经发生」的单调事实,后续成功发布
-// 不翻回)。daemon 侧 RunControlSource.RunStatus 与 attach 响应经它向客户端
-// 暴露回放完整性的显式信号(I6:不能让客户端把不完整事件当成完整历史)。
-func (h *EventHub) EventsComplete() bool {
+// ReplayIntegrity 返回回放完整性三态(I4,eventsIncomplete 布尔/EventsComplete
+// 的替代读面):构造期播种(有 journal 历史 → Unknown,空历史/纯内存 →
+// Complete),此后本 hub 纪元内任何 key 事件落盘失败或合并 delta flush 失败
+// 使其变为 Incomplete 且永不复位(粘滞——失败是「曾经发生」的单调事实,后续
+// 成功发布不翻回)。daemon 侧 RunControlSource.RunStatus 与 attach 响应经它
+// 向客户端暴露回放完整性的显式信号(I4:不能让客户端把不完整事件当完整历史,
+// 也不能把不可验证的跨纪元历史谎报为完整)。
+func (h *EventHub) ReplayIntegrity() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return !h.eventsIncomplete
+	return h.replayIntegrity
 }
 
 // Subscribe 注册一个事件订阅者并返回只读投递通道(P3-3,总方案第五节第 3 条
@@ -403,6 +432,17 @@ func (h *EventHub) Subscribe(ctx context.Context, fromSeq uint64) (<-chan sessio
 			// (I2lite 修复:合并记录的范围声明上 wire,客户端可区分批量与单条
 			// ——实时逐事件投递的 FromSeq 恒 0,回放的合并记录带 [FromSeq..Seq];
 			// 游标语义不变,回放方仍按 Seq=ToSeq 推进)。
+			//
+			// FromSeq 批量语义(I6 定稿,与 journal.go SessionEvent 注释同文):
+			//   - FromSeq==0 = 单条事件(实时投递与未合并的持久化记录);
+			//   - FromSeq>0 = 批量聚合事件:Seq=区间末、FromSeq=区间首,payload
+			//     为聚合结果(文本类=窗内增量拼接,对象类=窗内末条,见
+			//     aggregateDeltaPayload);
+			//   - 客户端游标以**实际收到的事件 Seq** 逐条推进,不得假设
+			//     [FromSeq..Seq] 区间内没有其他类型事件——key 事件在发布时逐条
+			//     落盘,可与合并窗的 seq 区间交错(物理序 ≠ seq 序,上方注释),
+			//     范围声明只描述本条聚合记录的覆盖范围,不是「区间内仅此一条」
+			//     的承诺;游标授权永远以逐事件 Seq 为准。
 			replay = append(replay, session.SessionEvent{
 				SessionID: rec.SessionID,
 				RunID:     rec.RunID,
@@ -633,11 +673,11 @@ func (h *EventHub) flushDeltaTypeLocked(typ string) {
 		Payload:   aggregateDeltaPayload(b.parts),
 	}
 	if err := h.journal.AppendEvent(rec); err != nil {
-		// I6lite:合并 flush 失败置位完整性标记(永不复位)——重放缺 [FromSeq..
-		// Seq] 段的事实被单调记账,EventsComplete 随之 false,客户端不再把缺段
-		// 回放当完整历史。warn 降级语义不变(assistant.message_finalized 兜底
-		// 定稿,执行不受阻)。
-		h.eventsIncomplete = true
+		// I4:合并 flush 失败置 Incomplete(粘滞永不复位)——重放缺 [FromSeq..
+		// Seq] 段的事实被单调记账,ReplayIntegrity 随之 Incomplete,客户端不再
+		// 把缺段回放当完整历史。warn 降级语义不变(assistant.message_finalized
+		// 兜底定稿,执行不受阻)。
+		h.replayIntegrity = ReplayIntegrityIncomplete
 		slog.Warn("agent: event hub delta flush failed (replay may miss delta range)",
 			"err", err, "session", h.sessionID, "run", b.runID, "type", typ,
 			"from_seq", b.fromSeq, "to_seq", b.toSeq)

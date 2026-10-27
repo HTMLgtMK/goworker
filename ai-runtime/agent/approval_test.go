@@ -91,6 +91,45 @@ func TestApprovalWaitResolves(t *testing.T) {
 	}
 }
 
+// TestApprovalOwner(C1 修复的 SDK 侧钉子):Owner 返回服务端记录的归属会话
+// ——在途条目可查;已 resolved 的滞留条目(宽限窗内)归属仍可查(daemon 的
+// 归属校验在「首个有效决策获胜」窗口内都要对得上归属会话);未知 requestID →
+// ok=false。
+func TestApprovalOwner(t *testing.T) {
+	m := NewApprovalManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 在途条目:归属 = Wait 的 sessionID。
+	got := make(chan hitl.Decision, 1)
+	go func() {
+		got <- m.Wait(ctx, "sess-a", "run-1", approvalReq("req-owner", time.Now().Add(30*time.Second)))
+	}()
+	waitPending(t, m, "sess-a", 1)
+	if owner, ok := m.Owner("req-owner"); !ok || owner != "sess-a" {
+		t.Fatalf("Owner(pending) = (%q, %v), want (sess-a, true)", owner, ok)
+	}
+	if _, ok := m.Owner("req-missing"); ok {
+		t.Fatal("Owner(unknown requestID) must report not found")
+	}
+
+	// resolved 滞留条目:归属仍可查(Resolve 后,宽限窗内)。
+	if err := m.Resolve("req-owner", hitl.Decision{Type: hitl.DecisionApprove}); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if owner, ok := m.Owner("req-owner"); !ok || owner != "sess-a" {
+		t.Fatalf("Owner(resolved entry) = (%q, %v), want (sess-a, true) (resolved 后归属仍可查)", owner, ok)
+	}
+	select {
+	case d := <-got:
+		if d.Type != hitl.DecisionApprove {
+			t.Fatalf("Wait decision = %+v, want approve", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not return after Resolve")
+	}
+}
+
 // TestApprovalWaitTimeoutRejects:ExpiresAt 已过期 / 短窗超时 → reject
 // (超时默认拒绝,不隐式通过)。
 func TestApprovalWaitTimeoutRejects(t *testing.T) {
