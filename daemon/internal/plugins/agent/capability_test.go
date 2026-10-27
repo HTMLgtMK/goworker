@@ -147,9 +147,13 @@ func waitRunState(t *testing.T, h runtimeagent.RunHandle, want runtimeagent.RunS
 }
 
 // waitToolResultCollect 返回 EmitToken 回调与断连通知通道:首个本工具 tool_call
-// token 到达时执行 disconnect 并关闭 done——ai-core 对 tool_call token 的发送
-// 阻塞在消费面,断连严格先于工具 Execute,无竞态窗口;tool_result 文本收集进
-// toolResults。形态对齐 SDK 侧 waitToolCallUnbound。
+// token 到达时执行 disconnect 并关闭 done;tool_result 文本收集进 toolResults。
+// 形态对齐 SDK 侧 waitToolCallUnbound。时序警示:ai-core 的 tool_call token 发送
+// 是执行 goroutine 到 streamTokens 消费 goroutine 的通道交接,交接完成即返回——
+// disconnect 的实际执行时刻相对工具 Execute 无保证(满载下消费面可晚于 Invoke
+// 被调度)。因此**需要严格先于 Execute 的编排(如断连)不得放进本钩子**,先验
+// 完成;钩子只承载无时序要求的通知/收集面(见
+// TestDeviceToolBindingRebindAfterDisconnect 的竞态修正注)。
 func waitToolResultCollect(disconnect func(), toolResults *[]string) (cb runtimeagent.RunCallbacks, done chan struct{}) {
 	done = make(chan struct{})
 	fired := false // 仅执行 goroutine 读写(EmitToken 单调用面)
@@ -234,11 +238,21 @@ func TestDeviceToolSourceProbeFailureCollapses(t *testing.T) {
 }
 
 // TestDeviceToolBindingRebindAfterDisconnect(P5 显式可见变化 #1 的 daemon 集成
-// 证明):绑定 conn-A → run 执行设备工具 → 断连(UnbindCapabilities + dead
-// executor 陷阱)→ run 迁移 RunWaitingCapability → 新连接 conn-B 显式重绑(经
-// binder 的 ClientToolSource 探测+Bind)→ 工具在 conn-B 执行完成 → RunCompleted。
-// dead executor 的 x-device/call 计数==0:等待重绑绝不把请求静默路由到已断开
-// (或任何未显式重绑)的连接。
+// 证明):绑定 conn-A → 断连(UnbindCapabilities + dead executor 陷阱,先于
+// StartRun 的确定性编排)→ run 执行设备工具时 lookup 必然 miss → run 迁移
+// RunWaitingCapability → 新连接 conn-B 显式重绑(经 binder 的 ClientToolSource
+// 探测+Bind)→ 工具在 conn-B 执行完成 → RunCompleted。dead executor 的
+// x-device/call 计数==0:等待重绑绝不把请求静默路由到已断开(或任何未显式
+// 重绑)的连接。
+//
+// 为什么断连先于 StartRun(而非 tool_call token 消费钩子):token 发送是 ai-core
+// 执行 goroutine 到 streamTokens 消费 goroutine 的通道交接(agent.go emitToken),
+// 交接完成执行面即继续跑中间件与 Execute,消费面何时被调度无保证——满载
+// -race 全量组合下 Invoke 可先命中绑定成功返回,run 直接 completed,
+// callCount==0 断言闪失败(goworker_no_agent 全量组合实测复现)。「在途 Invoke
+// 失败→即时 Invalidate→等待」路径由 SDK 侧单测钉死
+// (TestCapabilityInvokeFailureClassification「plain error invalidates and
+// waits」),本测试聚焦断连→等待→重绑→新连接执行的 daemon 集成面。
 func TestDeviceToolBindingRebindAfterDisconnect(t *testing.T) {
 	p := newDeviceToolPlugin(t, 0, &scriptedToolProvider{msgs: []core.Message{
 		deviceToolCallRound("call-dev-1"),
@@ -250,13 +264,13 @@ func TestDeviceToolBindingRebindAfterDisconnect(t *testing.T) {
 	srcA := p.ClientToolSource("conn-A", callerA)
 	tools := srcA(context.Background()) // 绑定 conn-A
 
-	// 断连编排:tool_call token 处先置 dead executor 陷阱(若被静默路由,Invoke
-	// 必失败留下计数证据)再 Unbind——handler.Close 的断连收口等价物。
+	// 断连编排:死执行器陷阱(若被静默路由,Invoke 必失败留下计数证据)+
+	// Unbind——handler.Close 的断连收口等价物,先于 StartRun(见上注)。
+	callerA.failCalls(errors.New("connection dead"))
+	p.UnbindCapabilities("conn-A")
+
 	var toolResults []string
-	cb, disconnected := waitToolResultCollect(func() {
-		callerA.failCalls(errors.New("connection dead"))
-		p.UnbindCapabilities("conn-A")
-	}, &toolResults)
+	cb, _ := waitToolResultCollect(func() {}, &toolResults) // 只收集 tool_result
 
 	h, err := p.manager.StartRun(sid, runtimeagent.RunRequest{
 		Input:      "vibrate the device",
@@ -266,11 +280,6 @@ func TestDeviceToolBindingRebindAfterDisconnect(t *testing.T) {
 		t.Fatalf("StartRun: %v", err)
 	}
 
-	select {
-	case <-disconnected:
-	case <-time.After(5 * time.Second):
-		t.Fatal("tool call never reached the disconnect hook")
-	}
 	waitRunState(t, h, runtimeagent.RunWaitingCapability) // 断连 → waiting_capability
 
 	// 重绑:新连接 conn-B 声明同一工具(binder 探测 + Bind,就绪通知唤醒等待者)。

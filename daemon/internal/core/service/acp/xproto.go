@@ -58,10 +58,14 @@ type XRunGetParams struct {
 // (总方案 §7)。result 字段对齐总方案 wire 形状(run 终态结果文本);P5-6
 // 的 RunStatus 不产生 result,本步恒省略(omitempty),run 结果面在后续
 // step 接通 RunResult 时补齐——诚实收缩,不发明第二事实源。
+// eventsComplete(I6lite)恒显式携带(true/false 都在,无 omitempty——false 是
+// 告警态,若缺席客户端将无从区分「完整」与「未知」):false = 本进程纪元内
+// 发生过事件落盘失败,回放可能缺段,不得当完整历史消费。
 type XRunGetResult struct {
-	State     string `json:"state"`
-	Result    string `json:"result,omitempty"`
-	LatestSeq uint64 `json:"latestSeq"`
+	State          string `json:"state"`
+	Result         string `json:"result,omitempty"`
+	LatestSeq      uint64 `json:"latestSeq"`
+	EventsComplete bool   `json:"eventsComplete"`
 }
 
 // XRunCancelParams 是 x-goworker/run/cancel 的入参。
@@ -136,12 +140,16 @@ type XSessionAttachRun struct {
 // attach 时刻会话事件流的位置快照,**仅描述当前位置,客户端不得跳游标**——
 // 只有真正应用了对应事件才能推进本地 cursor(总方案 §7 :586-589);订阅注册
 // 水位可能高于本值(attach 与 Subscribe 之间发布的事件由 live 侧续传),客户端
-// 按逐事件 seq 记账,不据此批量前移。tookOver 仅 mode=control 且接管了他连接
+// 按逐事件 seq 记账,不据此批量前移。eventsComplete(I6lite)恒显式携带:
+// attach 时刻事件流的完整性快照——false = 本进程纪元内发生过事件落盘失败
+// (key 事件 durable-first 拒绝/合并 delta flush 失败,标记永不复位),回放
+// 可能缺段,客户端据此判断回放完整性。tookOver 仅 mode=control 且接管了他连接
 // 的 lease 时为 true(其余省略)。
 type XSessionAttachResult struct {
-	CurrentRun *XSessionAttachRun `json:"currentRun"`
-	LatestSeq  uint64             `json:"latestSeq"`
-	TookOver   bool               `json:"tookOver,omitempty"`
+	CurrentRun     *XSessionAttachRun `json:"currentRun"`
+	LatestSeq      uint64             `json:"latestSeq"`
+	EventsComplete bool               `json:"eventsComplete"`
+	TookOver       bool               `json:"tookOver,omitempty"`
 }
 
 // XSessionDetachParams 是 x-goworker/session/detach 的入参。mode 与 attach 同

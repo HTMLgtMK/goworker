@@ -31,6 +31,16 @@ var (
 	ErrRunNotCancellable = errors.New("session: run not cancellable")
 )
 
+// ErrRunJournalWrite 是 StartRun 的 queued 登记持久化失败 sentinel(I1 修复,
+// GPT 评审):run/start 的契约是「Run 被接受**并持久化登记**后返回」(总方案
+// 第七节)——queued 记录写不进 journal(磁盘满/journal I/O 故障)时,已接受的
+// run 在重启后无处可寻,属「已接受但无法追踪」,必须拒绝启动而非降级继续。
+// StartRun 以 %w 链同时包裹本 sentinel 与底层 journal 错误(errors.Is 双向可判);
+// 失败的 run 不产生 RunHandle、不占任何记账(journal 无记录即无痕)。运行中的
+// 非关键遥测与终态记录仍走 journalRunState 的 warn 降级——严格化只针对「接受
+// 登记」这一个写点(其余记录的缺口由恢复扫描显式标记 interrupted)。
+var ErrRunJournalWrite = errors.New("session: queued run journal write failed (run rejected, not started)")
+
 // 全局并发默认配额(总方案第四节建议值):WithRunLimits 对 <=0 回落此处,
 // P2-7 接 SessionConfig 时 0 值配置由此双保险。
 const (

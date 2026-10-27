@@ -39,14 +39,17 @@ import (
 // decodeCaps。栈构造(newXGWLiveStack)与 helper 形态对齐 newXGWStack,因
 // 会话源类型不同(xgwLiveControl ≠ *fakeRunControl)单独成列。
 //
-// 事件面的诚实边界(信息项,plan P5-10 测试①与已提交代码的偏差):daemon 的
-// run/start(P5-6)以 RunCallbacks{} 全 nil 提交后台 Run——tee 只包装非 nil
-// 入口(supervisor.go teeRunCallbacks),streamTokens 对 nil EmitToken 不转发
-// (session.go:260),故真实后台 Run 的事件流只含 run.* 生命周期与审批事件对,
-// 不含 tool_call/text.delta/assistant.message_finalized(plan P5-10 测试①的
-// 事件清单早于 P5-6 的落地形态)。这三类 token 派生事件的线上形状由
-// TestXGWIntegrationTokenEventWireShapes 经同一 hub.Publish 路径
-// (teePublish 的生产发布面)钉住;生命周期事件由本文件的真 run 集成钉住。
+// 事件面(C2 修复后的真实链路覆盖,原「诚实适配」信息项已消解):supervisor 的
+// tee 在 hub 非 nil 时主动供给 EmitToken/Publish 的事件采集(ai-runtime/agent/
+// supervisor.go teeRunCallbacks,C2 修复)——daemon 的 run/start 虽仍以
+// RunCallbacks{} 全 nil 提交后台 Run(runcontrol.go 注释对齐),真实 token 派生
+// 事件(text.delta/assistant.message_finalized)与 usage 类事件照常进事件流。
+// 真实后台 run 全链由 TestXGWIntegrationBackgroundRunEventsAndIdempotency 与
+// TestXGWIntegrationTokenEventWireShapesRealChain(追加的真实链路变体,含
+// tool_call)经 attach 订阅逐条钉住;TestXGWIntegrationTokenEventWireShapes 保留
+// 为 hub.Publish(teePublish 的生产发布面)直发的信封形状对偶面。tool_call 的
+// SDK 侧 journal 回归在 ai-runtime/agent 的 TestStartRunJournalsRealTokens
+// (真 journal 全链)。
 
 // xgwDeviceToolName 是 ④ 的 fake 设备工具注册名(sys_ 前缀 + 客户端原名)。
 const xgwDeviceToolName = "sys_vibrate"
@@ -99,7 +102,7 @@ type xgwLiveControl struct {
 	sid string // runtime id(manager 注册键 = StartRun/EnsureHub 的会话键)
 
 	leaseMu sync.Mutex
-	lease   string
+	leases  map[string]string // sessionID → connectionID(I3 per-session 租约)
 
 	reqMu     sync.Mutex
 	runByReq  map[string]runtimeagent.RunHandle
@@ -133,7 +136,7 @@ func newXGWLiveControl(t *testing.T, id string, pv core.Provider, collect func(*
 	if err := m.Register(rt); err != nil {
 		t.Fatalf("register runtime: %v", err)
 	}
-	return &xgwLiveControl{fakeSessionSource: &fakeSessionSource{}, m: m, sid: id}
+	return &xgwLiveControl{fakeSessionSource: &fakeSessionSource{}, m: m, sid: id, leases: map[string]string{}}
 }
 
 // SetSession 覆写:handler 的 session/new 经 SetSession 声明会话(fake 只记
@@ -191,21 +194,24 @@ func (f *xgwLiveControl) CancelRun(sessionID, runID string) error {
 }
 
 // RunStatus mirror runcontrol.go 纯内存两分支:rt.Active() 命中 → 实时快照;
-// 幂等表按 runID 反查 → 终态保留快照。latestSeq 取 hub(会话维度游标)。
-func (f *xgwLiveControl) RunStatus(sessionID, runID string) (string, uint64, error) {
+// 幂等表按 runID 反查 → 终态保留快照。latestSeq 取 hub(会话维度游标);
+// eventsComplete(I6lite)取 hub.EventsComplete(),hub 未建 → true(无失败证据)。
+func (f *xgwLiveControl) RunStatus(sessionID, runID string) (string, uint64, bool, error) {
 	if err := f.requireCurrent(sessionID); err != nil {
-		return "", 0, err
+		return "", 0, true, err
 	}
 	rt := f.m.Get(f.sid)
 	if rt == nil {
-		return "", 0, errors.New("xgwLiveControl: no active runtime")
+		return "", 0, true, errors.New("xgwLiveControl: no active runtime")
 	}
 	latest := uint64(0)
+	eventsComplete := true
 	if hub := rt.Hub(); hub != nil {
 		latest = hub.LatestSeq()
+		eventsComplete = hub.EventsComplete()
 	}
 	if run := rt.Active(); run != nil && run.ID == runID {
-		return string(run.State()), latest, nil
+		return string(run.State()), latest, eventsComplete, nil
 	}
 	f.reqMu.Lock()
 	var h runtimeagent.RunHandle
@@ -218,9 +224,9 @@ func (f *xgwLiveControl) RunStatus(sessionID, runID string) (string, uint64, err
 	}
 	f.reqMu.Unlock()
 	if tracked {
-		return string(h.State()), latest, nil
+		return string(h.State()), latest, eventsComplete, nil
 	}
-	return "", 0, fmt.Errorf("xgwLiveControl: run %q: %w", runID, runtimeagent.ErrRunNotFound)
+	return "", 0, eventsComplete, fmt.Errorf("xgwLiveControl: run %q: %w", runID, runtimeagent.ErrRunNotFound)
 }
 
 // PendingApprovals mirror runcontrol.go:manager 审批快照 → model 扁平结构。
@@ -281,32 +287,42 @@ func (f *xgwLiveControl) ActiveRun(sessionID string) (string, string, bool) {
 	return "", "", false
 }
 
-func (f *xgwLiveControl) AcquireControl(connectionID string) bool {
+func (f *xgwLiveControl) AcquireControl(sessionID, connectionID string) bool {
 	if connectionID == "" {
 		return false
 	}
 	f.leaseMu.Lock()
 	defer f.leaseMu.Unlock()
-	if f.lease == connectionID {
+	if f.leases[sessionID] == connectionID {
 		return false
 	}
-	tookOver := f.lease != ""
-	f.lease = connectionID
+	tookOver := f.leases[sessionID] != ""
+	f.leases[sessionID] = connectionID
 	return tookOver
 }
 
-func (f *xgwLiveControl) ReleaseControl(connectionID string) {
+func (f *xgwLiveControl) ReleaseControl(sessionID, connectionID string) {
 	f.leaseMu.Lock()
 	defer f.leaseMu.Unlock()
-	if f.lease == connectionID {
-		f.lease = ""
+	if f.leases[sessionID] == connectionID {
+		delete(f.leases, sessionID)
 	}
 }
 
-func (f *xgwLiveControl) HoldControl(connectionID string) bool {
+func (f *xgwLiveControl) HoldControl(sessionID, connectionID string) bool {
 	f.leaseMu.Lock()
 	defer f.leaseMu.Unlock()
-	return f.lease == connectionID
+	return f.leases[sessionID] == connectionID
+}
+
+func (f *xgwLiveControl) ReleaseConnection(connectionID string) {
+	f.leaseMu.Lock()
+	defer f.leaseMu.Unlock()
+	for sessionID, holder := range f.leases {
+		if holder == connectionID {
+			delete(f.leases, sessionID)
+		}
+	}
 }
 
 func (f *xgwLiveControl) UnbindCapabilities(connectionID string) {
@@ -514,7 +530,7 @@ func TestXGWIntegrationBackgroundRunEventsAndIdempotency(t *testing.T) {
 	if fields["latestSeq"] != float64(0) {
 		t.Fatalf("attach latestSeq = %v, want 0 (no events yet)", fields["latestSeq"])
 	}
-	if !l.src.HoldControl(l.handler.connectionID) {
+	if !l.src.HoldControl(sid, l.handler.connectionID) {
 		t.Fatal("attach(mode=control) did not acquire the lease")
 	}
 
@@ -537,24 +553,34 @@ func TestXGWIntegrationBackgroundRunEventsAndIdempotency(t *testing.T) {
 		t.Fatalf("run/start result %s missing runId", raw)
 	}
 
-	// 逐条收 session/events:真实后台 run 的事件流 = run.started → run.finished
-	// (P5-6 以全 nil 回调提交,token 派生事件不经后台路径——见文件头信息项;
-	// token 型事件的线上形状由 TestXGWIntegrationTokenEventWireShapes 钉住)。
-	waitFor(t, "run lifecycle events", func() bool { return log.count() >= 2 })
+	// 逐条收 session/events:真实后台 run 的事件流(C2 修复后 tee 自供给采集,
+	// 见文件头)= run.started 打头 → usage.progress(iteration/usage 中间件经
+	// cb.Publish 的映射)→ text.delta(非流式整段文本)→
+	// assistant.message_finalized(kernel 收尾 Done)→ run.finished 收尾。
+	// 以「末位是 run.finished」为收齐锚点(流长度不再恒为 2)。
+	waitFor(t, "run finished event", func() bool {
+		events, _, bad := log.snapshot()
+		return len(bad) == 0 && len(events) > 0 && events[len(events)-1].Type == session_event_run_finished
+	})
 	events, raws, bad := log.snapshot()
 	if len(bad) > 0 {
 		t.Fatalf("notification decode failures: %v", bad)
 	}
-	if len(events) != 2 {
-		t.Fatalf("received %d events, want exactly 2", len(events))
+	if len(events) < 4 {
+		t.Fatalf("received %d events, want >= 4 (生命周期边界 + usage/token 派生,C2 修复的 token 面)", len(events))
 	}
-	wantTypes := []string{session_event_run_started, session_event_run_finished}
+	if events[0].Type != session_event_run_started {
+		t.Fatalf("first event = %q, want run.started", events[0].Type)
+	}
+	if last := events[len(events)-1]; last.Type != session_event_run_finished {
+		t.Fatalf("last event = %q, want run.finished", last.Type)
+	}
+	// 全流逐条:Seq 从 1 连续、RunID/SessionID 同源;usage.progress 至少一条,
+	// text.delta 先于 assistant.message_finalized 且都夹在生命周期边界内。
+	idxText, idxFinal, usageCount := -1, -1, 0
 	for i, ev := range events {
 		if ev.Seq != uint64(i+1) {
 			t.Fatalf("event[%d] seq = %d, want %d (会话游标从 1 起连续)", i, ev.Seq, i+1)
-		}
-		if ev.Type != wantTypes[i] {
-			t.Fatalf("event[%d] type = %q, want %q", i, ev.Type, wantTypes[i])
 		}
 		if ev.RunID != runID {
 			t.Fatalf("event[%d] run_id = %q, want %q", i, ev.RunID, runID)
@@ -562,6 +588,20 @@ func TestXGWIntegrationBackgroundRunEventsAndIdempotency(t *testing.T) {
 		if ev.SessionID != "xgw-proto-run" {
 			t.Fatalf("event[%d] session_id = %q, want runtime id (hub 以 rt.ID 为会话键)", i, ev.SessionID)
 		}
+		switch ev.Type {
+		case session.EventUsageProgress:
+			usageCount++
+		case session_event_text_delta:
+			idxText = i
+		case session_event_message_finalized:
+			idxFinal = i
+		}
+	}
+	if usageCount == 0 {
+		t.Fatal("no usage.progress events (中间件 usage/iteration 未进后台事件流,C2)")
+	}
+	if idxText <= 0 || idxFinal <= idxText || idxFinal >= len(events)-1 {
+		t.Fatalf("text.delta@%d message_finalized@%d (len=%d), want run.started < text.delta < message_finalized < run.finished (C2 修复的 token 面)", idxText, idxFinal, len(events))
 	}
 	if !strings.Contains(raws[0], `"session_id"`) {
 		t.Fatalf("notification params = %s, want SessionEvent as-is JSON (蛇形 session_id 键)", raws[0])
@@ -576,8 +616,8 @@ func TestXGWIntegrationBackgroundRunEventsAndIdempotency(t *testing.T) {
 	if err := json.Unmarshal(raw, &status); err != nil {
 		t.Fatalf("decode run/get result %s: %v", raw, err)
 	}
-	if status["state"] != "completed" || status["latestSeq"] != float64(2) {
-		t.Fatalf("run/get result = %s, want {state:completed,latestSeq:2}", raw)
+	if status["state"] != "completed" || status["latestSeq"] != float64(len(events)) {
+		t.Fatalf("run/get result = %s, want {state:completed,latestSeq:%d}", raw, len(events))
 	}
 
 	// ③ requestId 幂等(真实 manager 面):run 完成后同 requestId 重试 → 原
@@ -611,28 +651,37 @@ func TestXGWIntegrationBackgroundRunEventsAndIdempotency(t *testing.T) {
 		t.Fatalf("future cursor message = %q, want ErrCursorExpired text", rpcErr.Message)
 	}
 
-	// ③ afterSeq 断点续传:以 seq=1(run.started)为已确认游标重新 attach →
-	// 恰好补齐 (1, latest] = [run.finished] 一条,无缺无重。
+	// ③ afterSeq 断点续传:以 assistant.message_finalized(key 事件,不进合并
+	// 缓冲)的 seq 为已确认游标重新 attach → 恰好补齐 (cursor, latest] =
+	// [run.finished] 一条,无缺无重。不以 seq=1 续传:回放侧的合并 delta 记录
+	// 按「一条记录一条 ToSeq 事件」塌缩交付(P3-1 契约;I2lite 起 FromSeq 随
+	// 记录上 wire 作范围声明,交付粒度仍是每记录一条 ToSeq 事件),(1, latest]
+	// 内的 usage.progress 合并段不逐条重放——断点续传的客户端契约是「游标后
+	// 事件不缺终段」,对 delta 合并段以 ToSeq 为准。
 	before := log.count()
-	fields, err = l.liveAttachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 1})
+	resumeFrom := uint64(events[idxFinal].Seq)
+	resumeWant := len(events) - int(resumeFrom) // = 1(run.finished)
+	fields, err = l.liveAttachRaw(t, map[string]any{"sessionId": sid, "afterSeq": resumeFrom})
 	if err != nil {
 		t.Fatalf("resume attach: %v", err)
 	}
-	if fields["latestSeq"] != float64(2) {
-		t.Fatalf("resume attach latestSeq = %v, want 2", fields["latestSeq"])
+	if fields["latestSeq"] != float64(len(events)) {
+		t.Fatalf("resume attach latestSeq = %v, want %d", fields["latestSeq"], len(events))
 	}
-	waitFor(t, "resumed event", func() bool { return log.count() >= before+1 })
-	time.Sleep(100 * time.Millisecond) // 宽限:断言「恰好一条」前排除在途尾包
+	waitFor(t, "resumed events", func() bool { return log.count() >= before+resumeWant })
+	time.Sleep(100 * time.Millisecond) // 宽限:断言「恰好补齐」前排除在途尾包
 	events, _, bad = log.snapshot()
 	if len(bad) > 0 {
 		t.Fatalf("notification decode failures: %v", bad)
 	}
-	if got := len(events) - before; got != 1 {
-		t.Fatalf("resume delivered %d new events, want exactly 1 (断点续传无缺无重)", got)
+	if got := len(events) - before; got != resumeWant {
+		t.Fatalf("resume delivered %d new events, want exactly %d (断点续传无缺无重)", got, resumeWant)
 	}
-	resumed := events[before]
-	if resumed.Seq != 2 || resumed.Type != session_event_run_finished {
-		t.Fatalf("resumed event = {seq:%d type:%s}, want {seq:2 type:run.finished}", resumed.Seq, resumed.Type)
+	// 续传段逐条对齐首轮流的后缀(seq 与类型;快照前缀即首轮事件,下标对齐)。
+	for i, ev := range events[before:] {
+		if ev.Seq != uint64(int(resumeFrom)+1+i) || ev.Type != events[int(resumeFrom)+i].Type {
+			t.Fatalf("resumed event[%d] = {seq:%d type:%s}, want first-pass {seq:%d type:%s}", i, ev.Seq, ev.Type, int(resumeFrom)+1+i, events[int(resumeFrom)+i].Type)
+		}
 	}
 }
 
@@ -715,6 +764,12 @@ func TestXGWIntegrationApprovalAfterReconnect(t *testing.T) {
 	if !ok || cur["runId"] != runID || cur["state"] != "waiting_input" {
 		t.Fatalf("attach B currentRun = %v, want {runId:%s,state:waiting_input}", fields["currentRun"], runID)
 	}
+	// B 的 attach 游标(回放/实时边界):实时段逐条对齐的比较锚点,见文末。
+	bLatestF, ok := fields["latestSeq"].(float64)
+	if !ok {
+		t.Fatalf("attach B latestSeq missing: %v", fields)
+	}
+	bAttachLatest := uint64(bLatestF)
 
 	// 接管后原 holder 的 approval/respond 被拒(-32000,lease 在 daemon 侧
 	// 强制,不依赖前端 UI 自律),且不触达审批管理面。
@@ -811,21 +866,48 @@ func TestXGWIntegrationApprovalAfterReconnect(t *testing.T) {
 		t.Fatalf("permission events: requested@%d resolved@%d, want 成对且 requested 在先", requestedAt, resolvedAt)
 	}
 
-	// 双连接同流:B 的订阅(attach afterSeq=0,接管时回放 1..3 + live 续传)
-	// 也收齐同一事件流(多观察者并存;观察/控制分离)。
-	waitFor(t, "B receives the same stream", func() bool { return logB.count() >= len(eventsA) })
+	// 双连接同流:B 的订阅(attach afterSeq=0:回放历史 + live 续传)与 A 并存
+	// (多观察者;观察/控制分离)。回放侧的合并 delta 记录按「一条记录一条
+	// ToSeq 事件」塌缩交付(P3-1 契约;I2lite 起 FromSeq 随记录上 wire 作范围
+	// 声明,交付粒度不变),逐条全等只对 attach 点之后的实时段成立:B 的
+	// Seq>bAttachLatest 段与 A 的同段逐条对齐,且两流末位 seq/类型一致(同一
+	// 会话游标)、B 全流 seq 严格递增。
+	waitFor(t, "B receives the same stream", func() bool {
+		eventsB, _, badB := logB.snapshot()
+		return len(badB) == 0 && len(eventsB) > 0 && eventsB[len(eventsB)-1].Seq == lastSeq
+	})
 	eventsB, _, badB := logB.snapshot()
 	if len(badB) > 0 {
 		t.Fatalf("B notification decode failures: %v", badB)
 	}
-	if len(eventsB) != len(eventsA) {
-		t.Fatalf("B received %d events, want %d (同一会话游标)\nA=%s\nB=%s",
-			len(eventsB), len(eventsA), seqDump(eventsA), seqDump(eventsB))
+	if last := eventsB[len(eventsB)-1]; last.Seq != lastSeq || last.Type != session_event_run_finished {
+		t.Fatalf("B last event = {seq:%d type:%s}, want {seq:%d type:%s} (同一会话游标)\nB=%s",
+			last.Seq, last.Type, lastSeq, session_event_run_finished, seqDump(eventsB))
 	}
-	for i, ev := range eventsB {
-		if ev.Seq != eventsA[i].Seq || ev.Type != eventsA[i].Type {
-			t.Fatalf("B event[%d] = {seq:%d type:%s}, want A's {seq:%d type:%s}\nA=%s\nB=%s",
-				i, ev.Seq, ev.Type, eventsA[i].Seq, eventsA[i].Type, seqDump(eventsA), seqDump(eventsB))
+	for i := 1; i < len(eventsB); i++ {
+		if eventsB[i].Seq <= eventsB[i-1].Seq {
+			t.Fatalf("B stream seq not strictly increasing at #%d\nB=%s", i, seqDump(eventsB))
+		}
+	}
+	var tailA, tailB []session.SessionEvent
+	for _, ev := range eventsA {
+		if ev.Seq > bAttachLatest {
+			tailA = append(tailA, ev)
+		}
+	}
+	for _, ev := range eventsB {
+		if ev.Seq > bAttachLatest {
+			tailB = append(tailB, ev)
+		}
+	}
+	if len(tailB) != len(tailA) {
+		t.Fatalf("B live tail = %d events, want %d (attach 点后两连接同流)\nA=%s\nB=%s",
+			len(tailB), len(tailA), seqDump(eventsA), seqDump(eventsB))
+	}
+	for i := range tailA {
+		if tailB[i].Seq != tailA[i].Seq || tailB[i].Type != tailA[i].Type {
+			t.Fatalf("B tail[%d] = {seq:%d type:%s}, want A's {seq:%d type:%s}\nA=%s\nB=%s",
+				i, tailB[i].Seq, tailB[i].Type, tailA[i].Seq, tailA[i].Type, seqDump(eventsA), seqDump(eventsB))
 		}
 	}
 }
@@ -862,7 +944,7 @@ func TestXGWIntegrationTokenEventWireShapes(t *testing.T) {
 	if _, err := stack.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0}); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	stack.runs.AcquireControl(stack.handler.connectionID)
+	stack.runs.AcquireControl(sid, stack.handler.connectionID)
 	if _, err := stack.callRaw(t, XMethodRunStart, map[string]any{
 		"sessionId": sid, "input": "x", "requestId": "wire-shape-1",
 	}); err != nil {
@@ -899,9 +981,110 @@ func TestXGWIntegrationTokenEventWireShapes(t *testing.T) {
 // 事件类型常量(token 形状测试使用)。
 const (
 	session_event_tool_call         = "tool_call"
+	session_event_tool_result       = "tool_result"
 	session_event_text_delta        = "text.delta"
 	session_event_message_finalized = "assistant.message_finalized"
 )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ①(补二,C2 修复回归):token 派生事件的真实后台生产链 —— run/start 以全 nil
+// 回调提交的后台 run 经 tee 自供给的采集回调(supervisor.go teeRunCallbacks)产
+// 出 tool_call / tool_result / text.delta / assistant.message_finalized,attach
+// 订阅逐条到达。与 TestXGWIntegrationTokenEventWireShapes(hub.Publish 直发)
+// 互为对偶:生产者是真实 manager → Session → ai-core kernel → tee → hub 链,
+// 线上信封(蛇形键 + seq 连续)同一契约。
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestXGWIntegrationTokenEventWireShapesRealChain(t *testing.T) {
+	// 未注册工具探针(与 SDK TestStartRunEmitsJournalEvents 同型):kernel 照常
+	// 产出 tool_call/tool_result token("unknown tool" 结果),无 HITL 参与;
+	// 非流式路径整段文本 → text.delta,kernel 收尾 Done → message_finalized。
+	pv := &xgwScriptedProvider{msgs: []core.Message{
+		{Role: "assistant", ToolCalls: []core.ToolCall{{
+			ID:       "call-wire-1",
+			Type:     "function",
+			Function: core.ToolCallFunction{Name: "missing_tool", Arguments: `{"x":"1"}`},
+		}}},
+		{Role: "assistant", Content: "real chain final"},
+	}}
+	src := newXGWLiveControl(t, "xgw-proto-wire", pv, nil)
+	l := newXGWLiveStack(t, nil, src)
+	l.liveInitialize(t)
+	sid := l.liveNewSession(t)
+	log := &xgwEventLog{}
+	l.client.HandleNotification(XMethodSessionEvents, log.handle)
+	t.Cleanup(l.handler.Close)
+
+	// 先建立订阅(attach control:run/start 持照),后 run/start:live 侧逐条到达。
+	if _, err := l.liveAttachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	raw, err := l.liveCallRaw(t, XMethodRunStart, map[string]any{
+		"sessionId": sid, "input": "x", "requestId": "wire-shape-real-1",
+	})
+	if err != nil {
+		t.Fatalf("run/start: %v", err)
+	}
+	var start map[string]any
+	if err := json.Unmarshal(raw, &start); err != nil {
+		t.Fatalf("decode run/start result %s: %v", raw, err)
+	}
+	runID, _ := start["runId"].(string)
+	if runID == "" {
+		t.Fatalf("run/start result %s missing runId", raw)
+	}
+
+	// 以「末位是 run.finished」为收齐锚点(该 run 的最后一条事件)。
+	waitFor(t, "real-chain run finished", func() bool {
+		events, _, bad := log.snapshot()
+		return len(bad) == 0 && len(events) > 0 && events[len(events)-1].Type == session_event_run_finished
+	})
+	events, raws, bad := log.snapshot()
+	if len(bad) > 0 {
+		t.Fatalf("notification decode failures: %v", bad)
+	}
+	if len(events) < 4 {
+		t.Fatalf("received %d events, want >= 4 (token 派生事件未进真实后台流,C2)\n%s", len(events), seqDump(events))
+	}
+
+	// 四类 token 派生事件全部在流中,且次序正确:tool_call < tool_result <
+	// text.delta < assistant.message_finalized < run.finished(流末位);每条
+	// RunID 同源、信封蛇形键。
+	idx := map[string]int{}
+	for i, ev := range events {
+		if ev.RunID != runID {
+			t.Fatalf("event[%d] run_id = %q, want %q", i, ev.RunID, runID)
+		}
+		if !strings.Contains(raws[i], `"session_id"`) || !strings.Contains(raws[i], `"run_id"`) {
+			t.Fatalf("notification params = %s, want SessionEvent as-is JSON(蛇形键信封)", raws[i])
+		}
+		if _, dup := idx[ev.Type]; !dup {
+			idx[ev.Type] = i
+		}
+	}
+	for _, typ := range []string{session_event_tool_call, session_event_tool_result, session_event_text_delta, session_event_message_finalized} {
+		if _, ok := idx[typ]; !ok {
+			t.Fatalf("real-chain stream missing %s —— token 派生事件未进后台流,C2\n%s", typ, seqDump(events))
+		}
+	}
+	if !(idx[session_event_tool_call] < idx[session_event_tool_result] &&
+		idx[session_event_tool_result] < idx[session_event_text_delta] &&
+		idx[session_event_text_delta] < idx[session_event_message_finalized] &&
+		idx[session_event_message_finalized] < len(events)-1) {
+		t.Fatalf("token event order wrong: tool_call@%d tool_result@%d text.delta@%d message_finalized@%d (len=%d)\n%s",
+			idx[session_event_tool_call], idx[session_event_tool_result], idx[session_event_text_delta], idx[session_event_message_finalized], len(events), seqDump(events))
+	}
+
+	// tool_call 载荷携带结构化关联(整个 core.Token 的 JSON,含工具名)。
+	for _, ev := range events {
+		if ev.Type == session_event_tool_call {
+			if !strings.Contains(string(ev.Payload), "missing_tool") {
+				t.Fatalf("tool_call payload = %s, want structured ToolCall(missing_tool)", ev.Payload)
+			}
+			break
+		}
+	}
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ③(补):标准方法(session/new|load|prompt|list)响应形状回归 —— x-goworker

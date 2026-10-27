@@ -63,12 +63,12 @@ run 生命周期）以持久化游标暴露给任意连接——断线重连不�
 | 方法 | 方向 | 入参 | 响应 | control lease |
 |---|---|---|---|---|
 | `x-goworker/run/start` | 请求 | `{sessionId, input, requestId}` | `{runId, state}` | **必须持有** |
-| `x-goworker/run/get` | 请求 | `{sessionId, runId}` | `{state, result?, latestSeq}` | 不需要（只读观察面） |
+| `x-goworker/run/get` | 请求 | `{sessionId, runId}` | `{state, result?, latestSeq, eventsComplete}` | 不需要（只读观察面） |
 | `x-goworker/run/cancel` | 请求 | `{sessionId, runId}` | `{accepted}` | **必须持有** |
-| `x-goworker/session/attach` | 请求 | `{sessionId, afterSeq, mode?}` | `{currentRun, latestSeq, tookOver?}` | `mode:"control"` 获取/接管；observe 不动 lease |
+| `x-goworker/session/attach` | 请求 | `{sessionId, afterSeq, mode?}` | `{currentRun, latestSeq, eventsComplete, tookOver?}` | `mode:"control"` 获取/接管；observe 不动 lease |
 | `x-goworker/session/detach` | 请求 | `{sessionId, mode?}` | `{detached}` | `mode:"control"` 归还（仅持有者本人有效） |
-| `x-goworker/approval/respond` | 请求 | `{requestId, decision}` | `{accepted}` | **必须持有** |
-| `x-goworker/session/events` | **服务端通知** | `SessionEvent`（原样 JSON，蛇形键） | — | attach 建立订阅后下行；observe/control 均可收 |
+| `x-goworker/approval/respond` | 请求 | `{requestId, decision}` | `{accepted}` | **必须持有**（至少一个会话的 lease） |
+| `x-goworker/session/events` | **服务端通知** | `SessionEvent`（原样 JSON，蛇形键；合并记录带 `from_seq`） | — | attach 建立订阅后下行；observe/control 均可收 |
 
 - **`state` 取值**：`queued` / `running` / `waiting_input`（HITL 等审批）/
   `waiting_capability`（设备工具等重绑）/ `completed` / `failed` /
@@ -88,32 +88,58 @@ run 生命周期）以持久化游标暴露给任意连接——断线重连不�
 
 ### Observe / Control（多客户端控制权限）
 
-同一会话可有多个观察者，至多一个 control 持有者（control lease）：
+control lease **按会话记账**（拍板②原文「每会话至多一个 control 持有者」）：
+同一会话可有多个观察者、至多一个 control 持有者；两连接各控各会话互不影响，
+接管只发生在同一会话上：
 
 - `attach` 不带 `mode` 或 `mode:"observe"` = **只读观察**：收事件流，不碰
   lease；run/start|cancel 与 approval/respond 一律 -32000。
-- `attach` `mode:"control"` = **获取 control lease**：空闲时获取（响应不含
-  `tookOver`）；他人持有时**显式接管**（响应 `tookOver:true`，daemon 侧记
-  slog 审计日志）。
+- `attach` `mode:"control"` = **获取该会话的 control lease**：该会话空闲时
+  获取（响应不含 `tookOver`）；他人持有该会话时**显式接管**（响应
+  `tookOver:true`，daemon 侧记 slog 审计日志）。attach 的准备阶段
+  （会话/游标校验与订阅建立）失败时 lease 与既有订阅原样保持——接管只在
+  订阅建立成功后提交。
+- run/start|cancel 守卫**被操作会话**：请求 `sessionId` 的 lease 持有者才
+  被授权（持有其他会话的 lease 不构成授权）；`approval/respond` 的入参无
+  `sessionId`，守卫为「持有至少一个会话的 lease」。
 - V1 采用本机信任的宿主授权（单用户 daemon，无账号体系）：不做 lease 过期
-  与授权协商；**断开连接即释放 lease**（审批不悬死在已死连接上）；
-  `detach` `mode:"control"` 主动归还。权限检查全部在 daemon 侧完成，不依赖
-  客户端 UI 自律。
+  与授权协商；**断开连接即释放该连接全部会话的 lease**（审批不悬死在已死
+  连接上）；`detach` `mode:"control"` 按会话主动归还。权限检查全部在 daemon
+  侧完成，不依赖客户端 UI 自律。
 
 ### attach：原子 Replay+Live 与 latestSeq 语义
 
 - `attach {sessionId, afterSeq}` **原子建立「回放 + 实时」订阅**：先重放
   `(afterSeq, latest]` 的持久化事件，再无缝续上此后实时产生的事件——无缺、
   无重、无乱序。`afterSeq` 是客户端已确认游标（0 = 从保留最早开始）。
+- **`eventsComplete` 是回放完整性信号**（attach 响应与 run/get 响应均携带，
+  显式 true/false）：daemon 本进程纪元内发生过事件落盘失败（关键事件
+  durable-first 拒绝，或高频 delta 合并落盘失败——重放缺 delta 段）时为
+  `false` 且不因后续成功翻回；客户端据此判断回放完整性，`false` 时**不得把
+  收到的事件当完整历史**（等待新一轮 run 或按 0 重放后自行核对终态）。
+- **`SessionEvent.from_seq` 区分批量与单条**（回放侧增量合并的 wire 声明）：
+  高频 delta（`text.delta`/`thinking.delta`/`usage.progress`）实时逐事件下行
+  （`from_seq` 省略），持久化侧按窗合并——断线重连回放到合并记录时该字段
+  `>0`，声明本条覆盖 `[from_seq..seq]` 的连续区间（`seq` 即区间末事件，游标
+  仍按 `seq` 推进）；`from_seq` 缺省 = 单条事件。文本类合并记录的 payload 是
+  窗内全部增量的拼接字符串，客户端按批量语义还原内容。
 - **响应的 `latestSeq` 仅描述 attach 时刻事件流的位置，不是游标授权**：
   客户端不得把本地游标直接跳到 latestSeq——只有真正应用了对应事件之后，
   才能按逐事件 `seq` 推进本地 cursor。
 - 游标超前保留窗口 → -32000（文案含 `cursor expired`），订阅不建立；客户端
-  修正游标（或按 0 全量重放）后重新 attach。
-- **attach 仅限当前会话**：对非当前会话（归档/已被对端 `session/new` 顶掉）
-  的 run/start|attach 返回 -32000（文案含 `not the current session`）——
-  归档历史走 `session/load` 只读重放。分工：`session/load` = 历史对话重放，
-  `x-goworker/session/attach` = 事件游标（Replay+Live）。
+  修正游标（或按 0 全量重放）后重新 attach。attach 失败（会话/游标校验）时
+  该连接的既有订阅与 control lease **原样保持**——换代只在订阅建立成功后
+  提交。
+- **run/start|status|cancel 与 attach 按 sessionId 寻址**（C3 修正，不再限当
+  前会话）——**多 Session 路由**：x-goworker 方法寻址**任意已注册会话**
+  （daemon 侧会话注册表权威，不限当前会话；与标准方法「单活动会话」的约束
+  是两回事，标准面行为不变）。`session/new` 建新会话时旧会话被归档并从注册
+  表**收口**——此后对已收口旧 sessionId 或任意未注册 id 的 x-goworker 寻址
+  **诚实失败**：-32000（文案含 `session not found`），归档历史走
+  `session/load` 只读重放。分工：`session/load` = 历史对话重放，
+  `x-goworker/session/attach` = 事件游标（Replay+Live）。`requestId` 幂等键
+  按 (sessionId, requestId) 组合寻址：同键同 input 重试返回原 run；同键不同
+  input（含跨会话复用同一 requestId）返回 -32000 显式冲突。
 - 同连接重复 attach 同一会话 = **换代**：旧订阅收掉、按本次 afterSeq 重建，
   每连接每会话至多一条事件流；`detach` 或断连收掉订阅。
 - **与标准方法的共存语义**：后台 Run 运行期间，任何连接的标准
@@ -272,14 +298,26 @@ LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下�
   - 预算内同会话出现具备相同工具能力的新绑定（新连接 prompt 探测成功即重绑）
     → 工具在新连接上执行完成；重绑后的调用照常走统一 HITL 门控（per-call
     裁决，危险操作重绑后仍需确认）；
+  - **审批语义边界（P4 评审 issue6）**：统一 HITL 门控在每次工具调用前裁决
+    （ai-core OnBeforeTool，一次调用一次审批）。**单次工具调用内的审批随重绑
+    转移到新连接执行**——调用获批后连接断开、预算内重绑成功的，本次调用以
+    既有授权直接在新连接上执行完成，不重复弹审批；**再裁决发生在下一次调用**
+    （重绑后的新一次工具调用照常走门控，危险操作仍需确认，见上条）；
+  - **能力等待总预算受 ai-core toolCtx 60s 约束（预算钳 55s）**：等待发生在
+    ai-core 工具执行预算（toolCtx 60s）之内，重绑后再失败回到等待也不复位
+    计时（总等待 ≤ 预算）；daemon 把显式配置 >55s 的预算**钳到 55s** 并记
+    warn（给 Invoke 留 5s 余量）——超配不生效，否则等待会被 60s 掐断、呈现
+    为普通工具超时而非下面的明确失败文案；
   - 预算耗尽 → 返回**明确失败文本**（`device tool sys_<name> unavailable:
     connection lost, waited Ns`）交给模型决定下一步，run 正常继续；
   - **绝不把工具请求静默路由到其他连接**（含已断开的旧连接）；
   - 等待期间 run 状态为 `waiting_capability`（x-goworker 的 run/get /
     session/events 可观测）。
 - **`capability_wait_timeout` 配置**：上述等待预算，秒为单位，`config.yaml`
-  的 `session.capability_wait_timeout`，默认 45（硬约束：必须小于工具执行
-  60s 上限，否则等待被掐断呈现为普通超时）；<=0 回落 45s 兜底。
+  的 `session.capability_wait_timeout`，默认 45；**daemon 侧钳制（P4 评审
+  issue6）**：显式配置 >55 被钳到 55 并记 slog.Warn（硬约束：等待发生在
+  ai-core 工具执行 60s 预算内，55s 给 Invoke 留余量——配置方无需自律，超配
+  只是无效而非错误）；<=0 回落 45s 兜底。
 - **实现位置**：worker 中继 `daemon/internal/core/acpworker/sys_relay.go`；统一裁决 `ai-runtime/middlewares/hitl.go`；执行器在 Kotlin `DeviceTools` 注册表
 - **每加一个能力的成本 = Kotlin 一处**（注册描述符 + handler），Go/协议零改动、无需重绑 AAR 之外的任何东西
 

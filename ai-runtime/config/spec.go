@@ -108,9 +108,10 @@ type SessionConfig struct {
 	// 60s(ai-core/agent/agent.go:147-153 的 toolCtx)——等待发生在代理工具的
 	// Execute 内(agent.go:149 的 tool.Execute 调用点),预算无余量会被 60s
 	// 掐断、呈现为普通工具超时(勘察 risk)。0 值经 omitempty 省略——旧二进制
-	// 读含新字段的配置安全(未识别键被忽略);消费侧 resolveCapabilityWait
-	// (agent/capability.go)对 <=0 回落常量 45s(双保险,不依赖 yaml 载入路径,
-	// MaxConcurrentRuns/MaxPendingRuns 同型先例)。
+	// 读含新字段的配置安全(未识别键被忽略);消费侧钳制已落为代码(P4 评审
+	// issue2):resolveCapabilityWait(agent/capability.go)对 <=0 回落常量 45s、
+	// >55s 钳到 55s 并 slog.Warn(daemon 侧 CapabilityWaitTimeout 出口同型
+	// 钳制,不依赖 yaml 载入路径,MaxConcurrentRuns/MaxPendingRuns 同型先例)。
 	CapabilityWaitTimeout int `yaml:"capability_wait_timeout,omitempty"`
 }
 

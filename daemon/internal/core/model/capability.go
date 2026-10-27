@@ -102,19 +102,27 @@ type PendingApprovalInfo struct {
 
 // RunControlSource 是 x-goworker 扩展协议的消费面（P5-6，可选能力接口，handler
 // 以 type-assert 获取——SessionSource 先例；无此能力的插件/测试桩零感知）。
-// V1 路由面（拍板⑤）：run/start|status|cancel、attach 与 approval 全部限当前
-// 会话（CurrentSessionID），归档历史走既有 session/load 只读重放。Control
-// lease 为 V1 宿主授权简化形（拍板②）：本机信任、每会话至多一个持有者、断开
-// 即释放（handler.Close）、后到连接显式接管（tookOver=true + slog 审计）。
+// 路由面（C3 修正，推翻拍板⑤的 current-only）：run/start|status|cancel、attach
+// 与 approval 列表按 sessionID 多会话寻址（runtime 注册表权威），未知会话返回
+// ErrSessionNotFound 语义错误；同步 /agent 与标准 ACP 面保持 current 语义不动
+// （总方案 §7）。Control lease 为 V1 宿主授权简化形（拍板②原文「每会话至多
+// 一个 control 持有者」，I3 修正后按会话维度记账）：本机信任、每会话至多一个
+// 持有者（两连接各控各会话互不影响）、断开即释放（handler.Close 经
+// ReleaseConnection 释放该连接全部租约）、后到连接对同一会话显式接管
+// （tookOver=true + slog 审计）。
 type RunControlSource interface {
 	// StartRun 提交一次后台 Run 并立即返回 (runID, 提交时状态)。requestID 是
-	// 与 JSON-RPC id 不同的幂等键：重试同 requestID 返回原 runID 与其当前状态，
-	// 不重复起跑。
+	// 与 JSON-RPC id 不同的幂等键，按 (sessionID, requestID) 组合寻址（I5）：
+	// 重试同键同 Input 返回原 runID 与其当前状态，不重复起跑；同键不同 Input
+	// （含跨会话同 requestID 不同 Input）返回显式冲突错误。
 	StartRun(sessionID, input, requestID string) (runID, state string, err error)
 	CancelRun(sessionID, runID string) error
-	// RunStatus 返回 run 当前状态与会话事件流的 latest seq（游标描述，非游标
-	// 授权——客户端只有真正应用了对应事件才能推进本地游标）。
-	RunStatus(sessionID, runID string) (state string, latestSeq uint64, err error)
+	// RunStatus 返回 run 当前状态、会话事件流的 latest seq（游标描述，非游标
+	// 授权——客户端只有真正应用了对应事件才能推进本地游标）与事件流完整性
+	// （I6lite：eventsComplete=false = 本进程纪元内发生过事件落盘失败——key
+	// 事件 durable-first 拒绝或合并 delta flush 失败，回放可能缺段，客户端不得
+	// 把不完整事件当完整历史；无事件流/无失败证据时为 true）。
+	RunStatus(sessionID, runID string) (state string, latestSeq uint64, eventsComplete bool, err error)
 	// PendingApprovals 返回会话未过期审批快照（daemon 侧扁平结构，避免
 	// model→agent 类型泄漏）。未知会话/无审批返回空切片。
 	PendingApprovals(sessionID string) ([]PendingApprovalInfo, error)
@@ -129,13 +137,20 @@ type RunControlSource interface {
 	// 响应契约最小补齐——RunStatus 需 runID 寻址，无法充当）。无活动 Run、无
 	// runtime 或非 current 会话 → ok=false（currentRun=null，非错误）。
 	ActiveRun(sessionID string) (runID, state string, ok bool)
-	// AcquireControl 获取 control lease：空闲→占用并返回 false；他人持有→
-	// 显式接管（返回 true，slog.Info 审计）；同持有者重复→false。
-	AcquireControl(connectionID string) (tookOver bool)
-	// ReleaseControl 释放 control lease：仅持有者本人有效，他人调用为空操作。
-	ReleaseControl(connectionID string)
-	// HoldControl 报告 connectionID 当前是否持有 control lease。
-	HoldControl(connectionID string) bool
+	// AcquireControl 获取 (sessionID, connectionID) 的 control lease：该会话
+	// 空闲→占用并返回 false；他人持有→显式接管（返回 true，slog.Info 审计）；
+	// 同持有者重复→false。每会话独立记账（I3）：连接 A 控制会话 A、连接 B
+	// 控制会话 B 互不影响，接管只发生在同一会话上。
+	AcquireControl(sessionID, connectionID string) (tookOver bool)
+	// ReleaseControl 释放 (sessionID, connectionID) 的 control lease：仅该会话
+	// 的持有者本人有效，他人调用为空操作。
+	ReleaseControl(sessionID, connectionID string)
+	// HoldControl 报告 connectionID 当前是否持有 sessionID 的 control lease。
+	HoldControl(sessionID, connectionID string) bool
+	// ReleaseConnection 释放 connectionID 持有的全部会话的 control lease
+	// （I3：断连收口——handler.Close 一次调用替代逐会话归还，审批不悬死在
+	// 已死连接上）。连接不持有任何租约时幂等空操作。
+	ReleaseConnection(connectionID string)
 	// UnbindCapabilities 解绑某连接登记的全部客户端工具能力（P5-9 的
 	// handler.Close 断连收口消费）。
 	UnbindCapabilities(connectionID string)

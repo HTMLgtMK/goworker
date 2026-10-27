@@ -82,13 +82,18 @@ type EventRecord struct {
 }
 
 // SessionEvent 是事件回放/实时投递的传输形状（总方案第五节，agent 侧 EventHub
-// 消费）。与 EventRecord 的差异：无 Kind 信封与 FromSeq 合并声明（合并对传输方
-// 不可见，一条合并记录产出一条 Seq=ToSeq 的 SessionEvent），Payload 不 omit
-// 空值。EventHub.Publish 把 IngressEvent 包成本类型后既广播又落盘（P3-2）。
+// 消费）。与 EventRecord 的差异：无 Kind 信封（存储信封对传输方不可见），Payload
+// 不 omit 空值。FromSeq 上 wire（I2lite 修复，GPT 评审）：>0 = 本条是合并记录、
+// 覆盖 [FromSeq..Seq] 的连续区间（且 Seq=ToSeq）——实时逐事件投递恒为 0（省略），
+// 客户端据此区分批量与单条：同一 Seq 区间在实时侧呈现逐事件粒度、回放侧呈现
+// 合并粒度的差异（I2）由范围声明显式化，不再与「单条事件恰逢游标」不可辨。
+// EventHub.Publish 把 IngressEvent 包成本类型后既广播又落盘（P3-2，实时侧
+// FromSeq=0），Subscribe 的回放转换透传持久化记录的 FromSeq（P3-3）。
 type SessionEvent struct {
 	SessionID string          `json:"session_id"`
 	RunID     string          `json:"run_id"`
 	Seq       uint64          `json:"seq"`
+	FromSeq   uint64          `json:"from_seq,omitempty"` // >0 = 合并记录，覆盖 [FromSeq..Seq]（实时逐事件恒省略）
 	Type      string          `json:"type"`
 	Time      time.Time       `json:"time"`
 	Payload   json.RawMessage `json:"payload"`

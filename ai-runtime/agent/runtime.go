@@ -225,18 +225,31 @@ func (r *SessionRuntime) closeEvents() {
 	}
 }
 
+// appendRunState 将一条 Run 状态记录写入会话绑定的 Run journal 并**上抛错误**
+// (I1 修复:journalRunState 的错误返回变体)。唯一调用方是 StartRun 的 queued
+// 接受记录写点(supervisor.go ⑤)——「run/start 被接受」以持久化登记成功为前提
+// (总方案第七节),写失败必须拒绝启动而非降级;其余写点(RecordRun 起跑、
+// execute 各状态迁移、finalizeRun 终态)仍走 journalRunState 的 warn 降级。
+// s 为 nil(未绑定会话)或 RunJournal 为 nil(不持久化,接口字段必须真 nil 的
+// typed-nil 约定)时跳过并返回 nil;调用点在 rt.mu 外(锁内不做文件 I/O)。
+func appendRunState(s *Session, rec session.RunStateRecord) error {
+	if s == nil || s.deps.RunJournal == nil {
+		return nil
+	}
+	return s.deps.RunJournal.AppendState(rec)
+}
+
 // journalRunState 将一条 Run 状态记录写入会话绑定的 Run journal(s.deps.RunJournal,
 // P2-3):daemon 同步路径(RecordRun)与后台路径(P2-5 StartRun)共用同一持久化面。
 // s 为 nil(未绑定会话)或 RunJournal 为 nil(不持久化)时直接跳过——接口字段必须
 // 真 nil 的宿主约定(spec.go typed-nil 陷阱同 Store)保证零值 deps 的测试路径安全。
 // AppendState 失败只 warn 不阻塞:journal 可用性低于执行可用性,缺终态记录由恢复
-// 扫描显式标记 interrupted(缺口可观测,不静默)。调用点在 rt.mu 外(锁内不做文件
-// I/O);同会话串行由调用方已持的 gate 保证,跨会话互不共享句柄(每 run 一文件)。
+// 扫描显式标记 interrupted(缺口可观测,不静默)。例外是 StartRun 的 queued 接受
+// 记录(I1 修复改走 appendRunState 的错误上抛变体——「已接受但无法追踪」的 Run
+// 绝不产生)。调用点在 rt.mu 外(锁内不做文件 I/O);同会话串行由调用方已持的
+// gate 保证,跨会话互不共享句柄(每 run 一文件)。
 func journalRunState(s *Session, rec session.RunStateRecord) {
-	if s == nil || s.deps.RunJournal == nil {
-		return
-	}
-	if err := s.deps.RunJournal.AppendState(rec); err != nil {
+	if err := appendRunState(s, rec); err != nil {
 		slog.Warn("agent: run journal append failed", "err", err, "run_id", rec.RunID, "state", rec.State)
 	}
 }

@@ -17,11 +17,15 @@ import (
 // 类型在 xproto.go;消费面是工厂 type-assert 得到的 model.RunControlSource
 // (h.runs,P5-6 实现=P5-6 的 AgentPlugin runcontrol.go)。
 //
-// control lease(V1 宿主授权简化形,拍板②):本机信任、每会话至多一个持有者。
-// run/start|cancel 与 approval/respond 要求请求方连接当前持有 lease(HoldControl);
-// run/get 是只读观察面,不要求。lease 的获取/归还入口是 attach/detach
-// (mode=control):attach(control) 获取或显式接管(tookOver 回显),detach
-// (control) 归还,断连经 Close 强制归还。
+// control lease(V1 宿主授权简化形,拍板②原文「每会话至多一个 control 持有
+// 者」;I3 修正后按会话维度记账,两连接各控各会话互不影响):run/start|cancel
+// 要求请求方连接持有**被操作会话**(请求 sessionId)的 lease(requireControl);
+// approval/respond 的 wire 入参无 sessionId(总方案 §7:{requestId, decision}),
+// 守卫退化为「持有至少一个会话的 lease」(requireControlForApproval,权威判定
+// 仍逐会话询问 source);run/get 是只读观察面,不要求。lease 的获取/归还入口是
+// attach/detach(mode=control):attach(control) 获取或显式接管(tookOver 回显,
+// I4:订阅建立成功后才变更控制权),detach(control) 按会话归还,断连经 Close
+// 的 ReleaseConnection 强制归还该连接全部租约。
 //
 // 行为变化声明(P5-7/P5-8):新协议面(增量能力,非破坏)。标准 6 方法与
 // session/update/request_permission 逐字不动;不调用 x- 方法的旧客户端零感知;
@@ -93,12 +97,39 @@ func registerXGWMethods(server *aiacp.Server, handler aiacp.SessionHandler) {
 	server.Handle(XMethodSessionDetach, fh.xgwSessionDetach)
 }
 
-// requireControl 断言本连接当前持有 control lease。当前持有者身份不经接口
-// 暴露(model.RunControlSource 只有 Hold 判等),错误文案回显请求方自身
+// requireControl 断言本连接当前持有 sessionID 的 control lease(I3:守卫按
+// 被操作会话授权——run/start|cancel 的被操作会话就是请求的 sessionId,持有
+// 其他会话的 lease 不构成对本会话的授权)。当前持有者身份不经接口暴露
+// (model.RunControlSource 只有 Hold 判等),错误文案回显请求方自身
 // connectionID(见 xgwControlLeaseError)。调用方必须先确认 h.runs != nil。
-func (h *FrontendHandler) requireControl() error {
-	if h.runs.HoldControl(h.connectionID) {
+func (h *FrontendHandler) requireControl(sessionID string) error {
+	if h.runs.HoldControl(sessionID, h.connectionID) {
 		return nil
+	}
+	return xgwControlLeaseError(h.connectionID)
+}
+
+// requireControlForApproval 是 approval/respond 的 control lease 守卫(I3):
+// 该方法的 wire 入参没有 sessionId(总方案 §7 :561:{requestId, decision},
+// requestID 全局寻址待决审批),「被操作会话」在协议面不可知——守卫退化为
+// 「请求方持有至少一个会话的 control lease」。候选集是本连接以 mode=control
+// 成功 attach 过的会话(h.controlSessions),权威判定逐会话询问 source 的
+// HoldControl:接管易主后旧候选自然落空(源判等,不依赖本地簿记的新鲜度)。
+// V1 宿主信任边界:持有会话 Y lease 的连接可应答会话 X 的审批——精确到审批
+// 归属会话的授权需要 wire 携带 sessionId(协议可见变化)或 source 暴露
+// requestID → sessionID 解析,均超出本修复范围;单一 controller 场景(V1 主
+// 形态)与旧全局 lease 守卫等价。调用方必须先确认 h.runs != nil。
+func (h *FrontendHandler) requireControlForApproval() error {
+	h.mu.Lock()
+	sessions := make([]string, 0, len(h.controlSessions))
+	for sessionID := range h.controlSessions {
+		sessions = append(sessions, sessionID)
+	}
+	h.mu.Unlock()
+	for _, sessionID := range sessions {
+		if h.runs.HoldControl(sessionID, h.connectionID) {
+			return nil
+		}
 	}
 	return xgwControlLeaseError(h.connectionID)
 }
@@ -119,7 +150,7 @@ func (h *FrontendHandler) xgwRunStart(_ context.Context, params json.RawMessage)
 	if req.RequestID == "" {
 		return nil, xgwError("%s: requestId is required (idempotency key)", XMethodRunStart)
 	}
-	if err := h.requireControl(); err != nil {
+	if err := h.requireControl(req.SessionID); err != nil {
 		return nil, err
 	}
 	runID, state, err := h.runs.StartRun(req.SessionID, req.Input, req.RequestID)
@@ -129,9 +160,11 @@ func (h *FrontendHandler) xgwRunStart(_ context.Context, params json.RawMessage)
 	return XRunStartResult{RunID: runID, State: state}, nil
 }
 
-// xgwRunGet 处理 x-goworker/run/get:run 状态 + 会话事件流 latestSeq 的只读
-// 观察面,不要求 control lease(观察者与控制者分离,总方案 §7.4;与 P5-8 的
-// observe attach 模式同向)。未知 run → source 的 ErrRunNotFound 归一 -32000。
+// xgwRunGet 处理 x-goworker/run/get:run 状态 + 会话事件流 latestSeq + 事件流
+// 完整性(I6lite:eventsComplete=false = 回放可能缺段,客户端不得把不完整事件
+// 当完整历史)的只读观察面,不要求 control lease(观察者与控制者分离,总方案
+// §7.4;与 P5-8 的 observe attach 模式同向)。未知 run → source 的 ErrRunNotFound
+// 归一 -32000。
 func (h *FrontendHandler) xgwRunGet(_ context.Context, params json.RawMessage) (any, error) {
 	if h.runs == nil {
 		return nil, xgwNotAvailableError(XMethodRunGet)
@@ -140,11 +173,11 @@ func (h *FrontendHandler) xgwRunGet(_ context.Context, params json.RawMessage) (
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, xgwError("%s: invalid params: %v", XMethodRunGet, err)
 	}
-	state, latestSeq, err := h.runs.RunStatus(req.SessionID, req.RunID)
+	state, latestSeq, eventsComplete, err := h.runs.RunStatus(req.SessionID, req.RunID)
 	if err != nil {
 		return nil, xgwError("%s: %v", XMethodRunGet, err)
 	}
-	return XRunGetResult{State: state, LatestSeq: latestSeq}, nil
+	return XRunGetResult{State: state, LatestSeq: latestSeq, EventsComplete: eventsComplete}, nil
 }
 
 // xgwRunCancel 处理 x-goworker/run/cancel:require control → runs.CancelRun。
@@ -158,7 +191,7 @@ func (h *FrontendHandler) xgwRunCancel(_ context.Context, params json.RawMessage
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, xgwError("%s: invalid params: %v", XMethodRunCancel, err)
 	}
-	if err := h.requireControl(); err != nil {
+	if err := h.requireControl(req.SessionID); err != nil {
 		return nil, err
 	}
 	if err := h.runs.CancelRun(req.SessionID, req.RunID); err != nil {
@@ -180,7 +213,7 @@ func (h *FrontendHandler) xgwApprovalRespond(_ context.Context, params json.RawM
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, xgwError("%s: invalid params: %v", XMethodApprovalRespond, err)
 	}
-	if err := h.requireControl(); err != nil {
+	if err := h.requireControlForApproval(); err != nil {
 		return nil, err
 	}
 	decision, err := xgwDecisionFromWire(req.Decision)
@@ -194,27 +227,35 @@ func (h *FrontendHandler) xgwApprovalRespond(_ context.Context, params json.RawM
 }
 
 // xgwSessionAttach 处理 x-goworker/session/attach(P5-8):原子建立 Replay+Live
-// 订阅(总方案 §7)。序:mode 白名单校验 → mode=control 先取 lease(后到显式
-// 接管,tookOver 回显;observe 不动 lease)→ runs.Attach(current 会话校验 +
-// EnsureHub——遗留③「重启后 attach 时 hub 未建」的解法;RunEvents 未接线/纯
-// 内存诚实报错)→ 先 cancel 本会话旧泵再 hub.Subscribe(ctx, afterSeq)(窗口
-// 校验/ErrCursorExpired 原样上抛为 -32000)→ 起订阅泵 → 响应 currentRun +
-// latestSeq。
+// 订阅(总方案 §7)。I4 修正后是准备/提交两阶段:
+//
+//	准备(不触碰任何既有状态):mode 白名单校验 → runs.Attach(sessionID)(会话
+//	校验 + EnsureHub——遗留③「重启后 attach 时 hub 未建」的解法;RunEvents 未
+//	接线/纯内存诚实报错)→ hub.Subscribe(ctx, afterSeq)(窗口校验/
+//	ErrCursorExpired 原样上抛为 -32000)。任一步失败 → 旧订阅与 control lease
+//	原样保持,本请求零副作用。
+//	提交:h.mu 内原子换入新订阅句柄(表内每会话恒一条,并发 attach 串行换入,
+//	被换下者由换入者收泵)→ 锁外 stop 旧泵(换代语义不变:done 优先检查、宁丢
+//	不重)→ 起新泵 → mode=control 才 AcquireControl(接管;同持有者重复 acquire
+//	幂等)并记入 controlSessions。
+//
+// 控制权后置的理由(I4 评审点一):Acquire 在订阅建立成功之后——Attach/Subscribe
+// 失败(如 ErrCursorExpired)绝不夺走原持有者的 lease;旧序(先 Acquire 后
+// Attach)会在 attach 失败时把 lease 无谓易主。
+//
+// 换代语义的窗口论证:新 Subscribe 与旧泵 stop 之间存在 μs 级窗口,窗内发布的
+// 事件可能被旧泵(其 done 检查先于 stop 完成)与新泵各投递一次——换取的是
+// Subscribe 失败时旧订阅完整保持(I4 评审点二:旧序先 cancel 旧泵,Subscribe
+// 失败即毁掉正常订阅)。detach/Close 是客户端终事,不换代,无此窗口。
 //
 // 泵 ctx 是 handler 作用域的 WithCancel(context.Background() 派生),不是每请求
 // ctx——ai-acp 的 dispatchRequest 在响应返回时即 cancel 请求 ctx
 // (protocol/jsonrpc.go:281-283 defer cancel),订阅必须活过本请求,直到 detach/
 // 换代/断连(handler.Close)统一回收。
 //
-// 换代取「先 cancel 旧泵再建新」:每连接每会话至多一订阅,先 cancel 消除新旧
-// 泵并存期的重复投递;换代到新泵启动之间的缺口由本次 attach 的 replay 补齐
-// (客户端带自己的游标)。代价:新 Subscribe 失败(如 ErrCursorExpired)时旧泵
-// 已被 cancel——attach 已报错,客户端修正游标后重新 attach 即可,重放不丢事件。
-// 此前的失败(Acquire/Attach)不动既有订阅。
-//
-// 并发与锁:subs 表在 h.mu 内(叶锁);source 调用与 hub.Subscribe 均在锁外
-// (各自内部锁序见 P5-6/event_hub.go,与 h.mu 无嵌套);泵退出自清仅短暂取
-// h.mu 做指针身份判重。
+// 并发与锁:subs/controlSessions 表在 h.mu 内(叶锁);source 调用与
+// hub.Subscribe 均在锁外(各自内部锁序见 P5-6/event_hub.go,与 h.mu 无嵌套);
+// 泵退出自清仅短暂取 h.mu 做指针身份判重。
 func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMessage) (any, error) {
 	if h.runs == nil {
 		return nil, xgwNotAvailableError(XMethodSessionAttach)
@@ -231,35 +272,54 @@ func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMes
 		return nil, err
 	}
 
-	tookOver := false
-	if mode == XAttachModeControl {
-		tookOver = h.runs.AcquireControl(h.connectionID)
-	}
+	// 准备阶段(零副作用):Attach(会话校验 + EnsureHub)→ Subscribe(游标
+	// 校验 + Replay+Live 注册)。失败路径只回收本请求自建的 ctx。
 	hub, latest, err := h.runs.Attach(req.SessionID)
 	if err != nil {
 		return nil, xgwError("%s: %v", XMethodSessionAttach, err)
 	}
-
-	// 旧泵先收(P5-8 换代语义,见函数头);再以新 ctx 订阅。
-	h.cancelSub(req.SessionID)
 	ctx, cancel := context.WithCancel(context.Background())
 	ch, err := hub.Subscribe(ctx, req.AfterSeq)
 	if err != nil {
 		cancel()
 		return nil, xgwError("%s: %v", XMethodSessionAttach, err)
 	}
+
+	// 提交阶段:h.mu 内原子换入新句柄(old := 表内旧句柄一并取出),锁外收旧
+	// 泵、起新泵——并发 attach 对同会话的替换在 mu 内串行完成句柄原子换入,
+	// 表内恒恰一「现任」句柄;被换下者由换入者 stop,不会残留未登记的泵。
 	sub := &xgwSubscription{cancel: cancel, done: make(chan struct{})}
 	h.mu.Lock()
 	if h.subs == nil {
 		h.subs = make(map[string]*xgwSubscription)
 	}
+	old := h.subs[req.SessionID]
 	h.subs[req.SessionID] = sub
 	h.mu.Unlock()
+	if old != nil {
+		old.stop()
+	}
 	go h.pumpSessionEvents(req.SessionID, sub, ch, h.events)
 
+	// 控制权变更最后提交(I4:成功后才 Acquire/接管);controlSessions 记入
+	// approval/respond 守卫的候选集(requireControlForApproval)。
+	tookOver := false
+	if mode == XAttachModeControl {
+		tookOver = h.runs.AcquireControl(req.SessionID, h.connectionID)
+		h.mu.Lock()
+		if h.controlSessions == nil {
+			h.controlSessions = make(map[string]bool)
+		}
+		h.controlSessions[req.SessionID] = true
+		h.mu.Unlock()
+	}
+
 	// currentRun:attach 时刻的活动 Run 快照(ActiveRun,ok=false → null);
-	// latestSeq 仅描述位置,客户端不得跳游标(XSessionAttachResult 注释)。
-	res := XSessionAttachResult{LatestSeq: latest, TookOver: tookOver}
+	// latestSeq 仅描述位置,客户端不得跳游标(XSessionAttachResult 注释);
+	// eventsComplete(I6lite):attach 时刻 hub 的完整性快照——本进程纪元内任何
+	// key 事件落盘失败/合并 flush 失败 → false(标记永不复位),客户端据此判断
+	// 回放完整性,不把缺段回放当完整历史。
+	res := XSessionAttachResult{LatestSeq: latest, EventsComplete: hub.EventsComplete(), TookOver: tookOver}
 	if runID, state, ok := h.runs.ActiveRun(req.SessionID); ok {
 		res.CurrentRun = &XSessionAttachRun{RunID: runID, State: state}
 	}
@@ -335,9 +395,11 @@ func (h *FrontendHandler) clearSub(sessionID string, sub *xgwSubscription) {
 }
 
 // xgwSessionDetach 处理 x-goworker/session/detach(P5-8):先收本连接该会话的
-// 订阅泵(cancelSub;无订阅为幂等空操作);mode=control 再归还 control lease
-// ——ReleaseControl 仅持有者本人有效(P5-6 契约),observe/省略不动 lease。
-// 响应 detached=true(总方案 §7 形状;幂等,对无订阅会话同样成立)。
+// 订阅泵(cancelSub;无订阅为幂等空操作);mode=control 再归还该会话的
+// control lease——ReleaseControl 仅该会话持有者本人有效(P5-6/I3 契约),
+// observe/省略不动 lease;controlSessions 候选集同步移除(归还的是 lease,
+// detach(observe) 不移除)。响应 detached=true(总方案 §7 形状;幂等,对无
+// 订阅会话同样成立)。
 func (h *FrontendHandler) xgwSessionDetach(_ context.Context, params json.RawMessage) (any, error) {
 	if h.runs == nil {
 		return nil, xgwNotAvailableError(XMethodSessionDetach)
@@ -352,7 +414,10 @@ func (h *FrontendHandler) xgwSessionDetach(_ context.Context, params json.RawMes
 	}
 	h.cancelSub(req.SessionID)
 	if mode == XAttachModeControl {
-		h.runs.ReleaseControl(h.connectionID)
+		h.runs.ReleaseControl(req.SessionID, h.connectionID)
+		h.mu.Lock()
+		delete(h.controlSessions, req.SessionID)
+		h.mu.Unlock()
 	}
 	return XSessionDetachResult{Detached: true}, nil
 }
@@ -360,7 +425,8 @@ func (h *FrontendHandler) xgwSessionDetach(_ context.Context, params json.RawMes
 // Close 是连接生命周期钩子(daemon 侧扩展约定,ai-acp 无此接口):Service.accept
 // 在 <-server.Done() 返回路径 type-assert 调用(service.go connectionCloser)。
 // V1 语义:断开即释放 control lease——「审批不悬死在已死连接上」的宿主授权
-// 收口;Release 仅持有者本人有效,重复/他人调用幂等空操作(P5-6 契约)。
+// 收口;I3 后 lease 按会话记账,ReleaseConnection 一次释放本连接持有的全部
+// 会话租约,重复/他人调用幂等空操作(P5-6 契约)。
 //
 // P5-8:订阅泵统一回收——先清空 subs 表再逐个 stop,泵退出自清的判重落空;
 // done 关闭使各协议泵立即退出,cancel 唤醒各 SDK 泵 → 投递通道关闭。断连即
@@ -369,7 +435,7 @@ func (h *FrontendHandler) xgwSessionDetach(_ context.Context, params json.RawMes
 // P5-9:runs.UnbindCapabilities(h.connectionID)——断连解绑客户端工具能力。
 func (h *FrontendHandler) Close() {
 	if h.runs != nil {
-		h.runs.ReleaseControl(h.connectionID)
+		h.runs.ReleaseConnection(h.connectionID)
 		// P5-9:断连解绑客户端工具能力——连接退出即解绑 CapabilityRegistry 中
 		// 本连接的全部绑定;在途的设备工具等待由 P4-4 的「Invoke 失败→Invalidate
 		// →等待重绑」语义接管(预算内重绑成功则继续执行,超时返回明确失败文本)。
@@ -378,6 +444,7 @@ func (h *FrontendHandler) Close() {
 	h.mu.Lock()
 	subs := h.subs
 	h.subs = nil
+	h.controlSessions = nil
 	h.mu.Unlock()
 	for _, sub := range subs {
 		sub.stop()

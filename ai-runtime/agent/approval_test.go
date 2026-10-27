@@ -199,6 +199,81 @@ func TestApprovalLateResolveRejected(t *testing.T) {
 	}
 }
 
+// TestApprovalSweepsResolvedExpiredEntries(P4 评审 issue3):已 resolved 且
+// 已过期超过 approvalResolvedRetention 宽限窗的滞留条目,在后续 Wait / Resolve
+// 入口被顺带清扫(Pending 可能从不被调——客户端的事实源是 permission.requested
+// 事件流);宽限窗内的迟到 Resolve 仍报 ErrApprovalResolved(TestApprovalLate
+// ResolveRejected 钉死),宽限窗外落 ErrApprovalUnknown。ExpiresAt 回拨为
+// 白箱操作(同包单元测试,免真实等待 30s);断言直读 m.pending——Pending 的
+// 读时清扫会抢跑,不能作为本用例的观察面。
+func TestApprovalSweepsResolvedExpiredEntries(t *testing.T) {
+	m := NewApprovalManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 造第一笔滞留条目:已过期请求 Wait 立即 reject(resolved 收口,entry 留表),
+	// 再把其 ExpiresAt 回拨到宽限窗之外。
+	if d := m.Wait(ctx, "sess-a", "run-1", approvalReq("req-stale", time.Now().Add(-time.Hour))); d.Type != hitl.DecisionReject {
+		t.Fatalf("Wait on expired request = %+v, want reject", d)
+	}
+	m.mu.Lock()
+	entry, ok := m.pending["req-stale"]
+	if !ok {
+		m.mu.Unlock()
+		t.Fatal("resolved+expired entry must linger in the map before any sweep")
+	}
+	entry.pa.Request.ExpiresAt = time.Now().Add(-approvalResolvedRetention - time.Hour)
+	m.mu.Unlock()
+
+	// 后续 Wait(另一 requestID)入口的顺带清扫把它逐出。
+	got := make(chan hitl.Decision, 1)
+	go func() { got <- m.Wait(ctx, "sess-a", "run-2", approvalReq("req-live", time.Now().Add(30*time.Second))) }()
+	deadline := time.After(5 * time.Second)
+	for {
+		m.mu.Lock()
+		_, hasStale := m.pending["req-stale"]
+		_, hasLive := m.pending["req-live"]
+		m.mu.Unlock()
+		if hasLive && !hasStale {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("resolved+expired entry survived a subsequent Wait (hasLive=%v, hasStale=%v)", hasLive, hasStale)
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	cancel() // 收敛 req-live 的等待 goroutine
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("live Wait did not return after ctx cancel")
+	}
+
+	// Resolve 入口同清扫:再造一笔宽限窗外的滞留条目并对它迟到 Resolve——
+	// 条目被逐出,返回 ErrApprovalUnknown。
+	if d := m.Wait(ctx, "sess-a", "run-1", approvalReq("req-stale2", time.Now().Add(-time.Hour))); d.Type != hitl.DecisionReject {
+		t.Fatalf("Wait on expired request = %+v, want reject", d)
+	}
+	m.mu.Lock()
+	entry2, ok := m.pending["req-stale2"]
+	if !ok {
+		m.mu.Unlock()
+		t.Fatal("second stale entry must linger in the map before any sweep")
+	}
+	entry2.pa.Request.ExpiresAt = time.Now().Add(-approvalResolvedRetention - time.Hour)
+	m.mu.Unlock()
+	if err := m.Resolve("req-stale2", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, ErrApprovalUnknown) {
+		t.Fatalf("Resolve past retention = %v, want ErrApprovalUnknown(宽限窗外条目已被入口清扫)", err)
+	}
+	m.mu.Lock()
+	_, still := m.pending["req-stale2"]
+	m.mu.Unlock()
+	if still {
+		t.Fatal("Resolve must sweep the past-retention entry")
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // P4-2:StartRun 审批回退接线 + waiting 迁移(总方案第十一节
 // TestApprovalAfterReconnect → 本步)。
@@ -479,5 +554,104 @@ func TestStartRunJournalsWaiting(t *testing.T) {
 	// waiting_input 存在且先于终态记录(计划验收口径,序列断言的显式对偶)。
 	if waitingIdx < 0 || terminalIdx < 0 || waitingIdx >= terminalIdx {
 		t.Fatalf("waiting record (idx %d) must exist and precede terminal record (idx %d)", waitingIdx, terminalIdx)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P4 评审 issue1 回归(确定性时序缺陷,跨组件:GetDecision × ApprovalManager.Wait):
+// 中间件侧 GetDecision(hitl/channel_decision_provider.go:12-53)与 agent 侧
+// decideFunc 的 ApprovalManager.Wait(approval.go:78-143)对同一 interrupt 的
+// 同一 ExpiresAt 各起计时器、共用容量 1 的 decisions 缓冲(session.go:149)。
+// 一次超时后(GetDecision 先到期返回),Wait 的超时 reject 残留缓冲无人消费
+// (后台 decideFunc → streamTokens 投递);同 run 下一个 interrupt 的 GetDecision
+// 若不排空,select 立即吃到上一轮的决策——第二次审批用户看不到就被自动拒绝
+// 且级联。sync 路径同型隐患:调用方 Decide 在窗口关闭后的迟到响应同样残留
+// 缓冲。以下用例在纯 provider 面复现该序列(agent 级端到端复现不可行:中间件
+// 恒硬编码 ExpiresAt=now+DefaultTimeout 2min 窗口,hitl.go:137/238/280/343,
+// TestApprovalTimeoutFailsTool 头注释已记录该约束——其「收短 Decide 侧副本」
+// 恰好让陈旧值被就地消费,缓冲保持干净,无法触发毒化)。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestChannelDecisionProviderDrainsStaleReject:第一个 interrupt 短窗超时后,
+// 其陈旧 reject(后台 Wait 超时的形态)残留缓冲;第二个 interrupt 的
+// GetDecision 必须等待自己的完整窗口并接受自己的决策(InterruptID 匹配),
+// 绝不立即返回上一轮的陈旧 reject。
+func TestChannelDecisionProviderDrainsStaleReject(t *testing.T) {
+	decisions := make(chan hitl.Decision, 1) // 容量与创建形态对齐 session.go:149
+	p := hitl.NewChannelDecisionProvider(decisions)
+	ctx := context.Background()
+
+	// 第一轮:窗口 50ms,无决策 → 按窗口超时 reject。
+	if d := p.GetDecision(ctx, approvalReq("req-1", time.Now().Add(50*time.Millisecond))); d.Type != hitl.DecisionReject || d.InterruptID != "req-1" {
+		t.Fatalf("first GetDecision = %+v, want reject for req-1", d)
+	}
+	// 重现毒化:agent 侧 Wait 的计时器晚于中间件侧到期,其超时 reject 在
+	// GetDecision 返回后才经 streamTokens 入缓冲(session.go:280-283)。
+	decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionReject}
+
+	// 第二轮:全新窗口。有缺陷的实现微秒级吃到缓冲里的 req-1 reject;
+	// 修复后必须排空并等待本窗口。
+	got := make(chan hitl.Decision, 1)
+	start := time.Now()
+	go func() { got <- p.GetDecision(ctx, approvalReq("req-2", time.Now().Add(400*time.Millisecond))) }()
+
+	select {
+	case d := <-got:
+		t.Fatalf("GetDecision(req-2) returned early after %v: %+v(上一轮的陈旧 reject 未被排空)", time.Since(start), d)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// 本轮自己的决策到达 → 返回该决策(而非上一轮的陈旧 reject)。
+	decisions <- hitl.Decision{InterruptID: "req-2", Type: hitl.DecisionApprove}
+	select {
+	case d := <-got:
+		if d.Type != hitl.DecisionApprove || d.InterruptID != "req-2" {
+			t.Fatalf("GetDecision(req-2) = %+v, want approve for req-2", d)
+		}
+		if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+			t.Fatalf("GetDecision(req-2) returned after %v, want it to hold its own window", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetDecision(req-2) did not return after its own decision arrived")
+	}
+}
+
+// TestChannelDecisionProviderIgnoresLateApprove:sync 路径既有隐患——用户在
+// 上一轮窗口关闭后才 approve,迟到决策残留缓冲;下一轮 interrupt 绝不能被它
+// 放行:短窗无人决策时必须返回本请求的 reject(而非缓冲里的陈旧 approve)。
+func TestChannelDecisionProviderIgnoresLateApprove(t *testing.T) {
+	decisions := make(chan hitl.Decision, 1)
+	p := hitl.NewChannelDecisionProvider(decisions)
+	ctx := context.Background()
+
+	if d := p.GetDecision(ctx, approvalReq("req-1", time.Now().Add(50*time.Millisecond))); d.Type != hitl.DecisionReject {
+		t.Fatalf("first GetDecision = %+v, want reject for req-1", d)
+	}
+	// 迟到的 approve:sync 路径 streamTokens 的投递晚于中间件窗口。
+	decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionApprove}
+
+	start := time.Now()
+	d := p.GetDecision(ctx, approvalReq("req-2", time.Now().Add(50*time.Millisecond)))
+	if d.Type != hitl.DecisionReject || d.InterruptID != "req-2" {
+		t.Fatalf("GetDecision(req-2) = %+v, want reject for req-2(迟到的 approve 绝不能放行下一个 interrupt)", d)
+	}
+	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
+		t.Fatalf("GetDecision(req-2) returned after %v, want it to hold its own window", elapsed)
+	}
+}
+
+// TestChannelDecisionProviderDrainRespectsCtx:排空循环的退出边界是 ctx/超时
+// ——缓冲中有陈旧决策且 ctx 已取消时,必须返回本请求的 reject;select 与
+// ctx.Done 的竞争双方都不得把陈旧决策当作本请求的决策返回。
+func TestChannelDecisionProviderDrainRespectsCtx(t *testing.T) {
+	decisions := make(chan hitl.Decision, 1)
+	p := hitl.NewChannelDecisionProvider(decisions)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 取消先于调用:ctx.Done 与缓冲中的陈旧决策同时就绪(竞争确定性出口)
+	decisions <- hitl.Decision{InterruptID: "req-old", Type: hitl.DecisionApprove}
+
+	d := p.GetDecision(ctx, approvalReq("req-new", time.Now().Add(time.Minute)))
+	if d.Type != hitl.DecisionReject || d.InterruptID != "req-new" {
+		t.Fatalf("GetDecision with cancelled ctx = %+v, want reject for req-new(陈旧 approve 绝不能在取消后放行)", d)
 	}
 }

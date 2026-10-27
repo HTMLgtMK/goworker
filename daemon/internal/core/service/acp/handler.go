@@ -57,6 +57,16 @@ type FrontendHandler struct {
 	// 临界区互不嵌套、均为叶锁,无锁环。
 	subs map[string]*xgwSubscription
 
+	// controlSessions 是本连接以 mode=control 成功 attach 过的会话集合(I3,
+	// per-session control lease):approval/respond 的 wire 入参没有 sessionId
+	// (总方案 §7:{requestId, decision}),「必须持有 control lease」的守卫在该
+	// 方法上退化为「持有至少一个会话的 lease」——本集合是 handler 侧的候选集,
+	// 权威判定仍经 source 的 HoldControl(逐会话询问,接管易主后旧候选自然
+	// 落空)。attach(control) 成功记入(I4 两阶段:订阅建立成功才记)、
+	// detach(control) 移除、Close 清空;detach(observe) 不移除(observe 归还
+	// 的是订阅不是 lease,P5-8 契约)。与 subs 共用 h.mu(叶锁,无锁环)。
+	controlSessions map[string]bool
+
 	mu         sync.Mutex
 	promptable map[string]struct{} // 可 prompt 集合：session/new 与当前会话 load 记入
 	readOnly   map[string]struct{} // 只读集合：归档 load 记入，prompt 诚实报错

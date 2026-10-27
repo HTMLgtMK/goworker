@@ -50,14 +50,14 @@ type fakeRunControl struct {
 	*fakeSessionSource
 
 	mu          sync.Mutex
-	lease       string
-	startCalls  []fakeStartCall // 仅真实新起跑;幂等命中不记
+	leases      map[string]string // sessionID → connectionID(I3 per-session 租约)
+	startCalls  []fakeStartCall   // 仅真实新起跑;幂等命中不记
 	runByReq    map[string]string
 	cancelCalls []fakeCancelCall
 	approvals   []fakeApprovalCall
 	released    []string
-	statusFn    func(sessionID, runID string) (string, uint64, error) // 缺省 running/42
-	resolveErr  error                                                 // ResolveApproval 脚本化失败
+	statusFn    func(sessionID, runID string) (string, uint64, bool, error) // 缺省 running/42/true
+	resolveErr  error                                                       // ResolveApproval 脚本化失败
 	nextRun     int
 
 	// P5-8 附加面:attachHub 配置后,StartRun 在其上产出 3 条 key 事件(建模
@@ -73,6 +73,7 @@ func newFakeRunControl() *fakeRunControl {
 	return &fakeRunControl{
 		fakeSessionSource: &fakeSessionSource{},
 		runByReq:          map[string]string{},
+		leases:            map[string]string{},
 	}
 }
 
@@ -121,13 +122,13 @@ func (f *fakeRunControl) CancelRun(sessionID, runID string) error {
 	return nil
 }
 
-func (f *fakeRunControl) RunStatus(sessionID, runID string) (string, uint64, error) {
+func (f *fakeRunControl) RunStatus(sessionID, runID string) (string, uint64, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.statusFn != nil {
 		return f.statusFn(sessionID, runID)
 	}
-	return "running", 42, nil
+	return "running", 42, true, nil
 }
 
 func (f *fakeRunControl) PendingApprovals(sessionID string) ([]model.PendingApprovalInfo, error) {
@@ -168,36 +169,48 @@ func (f *fakeRunControl) ActiveRun(sessionID string) (string, string, bool) {
 	return f.curRunID, f.curRunState, true
 }
 
-func (f *fakeRunControl) AcquireControl(connectionID string) bool {
+// AcquireControl / ReleaseControl / HoldControl / ReleaseConnection(I3
+// per-session 租约,mirror runcontrol.go 契约): leases 按 sessionID 记账,同会话
+// 空闲→false、他人持有→接管 true、同持有者重复→false;Release 仅本人有效;
+// ReleaseConnection 释放该连接全部租约(released 记账供断连收口断言)。
+func (f *fakeRunControl) AcquireControl(sessionID, connectionID string) bool {
 	if connectionID == "" {
 		return false
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.lease == connectionID {
+	if f.leases[sessionID] == connectionID {
 		return false
 	}
-	// 返回值语义对齐 P5-6 契约(runcontrol.go):空闲→占用并返回 false,他人
-	// 持有→显式接管返回 true。P5-7 期间本 fake 恒返回 true,返回值首次被
-	// P5-8 的 tookOver 回显断言消费时暴露(信息项:P5-7 测试未消费返回值)。
-	tookOver := f.lease != ""
-	f.lease = connectionID
+	tookOver := f.leases[sessionID] != ""
+	f.leases[sessionID] = connectionID
 	return tookOver
 }
 
-func (f *fakeRunControl) ReleaseControl(connectionID string) {
+func (f *fakeRunControl) ReleaseControl(sessionID, connectionID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.lease == connectionID {
-		f.lease = ""
+	if f.leases[sessionID] == connectionID {
+		delete(f.leases, sessionID)
 	}
 	f.released = append(f.released, connectionID)
 }
 
-func (f *fakeRunControl) HoldControl(connectionID string) bool {
+func (f *fakeRunControl) HoldControl(sessionID, connectionID string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.lease == connectionID
+	return f.leases[sessionID] == connectionID
+}
+
+func (f *fakeRunControl) ReleaseConnection(connectionID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for sessionID, holder := range f.leases {
+		if holder == connectionID {
+			delete(f.leases, sessionID)
+		}
+	}
+	f.released = append(f.released, connectionID)
 }
 
 func (f *fakeRunControl) UnbindCapabilities(connectionID string) {}
@@ -320,8 +333,8 @@ func TestXGWRunStartRoundTripAndRequestIdempotency(t *testing.T) {
 	sid := stack.initAndNew(t)
 	// 测试面经 source 直接持照(AcquireControl 返回值是 tookOver 语义,非成败;
 	// 持照以 HoldControl 断言)。
-	stack.runs.AcquireControl(stack.handler.connectionID)
-	if !stack.runs.HoldControl(stack.handler.connectionID) {
+	stack.runs.AcquireControl(sid, stack.handler.connectionID)
+	if !stack.runs.HoldControl(sid, stack.handler.connectionID) {
 		t.Fatal("test setup: acquire control lease failed")
 	}
 
@@ -444,8 +457,8 @@ func TestXGWRunGetAndCancelForwarding(t *testing.T) {
 
 	// source 错误(如 ErrRunNotFound 语义)→ -32000 + 文案透传。
 	stack.runs.mu.Lock()
-	stack.runs.statusFn = func(string, string) (string, uint64, error) {
-		return "", 0, fmt.Errorf("run %q: %w", "run-x", errors.New("not found"))
+	stack.runs.statusFn = func(string, string) (string, uint64, bool, error) {
+		return "", 0, true, fmt.Errorf("run %q: %w", "run-x", errors.New("not found"))
 	}
 	stack.runs.mu.Unlock()
 	_, err := stack.callRaw(t, XMethodRunGet, map[string]any{"sessionId": sid, "runId": "run-x"})
@@ -454,7 +467,7 @@ func TestXGWRunGetAndCancelForwarding(t *testing.T) {
 		t.Fatalf("run/get error message = %q, want source error text", rpcErr.Message)
 	}
 
-	stack.runs.AcquireControl(stack.handler.connectionID)
+	stack.runs.AcquireControl(sid, stack.handler.connectionID)
 	raw, err := stack.callRaw(t, XMethodRunCancel, map[string]any{"sessionId": sid, "runId": "run-1"})
 	if err != nil {
 		t.Fatalf("run/cancel: %v", err)
@@ -473,7 +486,7 @@ func TestXGWRunGetAndCancelForwarding(t *testing.T) {
 		t.Fatalf("source got cancel %+v, want {sessionId:%q, runId:run-1}", call, sid)
 	}
 
-	stack.runs.ReleaseControl(stack.handler.connectionID)
+	stack.runs.ReleaseControl(sid, stack.handler.connectionID)
 	_, err = stack.callRaw(t, XMethodRunCancel, map[string]any{"sessionId": sid, "runId": "run-1"})
 	rpcErr = wantXGWError(t, "run/cancel after release", err)
 	if !strings.Contains(rpcErr.Message, "control lease") {
@@ -484,12 +497,20 @@ func TestXGWRunGetAndCancelForwarding(t *testing.T) {
 // TestXGWApprovalRespondForwardsDecision(P5-7 审批面):decision wire 形状
 // (interrupt_id/type,与 hitl.Decision JSON 同形)白名单映射转发;未知/空
 // type 一律 -32000 且绝不触达 source(零值 DecisionType 穿透中间件=放行,
-// 映射的失败方向必须是拒绝);source 错误归一 -32000。
+// 映射的失败方向必须是拒绝);source 错误归一 -32000。持照走生产路径
+// attach(mode=control)(I3 后 approval/respond 的守卫候选集来自 control
+// attach,直接经 source 持照不经 handler,守卫无从建立候选)。
 func TestXGWApprovalRespondForwardsDecision(t *testing.T) {
 	frc := newFakeRunControl()
+	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
+	frc.mu.Lock()
+	frc.attachHub = hub
+	frc.mu.Unlock()
 	stack := newXGWStack(t, nil, frc)
-	stack.initAndNew(t)
-	stack.runs.AcquireControl(stack.handler.connectionID)
+	sid := stack.initAndNew(t)
+	if _, err := stack.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"}); err != nil {
+		t.Fatalf("attach control: %v", err)
+	}
 
 	respond := func(t *testing.T, decision map[string]any) (json.RawMessage, error) {
 		t.Helper()
@@ -727,7 +748,7 @@ func TestXGWServiceAcceptClosesHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
-	frc.AcquireControl(handler.connectionID)
+	frc.AcquireControl(sid, handler.connectionID)
 	var raw json.RawMessage
 	if err := client.Call(context.Background(), XMethodRunStart,
 		map[string]any{"sessionId": sid, "input": "x", "requestId": "r1"}, &raw); err != nil {
@@ -878,8 +899,8 @@ func handlerSubCount(h *FrontendHandler) int {
 // TestXGWSessionAttachReplayNoGap(P5-8 主路径):先经协议面 run/start 产事件
 // (fake 在真 EventHub 上产出 seq 1..3)→ 后 attach afterSeq=0 → 客户端收齐
 // (0, latest] 无重无缺,Replay+Live 无缝续上 attach 后发布的事件;响应形状
-// {currentRun,latestSeq}(tookOver 省略)、事件线上形状 = SessionEvent 原样
-// JSON(蛇形键,总方案 §7 报文)。
+// {currentRun,latestSeq,eventsComplete}(tookOver 省略)、事件线上形状 =
+// SessionEvent 原样 JSON(蛇形键,总方案 §7 报文)。
 func TestXGWSessionAttachReplayNoGap(t *testing.T) {
 	stack, hub := newAttachStack(t)
 	sid := stack.initAndNew(t)
@@ -888,8 +909,8 @@ func TestXGWSessionAttachReplayNoGap(t *testing.T) {
 
 	// 先 StartRun 产事件:run/start 要求 control lease(测试面直接经 source 设置,
 	// 与 P5-7 既有用例同款;attach 自身的 lease 获取路径由接管/observe 用例覆盖)。
-	stack.runs.AcquireControl(stack.handler.connectionID)
-	if !stack.runs.HoldControl(stack.handler.connectionID) {
+	stack.runs.AcquireControl(sid, stack.handler.connectionID)
+	if !stack.runs.HoldControl(sid, stack.handler.connectionID) {
 		t.Fatal("test setup: acquire control lease failed")
 	}
 	if _, err := stack.callRaw(t, XMethodRunStart, map[string]any{
@@ -906,8 +927,11 @@ func TestXGWSessionAttachReplayNoGap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	if len(fields) != 2 {
-		t.Fatalf("attach result = %v, want exactly currentRun+latestSeq keys", fields)
+	if len(fields) != 3 {
+		t.Fatalf("attach result = %v, want exactly currentRun+latestSeq+eventsComplete keys", fields)
+	}
+	if fields["eventsComplete"] != true {
+		t.Fatalf("attach eventsComplete = %v, want true(健康 hub 无失败证据)", fields["eventsComplete"])
 	}
 	cur, ok := fields["currentRun"].(map[string]any)
 	if !ok || cur["runId"] != "run-1" || cur["state"] != "running" {
@@ -1004,10 +1028,13 @@ func TestXGWSessionAttachCursorExpired(t *testing.T) {
 	}
 }
 
-// TestXGWSessionAttachControlTakeover(P5-8 Observe/Control):attach(mode=control)
-// 经 wire 获取 lease(空闲获取 tookOver 省略);第二连接 attach(mode=control)
-// 显式接管(tookOver=true 回显);接管后原 holder 的 approval/respond 被
-// requireControl 拒绝,新 holder 可用;lease 易主不断原 holder 的事件流。
+// TestXGWSessionAttachControlTakeover(P5-8 Observe/Control;I3 后同会话接管):
+// attach(mode=control) 经 wire 获取该会话 lease(空闲获取 tookOver 省略);
+// 第二连接对**同一会话** attach(mode=control) 显式接管(tookOver=true 回显);
+// 接管后原 holder 的 approval/respond 被 requireControlForApproval 拒绝(其
+// controlSessions 候选经 source 逐会话判等落空),新 holder 可用;lease 易主
+// 不断原 holder 的事件流。跨会话互不影响由 TestXGWSessionAttachControlPerSession
+// 单独覆盖(I3:接管只发生在同一会话上)。
 func TestXGWSessionAttachControlTakeover(t *testing.T) {
 	frc := newFakeRunControl()
 	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
@@ -1018,13 +1045,12 @@ func TestXGWSessionAttachControlTakeover(t *testing.T) {
 	stackB := newXGWStack(t, nil, frc)
 	t.Cleanup(stackA.handler.Close)
 	t.Cleanup(stackB.handler.Close)
-	sidA := stackA.initAndNew(t)
-	sidB := stackB.initAndNew(t)
+	sid := stackA.initAndNew(t)
 	logA := &xgwEventLog{}
 	stackA.client.HandleNotification(XMethodSessionEvents, logA.handle)
 
 	// A:空闲获取,tookOver 省略(false),currentRun=null(无活动 run)。
-	fieldsA, err := stackA.attachRaw(t, map[string]any{"sessionId": sidA, "afterSeq": 0, "mode": "control"})
+	fieldsA, err := stackA.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"})
 	if err != nil {
 		t.Fatalf("attach A control: %v", err)
 	}
@@ -1034,22 +1060,22 @@ func TestXGWSessionAttachControlTakeover(t *testing.T) {
 	if fieldsA["currentRun"] != nil {
 		t.Fatalf("attach A currentRun = %v, want null (no active run)", fieldsA["currentRun"])
 	}
-	if !frc.HoldControl(stackA.handler.connectionID) {
+	if !frc.HoldControl(sid, stackA.handler.connectionID) {
 		t.Fatal("attach(mode=control) did not acquire the lease")
 	}
 
-	// B:显式接管,tookOver=true 回显;A 失去 lease。
-	fieldsB, err := stackB.attachRaw(t, map[string]any{"sessionId": sidB, "afterSeq": 0, "mode": "control"})
+	// B:对同一会话显式接管,tookOver=true 回显;A 失去该会话的 lease。
+	fieldsB, err := stackB.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"})
 	if err != nil {
 		t.Fatalf("attach B control: %v", err)
 	}
 	if fieldsB["tookOver"] != true {
 		t.Fatalf("attach B tookOver = %v, want true (explicit takeover)", fieldsB["tookOver"])
 	}
-	if frc.HoldControl(stackA.handler.connectionID) {
+	if frc.HoldControl(sid, stackA.handler.connectionID) {
 		t.Fatal("original holder still holds the lease after takeover")
 	}
-	if !frc.HoldControl(stackB.handler.connectionID) {
+	if !frc.HoldControl(sid, stackB.handler.connectionID) {
 		t.Fatal("takeover connection does not hold the lease")
 	}
 
@@ -1088,6 +1114,73 @@ func TestXGWSessionAttachControlTakeover(t *testing.T) {
 	waitFor(t, "event on evicted holder's stream", func() bool { return logA.count() >= 1 })
 }
 
+// TestXGWSessionAttachControlPerSession(I3 验收):两连接分别 attach(control)
+// 各自的会话 → 各自持有、互不影响(I3 修复前 B 会顶掉 A 的全局 lease);被
+// 操作会话授权(run/start 按 sessionId 守卫):A 持 sidA 的 lease 可 run/start
+// sidA,对 sidB 的 run/start 被拒,反之亦然;各连接的观察流照常。
+func TestXGWSessionAttachControlPerSession(t *testing.T) {
+	frc := newFakeRunControl()
+	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
+	frc.mu.Lock()
+	frc.attachHub = hub
+	frc.mu.Unlock()
+	stackA := newXGWStack(t, nil, frc)
+	stackB := newXGWStack(t, nil, frc)
+	t.Cleanup(stackA.handler.Close)
+	t.Cleanup(stackB.handler.Close)
+	sidA := stackA.initAndNew(t)
+	sidB := stackB.initAndNew(t)
+	logA := &xgwEventLog{}
+	logB := &xgwEventLog{}
+	stackA.client.HandleNotification(XMethodSessionEvents, logA.handle)
+	stackB.client.HandleNotification(XMethodSessionEvents, logB.handle)
+
+	// 各自 attach(control) 各自的会话:均空闲获取(无 tookOver),互不顶掉。
+	fieldsA, err := stackA.attachRaw(t, map[string]any{"sessionId": sidA, "afterSeq": 0, "mode": "control"})
+	if err != nil {
+		t.Fatalf("attach A control: %v", err)
+	}
+	if _, present := fieldsA["tookOver"]; present {
+		t.Fatalf("attach A tookOver = %v, want omitted (per-session lease, B holds nothing on sidA)", fieldsA["tookOver"])
+	}
+	fieldsB, err := stackB.attachRaw(t, map[string]any{"sessionId": sidB, "afterSeq": 0, "mode": "control"})
+	if err != nil {
+		t.Fatalf("attach B control: %v", err)
+	}
+	if _, present := fieldsB["tookOver"]; present {
+		t.Fatalf("attach B tookOver = %v, want omitted (per-session lease, A's lease is on sidA)", fieldsB["tookOver"])
+	}
+	if !frc.HoldControl(sidA, stackA.handler.connectionID) || !frc.HoldControl(sidB, stackB.handler.connectionID) {
+		t.Fatal("each connection must hold its own session's lease")
+	}
+	if frc.HoldControl(sidA, stackB.handler.connectionID) || frc.HoldControl(sidB, stackA.handler.connectionID) {
+		t.Fatal("per-session lease must not leak across sessions")
+	}
+
+	// 被操作会话授权:各连接对本会话 run/start 可达,对对方会话被拒。
+	runStart := func(s *xgwStack, target string) error {
+		t.Helper()
+		_, err := s.callRaw(t, XMethodRunStart, map[string]any{
+			"sessionId": target, "input": "x", "requestId": "per-session-" + target,
+		})
+		return err
+	}
+	if err := runStart(stackA, sidA); err != nil {
+		t.Fatalf("run/start A on sidA: %v", err)
+	}
+	if err := runStart(stackB, sidB); err != nil {
+		t.Fatalf("run/start B on sidB: %v", err)
+	}
+	if err := runStart(stackA, sidB); err == nil {
+		t.Fatal("run/start A on sidB must be rejected (A holds no lease on sidB)")
+	} else if rpcErr := wantXGWError(t, "cross-session start A→B", err); !strings.Contains(rpcErr.Message, "control lease") {
+		t.Fatalf("cross-session start message = %q, want control lease mention", rpcErr.Message)
+	}
+	if err := runStart(stackB, sidA); err == nil {
+		t.Fatal("run/start B on sidA must be rejected (B holds no lease on sidA)")
+	}
+}
+
 // TestXGWSessionAttachObserveCannotRespond(P5-8 observe 面):mode=observe
 // 不动 lease,approval/respond 被 requireControl 拒绝(-32000)且不触达 source;
 // 观察流本身正常(observe=只读观察面,总方案 §7.4)。
@@ -1104,7 +1197,7 @@ func TestXGWSessionAttachObserveCannotRespond(t *testing.T) {
 	if _, present := fields["tookOver"]; present {
 		t.Fatalf("observe attach contains tookOver = %v, want omitted", fields["tookOver"])
 	}
-	if frc := stack.runs; frc.HoldControl(stack.handler.connectionID) {
+	if frc := stack.runs; frc.HoldControl(sid, stack.handler.connectionID) {
 		t.Fatal("observe attach must not touch the control lease")
 	}
 
@@ -1204,7 +1297,7 @@ func TestXGWSessionDetachCleansUp(t *testing.T) {
 	if _, err := stack.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"}); err != nil {
 		t.Fatalf("attach control: %v", err)
 	}
-	if !stack.runs.HoldControl(stack.handler.connectionID) {
+	if !stack.runs.HoldControl(sid, stack.handler.connectionID) {
 		t.Fatal("test setup: attach(control) did not acquire the lease")
 	}
 
@@ -1219,7 +1312,7 @@ func TestXGWSessionDetachCleansUp(t *testing.T) {
 	if fields["detached"] != true {
 		t.Fatalf("detach result = %s, want {detached:true}", raw)
 	}
-	if stack.runs.HoldControl(stack.handler.connectionID) {
+	if stack.runs.HoldControl(sid, stack.handler.connectionID) {
 		t.Fatal("detach(mode=control) did not release the lease")
 	}
 	// 泵退出自清:订阅表收空(泵退出在 SDK 泵关通道之后,自清晚于订阅摘除)。
@@ -1249,7 +1342,7 @@ func TestXGWSessionDetachCleansUp(t *testing.T) {
 	if _, err := stack.callRaw(t, XMethodSessionDetach, map[string]any{"sessionId": sid, "mode": "observe"}); err != nil {
 		t.Fatalf("detach observe: %v", err)
 	}
-	if !stack.runs.HoldControl(stack.handler.connectionID) {
+	if !stack.runs.HoldControl(sid, stack.handler.connectionID) {
 		t.Fatal("detach(mode=observe) must not release the lease")
 	}
 }
@@ -1276,7 +1369,7 @@ func TestXGWHandlerCloseReclaimsSubscriptions(t *testing.T) {
 
 	stack.handler.Close()
 	waitFor(t, "pumps reclaimed by Close", func() bool { return handlerSubCount(stack.handler) == 0 })
-	if stack.runs.HoldControl(stack.handler.connectionID) {
+	if stack.runs.HoldControl(sid1, stack.handler.connectionID) {
 		t.Fatal("Close did not release the lease acquired via attach(control)")
 	}
 	publishHubEvent(t, hub, "run-1", session.EventToolCall)
@@ -1286,4 +1379,166 @@ func TestXGWHandlerCloseReclaimsSubscriptions(t *testing.T) {
 	}
 	// 重复 Close 幂等(无订阅、lease 已空)。
 	stack.handler.Close()
+}
+
+// TestXGWSessionAttachFailureKeepsSubscriptionAndLease(I4 修复验收,准备/提交
+// 两阶段的失败路径):A attach(control) 建立订阅并持有 lease 后,B 对同一会话
+// 带超前游标 attach(control) → hub.Subscribe 的 ErrCursorExpired 原样上抛为
+// -32000,且准备阶段的失败绝不触碰既有状态——旧订阅句柄原样(A 仍收实时
+// 事件)、A 的 lease 未被夺走(B 的 would-be 接管回滚/未发生,B 无 lease 亦无
+// 候选,B 的 approval/respond 同样被拒)。
+func TestXGWSessionAttachFailureKeepsSubscriptionAndLease(t *testing.T) {
+	frc := newFakeRunControl()
+	hub := runtimeagent.NewEventHub("sess-store-1", &memEventJournal{})
+	frc.mu.Lock()
+	frc.attachHub = hub
+	frc.mu.Unlock()
+	stackA := newXGWStack(t, nil, frc)
+	stackB := newXGWStack(t, nil, frc)
+	t.Cleanup(stackA.handler.Close)
+	t.Cleanup(stackB.handler.Close)
+	sid := stackA.initAndNew(t)
+	logA := &xgwEventLog{}
+	stackA.client.HandleNotification(XMethodSessionEvents, logA.handle)
+
+	// A:attach(control) → 持有 lease + 订阅建立。
+	if _, err := stackA.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 0, "mode": "control"}); err != nil {
+		t.Fatalf("attach A control: %v", err)
+	}
+	if !frc.HoldControl(sid, stackA.handler.connectionID) {
+		t.Fatal("test setup: attach(control) did not acquire the lease")
+	}
+	stackA.handler.mu.Lock()
+	subA := stackA.handler.subs[sid]
+	stackA.handler.mu.Unlock()
+	if subA == nil {
+		t.Fatal("test setup: attach A left no subscription")
+	}
+
+	// B:同一会话、mode=control、超前游标 → Subscribe 失败(ErrCursorExpired)
+	// → -32000;准备阶段失败零副作用。
+	_, err := stackB.attachRaw(t, map[string]any{"sessionId": sid, "afterSeq": 10, "mode": "control"})
+	rpcErr := wantXGWError(t, "attach(control) with future cursor", err)
+	if !strings.Contains(rpcErr.Message, "cursor expired") {
+		t.Fatalf("future cursor message = %q, want ErrCursorExpired text", rpcErr.Message)
+	}
+
+	// 回滚断言(接管未发生):A 的 lease 原样,B 无 lease;A 的订阅句柄原样。
+	if !frc.HoldControl(sid, stackA.handler.connectionID) {
+		t.Fatal("failed attach must not evict the original holder's lease")
+	}
+	if frc.HoldControl(sid, stackB.handler.connectionID) {
+		t.Fatal("failed attach must not grant the lease to the failed connection")
+	}
+	stackA.handler.mu.Lock()
+	subAfter := stackA.handler.subs[sid]
+	stackA.handler.mu.Unlock()
+	if subAfter != subA {
+		t.Fatal("failed attach must not replace the original subscription handle")
+	}
+	select {
+	case <-subA.done:
+		t.Fatal("failed attach must not stop the original pump")
+	default:
+	}
+	if n := handlerSubCount(stackB.handler); n != 0 {
+		t.Fatalf("failed connection's subscriptions = %d, want 0", n)
+	}
+
+	// B 的 approval/respond 被拒(无 lease、controlSessions 无候选);A 的
+	// approval/respond 照常(lease 完好)。
+	respond := func(s *xgwStack) error {
+		t.Helper()
+		_, err := s.callRaw(t, XMethodApprovalRespond, map[string]any{
+			"requestId": "req-1", "decision": map[string]any{"interrupt_id": "req-1", "type": "approve"},
+		})
+		return err
+	}
+	if err := respond(stackB); err == nil {
+		t.Fatal("approval/respond from the failed attach's connection must be rejected")
+	}
+	if err := respond(stackA); err != nil {
+		t.Fatalf("approval/respond from the intact holder: %v", err)
+	}
+
+	// 旧订阅仍收事件:A 的实时流未受失败 attach 影响。
+	publishHubEvent(t, hub, "run-1", session.EventToolCall)
+	waitFor(t, "live event on the untouched subscription", func() bool { return logA.count() >= 1 })
+}
+
+// TestXGWSessionAttachConcurrentSinglePump(I4 修复验收,并发 attach):同连接
+// 同会话并发 attach 的句柄替换在 h.mu 内原子换入——并发结束后表内恰一现任
+// 句柄(done 未关),settle 后发布的实时事件恰好投递一次(无未登记的残留泵
+// 在投递;换代 replay 的跨代重复是客户端显式要求 afterSeq=0 的预期行为,不在
+// 本断言面)。并发的 lease 获取幂等(同连接同会话)。
+func TestXGWSessionAttachConcurrentSinglePump(t *testing.T) {
+	stack, hub := newAttachStack(t)
+	sid := stack.initAndNew(t)
+	log := &xgwEventLog{}
+	stack.client.HandleNotification(XMethodSessionEvents, log.handle)
+	for _, typ := range []string{session.EventRunStarted, session.EventToolCall, session.EventRunFinished} {
+		publishHubEvent(t, hub, "run-1", typ)
+	}
+
+	const n = 8
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = stack.callRaw(t, XMethodSessionAttach, map[string]any{
+				"sessionId": sid, "afterSeq": 0, "mode": "control",
+			})
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent attach #%d: %v", i, err)
+		}
+	}
+
+	// 表内恰一现任句柄,且未被收泵。
+	stack.handler.mu.Lock()
+	subFinal, total := stack.handler.subs[sid], len(stack.handler.subs)
+	stack.handler.mu.Unlock()
+	if total != 1 {
+		t.Fatalf("subscriptions after concurrent attach = %d, want exactly 1", total)
+	}
+	if subFinal == nil {
+		t.Fatal("concurrent attach left no subscription")
+	}
+	select {
+	case <-subFinal.done:
+		t.Fatal("the surviving subscription must not be stopped")
+	default:
+	}
+
+	// settle 后发布的实时事件恰好一次:证明没有未登记的残留泵仍在投递。
+	// (等待以「probe 已到达」为锚:换代中被换下泵的在途 replay 会被丢弃,跨代
+	// replay 总数不确定,不能作为计数锚点。)
+	publishHubEvent(t, hub, "run-1", session.EventToolResult)
+	waitFor(t, "live probe after concurrent attach", func() bool {
+		events, _, _ := log.snapshot()
+		for _, ev := range events {
+			if ev.Seq == 4 {
+				return true
+			}
+		}
+		return false
+	})
+	events, _, bad := log.snapshot()
+	if len(bad) > 0 {
+		t.Fatalf("notification decode failures: %v", bad)
+	}
+	probes := 0
+	for _, ev := range events {
+		if ev.Seq == 4 {
+			probes++
+		}
+	}
+	if probes != 1 {
+		t.Fatalf("probe event (seq 4) delivered %d times, want exactly 1 (no zombie pump)", probes)
+	}
 }

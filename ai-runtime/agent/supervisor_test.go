@@ -27,8 +27,14 @@ import (
 //     RunQueued(同步段零阻塞、排队发生在全局槽一级);
 //   - TestStartRunPendingBounded:pending 有界,排队满即拒(ErrTooManyPending);
 //   - TestStartRunSecondRunRejected:同会话第二 StartRun 被拒(ErrRunActive);
+//   - TestStartRunAtomicOccupy:同会话并发 StartRun 的检查/占位原子性(C1 修复
+//     验收)——成功数严格 == 1,其余全部 ErrRunActive/ErrTooManyPending,成功
+//     run 可被 CancelRun 定位(Active() 即该 run);
 //   - TestStartRunJournalsQueuedBeforeReturn:StartRun 返回时 queued 记录已在
-//     (durable-first,总方案第七节)。
+//     (durable-first,总方案第七节);
+//   - TestStartRunRejectsWhenQueuedJournalFails:queued 记录持久化失败 → 拒绝
+//     启动(I1 修复验收,failing journal stub 注错:错误链上抛、零句柄、journal/
+//     active/pending/provider 四面无残留)。
 //
 // 并行性断言沿用 run_lifecycle_test.go 的「屏障代替计时」风格:唯一挂钟等待是
 // waitStarted(开工宣告)与终态 Wait 的超时上界,其余为确定性断言。
@@ -235,6 +241,80 @@ func TestStartRunSecondRunRejected(t *testing.T) {
 	waitHandle(t, h1)
 }
 
+// TestStartRunAtomicOccupy(C1 修复验收):200 个 goroutine 并发对同一 Session
+// StartRun——「检查 active」与「占位 active」必须原子(同一 rt.mu 临界区,
+// supervisor.go ②),否则并发提交可双双通过检查、后占位者覆盖先占位者的
+// rt.active(C1 的检查/占位 TOCTOU)。断言:
+//   - 成功数严格 == 1,其余全部 ErrRunActive/ErrTooManyPending(排队面满即拒
+//     与会话占用拒都是合法拒绝面——③ 预留先于 ②,满载风暴下两者都会出现);
+//   - 成功 run 的记账可被 CancelRun 定位:Active() 即该 run、CancelRun 成功
+//     (active 被覆盖时 CancelRun 撞 ErrRunNotFound,正是 C1 的危害面);
+//   - provider 恰被调用一次、store 恰一轮提交(被拒者从未执行)。
+//
+// provider 挂起(hang)而非正常返回:终态化会清 active,正常返回时 Active()/
+// CancelRun 断言与 run 完成存在竞态——挂起把成功 run 钉在在途,断言窗口确定;
+// 取消 + release 后经 execute ⑤ 的取消归一收敛 RunCancelled。
+func TestStartRunAtomicOccupy(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+	st, started, release := newSupRuntime(t, m, "atomic", "reply", true)
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) }) // 失败路径放行挂起的 provider,防 m.Close 死等在途 run
+
+	const submitters = 200
+	outcomes := make(chan startOutcome, submitters)
+	var wg sync.WaitGroup
+	for i := 0; i < submitters; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var buf strings.Builder // 每 goroutine 独立 cb:成功者唯一(契约①),拒绝者的 cb 不会被触碰
+			h, err := m.StartRun("atomic", RunRequest{Input: fmt.Sprintf("q-%d", i)}, testRunCallbacks(&buf))
+			outcomes <- startOutcome{h: h, err: err}
+		}(i)
+	}
+	wg.Wait()
+	close(outcomes)
+
+	var winners []RunHandle
+	for out := range outcomes {
+		if out.err == nil {
+			winners = append(winners, out.h)
+			continue
+		}
+		if !errors.Is(out.err, ErrRunActive) && !errors.Is(out.err, ErrTooManyPending) {
+			t.Fatalf("concurrent StartRun error = %v, want ErrRunActive or ErrTooManyPending", out.err)
+		}
+	}
+	if len(winners) != 1 {
+		t.Fatalf("concurrent StartRun successes = %d, want exactly 1(检查/占位原子性被破坏)", len(winners))
+	}
+	winner := winners[0]
+
+	waitStarted(t, started) // 成功 run 真实在跑(provider 挂起中)
+
+	rt := m.Get("atomic")
+	if rt == nil {
+		t.Fatal("runtime deregistered unexpectedly")
+	}
+	if act := rt.Active(); act == nil || act.ID != winner.RunID {
+		t.Fatalf("Active() = %+v, want the winning run %s(CancelRun 的定位面被覆盖)", act, winner.RunID)
+	}
+	if err := m.CancelRun("atomic", winner.RunID); err != nil {
+		t.Fatalf("CancelRun winning run = %v, want nil(成功 run 必须可定位取消)", err)
+	}
+
+	releaseOnce.Do(func() { close(release) }) // 放行 provider → 取消归一收敛终态
+	waitCancelled(t, winner)
+
+	st.mu.Lock()
+	commits := len(st.commits)
+	st.mu.Unlock()
+	if commits != 1 {
+		t.Fatalf("store commits = %d, want 1(被拒的提交不得执行)", commits)
+	}
+}
+
 // TestStartRunJournalsQueuedBeforeReturn:sink stub 断言 StartRun 返回时 queued
 // 记录已在(durable-first:「run/start 响应在 Run 被接受并持久化登记后立即返回」,
 // 总方案第七节);完成后记录流为 queued → running → completed,RunID 同源。
@@ -294,6 +374,84 @@ func TestStartRunJournalsQueuedBeforeReturn(t *testing.T) {
 			t.Fatalf("record %d state = %q, want %q", i, rec.State, wantStates[i])
 		}
 	}
+}
+
+// TestStartRunRejectsWhenQueuedJournalFails(I1 修复验收,failing journal stub
+// 故障注入):queued 接受记录持久化失败 → StartRun 拒绝启动——返回包裹
+// ErrRunJournalWrite 与底层错误的链、零值 RunHandle,绝不产生「已接受但无法
+// 追踪」的 Run。无痕断言四件套:
+//   - journal 零记录(stub 注错不收;真 journal 形态下恢复扫描对无 state 记录的
+//     run 亦跳过——失败发生在任何记录之前);
+//   - active 已清退:同会话后续提交不再撞 ErrRunActive;
+//   - pending 令牌已归还:WithRunLimits(1,1) 下 pending 容量恰为 1,若 ⑤ 失败
+//     路径未归还会令牌,恢复后的下一次提交必撞 ErrTooManyPending——两项清退由
+//     「恢复后同会话重提成功」联合证明(确定性,无计时断言);
+//   - provider 未开工:被拒 run 的 execute 从未启动(goroutine 未创建,确定性),
+//     恢复后的 run 才开工。
+func TestStartRunRejectsWhenQueuedJournalFails(t *testing.T) {
+	m := NewSessionManager(WithRunLimits(1, 1)) // pending 容量 1:令牌守恒的探针
+	defer m.Close()
+
+	jr := &stubRunJournal{}
+	cause := errors.New("disk full")
+	jr.appendErr = cause
+	started := make(chan struct{})
+	pv := &gatedProvider{
+		replies: []string{"reply"},
+		starts:  []chan struct{}{started},
+		release: nil, // 不挂起:被调用即返回
+	}
+	s := NewSession(SessionDeps{
+		Config:   runtimeconfig.Default(),
+		AuditDir: "",
+		CollectTools: func(*sandbox.Config) []core.Tool {
+			return nil
+		},
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			return pv, nil
+		},
+		Store:      &fakeConversationStore{},
+		RunJournal: jr,
+	})
+	rt := NewSessionRuntime("journal-reject", s)
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// 注错提交:拒绝 + 错误链(sentinel 与底层因果都可 errors.Is 判)+ 零句柄。
+	h, err := m.StartRun("journal-reject", RunRequest{Input: "q"}, testRunCallbacks(&strings.Builder{}))
+	if !errors.Is(err, ErrRunJournalWrite) {
+		t.Fatalf("StartRun with failing journal = %v, want ErrRunJournalWrite", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("StartRun error chain = %v, want wrap of underlying %v", err, cause)
+	}
+	if h != (RunHandle{}) {
+		t.Fatalf("rejected StartRun returned handle %+v, want zero value(拒绝绝不携带句柄)", h)
+	}
+
+	// 无痕:journal 零记录、active 清退、provider 未开工(execute 未启动)。
+	if recs := jr.snapshot(); len(recs) != 0 {
+		t.Fatalf("journal records after rejected StartRun = %d, want 0(失败发生在任何记录之前)", len(recs))
+	}
+	if act := rt.Active(); act != nil {
+		t.Fatalf("active after rejected StartRun = %+v, want nil(记账已无痕清退)", act)
+	}
+	select {
+	case <-started:
+		t.Fatal("provider started for a rejected run(execute 不得已启动)")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// 恢复 journal 后同会话重提成功 = active 清退(不撞 ErrRunActive)与 pending
+	// 令牌归还(容量 1 不撞 ErrTooManyPending)的联合证明;随后走完正常生命周期。
+	jr.appendErr = nil
+	h2, err := m.StartRun("journal-reject", RunRequest{Input: "q2"}, testRunCallbacks(&strings.Builder{}))
+	if err != nil {
+		t.Fatalf("StartRun after journal recovery = %v, want nil(failed write left residue: pending token or active)", err)
+	}
+	waitStarted(t, started)
+	waitHandle(t, h2)
 }
 
 // ---------------------------------------------------------------------------
@@ -954,6 +1112,144 @@ func TestStartRunEmitsJournalEvents(t *testing.T) {
 	}
 	if !hasRunning || !hasEvent {
 		t.Fatalf("middle lines missing running state (%v) or event records (%v) — 同文件混存不成立", hasRunning, hasEvent)
+	}
+}
+
+// TestStartRunJournalsRealTokens(C2 修复验收):daemon run/start 的生产提交形态
+// ——RunCallbacks{} 全 nil(runcontrol.go StartRun)——下,真实 Token 流仍进事件
+// journal。C2 修复前 teeRunCallbacks 只包装非 nil 入口,streamTokens/中间件对
+// nil 回调直接跳过(session.go 的 nil 检查),后台 Run 的 text.delta/tool_call/
+// assistant.message_finalized 全部丢失,Re-Attach 只见 run.* 生命周期事件;修复
+// 后 tee 在 hub 非 nil 时对 nil 的 EmitToken/Publish 主动装上事件映射版。
+//
+// 装置与 TestStartRunEmitsJournalEvents 同款真 journal 全链(manager → runtime →
+// Session → ai-core kernel → streamTokens → tee → hub → RunJournalStore 落盘),
+// 差异仅在提交回调:全 nil。断言(ReadEvents(0) 全量回放):
+//   - 含 text.delta(两轮模型的文本增量)、tool_call(未注册工具的调用,ai-core
+//     kernel 产出)与 assistant.message_finalized(kernel 收尾空 content Done
+//     token,恰 1 条——ai-core 剥掉增量 Done,agent.go chat());
+//   - tool_call 载荷可还原 token 全貌(payload=整个 core.Token 的 JSON,P3-4 表,
+//     含结构化 ToolCall 关联);
+//   - 全部记录 Seq 连续无重复:记录的 [FromSeq..Seq] 区间并集铺满 [1..N]
+//     (FromSeq 是范围声明非所有权,区间可横跨其他类型事件的 seq——与
+//     TestStartRunEmitsJournalEvents 的覆盖记账同款语义,不断言两两不交)。
+func TestStartRunJournalsRealTokens(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	pv := &scriptedStreamProvider{rounds: []func(ch chan<- core.Token){
+		// 第 0 轮:文本增量 + 携带 tool call 的重组响应(工具未注册 → kernel 产
+		// 出 tool_call/tool_result token,无 HITL 参与——未知工具不进审批)。
+		func(ch chan<- core.Token) {
+			ch <- core.Token{Type: core.TokenTypeText, Content: "need a tool"}
+			ch <- core.Token{Type: core.TokenTypeText, Done: true, Response: &core.ChatResponse{
+				Choices: []core.ResponseChoice{{Message: core.Message{
+					Role: "assistant",
+					ToolCalls: []core.ToolCall{{
+						ID:       "call-1",
+						Type:     "function",
+						Function: core.ToolCallFunction{Name: "missing_tool", Arguments: `{"x":"1"}`},
+					}},
+				}}},
+			}}
+		},
+		// 第 1 轮:终答增量 + 纯文本响应(kernel 收尾发空 content Done)。
+		func(ch chan<- core.Token) {
+			ch <- core.Token{Type: core.TokenTypeText, Content: "final answer"}
+			ch <- core.Token{Type: core.TokenTypeText, Done: true, Response: &core.ChatResponse{
+				Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: "final answer"}}},
+			}}
+		},
+	}}
+	fx := newEventRunRuntime(t, m, pv)
+
+	// daemon run/start 的提交形态:全 nil 回调(C2 的生产入口形状——修复前本
+	// 测试失败,三类 token 派生事件全部缺席)。
+	h, err := m.StartRun(fx.sessionID, RunRequest{Input: "q"}, RunCallbacks{})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	waitHandle(t, h)
+
+	recs, err := fx.journal.ReadEvents(0)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	if len(recs) == 0 {
+		t.Fatal("no event records persisted")
+	}
+	var (
+		hasTextDelta    bool
+		hasToolCall     bool
+		hasToolResult   bool
+		finalizedCount  int
+		toolCallPayload []byte
+	)
+	for _, rec := range recs {
+		if rec.RunID != h.RunID {
+			t.Fatalf("record seq %d RunID = %q, want %q", rec.Seq, rec.RunID, h.RunID)
+		}
+		switch rec.Type {
+		case session.EventTextDelta:
+			hasTextDelta = true
+		case session.EventToolCall:
+			hasToolCall = true
+			toolCallPayload = rec.Payload
+		case session.EventToolResult:
+			hasToolResult = true
+		case session.EventAssistantMessageFinalized:
+			finalizedCount++
+		}
+	}
+	if !hasTextDelta {
+		t.Fatal("journal missing text.delta(后台 Run 的真实 token 未进事件流,C2)")
+	}
+	if !hasToolCall || !hasToolResult {
+		t.Fatalf("journal tool_call=%v tool_result=%v, want both(后台 Run 的工具调用未进事件流,C2)", hasToolCall, hasToolResult)
+	}
+	if finalizedCount != 1 {
+		t.Fatalf("assistant.message_finalized count = %d, want 1(kernel 收尾 Done token 恰一条)", finalizedCount)
+	}
+	// tool_call 载荷还原 token 全貌:结构化 ToolCall 关联可回放(P3-4 表)。
+	var tok core.Token
+	if err := json.Unmarshal(toolCallPayload, &tok); err != nil {
+		t.Fatalf("decode tool_call payload %s: %v", toolCallPayload, err)
+	}
+	if tok.ToolCall.Function.Name != "missing_tool" || tok.ToolCall.ID != "call-1" {
+		t.Fatalf("tool_call payload = %s, want structured ToolCall(missing_tool/call-1)", toolCallPayload)
+	}
+
+	// Seq 连续无重复(记录面的可观测不变量,TestStartRunEmitsJournalEvents 同款
+	// 覆盖记账):记录的 [FromSeq..Seq] 区间并集铺满 [1..N],记录 Seq 两两不同。
+	type seqRange struct {
+		lo, hi uint64
+		typ    string
+	}
+	ranges := make([]seqRange, 0, len(recs))
+	for _, rec := range recs {
+		lo := rec.Seq
+		if rec.FromSeq > 0 && rec.FromSeq < lo {
+			lo = rec.FromSeq
+		}
+		ranges = append(ranges, seqRange{lo: lo, hi: rec.Seq, typ: rec.Type})
+	}
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].lo < ranges[j].lo })
+	seenSeq := map[uint64]string{}
+	var cursor uint64
+	for _, rg := range ranges {
+		if rg.lo > cursor+1 {
+			t.Fatalf("seq gap: range [%d..%d] (%s) starts after cursor %d(Seq 全局连续)", rg.lo, rg.hi, rg.typ, cursor)
+		}
+		if prev, dup := seenSeq[rg.hi]; dup {
+			t.Fatalf("record seq %d duplicated (%s and %s)(Seq 无重复)", rg.hi, prev, rg.typ)
+		}
+		seenSeq[rg.hi] = rg.typ
+		if rg.hi > cursor {
+			cursor = rg.hi
+		}
+	}
+	if cursor < 6 {
+		t.Fatalf("final seq = %d, want >= 6(2 轮 token + tool_call/result + 收尾 + usage/iteration + 生命周期,token 面未生效)", cursor)
 	}
 }
 

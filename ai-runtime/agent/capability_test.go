@@ -1,8 +1,10 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -336,6 +338,99 @@ func TestCapabilityWaitTimeoutFallback(t *testing.T) {
 	}
 }
 
+// TestCapabilityWaitTimeoutClampedToToolCtxBudget(P4 评审 issue2):显式配置
+// >=60s 被钳到 maxCapabilityWaitTimeout(55s)并 slog.Warn——45/55 < ai-core
+// toolCtx 60s 的硬约束从注释落为代码,超配的「静默语义劣化」改为显式降级+
+// 告警;<=0 回落 45s、1~55s 显式区间原样放行(上限值本身不钳)。
+func TestCapabilityWaitTimeoutClampedToToolCtxBudget(t *testing.T) {
+	// 捕获 slog 默认 logger 输出断言 warn 面(本包测试不并行,SetDefault 安全;
+	// defer 还原,不污染其他用例)。
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+
+	if got := resolveCapabilityWait(60 * time.Second); got != 55*time.Second {
+		t.Fatalf("resolveCapabilityWait(60s) = %v, want 55s(超配被钳制)", got)
+	}
+	if got := resolveCapabilityWait(90 * time.Second); got != maxCapabilityWaitTimeout {
+		t.Fatalf("resolveCapabilityWait(90s) = %v, want %v", got, maxCapabilityWaitTimeout)
+	}
+	// 钳制边界内原样放行:55s 恰为上限,不得自钳;1s 显式预算不被覆盖。
+	if got := resolveCapabilityWait(55 * time.Second); got != 55*time.Second {
+		t.Fatalf("resolveCapabilityWait(55s) = %v, want 55s(上限值原样)", got)
+	}
+	if got := resolveCapabilityWait(time.Second); got != time.Second {
+		t.Fatalf("resolveCapabilityWait(1s) = %v, want 1s(区间内不被钳)", got)
+	}
+	if !strings.Contains(buf.String(), "clamped") {
+		t.Fatalf("clamp warning missing from log output: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "configured=1m30s") {
+		t.Fatalf("clamp warning missing configured value: %q", buf.String())
+	}
+}
+
+// TestCapabilityInvokeFailureClassification(P4 评审 issue5):Invoke 失败按
+// 错误类别分流——context.Canceled/DeadlineExceeded(run 取消传播 / toolCtx
+// 60s 到点)不是「通道事实不可用」,跳过 Invalidate 直接上抛(健康绑定不得
+// 误失效;Invalidate 无计数面,以「绑定仍可 Lookup 命中」为等价观测);其余
+// 失败仍即时失效并转入等待,超时返回明确失败文本。
+func TestCapabilityInvokeFailureClassification(t *testing.T) {
+	specs := []ClientToolSpec{{Name: "sys_x", Schema: "{}"}}
+
+	t.Run("ctx cancel keeps binding", func(t *testing.T) {
+		r := NewCapabilityRegistry()
+		exec := &fakeClientExecutor{err: context.Canceled}
+		r.Bind("sess-1", "conn-A", []string{"sys_x"}, time.Minute, exec)
+		tools := NewClientToolProxy(r, "sess-1", specs, time.Second)
+
+		_, err := tools[0].Execute(context.Background(), map[string]any{})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Execute = %v, want context.Canceled rethrown", err)
+		}
+		if exec.calls != 1 {
+			t.Fatalf("executor invoked %d time(s), want 1", exec.calls)
+		}
+		if _, ok := r.Lookup("sess-1", "sys_x"); !ok {
+			t.Fatal("binding invalidated on cancel(取消不得误失效健康绑定)")
+		}
+	})
+
+	t.Run("tool deadline keeps binding", func(t *testing.T) {
+		r := NewCapabilityRegistry()
+		exec := &fakeClientExecutor{err: context.DeadlineExceeded}
+		r.Bind("sess-1", "conn-A", []string{"sys_x"}, time.Minute, exec)
+		tools := NewClientToolProxy(r, "sess-1", specs, time.Second)
+
+		_, err := tools[0].Execute(context.Background(), map[string]any{})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Execute = %v, want context.DeadlineExceeded rethrown", err)
+		}
+		if _, ok := r.Lookup("sess-1", "sys_x"); !ok {
+			t.Fatal("binding invalidated on deadline(60s 超时不得误失效健康绑定)")
+		}
+	})
+
+	t.Run("plain error invalidates and waits", func(t *testing.T) {
+		r := NewCapabilityRegistry()
+		exec := &fakeClientExecutor{err: errors.New("connection dead")}
+		r.Bind("sess-1", "conn-A", []string{"sys_x"}, time.Minute, exec)
+		tools := NewClientToolProxy(r, "sess-1", specs, 80*time.Millisecond)
+
+		res, err := tools[0].Execute(context.Background(), map[string]any{})
+		if err != nil {
+			t.Fatalf("wait-exit must be a tool result, not an error: %v", err)
+		}
+		if !strings.Contains(res, "device tool sys_x unavailable: connection lost") {
+			t.Fatalf("result = %q, want explicit failure text", res)
+		}
+		if _, ok := r.Lookup("sess-1", "sys_x"); ok {
+			t.Fatal("binding kept on plain failure(通道事实不可用必须即时失效)")
+		}
+	})
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // P4-4:等待/安全超时/失效语义 + waiting_capability + 观察者注入(总方案
 // 第十一节 TestToolBindingDisconnect → 本步,P4 完成线)。
@@ -412,9 +507,16 @@ func waitRunState(t *testing.T, h RunHandle, want RunState) {
 }
 
 // waitToolCallUnbound 返回 EmitToken 钩子:首个本工具 tool_call token 到达时
-// 执行 disconnect(解绑 conn-A)并关闭 done——token 消费先于工具 Execute,
-// 「先断连、后执行」的次序由此钉死。toolResults 收集 tool_result 文本
+// 执行 disconnect(解绑 conn-A)并关闭 done。toolResults 收集 tool_result 文本
 // (单写者 = 执行 goroutine;主 goroutine 在 Wait 返回后读取,happens-before)。
+//
+// 时序警示(修正旧注「token 消费先于工具 Execute」的过度声明):tool_call
+// token 的发送是 ai-core 执行 goroutine 到 streamTokens 消费 goroutine 的通道
+// 交接(agent.go emitToken),交接完成执行面即继续跑中间件与 Execute——钩子的
+// disconnect 何时被调度无保证,满载 -race 全量下可晚于 Invoke。需要严格先于
+// Execute 的编排(如断连)必须先验完成,不得放进本钩子;钩子只承载无时序要求
+// 的通知/收集面(见 TestToolBindingDisconnect 与 daemon 侧
+// TestDeviceToolBindingRebindAfterDisconnect 的同款竞态修正)。
 func waitToolCallUnbound(disconnect func(), toolResults *[]string) (cb RunCallbacks, done chan struct{}) {
 	done = make(chan struct{})
 	fired := false // 仅执行 goroutine 读写(EmitToken 单调用面)
@@ -435,11 +537,15 @@ func waitToolCallUnbound(disconnect func(), toolResults *[]string) (cb RunCallba
 
 // TestToolBindingDisconnect(总方案第十一节 → 本步):StartRun + ToolSource
 // 返回代理(绑 conn-A 的 dead executor,Invoke 置失败做陷阱)+ scripted
-// provider 先发 tool_call 再 final → run 到工具调用(EmitToken 钩子解绑
-// conn-A)→ run 迁移 RunWaitingCapability → Bind(conn-B, 含同名工具, 新
-// executor)→ 工具在 conn-B 执行完成 → RunCompleted。dead executor 的
-// Invoke 计数==0:等待重绑绝不把请求静默路由到已断开(或任何未显式重绑)的
-// 连接(总方案 §8 :650 断言钉死)。
+// provider 先发 tool_call 再 final → StartRun 前先验断连(UnbindConnection,
+// 确定性编排,理由见 waitToolCallUnbound 的时序警示)→ run 到工具调用时
+// lookup 必然 miss → run 迁移 RunWaitingCapability → Bind(conn-B, 含同名
+// 工具, 新 executor)→ 工具在 conn-B 执行完成 → RunCompleted。dead executor
+// 的 Invoke 计数==0:等待重绑绝不把请求静默路由到已断开(或任何未显式重绑)
+// 的连接(总方案 §8 :650 断言钉死;若被静默重绑/路由,Invoke 必失败且计数,
+// 陷阱照常触发)。「在途 Invoke 失败→即时 Invalidate→等待」路径由
+// TestCapabilityInvokeFailureClassification「plain error invalidates and
+// waits」单测钉死。
 func TestToolBindingDisconnect(t *testing.T) {
 	m := NewSessionManager()
 	defer m.Close()
@@ -456,19 +562,17 @@ func TestToolBindingDisconnect(t *testing.T) {
 	sid := newCapabilityRunRuntime(t, m, "cap-disc", pv, nil)
 	tools := NewClientToolProxy(reg, sid, capToolSpecs("never"), 5*time.Second)
 
+	// 断连编排:先于 StartRun(确定性),handler.Close 断连收口的等价物。
+	reg.UnbindConnection("conn-A")
+
 	var toolResults []string
-	cb, unbound := waitToolCallUnbound(func() { reg.UnbindConnection("conn-A") }, &toolResults)
+	cb, _ := waitToolCallUnbound(func() {}, &toolResults) // 只收集 tool_result
 
 	h, err := m.StartRun(sid, RunRequest{Input: "take a photo", ToolSource: func(context.Context) []core.Tool { return tools }}, cb)
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
 
-	select {
-	case <-unbound:
-	case <-time.After(5 * time.Second):
-		t.Fatal("tool call never reached the disconnect hook")
-	}
 	waitRunState(t, h, RunWaitingCapability) // 断连 → waiting_capability(与 waiting_input 可区分)
 
 	reg.Bind(sid, "conn-B", []string{capToolName}, time.Minute, execB) // 显式重绑:含同名工具
@@ -563,19 +667,19 @@ func TestRebindRequiresCapabilityMatch(t *testing.T) {
 	sid := newCapabilityRunRuntime(t, m, "cap-mismatch", pv, nil)
 	tools := NewClientToolProxy(reg, sid, capToolSpecs("never"), 600*time.Millisecond)
 
+	// 断连编排:先于 StartRun 的确定性 UnbindConnection(时序竞态与修正理由见
+	// waitToolCallUnbound 的警示——钩子式断连满载下可晚于 Invoke,健康执行器
+	// 会先成功返回把 run 直送 completed)。
+	reg.UnbindConnection("conn-A")
+
 	var toolResults []string
-	cb, unbound := waitToolCallUnbound(func() { reg.UnbindConnection("conn-A") }, &toolResults)
+	cb, _ := waitToolCallUnbound(func() {}, &toolResults) // 只收集 tool_result
 
 	h, err := m.StartRun(sid, RunRequest{Input: "take a photo", ToolSource: func(context.Context) []core.Tool { return tools }}, cb)
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
 
-	select {
-	case <-unbound:
-	case <-time.After(5 * time.Second):
-		t.Fatal("tool call never reached the disconnect hook")
-	}
 	waitRunState(t, h, RunWaitingCapability)
 
 	// mismatch 重绑:conn-B 只声明 sys_other,不含 sys_camera。
@@ -634,11 +738,14 @@ func TestRebindReconfirmViaHITL(t *testing.T) {
 	decides := 0
 	cb := RunCallbacks{
 		EmitToken: func(core.Token) {},
-		Decide: func(*hitl.InterruptRequest) hitl.Decision {
+		Decide: func(req *hitl.InterruptRequest) hitl.Decision {
 			decideMu.Lock()
 			decides++
 			decideMu.Unlock()
-			return hitl.Decision{Type: hitl.DecisionApprove}
+			// 决策回执 InterruptRequest.ID(GetDecision 仅消费 InterruptID
+			// 匹配的决策,P4 评审 issue1):生产调用方(DecideViaACP/
+			// hitl_consumer)均按 ID 回执。
+			return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionApprove}
 		},
 	}
 

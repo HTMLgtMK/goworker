@@ -149,8 +149,8 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 	decisions := make(chan hitl.Decision, 1)
 	// 每 Run 一实例的错误捕获(AC-1):捕获 AfterAgentEvent.Err 供最终记账,
 	// 见 errcapture.go 的 happens-before 论证。
-	cap := &runErrorCapture{}
-	mws := s.buildMiddlewareChain(cb, provider, &sandboxCfg, cfg, decisions, cap)
+	errCap := &runErrorCapture{}
+	mws := s.buildMiddlewareChain(cb, provider, &sandboxCfg, cfg, decisions, errCap)
 	systemPrompt := s.buildSystemPrompt(cfg, tools)
 
 	opts := []coreagent.Option{coreagent.WithMaxIterations(cfg.LLM.MaxIterations)}
@@ -193,7 +193,7 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 	// agent.go:54-58)建立 happens-before —— defer 内 fireMiddlewareEvent(:55,
 	// capture 写入点)先于 `msgCh <- messages`(:57),读时必可见;c.mu 仅为防御
 	// 与 -race 明示。次序依赖由 run_test.go 的 AC-1 断言钉死(plan §6 风险 1)。
-	runErr := cap.captured()
+	runErr := errCap.captured()
 	if len(messages) > 1 {
 		conv2 := stripMemoryBlocks(messages[1:]) // messages[0] 是 system prompt
 		if s.deps.Store == nil {
@@ -294,9 +294,10 @@ func (s *Session) streamTokens(cb RunCallbacks, agentCtx context.Context, tokenC
 // memory 必须在 compress 前：压缩器测量的是注入记忆后的完整 history。
 // errcapture（runErrorCapture，AC-1）挂链尾：AfterAgent hooks 全部触发、顺序
 // 无语义（fireMiddlewareEvent 逐个分发，ai-core/agent/agent.go:213-241），它
-// 只观察 AfterAgentEvent.Err 供 Session.Run 最终记账。cap 由 Run 每轮构造传入
-// （每 Run 一实例，跨 run 不复用）。
-func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, sandboxCfg *sandbox.Config, cfg *runtimeconfig.Config, decisions chan hitl.Decision, cap *runErrorCapture) []core.Middleware {
+// 只观察 AfterAgentEvent.Err 供 Session.Run 最终记账。errCap 由 Run 每轮构造
+// 传入(每 Run 一实例,跨 run 不复用;P4 评审 issue7:原局部名 cap 遮蔽内建
+// 函数,改名不涉行为)。
+func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, sandboxCfg *sandbox.Config, cfg *runtimeconfig.Config, decisions chan hitl.Decision, errCap *runErrorCapture) []core.Middleware {
 	publish := func(event string, data any) {
 		if cb.Publish != nil {
 			cb.Publish(event, data)
@@ -341,7 +342,7 @@ func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, 
 		memMw := middlewares.NewMemoryMiddleware(&memoryClientAdapter{s.deps.Memory}, cfg.Memory, contextWindow(cfg))
 		mws = append(mws, memMw)
 	}
-	return append(mws, compressMw, cap)
+	return append(mws, compressMw, errCap)
 }
 
 func contextWindow(cfg *runtimeconfig.Config) int {

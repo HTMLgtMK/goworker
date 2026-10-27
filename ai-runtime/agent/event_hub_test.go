@@ -25,6 +25,12 @@ import (
 //     合并记录(Seq=最后一条、FromSeq=第一条),订阅者仍逐条收到 100 条
 //     (实时不合并,P3-0 契约表第 3 行)。
 //
+// 修复验收(CR6):
+//   - TestSubscribeReplayCarriesFromSeq(I2lite):回放透传合并记录的 FromSeq
+//     范围声明(批量/单条可辨),实时逐事件 FromSeq 恒 0;
+//   - TestEventHubEventsIncompleteFlag(I6lite):key 落盘失败/合并 flush 失败
+//     置位完整性标记(EventsComplete false,永不复位)。
+//
 // P3-3 读侧(plan P3-3「新增测试」):
 //   - TestAttachReplayNoGap(总方案第十一节 → 本步):Replay+Live 原子切换的
 //     无缺口无重复压测(-race);
@@ -389,6 +395,111 @@ func TestDeltaMergeWindow(t *testing.T) {
 	if gotText != wantText.String() {
 		t.Fatalf("merged payload = %q, want concatenated %q", gotText, wantText.String())
 	}
+}
+
+// TestSubscribeReplayCarriesFromSeq(I2lite 修复验收):合并记录的范围声明上
+// wire——Subscribe 回放把持久化记录的 FromSeq 透传进 SessionEvent,客户端可
+// 区分批量与单条:
+//   - 回放侧:50ms 窗收口的 text.delta 合并记录 → 一条 SessionEvent{Seq=3,
+//     FromSeq=1}(批量);逐事件 key 记录 → FromSeq=0(单条);
+//   - 实时侧:订阅后 live 投递的逐事件 FromSeq 恒 0(省略);
+//   - 游标语义不变:回放方仍按 Seq=ToSeq 推进(FromSeq 只是范围声明)。
+//
+// 订阅晚于全部发布:无并发发布面,回放快照确定;订阅后另发一条 delta 验证
+// live 侧粒度,收尾关闭由 defer 的 hub.Close 承担(pump 随 Close 退出)。
+func TestSubscribeReplayCarriesFromSeq(t *testing.T) {
+	jr := &stubEventJournal{}
+	hub := NewEventHub("fromseq-wire", jr)
+	defer hub.Close()
+	hub.BeginRun("run-fs")
+
+	// 3 条 text.delta → EndRun 收口为一条合并记录 [1..3];再逐条 key 事件(seq 4)。
+	for i := 0; i < 3; i++ {
+		if err := hub.Publish(IngressEvent{RunID: "run-fs", Type: session.EventTextDelta, Payload: json.RawMessage(`"d"`)}); err != nil {
+			t.Fatalf("Publish delta #%d: %v", i, err)
+		}
+	}
+	hub.EndRun()
+	if err := hub.Publish(IngressEvent{RunID: "run-fs", Type: session.EventToolCall, Payload: json.RawMessage(`"c"`)}); err != nil {
+		t.Fatalf("Publish key: %v", err)
+	}
+
+	ch, err := hub.Subscribe(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	// 回放:恰 2 条(一条合并 + 一条逐条),FromSeq 可辨批量与单条。
+	ev1 := recvEvent(t, ch)
+	if ev1.Seq != 3 || ev1.FromSeq != 1 || ev1.Type != session.EventTextDelta {
+		t.Fatalf("replay #1 = {seq:%d from:%d type:%s}, want {seq:3 from:1 text.delta}(合并记录的范围声明)", ev1.Seq, ev1.FromSeq, ev1.Type)
+	}
+	ev2 := recvEvent(t, ch)
+	if ev2.Seq != 4 || ev2.FromSeq != 0 || ev2.Type != session.EventToolCall {
+		t.Fatalf("replay #2 = {seq:%d from:%d type:%s}, want {seq:4 from:0 tool_call}(单条记录无范围声明)", ev2.Seq, ev2.FromSeq, ev2.Type)
+	}
+	requireNoEvent(t, ch) // 回放快照止于注册点 latest=4
+
+	// 实时侧:live 投递逐事件,FromSeq 恒 0。
+	if err := hub.Publish(IngressEvent{RunID: "run-fs", Type: session.EventTextDelta, Payload: json.RawMessage(`"e"`)}); err != nil {
+		t.Fatalf("Publish live delta: %v", err)
+	}
+	ev3 := recvEvent(t, ch)
+	if ev3.Seq != 5 || ev3.FromSeq != 0 {
+		t.Fatalf("live event = {seq:%d from:%d}, want {seq:5 from:0}(实时逐事件无范围声明)", ev3.Seq, ev3.FromSeq)
+	}
+	requireNoEvent(t, ch)
+}
+
+// TestEventHubEventsIncompleteFlag(I6lite 修复验收):事件完整性标记的单调置位
+// ——stub journal 注错 → Publish 失败 → EventsComplete()==false,且永不复位:
+//   - key 事件落盘失败(durable-first 拒绝):Publish 返回错误 + 标记置位;
+//   - 合并 delta flush 失败:Publish 本身成功(delta 不逐条落盘),EndRun 收口
+//     的 flush 失败后标记置位——降级语义不变(执行不受阻),但完整性事实被记账;
+//   - 置位后成功的发布不翻回(单调「曾经失败」,健康 hub 对照 true)。
+func TestEventHubEventsIncompleteFlag(t *testing.T) {
+	t.Run("KeyEventAppendFailure", func(t *testing.T) {
+		jr := &stubEventJournal{appendErr: errors.New("fsync boom")}
+		hub := NewEventHub("incomplete-key", jr)
+		defer hub.Close()
+		hub.BeginRun("run-i")
+		if got := hub.EventsComplete(); !got {
+			t.Fatal("fresh hub EventsComplete = false, want true")
+		}
+		if err := hub.Publish(IngressEvent{RunID: "run-i", Type: session.EventToolCall, Payload: json.RawMessage(`"c"`)}); err == nil {
+			t.Fatal("Publish key event with failing journal = nil, want error")
+		}
+		if got := hub.EventsComplete(); got {
+			t.Fatal("EventsComplete after failed key publish = true, want false(落盘失败已置位)")
+		}
+		// 后续成功的发布不翻回:标记是单调的「曾经失败」事实。
+		if err := hub.Publish(IngressEvent{RunID: "run-i", Type: session.EventToolResult, Payload: json.RawMessage(`"r"`)}); err == nil {
+			t.Fatal("second publish with still-failing journal = nil, want error")
+		}
+		if got := hub.EventsComplete(); got {
+			t.Fatal("EventsComplete flipped back to true, want false(永不复位)")
+		}
+	})
+
+	t.Run("DeltaFlushFailure", func(t *testing.T) {
+		jr := &stubEventJournal{appendErr: errors.New("disk full")}
+		hub := NewEventHub("incomplete-delta", jr)
+		defer hub.Close()
+		hub.BeginRun("run-j")
+		// delta 发布不落盘(进合并缓冲):Publish 成功,标记仍 true。
+		if err := hub.Publish(IngressEvent{RunID: "run-j", Type: session.EventTextDelta, Payload: json.RawMessage(`"d"`)}); err != nil {
+			t.Fatalf("Publish delta: %v", err)
+		}
+		if got := hub.EventsComplete(); !got {
+			t.Fatal("EventsComplete before flush = false, want true(flush 未发生,无失败证据)")
+		}
+		hub.EndRun() // 收口 flush 撞注错:降级 warn,标记置位
+		if got := hub.EventsComplete(); got {
+			t.Fatal("EventsComplete after failed delta flush = true, want false(重放缺 delta 段)")
+		}
+		if recs := jr.snapshot(); len(recs) != 0 {
+			t.Fatalf("journal records = %d, want 0(注错未落盘,缺段由标记显式暴露)", len(recs))
+		}
+	})
 }
 
 // ── P3-3:Subscribe Replay+Live 原子切换(防 Race A/B)+ ErrCursorExpired ────

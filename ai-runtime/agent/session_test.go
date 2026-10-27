@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
@@ -29,6 +31,26 @@ func testSession(pv core.Provider) (*Session, *runtimeconfig.Config) {
 	return s, cfg
 }
 
+// interruptIDEmitter 捕获 interrupt 事件的请求 ID:决策回执契约要求
+// Decision.InterruptID == InterruptRequest.ID(GetDecision 仅消费 InterruptID
+// 匹配的决策,P4 评审 issue1 的排空语义),测试按真实 ID 回执而非猜测 req-N
+// (进程级原子计数,序号随测试执行序漂移)。
+type interruptIDEmitter struct {
+	ids chan string
+}
+
+func (e *interruptIDEmitter) Emit(_ context.Context, tok core.Token) {
+	if tok.Type == core.TokenTypeEvent && tok.Event != nil && tok.Event.Type == hitl.EventInterrupt {
+		var req hitl.InterruptRequest
+		if err := json.Unmarshal(tok.Event.Data, &req); err == nil {
+			select {
+			case e.ids <- req.ID:
+			default:
+			}
+		}
+	}
+}
+
 func TestSessionToolAllowRulesSnapshotAndRefresh(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	persisted := 0
@@ -52,10 +74,11 @@ func TestSessionToolAllowRulesSnapshotAndRefresh(t *testing.T) {
 	decisions := make(chan hitl.Decision, 1)
 	mws := s.buildMiddlewareChain(RunCallbacks{}, provider, sandboxCfg, cfg, decisions, &runErrorCapture{})
 	mw := mws[0].(*middlewares.HITLMiddleware)
-	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
+	em := &interruptIDEmitter{ids: make(chan string, 1)}
 	ev := &core.BeforeToolEvent{
 		Ctx:  context.Background(),
 		Tool: &core.ToolCall{ID: "call-1", Function: core.ToolCallFunction{Name: "custom_write"}},
+		Emit: em,
 		ToolDef: &core.Tool{
 			Name: "custom_write",
 			Metadata: map[string]string{
@@ -65,6 +88,15 @@ func TestSessionToolAllowRulesSnapshotAndRefresh(t *testing.T) {
 			},
 		},
 	}
+	// 决策按真实中断 ID 回执:主 goroutine 阻塞在 GetDecision,后台等
+	// interrupt 事件拿到 ID 后投递;5s 等不到即放弃,断言自会失败。
+	go func() {
+		select {
+		case id := <-em.ids:
+			decisions <- hitl.Decision{InterruptID: id, Type: hitl.DecisionApproveAlways}
+		case <-time.After(5 * time.Second):
+		}
+	}()
 	mw.OnBeforeTool(ev)
 	if ev.Abort != nil {
 		t.Fatalf("allow_always aborted: %+v", ev.Abort)

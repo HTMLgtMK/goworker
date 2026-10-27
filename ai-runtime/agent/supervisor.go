@@ -10,10 +10,14 @@
 //   - 通道获取次序固定 gate → runSlots,释放逆序 runSlots → gate,两把「锁」
 //     全序无环;pending 是计数令牌非锁:StartRun 同步段非阻塞获取(满即拒),
 //     execute 各出口路径恰好归还一次,无阻塞、无泄漏;
-//   - 同会话互斥:active 在同步段占位 ⇒ 第二 StartRun 被拒(ErrRunActive;排队
-//     只发生在全局槽一级);execute 的 AcquireRun 与同步路径 withSession 在 gate
-//     上天然互斥——RecordRun 若撞上在途后台 run,由 finalizeRun 的 active 相等
-//     防御与 gate 串行保证记账不互踩;
+//   - 同会话互斥:active 的检查与占位在同一 rt.mu 临界区内原子完成(C1 修复:
+//     旧形态检查后放锁、pending 预留后再单独占位,是检查/占位 TOCTOU——并发
+//     StartRun 可双双通过检查,后占位者覆盖先占位者的 active,CancelRun 定位
+//     失败);占位 ⇒ 第二 StartRun 被拒(ErrRunActive;排队只发生在全局槽一级),
+//     冲突拒绝锁内置标志、锁外归还 pending 令牌(rt.mu 内禁止 channel 操作,
+//     归还接收经令牌计数守恒保证无阻塞);execute 的 AcquireRun 与同步路径
+//     withSession 在 gate 上天然互斥——RecordRun 若撞上在途后台 run,由
+//     finalizeRun 的 active 相等防御与 gate 串行保证记账不互踩;
 //   - 不丢记账:状态迁移只经 transition(幂等);execute 各失败分支都收敛到
 //     finalizeRun(active 必清、终态必写、令牌必释放)。
 package agent
@@ -21,6 +25,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -81,8 +86,11 @@ func (h RunHandle) Wait(ctx context.Context) (RunResult, error) {
 //     调用方自带 Decide(CLI/测试形态)不受影响,本方法不覆盖。
 //
 // 拒绝语义:manager 已 Close → ErrManagerClosed;未知会话 → ErrSessionNotFound;
-// 同会话已有 Run(在跑或排队)→ ErrRunActive;会话未绑定 → ErrSessionNotBound;
-// 全局排队满 → ErrTooManyPending。
+// 全局排队满 → ErrTooManyPending(③ 预留先于 ② 的占用检查:排队面满即拒,不
+// 为注定拒绝的提交探测会话状态);同会话已有 Run(在跑或排队)→ ErrRunActive;
+// 会话未绑定 → ErrSessionNotBound;queued 接受记录持久化失败 → ErrRunJournalWrite
+// (I1 修复,包裹底层 journal 错误——「接受并持久化登记」是 run/start 返回的
+// 前提,写失败即拒绝启动,pending/active 记账无痕清退,绝不返回句柄)。
 func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallbacks) (RunHandle, error) {
 	// ① manager 查找:m.mu 内快照 closed 与 runtime 后立即释放(锁内不做等待)。
 	m.mu.RLock()
@@ -96,46 +104,79 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 		return RunHandle{}, ErrSessionNotFound
 	}
 
-	// ② 同会话互斥检查 + 会话快照:rt.mu 内记快照后先释放,再判拒绝(锁内不做
-	// 等待)。active 非 nil 即拒——同会话第二 Run 不排队(总方案第四节「Session
-	// 在排队期间已经被占用,不能继续提交第二个 Run」)。
-	rt.mu.Lock()
-	active := rt.active
-	sess := rt.session
-	rt.mu.Unlock()
-	if active != nil {
-		return RunHandle{}, ErrRunActive
-	}
-	if sess == nil {
-		return RunHandle{}, ErrSessionNotBound
-	}
-
-	// ③ pending 非阻塞预留(有界排队,满即拒——锁/通道都不等)。预留令牌由
-	// execute 归还(进入运行前或失败出口)。
+	// ③ pending 非阻塞预留(有界排队,满即拒——锁/通道都不等;先于 ②:排队面
+	// 满即拒,不为注定拒绝的提交探测会话状态)。预留令牌由 execute 归还(进入
+	// 运行前或失败出口),② 的拒绝路径亦原路归还(见下)。
 	select {
 	case m.pending <- struct{}{}:
 	default:
 		return RunHandle{}, ErrTooManyPending
 	}
 
-	// ④ 创建记账并占位:state 保持 RunQueued(不 transition,queued 状态由此
-	// 启用),execute 内再推进 running。
-	run := newAgentRun(newRunID(), sessionID)
+	// ② 同会话互斥检查 + ④ 记账占位,合并为同一 rt.mu 临界区(C1 修复:原形态
+	// ② 读 active 后放锁、③ 预留后 ④ 再单独占位,是检查/占位 TOCTOU——并发
+	// StartRun 可双双通过检查,后占位者覆盖先占位者的 rt.active,CancelRun 经
+	// Active() 定位失败、「同会话至多一个 Run(含排队)」不变量被破坏)。锁内
+	// 只做判定与指针写:active 非 nil → 置冲突标志(ErrRunActive);会话未绑定
+	// → 同置标志(ErrSessionNotBound);否则占位 rt.active=run 并快照 sess——
+	// 检查通过与占位同临界区完成,无窗口。rt.mu 内禁止 channel 操作:冲突/未
+	// 绑定先置标志,解锁后归还 ③ 预留的令牌再返回;归还接收无阻塞(令牌计数
+	// 守恒:每笔预留恰一次归还——execute 各出口或本冲突路径,任一归还者执行
+	// 接收时其余接收者至多完成「预留总数-1」次,缓冲恒非空)。
+	run := newAgentRun(newRunID(), sessionID) // state 保持 RunQueued(不 transition,queued 状态由此启用),execute 内再推进 running
+	var (
+		sess   *Session
+		reject error // 冲突标志:锁内置非 nil,锁外归还令牌后以此返回
+	)
 	rt.mu.Lock()
-	rt.active = run
+	switch {
+	case rt.active != nil: // 同会话第二 Run 不排队(总方案第四节「Session 在排队期间已经被占用,不能继续提交第二个 Run」)
+		reject = ErrRunActive
+	case rt.session == nil:
+		reject = ErrSessionNotBound
+	default:
+		rt.active = run
+		sess = rt.session
+	}
 	rt.mu.Unlock()
+	if reject != nil {
+		<-m.pending // ③ 预留的令牌原路归还(锁外——rt.mu 内不做 channel 操作)
+		return RunHandle{}, reject
+	}
 
 	// ⑤ queued 记录 durable-first:先落盘再返回(总方案第七节「run/start 响应
-	// 在 Run 被接受并持久化登记后立即返回」);失败 warn 继续(journalRunState,
-	// 缺口由恢复扫描显式标记 interrupted,不静默)。queued 记录同时是 run 事件
-	// 文件的首条记录(RunJournalStore 的句柄经它建立,后续事件走缓存命中)。
-	journalRunState(sess, session.RunStateRecord{
+	// 在 Run 被接受并持久化登记后立即返回」)。I1 修复:接受登记是 StartRun 唯一
+	// 的严格化写点——appendRunState 直接检查错误,失败即拒绝启动(返回
+	// ErrRunJournalWrite 包裹底层 journal 错误),绝不降级为「已接受但无法追踪」
+	// 的 Run(journalRunState 的 warn 语义只覆盖运行中/终态的非关键记录,其缺口
+	// 由恢复扫描标记 interrupted;接受记录缺失则整个 Run 无处可寻)。queued 记录
+	// 同时是 run 事件文件的首条记录(RunJournalStore 的句柄经它建立,后续事件走
+	// 缓存命中)。
+	//
+	// 失败清理(无痕拒绝):此刻 run 尚未 begin——未 transition(状态恒 queued 但
+	// 无观察者)、未 bindEvents(⑥ 未到达,零事件产出)、未派生 runCtx(cancel 未
+	// 写入)、execute 未启动,返回的零值 RunHandle 是唯一凭据且已被丢弃——journal
+	// 无该 run 的任何记录(RunJournalStore 建文件后首写失败时残留空/半行文件,
+	// 恢复扫描对「无 state 记录」的 run 跳过,不标 interrupted),按无痕收敛:
+	// rt.mu 内身份校验清 active(防御式,与 finalizeRun 同款——此窗口内不可能有
+	// 并发占位:active 非 nil 的第二 StartRun 全部撞 ErrRunActive)+ 锁外归还
+	// ③ 预留的 pending 令牌(rt.mu 内禁止 channel 操作的纪律不变)。
+	if err := appendRunState(sess, session.RunStateRecord{
 		Kind:      "state",
 		SessionID: run.SessionID,
 		RunID:     run.ID,
 		State:     string(RunQueued),
 		At:        time.Now(),
-	})
+	}); err != nil {
+		rt.mu.Lock()
+		if rt.active == run {
+			rt.active = nil
+		}
+		rt.mu.Unlock()
+		<-m.pending // ③ 预留的令牌原路归还(锁外,同 ② 的拒绝路径)
+		return RunHandle{}, fmt.Errorf("agent: start run %s in session %s: %w: %w",
+			run.ID, sessionID, ErrRunJournalWrite, err)
+	}
 
 	// ⑥ 事件面接线(P3-4,可选):deps.RunEvents 非 nil 时惰性创建会话级
 	// EventHub(runtime.bindEvents,创建一次后续 run 复用),括起本 run 的
@@ -178,9 +219,12 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 		cb.Decide = m.approvals.decideFunc(runCtx, sess, run, sessionID, hub)
 	}
 
-	// ⑦.6 tee 包装(P3-4):审批回退已就位,tee 看到的是 decideFunc 版本的
-	// Decide——permission.requested/resolved 事件对围绕真实等待产生,回放面
-	// 完整。包装对象仍是 cb 本体(execute 是唯一后续使用者,契约①不变)。
+	// ⑦.6 tee 包装(P3-4;C2 修复):审批回退已就位,tee 看到的是 decideFunc
+	// 版本的 Decide——permission.requested/resolved 事件对围绕真实等待产生,
+	// 回放面完整。hub 非 nil 时 tee 对 nil 的 EmitToken/Publish 主动装上事件
+	// 采集回调(C2:daemon run/start 以 RunCallbacks{} 全 nil 提交,采集不再
+	// 依赖调用方回调,真实 token/tool_call/最终消息与 usage 类事件照常进事件
+	// 流);包装对象仍是 cb 本体(execute 是唯一后续使用者,契约①不变)。
 	cb = teeRunCallbacks(cb, hub, run.ID)
 
 	// ⑧ 执行转移给 supervisor goroutine(cb 所有权随之转移,契约①;tee 包装
@@ -264,7 +308,8 @@ func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx conte
 	// 迁移 RunWaitingCapability 并落 waiting_capability journal 记录(与
 	// decideFunc 的 waiting_input 迁移同构:transition 在 run.mu 内、journal
 	// 在 rt.mu 外),等待收敛回 RunRunning(仅迁移,journal 由 ④ 与终态记录
-	// 夹注,不重复落 running)。onWait 经 ctx 注入代理 Execute(capability.go
+	// 夹注,不重复落 running;ctx 取消收敛时跳过回迁——P4 评审 issue4 的取消
+	// 守卫)。onWait 经 ctx 注入代理 Execute(capability.go
 	// 的 withCapabilityWaitObserver):ai-core 的 toolCtx 是本 Run agentCtx 的
 	// 子 ctx,值随链传播。
 	//
@@ -292,7 +337,14 @@ func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx conte
 				})
 				return
 			}
-			run.transition(RunRunning)
+			// 取消收敛守卫(P4 评审 issue4):等待因 ctx 取消退出时不再瞬时
+			// 回迁 running——transition 前查 runCtx.Err()==nil,取消路径的
+			// RunHandle.State() 轮询者不看到与事实不符的 running(finalizeRun
+			// 随后归一 cancelled);重绑成功/等待超时出口(runCtx 未取消)照常
+			// 回迁,onWait(true/false) 的调用配对不受影响(守卫只收迁移)。
+			if runCtx.Err() == nil {
+				run.transition(RunRunning)
+			}
 		}
 		req.ToolSource = func(ctx context.Context) []core.Tool {
 			tools := orig(ctx)
@@ -367,14 +419,29 @@ func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx conte
 	// ⑦ runSlots/gate 由 defer 释放(LIFO:runSlots → gate)。
 }
 
-// ── teeRunCallbacks:RunCallbacks → SessionEvent 的事件分流(P3-4)──────────
+// ── teeRunCallbacks:RunCallbacks → SessionEvent 的事件分流(P3-4;C2 修复)──
 //
 // 把 StartRun 的 cb 三个事件入口(EmitToken/Decide/Publish)按 plan P3-4 表
 // (P3-0 契约,源自 streamTokens 实际流 session.go:213-249)映射成 SessionEvent
-// 投进会话 hub(journal+广播),再原样转发给调用方 cb——tee 先落事件、后转发,
-// 消费方看到的事件流先于其输出被持久化/广播(与 hub 内 key 事件的 durable-first
-// 同向)。Write/WriteToken 不包装:终端文本由 assistant.message_finalized 覆盖,
-// 不进事件 journal(plan P3-4 表「Write:不进 journal」)。
+// 投进会话 hub(journal+广播),非 nil 的原回调随后被转发——tee 先落事件、后
+// 转发,消费方看到的事件流先于其输出被持久化/广播(与 hub 内 key 事件的
+// durable-first 同向)。
+//
+// 采集与调用方回调解耦(C2 修复,GPT 评审):hub 非 nil 时 EmitToken/Publish 的
+// 事件采集**主动供给**,不依赖调用方是否提供回调——daemon run/start 以
+// RunCallbacks{} 全 nil 提交后台 Run(runcontrol.go),只包装非 nil 入口的旧
+// 形态下 streamTokens/中间件对 nil 回调直接跳过(session.go 的 nil 检查),真实
+// Token/tool_call/最终消息与 usage 类事件全部丢失,Re-Attach 只见 run.* 生命
+// 周期事件。三个入口的形态:
+//   - EmitToken/Publish:调用方非 nil → 包装(先发事件再转发原回调);nil → 装
+//     纯事件映射版(只发事件,无原始转发——后台 Run 的输出只进事件流/journal,
+//     不进任何终端)。装上的回调仍受 streamTokens/中间件的既有调用条件约束
+//     (nil 检查变为命中而已),tee 不发明契约外事件;
+//   - Decide 面不变(P4-2):审批回退已在 StartRun ⑦.5 先行(调用方未提供时
+//     cb.Decide 已是 decideFunc),requested/resolved 事件对仍只围绕真实决策
+//     等待产生;
+//   - Write/WriteToken 不包装不采集:终端文本由 assistant.message_finalized
+//     覆盖,不进事件 journal(plan P3-4 表「Write:不进 journal」)。
 //
 // 并发论证(plan P3-4):tee 的全部函数都在 supervisor goroutine(execute→
 // Session.Run→streamTokens/中间件)上同步调用,Publish 的调用方即 execute——
@@ -384,22 +451,27 @@ func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx conte
 // 前后各发一条事件,HITL 决策等待(inner 的阻塞)本身在 hub 锁外——等待期间
 // 其他订阅者/发布者不受阻塞。
 //
-// cb 所有权:包装后的 teed 只在 execute 内使用(StartRun 返回起归 supervisor,
-// 契约①),tee 不引入新的跨 goroutine 共享。
+// cb 所有权:包装/供给后的 teed 只在 execute 内使用(StartRun 返回起归
+// supervisor,契约①),tee 不引入新的跨 goroutine 共享。
 func teeRunCallbacks(cb RunCallbacks, hub *EventHub, runID string) RunCallbacks {
 	if hub == nil {
 		return cb // RunEvents 未启用:原样透传,零开销路径
 	}
 	teed := cb
-	// 仅包装非 nil 入口:未提供的回调本就不会被 streamTokens/中间件调用
-	// (session.go 的 nil 检查),tee 不替调用方发明事件。
+	// EmitToken(C2 修复):nil → 纯事件映射版(daemon 全 nil 提交形态);非 nil →
+	// 包装(先发事件再转发原回调)。
 	if cb.EmitToken != nil {
 		inner := cb.EmitToken
 		teed.EmitToken = func(tok core.Token) {
 			teeToken(hub, runID, tok)
 			inner(tok)
 		}
+	} else {
+		teed.EmitToken = func(tok core.Token) {
+			teeToken(hub, runID, tok)
+		}
 	}
+	// Decide 面不变(P4-2,见函数头):包装只在调用前后各发一条事件。
 	if cb.Decide != nil {
 		inner := cb.Decide
 		teed.Decide = func(req *hitl.InterruptRequest) hitl.Decision {
@@ -412,24 +484,33 @@ func teeRunCallbacks(cb RunCallbacks, hub *EventHub, runID string) RunCallbacks 
 			return decision
 		}
 	}
+	// Publish(C2 修复):nil → 纯映射版;非 nil → 包装。映射规则见
+	// teePublishCallbackEvent(usage/iteration → EventUsageProgress)。
 	if cb.Publish != nil {
 		inner := cb.Publish
 		teed.Publish = func(event string, data any) {
-			switch event {
-			case runtimeconfig.EventUsage, runtimeconfig.EventIteration:
-				// usage/iteration 同型映射为 usage.progress 高频 delta(plan P3-4
-				// 表「usage/iteration 类→EventUsageProgress(delta)」)。iteration
-				// 的 data 为 nil,marshal 为 null payload——合并聚合按「非字符串
-				// 退化为窗内末条」处理,无语义损害。
-				teePublish(hub, runID, session.EventUsageProgress, data)
-			default:
-				// 其余事件名不在 P3-0 契约(现产生方只用上述两个),防御性跳过:
-				// 未知类型进 journal 会让回放方面对契约外语义。
-			}
+			teePublishCallbackEvent(hub, runID, event, data)
 			inner(event, data)
+		}
+	} else {
+		teed.Publish = func(event string, data any) {
+			teePublishCallbackEvent(hub, runID, event, data)
 		}
 	}
 	return teed
+}
+
+// teePublishCallbackEvent 把 cb.Publish 的中间件事件按 plan P3-4 表映射发布:
+// usage/iteration 同型映射为 usage.progress 高频 delta(表「usage/iteration 类
+// → EventUsageProgress(delta)」)。iteration 的 data 为 nil,marshal 为 null
+// payload——合并聚合按「非字符串退化为窗内末条」处理,无语义损害。其余事件名
+// 不在 P3-0 契约(现产生方只用上述两个),防御性跳过:未知类型进 journal 会让
+// 回放方面对契约外语义。
+func teePublishCallbackEvent(hub *EventHub, runID, event string, data any) {
+	switch event {
+	case runtimeconfig.EventUsage, runtimeconfig.EventIteration:
+		teePublish(hub, runID, session.EventUsageProgress, data)
+	}
 }
 
 // teeToken 把一个 core.Token 映射为事件类型并发布(payload=整个 Token 的 JSON,

@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
@@ -53,6 +55,14 @@ const (
 	// 留余量否则被 60s 掐断呈现为普通超时(勘察 risk)。NewClientToolProxy 对
 	// <=0 回落此处(双保险,P2-7 同款),不依赖 yaml 载入路径。
 	defaultCapabilityWaitTimeout = 45 * time.Second
+
+	// maxCapabilityWaitTimeout 是显式配置等待预算的安全钳制上限(P4 评审
+	// issue2:「必须 < ai-core toolCtx 60s」的硬约束从注释落为代码)。显式
+	// 配置 >55s 时钳到该值并 slog.Warn——超配的等待必被 toolCtx 60s 掐断,
+	// 「等待重绑→明确失败文本(capabilityFailureText)」的声明语义无声劣化为
+	// 「莫名工具超时」,且失败文案不再是 capabilityFailureText,用户与模型
+	// 无从分辨。55s 给 Invoke 留 5s 余量;45s 默认与 1~55s 显式区间原样放行。
+	maxCapabilityWaitTimeout = 55 * time.Second
 )
 
 // capabilityWaitObserverKey 是 onWait 观察者的 ctx 注入键(supervisor 观察者
@@ -81,10 +91,18 @@ func capabilityWaitObserver(ctx context.Context) capabilityWaitFunc {
 }
 
 // resolveCapabilityWait 归一等待预算:<=0 回落 defaultCapabilityWaitTimeout
-// (45s,双保险 P2-7 同款)。行为面由单元测试钉死,不做 45s 真实等待。
+// (45s,双保险 P2-7 同款);显式配置 > maxCapabilityWaitTimeout(55s)时钳到
+// 上限并 slog.Warn(P4 评审 issue2:45/55 < ai-core toolCtx 60s 的硬约束落地,
+// 超配的静默语义劣化改为显式降级+告警)。行为面由单元测试钉死,不做真实等待。
 func resolveCapabilityWait(waitTimeout time.Duration) time.Duration {
 	if waitTimeout <= 0 {
 		return defaultCapabilityWaitTimeout
+	}
+	if waitTimeout > maxCapabilityWaitTimeout {
+		slog.Warn("agent: capability wait timeout exceeds ai-core toolCtx budget, clamped",
+			"configured", waitTimeout, "clamped_to", maxCapabilityWaitTimeout,
+			"reason", "wait runs inside ai-core toolCtx (60s), budget must leave Invoke headroom")
+		return maxCapabilityWaitTimeout
 	}
 	return waitTimeout
 }
@@ -323,7 +341,8 @@ func (r *CapabilityRegistry) dropWaitChan(sessionID, toolName string, ch chan st
 //     Metadata,与执行端绑定无关,「危险操作重绑后仍需确认」由中间件 per-call
 //     裁决天然保证(总方案 §6 :524);
 //   - waitTimeout <=0 回落 defaultCapabilityWaitTimeout(45s,双保险 P2-7
-//     同款;硬约束 < ai-core toolCtx 60s,见常量注释);
+//     同款);>55s 钳到 maxCapabilityWaitTimeout 并 slog.Warn(resolveCapa-
+//     bilityWait,硬约束 < ai-core toolCtx 60s 从注释落为代码,见常量注释);
 //   - Execute 语义(等待/失效/超时)见 executeCapabilityTool;onWait 观察者
 //     经 ctx 注入(supervisor 的 ToolSource 包装面),未注入时等待照常发生、
 //     仅 RunState 不迁移(waiting_capability 仅后台 Run 可观测的 limitation)。
@@ -374,8 +393,11 @@ func NewClientToolProxy(reg *CapabilityRegistry, sessionID string, specs []Clien
 // 「显式等待重新绑定,且超时安全失败」):
 //
 //  1. 绑定在(每轮 prompt 探测后连接未断开)→ Invoke,成功即返回;
-//  2. 无绑定 / Invoke 失败(先 Invalidate 该绑定——精确到 connectionID,
-//     连接声明过能力但执行失败 = 通道事实不可用,不等 TTL)→ 进入等待:
+//  2. 无绑定 / Invoke 失败(先分类再 Invalidate,P4 评审 issue5:错误为
+//     context.Canceled/DeadlineExceeded——run 取消传播或 toolCtx 60s 到点
+//     ——时跳过 Invalidate 直接上抛,健康绑定不得被误失效;其余失败才
+//     Invalidate——精确到 connectionID,连接声明过能力但执行失败 = 通道
+//     事实不可用,不等 TTL)→ 进入等待:
 //     onWait(true)(supervisor 观察者把 Run 迁移 waiting_capability)→
 //     select{就绪通知 / ctx.Done / waitTimer};
 //  3. 就绪通知只是唤醒,事实源是 registry:唤醒后重查 lookupResolved,命中
@@ -387,7 +409,8 @@ func NewClientToolProxy(reg *CapabilityRegistry, sessionID string, specs []Clien
 //     :524);
 //  4. 超时/ctx 取消 → onWait(false) → 返回明确失败文本(device tool X
 //     unavailable: connection lost, waited Ns)交 Agent 决定下一步(§8
-//     :677)——失败是工具结果不是执行异常(error 恒 nil),不中断 ReAct 循环,
+//     :677)——失败是工具结果不是执行异常(等待出口 error 恒 nil;唯一例外
+//     是步骤 2 的取消/超时上抛,交 ai-core 错误通道),不中断 ReAct 循环,
 //     模型可在下一轮重试(重试即全新 Execute,重新解析绑定与预算)。
 //
 // 出口矩阵(plan §6.9 review 重点):「重绑成功」「超时」「ctx 取消」三条
@@ -434,6 +457,16 @@ func executeCapabilityTool(ctx context.Context, reg *CapabilityRegistry, session
 			result, err := exec.Invoke(ctx, toolName, argsJSON)
 			if err == nil {
 				return result, nil
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				// 取消/超时不是「通道事实不可用」(P4 评审 issue5):runCtx→
+				// agentCtx→toolCtx 传播的取消,或 toolCtx 60s 到点——绑定本身
+				// 健康,Invalidate 会误失效它(后者使同 run 下一次调用从直连
+				// Invoke 劣化为「等待至超时→失败文本」),失败文本 connection
+				// lost 在取消场景也名不副实。跳过 Invalidate 直接上抛,交
+				// ai-core 的工具错误通道(agent.go:149-152 转为 error 文本工具
+				// 结果,不中断执行面结构)。
+				return result, err
 			}
 			// Invoke 失败 = 通道事实不可用:即时失效「该绑定」,转入等待——
 			// 绝不静默吞掉失败后路由到其他连接(总方案 §8 :650)。
