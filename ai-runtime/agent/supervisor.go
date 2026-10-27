@@ -64,7 +64,8 @@ func (h RunHandle) Wait(ctx context.Context) (RunResult, error) {
 }
 
 // StartRun 提交一次后台运行并立即返回句柄(总方案 P2 第 2/3 条):同步段完成
-// 记账占位与 queued 记录 durable-first 落盘后即返回,执行由 supervisor goroutine
+// 记账占位、事件面接线(⑥,N1 修复:先于 queued 记录)与 queued 记录
+// durable-first 落盘后即返回,执行由 supervisor goroutine
 // (execute)接管,经「每会话 gate → 全局 runSlots」两级并发控制,排队面 pending
 // 有界(满即拒 ErrTooManyPending)。
 //
@@ -92,8 +93,11 @@ func (h RunHandle) Wait(ctx context.Context) (RunResult, error) {
 // (I1 修复,包裹底层 journal 错误——「接受并持久化登记」是 run/start 返回的
 // 前提,写失败即拒绝启动,pending/active 记账无痕清退,绝不返回句柄);
 // 事件 hub 接线失败(EventJournal.SeqRange 播种 I/O 错误,I3 修复,包裹底层
-// 错误)→ 同款无痕清退后显式拒绝——绝不返回携带「看似健康 hub」的句柄
-// (queued 接受记录已在,由恢复扫描标 interrupted,诚实可观测)。
+// 错误)→ 同款无痕清退后显式拒绝——绝不返回携带「看似健康 hub」的句柄。
+// N1 修复(第四轮评审):hub 接线(⑥)物理先于 queued 接受记录(⑤)——接线
+// 失败时 journal 零记录,不留「看似已接受但从未执行、无终态」的孤儿 queued Run
+// (旧形态接受点在先,残留 queued 只能靠恢复扫描标 interrupted 补救,与
+// 「StartRun 返回失败不留已接受痕迹」冲突)。
 func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallbacks) (RunHandle, error) {
 	// ① manager 查找:m.mu 内快照 closed 与 runtime 后立即释放(锁内不做等待)。
 	m.mu.RLock()
@@ -147,6 +151,41 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 		return RunHandle{}, reject
 	}
 
+	// ⑥ 事件面接线(P3-4,可选;N1 修复:**物理先于 ⑤** 的 queued 接受记录):
+	// deps.RunEvents 非 nil 时惰性创建会话级 EventHub(runtime.bindEvents,创建
+	// 一次后续 run 复用),本 run 的产生边界由 ⑤ 之后的 BeginRun 括起(设
+	// AppendEvent 目标兜底 + 防御性 flush 上一 run 残留合并缓冲)。RunEvents 为
+	// nil 时 hub 为 nil——零开销路径,同步 RecordRun 路径完全不经此处(行为零
+	// 变化)。tee 包装(cb = teeRunCallbacks)已下移到 ⑦.6:P4-2 的审批回退(⑦.5)
+	// 须先于 tee——tee 检测 cb.Decide 非 nil 才包 permission.requested/resolved,
+	// 次序颠倒会漏掉审批事件对。
+	//
+	// I3 修复:hub 构造失败(EventJournal.SeqRange 播种的 Journal I/O 错误)→
+	// 显式上抛,pending/active 无痕清退(与 ⑤ 的 I1 清退同款:rt.mu 内身份校验
+	// 清 active + 锁外归还 ③ 预留的 pending 令牌),绝不带着缺失/重起的 hub 进入
+	// 执行(事件流从 Seq=1 重起会与既有记录冲突)。此刻 run 尚未 begin——未
+	// transition、未派生 runCtx(cancel 未写入)、execute 未启动;接线本身只读
+	// (SeqRange 磁盘扫描,构造在 rt.mu 外——锁内不做文件 I/O 纪律不变),不写
+	// 任何 journal。
+	//
+	// N1 修复(第四轮评审):接线放在 ⑤ 的 queued 接受记录**之前**——失败路径
+	// journal 零记录,不留「看似已接受但从未执行、无终态」的孤儿 queued Run
+	// (旧形态接受点在先,失败后残留的 queued 只能由恢复扫描按「无终态」诚实标
+	// interrupted 补救)。接线成功后即便 ⑤ 落败,会话级 hub 留在 runtime 上也是
+	// 合法状态(创建恰好一次、后续 run 复用,与 EnsureHub 的 attach 先建同型,
+	// bindEvents 不缓存失败、下次调用重试),本 run 未 BeginRun、未装 tee、
+	// execute 未启动——零事件产出,无需回收。
+	hub, err := rt.bindEvents(sessionID, sess.deps.RunEvents)
+	if err != nil {
+		rt.mu.Lock()
+		if rt.active == run {
+			rt.active = nil
+		}
+		rt.mu.Unlock()
+		<-m.pending // ③ 预留的令牌原路归还(锁外,同 ② 的拒绝路径)
+		return RunHandle{}, fmt.Errorf("agent: start run %s in session %s: %w", run.ID, sessionID, err)
+	}
+
 	// ⑤ queued 记录 durable-first:先落盘再返回(总方案第七节「run/start 响应
 	// 在 Run 被接受并持久化登记后立即返回」)。I1 修复:接受登记是 StartRun 唯一
 	// 的严格化写点——appendRunState 直接检查错误,失败即拒绝启动(返回
@@ -154,16 +193,17 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	// 的 Run(journalRunState 的 warn 语义只覆盖运行中/终态的非关键记录,其缺口
 	// 由恢复扫描标记 interrupted;接受记录缺失则整个 Run 无处可寻)。queued 记录
 	// 同时是 run 事件文件的首条记录(RunJournalStore 的句柄经它建立,后续事件走
-	// 缓存命中)。
+	// 缓存命中)。N1 修复后本写点在 ⑥ 接线成功之后执行,失败路径同样 journal
+	// 零记录(queued 未写成,且无更早记录)。
 	//
 	// 失败清理(无痕拒绝):此刻 run 尚未 begin——未 transition(状态恒 queued 但
-	// 无观察者)、未 bindEvents(⑥ 未到达,零事件产出)、未派生 runCtx(cancel 未
-	// 写入)、execute 未启动,返回的零值 RunHandle 是唯一凭据且已被丢弃——journal
-	// 无该 run 的任何记录(RunJournalStore 建文件后首写失败时残留空/半行文件,
-	// 恢复扫描对「无 state 记录」的 run 跳过,不标 interrupted),按无痕收敛:
-	// rt.mu 内身份校验清 active(防御式,与 finalizeRun 同款——此窗口内不可能有
-	// 并发占位:active 非 nil 的第二 StartRun 全部撞 ErrRunActive)+ 锁外归还
-	// ③ 预留的 pending 令牌(rt.mu 内禁止 channel 操作的纪律不变)。
+	// 无观察者)、未派生 runCtx(cancel 未写入)、execute 未启动,返回的零值
+	// RunHandle 是唯一凭据且已被丢弃——journal 无该 run 的任何记录(RunJournalStore
+	// 建文件后首写失败时残留空/半行文件,恢复扫描对「无 state 记录」的 run 跳过,
+	// 不标 interrupted),按无痕收敛:rt.mu 内身份校验清 active(防御式,与
+	// finalizeRun 同款——此窗口内不可能有并发占位:active 非 nil 的第二 StartRun
+	// 全部撞 ErrRunActive)+ 锁外归还 ③ 预留的 pending 令牌(rt.mu 内禁止
+	// channel 操作的纪律不变)。
 	if err := appendRunState(sess, session.RunStateRecord{
 		Kind:      "state",
 		SessionID: run.SessionID,
@@ -176,36 +216,16 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 			rt.active = nil
 		}
 		rt.mu.Unlock()
-		<-m.pending // ③ 预留的令牌原路归还(锁外,同 ② 的拒绝路径)
+		<-m.pending // ③ 预留的令牌原路归还(锁外,同 ②/⑥ 的拒绝路径)
 		return RunHandle{}, fmt.Errorf("agent: start run %s in session %s: %w: %w",
 			run.ID, sessionID, ErrRunJournalWrite, err)
 	}
 
-	// ⑥ 事件面接线(P3-4,可选):deps.RunEvents 非 nil 时惰性创建会话级
-	// EventHub(runtime.bindEvents,创建一次后续 run 复用),括起本 run 的
-	// 产生边界(BeginRun:设 AppendEvent 目标兜底 + 防御性 flush 上一 run 残留
-	// 合并缓冲)。RunEvents 为 nil 时 hub 为 nil——零开销路径,同步 RecordRun
-	// 路径完全不经此处(行为零变化)。tee 包装(cb = teeRunCallbacks)已下移到
-	// ⑦.6:P4-2 的审批回退(⑦.5)须先于 tee——tee 检测 cb.Decide 非 nil 才包
-	// permission.requested/resolved,次序颠倒会漏掉审批事件对。
-	//
-	// I3 修复:hub 构造失败(EventJournal.SeqRange 播种的 Journal I/O 错误)→
-	// 显式上抛,pending/active 无痕清退(与 ⑤ 的 I1 清退同款:rt.mu 内身份校验
-	// 清 active + 锁外归还 ③ 预留的 pending 令牌),绝不带着缺失/重起的 hub 进入
-	// 执行(事件流从 Seq=1 重起会与既有记录冲突)。此刻 run 尚未 begin——未
-	// transition、未派生 runCtx(cancel 未写入)、execute 未启动;但 ⑤ 的 queued
-	// 接受记录已 durable-first 落盘(接受点在先):残留的 queued 记录由恢复扫描按
-	// 「无终态」诚实标记 interrupted,无任何终态/事件记录。
-	hub, err := rt.bindEvents(sessionID, sess.deps.RunEvents)
-	if err != nil {
-		rt.mu.Lock()
-		if rt.active == run {
-			rt.active = nil
-		}
-		rt.mu.Unlock()
-		<-m.pending // ③ 预留的令牌原路归还(锁外,同 ②/⑤ 的拒绝路径)
-		return RunHandle{}, fmt.Errorf("agent: start run %s in session %s: %w", run.ID, sessionID, err)
-	}
+	// BeginRun 括起本 run 的事件产生边界(N1 次序:在 ⑤ 的 queued 记录之后——
+	// BeginRun 只设 curRunID + flush 上一 run 残留合并缓冲(event_hub.go:298),
+	// 无任何 journal 写;本 run 首批事件晚于 queued 记录产生无碍——事件面与 run
+	// 面是两本账:⑤ 是 Run journal 的首条记录,⑥ 的 Seq 播种读的是事件 journal,
+	// 互不依赖)。
 	if hub != nil {
 		hub.BeginRun(run.ID)
 	}

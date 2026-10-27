@@ -1142,3 +1142,302 @@ func TestSubscribeCtxCancelCleansUp(t *testing.T) {
 		t.Fatalf("LatestSeq = %d, want 2", got)
 	}
 }
+
+// ── DE1-I1/I2:回放批次损坏/旧格式的诚实降级 ────────────────────────────────
+//
+// 三条验收(评审 DE1-I1/I2):
+//   - TestReplaySkipsCorruptBatchMarksIncomplete:损坏批次(两种解析都失败)
+//     被跳过、后续合法事件照收(单条损坏不炸整个 attach),replayIntegrity
+//     置 Incomplete——缺口显式暴露,不假装完整;
+//   - TestReplayLegacyMergedPayloadFallback:旧格式字符串批次(本功能发布前
+//     的开发数据形态)回退为区间末单事件,内容保留但同样置 Incomplete;
+//   - TestReplayRejectsMalformedBatchStructure:合法 JSON 但批次结构语义错误
+//     (seq 非严格递增等四种违反)视同解码失败——跳过 + Incomplete。
+//
+// 损坏/旧格式记录均经 jr.AppendEvent 直接预置(绕过 Publish 的编码路径,构造
+// 存储面的损坏形态);Subscribe 全程在 mu 内同步展开,返回后三态已定,无需轮询。
+
+// TestReplaySkipsCorruptBatchMarksIncomplete(DE1-I1 验收):损坏批次 [1..3]
+// + 合法后续事件 seq 4 → 批次被跳过(无 1..3 的任何投递)、后续事件照收,
+// Subscribe 不返回错误,replayIntegrity Unknown → Incomplete(粘滞)——
+// 客户端经三态得知存在缺口,不假装完整。
+func TestReplaySkipsCorruptBatchMarksIncomplete(t *testing.T) {
+	jr := &stubEventJournal{}
+	// 损坏批次记录 [1..3]:payload 既非 DeltaBatch JSON 也非旧格式字符串。
+	if err := jr.AppendEvent(session.EventRecord{
+		SessionID: "corrupt-batch", RunID: "run-old",
+		Type: session.EventTextDelta, Seq: 3, FromSeq: 1, Time: time.Now(),
+		Payload: json.RawMessage(`{"events": [not json`),
+	}); err != nil {
+		t.Fatalf("seed corrupt batch: %v", err)
+	}
+	// 合法后续事件 seq 4(key,单条记录):必须照常回放。
+	if err := jr.AppendEvent(session.EventRecord{
+		SessionID: "corrupt-batch", RunID: "run-old",
+		Type: session.EventToolCall, Seq: 4, Time: time.Now(),
+		Payload: json.RawMessage(`"c"`),
+	}); err != nil {
+		t.Fatalf("seed follow-up event: %v", err)
+	}
+
+	hub := mustNewEventHub(t, "corrupt-batch", jr)
+	defer hub.Close()
+	if got := hub.ReplayIntegrity(); got != ReplayIntegrityUnknown {
+		t.Fatalf("seeded hub replayIntegrity = %q, want %q", got, ReplayIntegrityUnknown)
+	}
+
+	ch, err := hub.Subscribe(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v(单条损坏不得炸整个 attach)", err)
+	}
+	// 损坏批次被跳过:首个回放事件即后续的 seq 4。
+	ev := recvEvent(t, ch)
+	if ev.Seq != 4 || ev.Type != session.EventToolCall {
+		t.Fatalf("first replayed event = {seq:%d type:%s}, want {seq:4 tool_call}(损坏批次被跳过、后续照收)", ev.Seq, ev.Type)
+	}
+	requireNoEvent(t, ch) // 恰此一条:1..3 无任何投递
+	// 缺口显式暴露:置 Incomplete(诚实降级,不假装完整)。
+	if got := hub.ReplayIntegrity(); got != ReplayIntegrityIncomplete {
+		t.Fatalf("replayIntegrity after corrupt batch = %q, want %q(缺口不得伪装成完整历史)", got, ReplayIntegrityIncomplete)
+	}
+}
+
+// TestReplayLegacyMergedPayloadFallback(DE1-I2 验收):旧格式合并批次(payload
+// 为窗内 delta 合并成的单个 JSON 字符串,per-seq 归属不可知)→ 批次解码失败
+// 后回退解析成功,产出一 SessionEvent(Seq=rec.Seq 区间末,Payload=原 raw 原样
+// 透传)——内容保留;per-seq 归属不可知 ⇒ 同样置 Incomplete(断点恢复不精确,
+// 不得谎报完整)。
+func TestReplayLegacyMergedPayloadFallback(t *testing.T) {
+	jr := &stubEventJournal{}
+	// 旧格式批次 [1..3]:payload 是 JSON 字符串(旧合并形态,无内部事件边界)。
+	if err := jr.AppendEvent(session.EventRecord{
+		SessionID: "legacy-batch", RunID: "run-old",
+		Type: session.EventTextDelta, Seq: 3, FromSeq: 1, Time: time.Now(),
+		Payload: json.RawMessage(`"ABC"`),
+	}); err != nil {
+		t.Fatalf("seed legacy batch: %v", err)
+	}
+
+	hub := mustNewEventHub(t, "legacy-batch", jr)
+	defer hub.Close()
+
+	ch, err := hub.Subscribe(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	ev := recvEvent(t, ch)
+	if ev.Seq != 3 {
+		t.Fatalf("legacy replayed event seq = %d, want 3(rec.Seq 区间末;旧格式无内部边界)", ev.Seq)
+	}
+	if ev.Type != session.EventTextDelta {
+		t.Fatalf("legacy replayed event type = %q, want %q", ev.Type, session.EventTextDelta)
+	}
+	if string(ev.Payload) != `"ABC"` {
+		t.Fatalf("legacy replayed payload = %s, want %q(原 raw 原样透传)", ev.Payload, `"ABC"`)
+	}
+	requireNoEvent(t, ch) // 恰一条单事件:批次区间不展开(per-seq 归属不可知)
+	if got := hub.ReplayIntegrity(); got != ReplayIntegrityIncomplete {
+		t.Fatalf("replayIntegrity after legacy fallback = %q, want %q(per-seq 归属不可知,不得谎报完整)", got, ReplayIntegrityIncomplete)
+	}
+}
+
+// TestReplayRejectsMalformedBatchStructure(DE1-I1 验收):合法 JSON(DeltaBatch
+// 可解码)但批次结构语义错误 → 视同解码失败:跳过该记录、后续事件照收、
+// replayIntegrity 置 Incomplete——「合法 JSON 但 seq 边界错乱」的数据不得进入
+// Replay。四种结构违反各一个子测试:
+//   - SeqNotStrictlyIncreasing(评审点名的形态:3 之后出现 2);
+//   - EmptyEvents(空批次,区间声明必然失真);
+//   - FirstSeqMismatch(首 part.Seq != FromSeq);
+//   - LastSeqMismatch(末 part.Seq != Seq)。
+//
+// part payload 内容与断言无关(整条记录被跳过,永不展开),取最短 JSON。
+func TestReplayRejectsMalformedBatchStructure(t *testing.T) {
+	malformed := []struct {
+		name    string
+		payload string
+	}{
+		{"SeqNotStrictlyIncreasing", `{"events":[{"seq":1,"payload":0},{"seq":3,"payload":0},{"seq":2,"payload":0},{"seq":4,"payload":0}]}`},
+		{"EmptyEvents", `{"events":[]}`},
+		{"FirstSeqMismatch", `{"events":[{"seq":2,"payload":0},{"seq":3,"payload":0}]}`},
+		{"LastSeqMismatch", `{"events":[{"seq":1,"payload":0},{"seq":3,"payload":0}]}`},
+	}
+	for _, tc := range malformed {
+		t.Run(tc.name, func(t *testing.T) {
+			jr := &stubEventJournal{}
+			// 畸形批次记录 [1..4](区间声明与载荷不符)+ 合法后续事件 seq 5。
+			if err := jr.AppendEvent(session.EventRecord{
+				SessionID: "malformed-batch", RunID: "run-old",
+				Type: session.EventTextDelta, Seq: 4, FromSeq: 1, Time: time.Now(),
+				Payload: json.RawMessage(tc.payload),
+			}); err != nil {
+				t.Fatalf("seed malformed batch: %v", err)
+			}
+			if err := jr.AppendEvent(session.EventRecord{
+				SessionID: "malformed-batch", RunID: "run-old",
+				Type: session.EventToolCall, Seq: 5, Time: time.Now(),
+				Payload: json.RawMessage(`"c"`),
+			}); err != nil {
+				t.Fatalf("seed follow-up event: %v", err)
+			}
+
+			hub := mustNewEventHub(t, "malformed-batch", jr)
+			defer hub.Close()
+			ch, err := hub.Subscribe(context.Background(), 0)
+			if err != nil {
+				t.Fatalf("Subscribe: %v(结构损坏不得炸整个 attach)", err)
+			}
+			ev := recvEvent(t, ch)
+			if ev.Seq != 5 || ev.Type != session.EventToolCall {
+				t.Fatalf("first replayed event = {seq:%d type:%s}, want {seq:5 tool_call}(畸形批次被跳过、后续照收)", ev.Seq, ev.Type)
+			}
+			requireNoEvent(t, ch) // 1..4 无任何投递:畸形批次绝不展开
+			if got := hub.ReplayIntegrity(); got != ReplayIntegrityIncomplete {
+				t.Fatalf("replayIntegrity after malformed batch = %q, want %q(结构校验失败视同解码失败)", got, ReplayIntegrityIncomplete)
+			}
+		})
+	}
+}
+
+// ── DE1-M1:Replay/Live 跨边界并发交接 ───────────────────────────────────────
+
+// TestReplayLiveHandoffWhilePublishing(DE1-M1 验收,评审场景「Replay 正在读取
+// Seq 101~110 → 另一 goroutine Publish Seq 111 → Replay 结束,切换 Live」):
+// journal 预置批次事件(text 窗被 key 事件打断的合并批次,物理序 ≠ seq 序)→
+// Subscribe(afterSeq=0) 注册完成即返回 → 屏障放行另一 goroutine **立即连续**
+// Publish 新事件(无 time.Sleep 对齐)——回放投递进行中实时发布已开始,订户
+// 收集至静默(发布收口、最终 seq 送达)后 Close 收口。
+//
+// 断言收到流 Seq 严格递增、恰好覆盖 (0, finalLatest] 每号一次——无重复、无
+// 遗漏、无越界:Replay→Live 交接(回放快照止于注册点 latest、watermark 只投
+// 其后、pump 先回放后 live)在发布并发下不丢不重。
+//
+// 容量论证(并发下仍无 flakes):实时发布总数 liveN < subscriberBuffer(256)
+// ——即便 pump 全程滞留回放阶段、sub.live 无人排空,fan-out 直投也不满缓冲,
+// 慢订户断开路径(fanOutLocked 的 delete+close)绝不触发,覆盖断言纯粹检验
+// 交接语义本身。
+func TestReplayLiveHandoffWhilePublishing(t *testing.T) {
+	jr := &stubEventJournal{}
+	hub := mustNewEventHub(t, "replay-live-handoff", jr)
+	defer hub.Close()
+
+	const (
+		preDeltas   = 100 // 预置批次每段 delta 条数(回放面要大,交接窗口才真重叠)
+		liveN       = 100 // 并发发布总数(必须 < subscriberBuffer,见函数头容量论证)
+		preLatest   = 2*preDeltas + 1
+		finalLatest = preLatest + liveN
+	)
+
+	// 预置 journal:100 delta + 1 key(打断 text 合并窗,单条落盘)+ 100 delta,
+	// EndRun 收口出批次记录 [FromSeq=1..Seq=201](parts 跳过 key)——订阅前批次
+	// 已在 journal,回放需展开 201 条 per-seq 事件(含物理序≠seq 序的排序)。
+	hub.BeginRun("run-pre")
+	for i := 0; i < preDeltas; i++ {
+		if err := hub.Publish(IngressEvent{RunID: "run-pre", Type: session.EventTextDelta, Payload: json.RawMessage(`"d"`)}); err != nil {
+			t.Fatalf("pre-seed Publish delta #%d: %v", i, err)
+		}
+	}
+	if err := hub.Publish(IngressEvent{RunID: "run-pre", Type: session.EventToolCall, Payload: json.RawMessage(`"c"`)}); err != nil {
+		t.Fatalf("pre-seed Publish key: %v", err)
+	}
+	for i := 0; i < preDeltas; i++ {
+		if err := hub.Publish(IngressEvent{RunID: "run-pre", Type: session.EventTextDelta, Payload: json.RawMessage(`"d"`)}); err != nil {
+			t.Fatalf("pre-seed Publish delta #%d: %v", i, err)
+		}
+	}
+	hub.EndRun()
+	if got := hub.LatestSeq(); got != preLatest {
+		t.Fatalf("pre-seed LatestSeq = %d, want %d", got, preLatest)
+	}
+
+	// 订阅注册完成即返回(pump 已起、watermark 已定);收集者持续记录 Seq 流,
+	// 订阅通道关闭(Close 断开)即退出。
+	ch, err := hub.Subscribe(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	var (
+		colMu sync.Mutex
+		col   []uint64
+	)
+	collectorDone := make(chan struct{})
+	go func() {
+		defer close(collectorDone)
+		for ev := range ch {
+			colMu.Lock()
+			col = append(col, ev.Seq)
+			colMu.Unlock()
+		}
+	}()
+
+	// 屏障(评审要求,非 sleep):订阅注册完成后才放行发布者——发布与回放投递
+	// 并发重叠;发布者连续 Publish 无停顿,最大化交接窗口。
+	pubStart := make(chan struct{})
+	pubDone := make(chan struct{})
+	go func() {
+		defer close(pubDone)
+		<-pubStart
+		hub.BeginRun("run-live")
+		for i := 0; i < liveN; i++ {
+			typ := session.EventTextDelta
+			if i%25 == 24 {
+				typ = session.EventToolCall // key 混入:实时侧同样穿过 durable-first 路径
+			}
+			if err := hub.Publish(IngressEvent{RunID: "run-live", Type: typ, Payload: json.RawMessage(`"p"`)}); err != nil {
+				t.Errorf("live Publish #%d: %v", i, err)
+				return
+			}
+		}
+		hub.EndRun()
+	}()
+	close(pubStart)
+	<-pubDone
+	if got := hub.LatestSeq(); got != finalLatest {
+		t.Fatalf("LatestSeq after publisher = %d, want %d(发布不得失败)", got, finalLatest)
+	}
+
+	// 收集至静默:轮询等收集者抵达 finalLatest(投递全序递增,见到末 seq 即
+	// 已收全部),再 Close 收口——提前 Close 会截断在途投递使覆盖断言失真。
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		colMu.Lock()
+		last, n := uint64(0), len(col)
+		if n > 0 {
+			last = col[n-1]
+		}
+		colMu.Unlock()
+		if last == finalLatest {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("collector did not reach final latest %d (got %d events, last=%d)", finalLatest, n, last)
+		}
+		time.Sleep(500 * time.Microsecond)
+	}
+	if err := hub.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case <-collectorDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("collector did not finish after Close")
+	}
+
+	// 断言:恰 finalLatest 条、严格递增、精确覆盖 1..finalLatest——无重复
+	// (严格递增即排除)、无遗漏、无越界(交接点两侧拼缝完整)。
+	colMu.Lock()
+	seqs := append([]uint64(nil), col...)
+	colMu.Unlock()
+	if len(seqs) != finalLatest {
+		t.Fatalf("collected %d events, want exactly %d(多收=重复,少收=遗漏)", len(seqs), finalLatest)
+	}
+	for i := 1; i < len(seqs); i++ {
+		if seqs[i] <= seqs[i-1] {
+			t.Fatalf("collected stream not strictly increasing at #%d (%d after %d): %v", i, seqs[i], seqs[i-1], seqs)
+		}
+	}
+	for i, sq := range seqs {
+		if sq != uint64(i+1) {
+			t.Fatalf("collected stream at #%d = seq %d, want %d(覆盖 (0,%d] 无缺口): %v", i, sq, i+1, finalLatest, seqs)
+		}
+	}
+}

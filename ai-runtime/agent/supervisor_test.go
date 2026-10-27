@@ -455,17 +455,20 @@ func TestStartRunRejectsWhenQueuedJournalFails(t *testing.T) {
 }
 
 // TestStartRunRejectsWhenEventHubSeedingFails(第三轮评审 I3 修复验收,I1 断言
-// 形态):EventJournal.SeqRange 播种(Journal 读取)失败 → ⑥ bindEvents/
-// NewEventHub 失败 → StartRun 显式拒绝,pending/active 无痕清退——绝不带着
-// 「看似健康」的 hub(旧形态把读取失败当空历史:replayIntegrity 报 complete 且
-// seq 从 1 重起,与既有记录冲突)进入执行。无痕断言四件套(同
+// 形态;第四轮评审 N1 修复更新 journal 断言):EventJournal.SeqRange 播种
+// (Journal 读取)失败 → ⑥ bindEvents/NewEventHub 失败 → StartRun 显式拒绝,
+// pending/active 无痕清退——绝不带着「看似健康」的 hub(旧形态把读取失败当空
+// 历史:replayIntegrity 报 complete 且 seq 从 1 重起,与既有记录冲突)进入执行。
+// N1:hub 接线已物理提到 queued 接受记录写入之前,失败时 journal 快照为空——
+// 不留「看似已接受但从未执行、无终态」的孤儿 queued Run(旧形态的残留 queued
+// 由恢复扫描标 interrupted 补救)。无痕断言四件套(同
 // TestStartRunRejectsWhenQueuedJournalFails):
 //   - 错误链包裹底层原因(errors.Is),零值 RunHandle;
 //   - active 已清退 + pending 令牌已归还:恢复播种后同会话重提成功(确定性,
 //     容量 1 探针);
 //   - provider 未开工:被拒 run 的 execute 从未启动;
-//   - journal 恰含 ⑤ 的 queued 接受记录、无终态/事件记录(接受点在先,残留的
-//     queued 记录由恢复扫描按「无终态」诚实标 interrupted)。
+//   - journal 快照为空、零记录(queued 写入在 hub 接线成功之后才发生——无
+//     queued 残留、无终态/事件记录)。
 func TestStartRunRejectsWhenEventHubSeedingFails(t *testing.T) {
 	m := NewSessionManager(WithRunLimits(1, 1)) // pending 容量 1:令牌守恒的探针
 	defer m.Close()
@@ -509,8 +512,8 @@ func TestStartRunRejectsWhenEventHubSeedingFails(t *testing.T) {
 		t.Fatalf("rejected StartRun returned handle %+v, want zero value(拒绝绝不携带句柄)", h)
 	}
 
-	// 无痕:active 清退、provider 未开工(execute 未启动)、journal 无终态/事件
-	// 记录(queued 接受记录已在,见上)。
+	// 无痕:active 清退、provider 未开工(execute 未启动)、journal 快照为空
+	// (N1:hub 接线先于 queued 写入,失败零记录——无 queued 残留)。
 	if act := rt.Active(); act != nil {
 		t.Fatalf("active after rejected StartRun = %+v, want nil(记账已无痕清退)", act)
 	}
@@ -519,9 +522,8 @@ func TestStartRunRejectsWhenEventHubSeedingFails(t *testing.T) {
 		t.Fatal("provider started for a rejected run(execute 不得已启动)")
 	case <-time.After(100 * time.Millisecond):
 	}
-	recs := sj.snapshot()
-	if len(recs) != 1 || recs[0].State != string(RunQueued) {
-		t.Fatalf("journal records after rejected StartRun = %+v, want exactly the queued accept record(无终态/事件记录)", recs)
+	if recs := sj.snapshot(); len(recs) != 0 {
+		t.Fatalf("journal records after rejected StartRun = %+v, want 0(N1:hub 播种失败先于 queued 写入,不留孤儿 queued)", recs)
 	}
 
 	// 恢复播种后同会话重提成功 = active 清退(不撞 ErrRunActive)与 pending 令牌

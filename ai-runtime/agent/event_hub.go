@@ -32,7 +32,10 @@ import (
 //     合并为一条批次记录(EventRecord FromSeq>0、Seq=批次末 seq,payload 为
 //     DeltaBatch JSON——按序保留窗内每个事件的 {seq,payload} 边界);Subscribe
 //     回放把批次展开为原始 per-seq 事件,实时与回放形状彻底一致(wire 上单条/
-//     批次不可区分,断点恢复精确到 seq)。合并落盘失败仅 warn——重放缺 delta
+//     批次不可区分,断点恢复精确到 seq);回放侧批次解码/结构校验失败走同一
+//     降级面(DE1-I1:置 Incomplete + warn + 跳过,绝不把缺口伪装成完整;
+//     DE1-I2:发布前的旧格式字符串批次回退为区间末单事件,同样置 Incomplete)。
+//     合并落盘失败仅 warn——重放缺 delta
 //     段可接受,assistant.message_finalized 兜底定稿(降级语义,P3-0 表第 7 行
 //     的对偶面),失败同样置 Incomplete:执行结果与事件完整性是两个独立状态,
 //     后者经 ReplayIntegrity()/attach 与 run/get 的 replayIntegrity 字段向
@@ -146,6 +149,31 @@ type DeltaPart struct {
 // SessionEvent,wire 上单条与批次不可区分。
 type DeltaBatch struct {
 	Events []DeltaPart `json:"events"`
+}
+
+// validDeltaBatch 是合并批次的结构校验(DE1-I1):解码成功只证明「合法 JSON」,
+// 不证明「语义正确」——进 Replay 展开前必须确认批次内部边界自洽:
+//   - Events 非空(空批次无任何事件,FromSeq..Seq 区间声明必然失真);
+//   - part.Seq 严格递增(桶内追加序即 seq 序,重复/倒序都是损坏形态);
+//   - 首 part.Seq == fromSeq(批次首边界与区间声明一致);
+//   - 末 part.Seq == seq(批次末边界与区间声明一致——回放游标按 part.Seq
+//     过滤、SeqRange 播种按记录 Seq 推进,都依赖该一致性)。
+//
+// 任一违反返回 false,调用方视同解码失败(跳过 + Incomplete),绝不让「合法
+// JSON 但 seq 边界错乱」的数据伪装成真实事件 seq 进入 Replay。
+func validDeltaBatch(batch DeltaBatch, fromSeq, seq uint64) bool {
+	if len(batch.Events) == 0 {
+		return false
+	}
+	if batch.Events[0].Seq != fromSeq {
+		return false
+	}
+	for i := 1; i < len(batch.Events); i++ {
+		if batch.Events[i].Seq <= batch.Events[i-1].Seq {
+			return false
+		}
+	}
+	return batch.Events[len(batch.Events)-1].Seq == seq
 }
 
 // pendingDelta 是 delta 合并缓冲的一个分桶(按 Type,同 run 内同型合并):
@@ -468,6 +496,8 @@ func (h *EventHub) Subscribe(ctx context.Context, fromSeq uint64) (<-chan sessio
 			//     不丢失(CR3-I1 的交错实例:批次 [101..104] 内含 103/104,游标
 			//     102 之后的恢复面恰为 103/104,101 绝不重放);
 			//   - part 顺序即 seq 序(桶内追加序),展开后统一按 Seq 升序排序。
+			//   - FromSeq>0 但批次解码/结构校验失败 → 旧格式回退(DE1-I2)或
+			//     跳过该记录,一律置 Incomplete(DE1-I1,unmarshal 处详注)。
 			//
 			// 展开后实时与回放形状彻底一致:wire 上均为 per-seq 单条事件,无
 			// 范围声明、无批量语义,客户端游标以实际收到的 Seq 逐条推进。
@@ -482,13 +512,58 @@ func (h *EventHub) Subscribe(ctx context.Context, fromSeq uint64) (<-chan sessio
 				})
 				continue
 			}
+			// 批次解码 + 结构校验(DE1-I1):解码成功只证明「合法 JSON」,不证明
+			// 「语义正确」——须再过 validDeltaBatch 结构校验(Events 非空、
+			// part.Seq 严格递增、首末 part 与 FromSeq/Seq 区间声明自洽)才得进
+			// Replay,防「合法 JSON 但 seq 边界错乱」的数据伪装成真实事件 seq。
+			//
+			// 失败语义(DE1-I1/I2):解码失败或结构校验失败 → 置 Incomplete(粘滞
+			// 永不复位)+ slog.Warn(含 rec.Seq/FromSeq)→ 跳过该记录继续——单条
+			// 损坏不炸整个 attach(降级语义与 P3-2 落盘失败对偶:重放缺 delta 段
+			// 可接受,assistant.message_finalized 兜底定稿),绝不从 Subscribe
+			// 返回错误;缺口经 replayIntegrity=Incomplete 向客户端显式暴露,不把
+			// 缺段回放假装成完整历史。
 			var batch DeltaBatch
 			if err := json.Unmarshal(rec.Payload, &batch); err != nil {
-				// 批次解码失败 → warn 跳过该记录(降级语义,与落盘失败对偶:
-				// 重放缺 delta 段可接受,assistant.message_finalized 兜底定稿)。
+				// 旧格式回退(DE1-I2):本功能发布前的开发数据曾把窗内 delta 合并
+				// 为一个 JSON 字符串(per-seq 归属不可知)。批次解码失败时先按
+				// 旧格式试解——成功则保留内容:产出一 SessionEvent(Seq=rec.Seq
+				// 区间末,旧格式无内部事件边界;Payload=原 raw 原样透传),同样置
+				// Incomplete(内容虽在,per-seq 归属不可知 ⇒ 断点恢复不精确,不得
+				// 谎报完整)。旧格式只存在于本功能发布前的开发数据,发布后的
+				// journal 不再产生;若无需保留开发期兼容,可整体清理本回退分支。
+				var legacy string
+				lerr := json.Unmarshal(rec.Payload, &legacy)
+				if lerr == nil {
+					h.replayIntegrity = ReplayIntegrityIncomplete
+					slog.Warn("agent: event hub replay legacy merged delta payload (per-seq attribution unknown)",
+						"session", h.sessionID, "run", rec.RunID,
+						"type", rec.Type, "seq", rec.Seq, "from_seq", rec.FromSeq)
+					replay = append(replay, session.SessionEvent{
+						SessionID: rec.SessionID,
+						RunID:     rec.RunID,
+						Seq:       rec.Seq,
+						Type:      rec.Type,
+						Time:      rec.Time,
+						Payload:   rec.Payload,
+					})
+					continue
+				}
+				// 两种解析都失败 → 跳过 + Incomplete(缺口经三态显式暴露)。
+				h.replayIntegrity = ReplayIntegrityIncomplete
 				slog.Warn("agent: event hub replay skip undecodable delta batch",
-					"err", err, "session", h.sessionID, "run", rec.RunID,
-					"type", rec.Type, "seq", rec.Seq)
+					"err", err, "legacy_err", lerr, "session", h.sessionID, "run", rec.RunID,
+					"type", rec.Type, "seq", rec.Seq, "from_seq", rec.FromSeq)
+				continue
+			}
+			if !validDeltaBatch(batch, rec.FromSeq, rec.Seq) {
+				// 结构校验失败视同解码失败(DE1-I1):跳过 + Incomplete。此形态的
+				// payload 已是 JSON 对象,旧格式(JSON 字符串)回退必然失败,直接
+				// 走跳过路径。
+				h.replayIntegrity = ReplayIntegrityIncomplete
+				slog.Warn("agent: event hub replay skip malformed delta batch structure",
+					"session", h.sessionID, "run", rec.RunID,
+					"type", rec.Type, "seq", rec.Seq, "from_seq", rec.FromSeq)
 				continue
 			}
 			for _, part := range batch.Events {
