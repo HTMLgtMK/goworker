@@ -1,0 +1,176 @@
+package agentcontrol
+
+import (
+	"fmt"
+
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
+)
+
+// runs.go 是 Run 控制操作(StartRun/CancelRun/RunStatus)的编排面:多会话寻址
+// (SessionRouter)→ fencing 校验(LeaseRegistry.WithControl)→ 幂等 single-flight
+// (RequestRegistry)→ 直转 runtimeagent.SessionManager。与迁移前的行为契约逐条
+// 对齐,差异仅两处且均为方案要求:①幂等注册表按 Key single-flight(§4.3,跨
+// 别名同键并发重试收敛为一次底层提交,见 RequestRegistry 论证);②StartRun 签名
+// 增 cb 参数(§4.1 草案允许的偏差:回调由调用方传入,本 PR 的 plugin 委托传零值
+// 回调,语义与迁移前逐字一致——事件采集由 supervisor 的 tee 自行供给,Decide
+// 留 nil → P4-2 审批回退接管,决策经 ResolveApproval 跨连接投递)。
+
+// ensureRegistered 修复「current runtime 已注册」不变量(原 runcontrol.go 的
+// registerCurrentRuntime 迁入;修复所需的两步操作只经 Service 持有的 manager,
+// 不依赖宿主状态):纯内存降级下 /new 的新旧 runtime 同 id,startSession 的
+// Register 撞旧条目保留旧值,handleNew 尾部 Remove 移除的正是旧条目——新
+// runtime 此刻不在册(Get == nil);经同 id 重建的路径(如测试 fixture 的
+// refreshSession)则可能有同 id 旧条目占位(Get != rt)。两者都违反不变量,
+// Remove+Register 幂等重建。Register 的错误不在此放大:唯一可达失败是
+// ErrManagerClosed,后续 manager.StartRun/CancelRun 会给出同一权威错误。
+func (s *Service) ensureRegistered(rt *runtimeagent.SessionRuntime) {
+	if got := s.sessions.Get(rt.ID); got != rt {
+		s.sessions.Remove(rt.ID)
+		_ = s.sessions.Register(rt)
+	}
+}
+
+// StartRun 提交一次后台 Run 并立即返回 (runID, 提交时状态):
+//
+//   - 寻址(C3):router.RouteSession 按 sessionID 定位 runtime(不限 current),
+//     StartRun 用该 rt——其 Session 自带本会话边界注入的 deps,journal/hub/
+//     conversation 天然按会话隔离;nil → sessionNotFoundErr(路由先于 lease
+//     校验:未注册会话诚实失败,ErrSessionNotFound 语义不受 fencing 影响)。
+//
+//   - fencing(第三轮评审 I4;DE2-I1 后锁粒度=会话):本会话 lease 临界区内原子
+//     完成「lease 校验 + 提交」——接管的 Acquire 同锁,校验通过后到提交完成之间
+//     不可能被接管,旧持有者绝无法在失权后落地 run/start。未持有(从未持有/
+//     已被接管/已释放)→ ErrControlLeaseLost 的明确错误;拒绝发生在幂等查表
+//     之前,被拒提交不入幂等表。
+//
+//   - 幂等(I5;§4.3 single-flight):requestID 非空时按 (rt.ID, requestID) 组合
+//     键寻址(键的 SessionID 取路由解析后的 rt.ID,canonical——纯内存降级的
+//     空串/"current" 两别名折叠为同一键)。同键同 Input → 返回原 runID 与其
+//     当前状态(RunHandle.State() 的实时快照,终态保留),不重复起跑;同键不同
+//     Input → ErrRequestConflict 显式冲突;requestID 的唯一性只在同一会话的
+//     幂等作用域内成立(第二轮评审 I5:跨会话冲突扫描已删)。空 requestID 不
+//     记账(每次新起跑)。single-flight 保证同键并发提交恰好一次底层 StartRun
+//     (见 RequestRegistry 注释的论证)。幂等表是进程内存量,重启清零。
+//
+//   - cb 所有权:manager.StartRun 返回起归 supervisor(其契约 1);同键并发下
+//     仅 leader 的 cb 生效(joiner 等待同一结果,与迁移前「命中幂等表的重试
+//     不再触发提交」的回调丢弃语义一致)。
+//
+//   - 返回的 state 是提交时快照(manager.StartRun 同步段落盘 queued 记录后
+//     durable-first 返回,恒为 queued)。
+func (s *Service) StartRun(sessionID, clientID, input, requestID string, cb runtimeagent.RunCallbacks) (string, string, error) {
+	rt := s.route(sessionID)
+	if rt == nil {
+		return "", "", sessionNotFoundErr(sessionID)
+	}
+	var key RequestKey
+	if requestID != "" {
+		key = RequestKey{SessionID: rt.ID, RequestID: requestID}
+	}
+
+	var runID, state string
+	err := s.leases.WithControl(sessionID, clientID, func() error {
+		h, submitErr := s.requests.Submit(key, input, func() (runtimeagent.RunHandle, error) {
+			s.ensureRegistered(rt)
+			return s.sessions.StartRun(rt.ID, runtimeagent.RunRequest{Input: input}, cb)
+		})
+		if submitErr == nil {
+			runID, state = h.RunID, string(h.State())
+		}
+		return submitErr
+	})
+	if err != nil {
+		return "", "", err
+	}
+	return runID, state, nil
+}
+
+// CancelRun 取消一个后台 Run:多会话寻址 → 本会话 lease 临界区内原子完成
+// 「lease 校验 + 取消提交」→ 直转 manager(与 StartRun 同构的 fencing:校验通过
+// 后不可能被接管,未持有 → ErrControlLeaseLost)。不变量修复的必要性同迁移前
+// (registerCurrentRuntime → ensureRegistered):current 会话的 runtime 在同 id
+// 重建窗口(纯内存 /new)下可能未在册,同步 run 活跃其上时不经修复会被误报
+// ErrRunNotFound;跨会话路由的 runtime 本就来自注册表,修复为幂等空操作。
+// manager 的拒绝语义原样上抛:未知 run → ErrRunNotFound;同步 RecordRun 路径
+// 的 run 无 cancel → ErrRunNotCancellable(其取消入口是调用方请求 ctx,P2-6
+// 契约)。
+func (s *Service) CancelRun(sessionID, clientID, runID string) error {
+	rt := s.route(sessionID)
+	if rt == nil {
+		return sessionNotFoundErr(sessionID)
+	}
+	return s.leases.WithControl(sessionID, clientID, func() error {
+		s.ensureRegistered(rt)
+		return s.sessions.CancelRun(rt.ID, runID)
+	})
+}
+
+// RunStatus 返回 run 当前状态、该会话事件流 latest seq 与回放完整性三态
+// replayIntegrity。只读观察面,不做 fencing(run/get 不要求 control lease,
+// 观察者与控制者分离,总方案 §7.4)。观测面三分支,按权威序:
+//  1. rt.Active() 命中 runID(在跑/排队)→ 实时快照;latestSeq 取
+//     hub.LatestSeq()(会话维度游标,P3-0 契约);
+//  2. 该会话自己的 journal(已终态,active 已清):journal 权威——journal 必须
+//     取被路由会话的事实源(JournalSource.RunJournal:current 会话走 deps 单例、
+//     跨会话路由的会话走 repo 只读实例的解析由宿主承担),读 runs/<runID>.jsonl
+//     末条 state 记录;latestSeq 取 SeqRange 的磁盘 latest(hub 可能尚未经
+//     StartRun 建立——只有同步 run 的会话即此形态);journal 存在但 miss →
+//     未找到,不回落幂等表(持久化模式 journal 覆盖本会话全部 run,不发明第二
+//     事实源);
+//  3. 幂等表反查(仅纯内存,JournalSource 为 nil 或该会话无 journal):经
+//     StartRun 记账的 RunHandle 是唯一观测面(按路由会话过滤)。
+//
+// replayIntegrity(I4)同源迁移:rt.Hub() 存在时取 hub.ReplayIntegrity()(三态:
+// 本进程纪元内任何 key 事件落盘失败/合并 delta flush 失败 → Incomplete,粘滞
+// 永不复位;journal 播种发现既有历史 → Unknown,跨进程纪元的完整性不可验证,
+// 诚实优先;空历史/纯内存 → Complete);hub 为 nil → Complete——无事件流即无
+// 「不完整回放」可言,该取值只携带失败证据、不发明完整性承诺。
+//
+// 未命中 → 包裹 runtimeagent.ErrRunNotFound 的错误(协议面映射 -32000)。
+func (s *Service) RunStatus(sessionID, runID string) (string, uint64, string, error) {
+	rt := s.route(sessionID)
+	if rt == nil {
+		return "", 0, runtimeagent.ReplayIntegrityComplete, sessionNotFoundErr(sessionID)
+	}
+
+	replayIntegrity := runtimeagent.ReplayIntegrityComplete
+	if hub := rt.Hub(); hub != nil {
+		replayIntegrity = hub.ReplayIntegrity()
+	}
+
+	// ① active 命中(在跑/排队)→ 实时快照。
+	if run := rt.Active(); run != nil && run.ID == runID {
+		latest := uint64(0)
+		if hub := rt.Hub(); hub != nil {
+			latest = hub.LatestSeq()
+		}
+		return string(run.State()), latest, replayIntegrity, nil
+	}
+
+	// ② journal 权威(被路由会话自己的事实源;存在即权威,miss 即未找到)。
+	if s.journals != nil {
+		if js := s.journals.RunJournal(rt); js != nil {
+			rec, ok := js.LastRunState(runID)
+			if !ok {
+				return "", 0, replayIntegrity, fmt.Errorf("agent: run %q: %w", runID, runtimeagent.ErrRunNotFound)
+			}
+			_, latest, _, err := js.SeqRange()
+			if err != nil {
+				// I3:扫描失败显式上抛,不把读取失败静默降级为 latest=0(游标是
+				// 「仅描述」,描述不可信时诚实报错优于编造一个看似合法的 0)。
+				return "", 0, replayIntegrity, fmt.Errorf("agent: run %q: seq range: %w", runID, err)
+			}
+			return rec.State, latest, replayIntegrity, nil
+		}
+	}
+
+	// ③ 幂等表反查(仅纯内存)。
+	if h, ok := s.requests.byRun(rt.ID, runID); ok {
+		latest := uint64(0)
+		if hub := rt.Hub(); hub != nil {
+			latest = hub.LatestSeq()
+		}
+		return string(h.State()), latest, replayIntegrity, nil
+	}
+	return "", 0, replayIntegrity, fmt.Errorf("agent: run %q: %w", runID, runtimeagent.ErrRunNotFound)
+}

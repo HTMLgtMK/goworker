@@ -25,6 +25,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/ai-sandbox"
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
@@ -79,38 +80,16 @@ type AgentPlugin struct {
 	// 拒绝已被其他连接顶掉的旧会话,而不是让 prompt 静默串到新声明的工作区里跑。
 	activeTransportSession string
 
-	// reqMu 保护 run/start 的 requestId 幂等表(runcontrol.go,P5-6;I5 修正):
-	// runRequests 记 (sessionID, requestID) 组合键 → 提交时返回的 RunHandle +
-	// input sha256 指纹(重试同键同 Input 返回原 runID 与其当前状态;同键不同
-	// Input 显式冲突,跨会话同 requestID 不同 Input 同样冲突),requestOrder 是
-	// 环形逐出队列(容量 4096,防无界)。DE2-I1 后 reqMu 只护表读写(查表/记账,
-	// 短临界区、无 I/O)——不再覆盖 manager.StartRun 同步段(旧形态会让某会话的
-	// journal fsync 经这把全局锁串行化所有会话的 StartRun);并发同 requestID 重
-	// 试的严格幂等由本会话 guard 串行保证(同键必经同一会话 guard,见
-	// runcontrol.go 文件头)。
-	reqMu        sync.Mutex
-	runRequests  map[string]trackedRun
-	requestOrder []string
-	// guardsMu 只护 controlGuards 表的 get-or-create(第四轮评审 DE2-I1 修复:
-	// 全局 leaseMu + controlLeases 租约表 → 按会话 fencing guard,P5-6 control
-	// lease,V1 宿主授权简化形,拍板②原文「每会话至多一个 control 持有者」;
-	// I3 修正后按会话维度记账):controlGuards 是 sessionID → *sessionControlGuard
-	// (runcontrol.go:mu 是本会话控制操作的线性化临界区,holder 是当前持有者
-	// connectionID)。本机信任、每会话至多一个持有者(两连接各控各会话互不影响)、
-	// 断开即释放(P5-7 handler.Close 经 ReleaseConnection 释放该连接全部租约)、
-	// 后到连接对同一会话显式接管(tookOver=true + slog.Info 审计)。第三轮评审
-	// I4 起 fenced 控制操作在**本会话 guard.mu** 临界区内原子完成「lease 校验 +
-	// 提交」(fencing);DE2-I1 后锁粒度是会话——某会话 manager.StartRun 同步段
-	// 的 journal fsync 只占住本会话 guard,不再跨会话互斥(旧全局 leaseMu 会被
-	// 单会话慢盘放大为全 daemon 控制面卡顿)。嵌套取 reqMu 与 manager 内部锁,
-	// 锁序 guard.mu→reqMu→manager 单向(runcontrol.go 文件头);不与 mu 嵌套;
-	// guardsMu 与 guard.mu 无嵌套(ReleaseConnection 先快照再逐个锁)。guardsMu
-	// 自身是叶锁(仅 controlGuard/snapshotControlGuards 取,临界区无 I/O 无回
-	// 调)。guard 条目只增不删(与会话注册表同生命周期量级,单条目仅互斥锁+一
-	// 个字符串;删除须与并发控制操作同步,徒增 fencing 复杂度)。惰性建表
-	// (controlGuard 首用时 make)。
-	guardsMu      sync.Mutex
-	controlGuards map[string]*sessionControlGuard
+	// control 是应用内唯一的 Application Control Plane(总方案 §4.2,PR1 建立):
+	// RunControlSource 的 StartRun/CancelRun/RunStatus/ResolveApproval 与 control
+	// lease 四操作全部委托至此——Lease fencing、(sessionID, requestID) 幂等
+	// per-key single-flight、审批归属校验的实现迁入 agentcontrol 包,本插件不再
+	// 直接维护 Lease 表和幂等表(原 reqMu/runRequests/requestOrder/guardsMu/
+	// controlGuards 字段与 sessionControlGuard 实现随迁删除,见 runcontrol.go)。NewPlugin 装配;SessionRouter/JournalSource 窄接口由本
+	// 插件自任(RouteSession/RunJournal)——Service 经此取 current 权威路由与被
+	// 路由会话的 journal,不反向持有插件状态;锁序 lease.mu→registry.mu→manager
+	// 单向,跨层 h.mu→session lease 单向(DE2-I1 论证随方法整体迁入)。
+	control *agentcontrol.Service
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
@@ -137,6 +116,12 @@ func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *AgentPlugi
 		runtimeagent.WithRunLimits(cfg.Session.MaxConcurrentRuns, cfg.Session.MaxPendingRuns),
 		runtimeagent.WithRunContext(runtimeagent.RunContextValue{Key: sessionGateKey{}, Value: p}),
 	)
+	// PR1(总方案 §4.2):装配应用内唯一的 Application Control Plane——plugin 与
+	// ACP 共享同一实例(两套 Lease/Request Registry 是明确禁止的形态)。router/
+	// journal 窄接口由本插件自任(RouteSession/RunJournal,runcontrol.go):Service
+	// 经此取 current 权威路由与被路由会话的 journal,不反向持有插件状态。此时尚
+	// 无会话(startSession 在 Init 创建),路由的 current 回退对 nil current 安全。
+	p.control = agentcontrol.NewService(p.manager, p, p)
 	return p
 }
 

@@ -23,6 +23,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/ai-sandbox"
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -174,6 +175,10 @@ func TestAgentPluginPersistToolAllowRuleRollsBackOnSaveFailure(t *testing.T) {
 func newAgentPlugin(hub *model.Hub) *AgentPlugin {
 	cfg, _ := hub.Config.(*runtimeconfig.Config)
 	p := &AgentPlugin{hub: hub, cfg: cfg, manager: runtimeagent.NewSessionManager()}
+	// PR1:与 NewPlugin 同形装配 Application Control Plane(runcontrol_test 等经
+	// 委托面调用控制操作;直接构造 AgentPlugin 的测试桩必须自行接线,否则委托
+	// 面解引用 nil control)。
+	p.control = agentcontrol.NewService(p.manager, p, p)
 	// 与 Init 编排一致：资源确认后组装 deps + 创建会话
 	p.deps = runtimeagent.SessionDeps{
 		Config:       cfg,
@@ -197,6 +202,9 @@ func newAgentPlugin(hub *model.Hub) *AgentPlugin {
 func newAgentPluginP(hub *model.Hub, pv core.Provider) *AgentPlugin {
 	cfg, _ := hub.Config.(*runtimeconfig.Config)
 	p := &AgentPlugin{hub: hub, cfg: cfg, manager: runtimeagent.NewSessionManager()}
+	// PR1:与 NewPlugin 同形装配 Application Control Plane(控制操作的委托面
+	// 消费方;直接构造 AgentPlugin 的测试桩必须自行接线)。
+	p.control = agentcontrol.NewService(p.manager, p, p)
 	p.deps = runtimeagent.SessionDeps{
 		Config:       cfg,
 		AuditDir:     "",

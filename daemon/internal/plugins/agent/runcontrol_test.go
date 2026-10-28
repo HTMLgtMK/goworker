@@ -13,11 +13,18 @@ import (
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/ai-runtime/session"
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 )
 
 // P5-6:RunControlSource 的 AgentPlugin 实现测试(后台 Run 的 daemon 面)。
 // 全部用模拟 Provider(零真实 LLM);固定 provider 形态沿用 newAgentPluginP +
 // fixedProvider 先例(plugin_test.go:197-222)。
+//
+// PR1(总方案 §四/§五)适配:StartRun/CancelRun/RunStatus/ResolveApproval 与
+// lease 四操作已迁 agentcontrol.Service,本文件经插件委托面全链路验证——fencing
+// 确定性、幂等 single-flight、跨会话独立、接管风暴的语义逐条保留(错误 sentinel
+// 现定义在 agentcontrol);幂等表记账断言改经 Service.TrackedRequest(原 reqMu/
+// runRequests 内部字段随迁删除)。
 
 // waitForRunStatus 轮询 RunStatus 直至 want 状态或超时(P5-6 的 RunStatus 是
 // 唯一跨包可用的状态观测面;StartRun 返回的 RunHandle 归 supervisor,daemon
@@ -42,7 +49,7 @@ func waitForRunStatus(t *testing.T, p *AgentPlugin, sid, runID, want string) (st
 
 // TestStartRunThroughPlugin(P5-6):经插件 StartRun 提交后台 Run → 轮询
 // RunStatus 至 completed(与持有 RunHandle.Wait 等价的完成观测);未持 lease 的
-// 连接 → ErrControlLeaseLost(第三轮评审 I4 fencing);未注册的 sessionID →
+// 连接 → agentcontrol.ErrControlLeaseLost(第三轮评审 I4 fencing);未注册的 sessionID →
 // 明确错误(C3 后按 sessionRuntime 多会话路由,任意未注册 id 在路由层诚实失败,
 // ErrSessionNotFound 语义——路由先于 lease 校验)。
 func TestStartRunThroughPlugin(t *testing.T) {
@@ -51,11 +58,11 @@ func TestStartRunThroughPlugin(t *testing.T) {
 	cfg.Memory.Enabled = false
 	hub, _ := testHub(cfg)
 	p := newAgentPluginP(hub, fixedProvider{content: "bg-done"})
-	sid := p.CurrentSessionID() // 纯内存形态为空串,经 sessionRuntime 的 current 回退寻址当前会话
+	sid := p.CurrentSessionID() // 纯内存形态为空串,经 RouteSession 的 current 回退寻址当前会话
 
 	// fencing(第三轮评审 I4):未持有 lease 的连接一律拒绝。
-	if _, _, err := p.StartRun(sid, "conn-other", "hello", "req-fenced"); !errors.Is(err, ErrControlLeaseLost) {
-		t.Fatalf("StartRun without lease err = %v, want ErrControlLeaseLost", err)
+	if _, _, err := p.StartRun(sid, "conn-other", "hello", "req-fenced"); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
+		t.Fatalf("StartRun without lease err = %v, want agentcontrol.ErrControlLeaseLost", err)
 	}
 	if p.AcquireControl(sid, "conn-A") {
 		t.Fatal("test setup: fresh acquire must not report takeover")
@@ -410,7 +417,7 @@ func TestEnsureHubSeedErrorPropagates(t *testing.T) {
 	cfg.Memory.Enabled = false
 	hub, _ := testHub(cfg)
 	p := newAgentPluginP(hub, fixedProvider{content: "bg-i3"})
-	sid := p.CurrentSessionID() // 纯内存形态为空串,sessionRuntime 的 current 回退寻址
+	sid := p.CurrentSessionID() // 纯内存形态为空串,RouteSession 的 current 回退寻址
 
 	// 注入播种注错的 EventJournal 并按会话边界重建(SessionDeps 值拷贝,必须
 	// refresh 传导进 runtime 的 session deps)。
@@ -445,14 +452,12 @@ func TestEnsureHubSeedErrorPropagates(t *testing.T) {
 		t.Fatalf("rejected StartRun returned runID %q, want empty", runID)
 	}
 
-	// 无残留:active 已清、幂等表未记账(被拒提交不得入表)。
-	if act := p.sessionRuntime(sid).Active(); act != nil {
+	// 无残留:active 已清、幂等表未记账(被拒提交不得入表;记账断言经
+	// Service.TrackedRequest——原 reqMu/runRequests 内部字段随迁 agentcontrol)。
+	if act := p.RouteSession(sid).Active(); act != nil {
 		t.Fatalf("active after rejected StartRun = %+v, want nil", act)
 	}
-	p.reqMu.Lock()
-	_, tracked := p.runRequests[requestKey(p.sessionRuntime(sid).ID, "req-i3-seed")]
-	p.reqMu.Unlock()
-	if tracked {
+	if _, tracked := p.control.TrackedRequest(p.RouteSession(sid).ID, "req-i3-seed"); tracked {
 		t.Fatal("idempotency table recorded a rejected run(拒绝路径不得入表)")
 	}
 
@@ -664,19 +669,19 @@ func TestCrossSessionRequestIdempotency(t *testing.T) {
 	}
 
 	// 同会话(B)同 requestID(req-x):同 Input 幂等返回原 runID;不同 Input →
-	// ErrRequestConflict(上轮 I5 的 Input 指纹校验收窄到同键范围)。
+	// agentcontrol.ErrRequestConflict(上轮 I5 的 Input 指纹校验收窄到同键范围)。
 	id3, _, err := p.StartRun(sidB, "conn-B", "payload-B", "req-x")
 	if err != nil || id3 != runB {
 		t.Fatalf("same-key retry = (%q, %v), want (%q, nil)", id3, err, runB)
 	}
-	if _, _, err := p.StartRun(sidB, "conn-B", "payload-B-changed", "req-x"); !errors.Is(err, ErrRequestConflict) {
-		t.Fatalf("same-session same-key different-input err = %v, want ErrRequestConflict", err)
+	if _, _, err := p.StartRun(sidB, "conn-B", "payload-B-changed", "req-x"); !errors.Is(err, agentcontrol.ErrRequestConflict) {
+		t.Fatalf("same-session same-key different-input err = %v, want agentcontrol.ErrRequestConflict", err)
 	}
 }
 
 // TestCrossSessionApprovalOwnership(C1 修复验收,真实 RunControlSource 实现):
 // 服务端记录的审批归属是授权事实源——会话 B 挂起的审批,由声明 sidA 的调用方
-// 应答 → ErrApprovalOwnership 越权拒绝(即便 sidA 是真实注册会话)且审批不被
+// 应答 → agentcontrol.ErrApprovalOwnership 越权拒绝(即便 sidA 是真实注册会话)且审批不被
 // 消费;归属会话本人应答 → 成功且决策送达 Wait;resolved 后归属仍可查(滞留
 // 条目),迟到决策报 ErrApprovalResolved 而非归属错误/未知;未知 requestID →
 // ErrApprovalUnknown;未知会话 → 路由层 ErrSessionNotFound。修复前 Resolve
@@ -716,11 +721,11 @@ func TestCrossSessionApprovalOwnership(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 
-	// ① 越权:声明 sidA 应答归属 sidB 的审批 → ErrApprovalOwnership,审批不被
+	// ① 越权:声明 sidA 应答归属 sidB 的审批 → agentcontrol.ErrApprovalOwnership,审批不被
 	// 消费(归属原样,后续归属会话本人仍可应答)。
 	err := p.ResolveApproval(sidA, "conn-A", "req-b-1", hitl.Decision{Type: hitl.DecisionApprove})
-	if !errors.Is(err, ErrApprovalOwnership) {
-		t.Fatalf("ResolveApproval(sidA, B's approval) err = %v, want ErrApprovalOwnership", err)
+	if !errors.Is(err, agentcontrol.ErrApprovalOwnership) {
+		t.Fatalf("ResolveApproval(sidA, B's approval) err = %v, want agentcontrol.ErrApprovalOwnership", err)
 	}
 	if owner, ok := p.manager.ApprovalOwner("req-b-1"); !ok || owner != sidB {
 		t.Fatalf("ownership after rejected respond = (%q, %v), want (%q, true) (被拒决策不得消费审批)", owner, ok, sidB)
@@ -825,9 +830,9 @@ func TestActiveRunNonCurrentSession(t *testing.T) {
 
 // TestControlFencingTakeoverStorm(第三轮评审 I4 修复验收):A 持 lease,
 // 「A 的 ResolveApproval/StartRun/CancelRun」与「B AcquireControl 接管」并发
-// 轰炸。断言:操作开始时已观察到接管 → 该操作必返回 ErrControlLeaseLost
+// 轰炸。断言:操作开始时已观察到接管 → 该操作必返回 agentcontrol.ErrControlLeaseLost
 // (fencing 生效:校验通过后到提交完成之间不可能被接管);风暴落定后 A 的全部
-// 控制操作一律 ErrControlLeaseLost;接管前基线提交的审批决策恰好送达一次,
+// 控制操作一律 agentcontrol.ErrControlLeaseLost;接管前基线提交的审批决策恰好送达一次,
 // 风暴期的应答要么接管前成功(送达恰好一次,Manager 单次投递保证)要么被
 // fencing 拒绝,绝不出现第二条。
 func TestControlFencingTakeoverStorm(t *testing.T) {
@@ -904,7 +909,7 @@ func TestControlFencingTakeoverStorm(t *testing.T) {
 	// —— 接管风暴:B 反复接管+释放(制造「conn-B 持有 / 空闲」翻转,A 永非
 	// 持有者);A 并发反复三类控制操作。A 每个操作前快照接管标志:已观察到接管
 	// (B 的 tookOver=true 已返回 ⇒ 本会话 guard 内 A 的租约已被夺走)→ 操作必返回
-	// ErrControlLeaseLost;未观察到的窗口内成功/业务错误(ErrApprovalResolved、
+	// agentcontrol.ErrControlLeaseLost;未观察到的窗口内成功/业务错误(ErrApprovalResolved、
 	// ErrRunNotFound)/并发接管皆可,由落定后的终态断言收束。
 	var takenOver atomic.Bool
 	const iters = 100
@@ -925,8 +930,8 @@ func TestControlFencingTakeoverStorm(t *testing.T) {
 			if !observedOver {
 				return // 接管未观察到的窗口:交由终态断言收束
 			}
-			if !errors.Is(err, ErrControlLeaseLost) {
-				t.Errorf("%s after observed takeover err = %v, want ErrControlLeaseLost (fencing)", op, err)
+			if !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
+				t.Errorf("%s after observed takeover err = %v, want agentcontrol.ErrControlLeaseLost (fencing)", op, err)
 			}
 		}
 		for i := 0; i < iters; i++ {
@@ -947,14 +952,14 @@ func TestControlFencingTakeoverStorm(t *testing.T) {
 
 	// —— 终态断言(风暴落定,B 的末次操作是释放 ⇒ lease 空闲,A 非持有者):
 	// fencing 的确定性收束,A 的全部控制操作一律明确错误 ——
-	if _, _, err := p.StartRun(sid, "conn-A", "storm", "req-storm-run"); !errors.Is(err, ErrControlLeaseLost) {
-		t.Fatalf("post-storm StartRun err = %v, want ErrControlLeaseLost", err)
+	if _, _, err := p.StartRun(sid, "conn-A", "storm", "req-storm-run"); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
+		t.Fatalf("post-storm StartRun err = %v, want agentcontrol.ErrControlLeaseLost", err)
 	}
-	if err := p.ResolveApproval(sid, "conn-A", "req-storm-2", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, ErrControlLeaseLost) {
-		t.Fatalf("post-storm ResolveApproval err = %v, want ErrControlLeaseLost", err)
+	if err := p.ResolveApproval(sid, "conn-A", "req-storm-2", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
+		t.Fatalf("post-storm ResolveApproval err = %v, want agentcontrol.ErrControlLeaseLost", err)
 	}
-	if err := p.CancelRun(sid, "conn-A", runID); !errors.Is(err, ErrControlLeaseLost) {
-		t.Fatalf("post-storm CancelRun err = %v, want ErrControlLeaseLost", err)
+	if err := p.CancelRun(sid, "conn-A", runID); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
+		t.Fatalf("post-storm CancelRun err = %v, want agentcontrol.ErrControlLeaseLost", err)
 	}
 
 	// 接管前已提交的审批恰好一次:req-storm-1 的决策已在基线送达;风暴期 A 对
@@ -980,7 +985,7 @@ func TestControlFencingTakeoverStorm(t *testing.T) {
 // goroutine 的确定性 fencing 断言——风暴测试(TestControlFencingTakeoverStorm)
 // 的「接管先于操作」由 goroutine 调度决定,本测试把时序钉死:A 空闲获取 →
 // A 未释放时 B 接管(tookOver=true)→ A 的 StartRun/ResolveApproval/CancelRun
-// 全部 ErrControlLeaseLost。fencing 校验先于幂等表/审批归属/manager 存在性判
+// 全部 agentcontrol.ErrControlLeaseLost。fencing 校验先于幂等表/审批归属/manager 存在性判
 // 定(请求ID 未记账、审批不存在、run 不存在都不影响拒绝语义),且被拒的
 // StartRun 不得入幂等表。
 func TestControlFencingDeterministicTakeover(t *testing.T) {
@@ -1007,22 +1012,20 @@ func TestControlFencingDeterministicTakeover(t *testing.T) {
 		t.Fatal("taker must hold the lease after the deterministic takeover")
 	}
 
-	// ③ A 的三类控制操作全部 ErrControlLeaseLost:守卫拒绝先于一切提交判定。
-	if _, _, err := p.StartRun(sid, "conn-A", "fenced", "req-det"); !errors.Is(err, ErrControlLeaseLost) {
-		t.Fatalf("fenced StartRun err = %v, want ErrControlLeaseLost", err)
+	// ③ A 的三类控制操作全部 agentcontrol.ErrControlLeaseLost:守卫拒绝先于一切提交判定。
+	if _, _, err := p.StartRun(sid, "conn-A", "fenced", "req-det"); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
+		t.Fatalf("fenced StartRun err = %v, want agentcontrol.ErrControlLeaseLost", err)
 	}
-	if err := p.ResolveApproval(sid, "conn-A", "req-det-approval", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, ErrControlLeaseLost) {
-		t.Fatalf("fenced ResolveApproval err = %v, want ErrControlLeaseLost", err)
+	if err := p.ResolveApproval(sid, "conn-A", "req-det-approval", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
+		t.Fatalf("fenced ResolveApproval err = %v, want agentcontrol.ErrControlLeaseLost", err)
 	}
-	if err := p.CancelRun(sid, "conn-A", "run-det"); !errors.Is(err, ErrControlLeaseLost) {
-		t.Fatalf("fenced CancelRun err = %v, want ErrControlLeaseLost", err)
+	if err := p.CancelRun(sid, "conn-A", "run-det"); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
+		t.Fatalf("fenced CancelRun err = %v, want agentcontrol.ErrControlLeaseLost", err)
 	}
 
-	// ④ 被拒的 StartRun 不得入幂等表(拒绝发生在 reqMu 临界区之前)。
-	p.reqMu.Lock()
-	_, tracked := p.runRequests[requestKey(p.sessionRuntime(sid).ID, "req-det")]
-	p.reqMu.Unlock()
-	if tracked {
+	// ④ 被拒的 StartRun 不得入幂等表(fencing 拒绝发生在幂等查表之前;断言经
+	// Service.TrackedRequest,原 reqMu/runRequests 内部字段随迁 agentcontrol)。
+	if _, tracked := p.control.TrackedRequest(p.RouteSession(sid).ID, "req-det"); tracked {
 		t.Fatal("fenced StartRun recorded an idempotency entry (拒绝路径不得入表)")
 	}
 }
