@@ -29,7 +29,7 @@ func TestRequestRegistryIdempotentRetry(t *testing.T) {
 	key := RequestKey{SessionID: "sess", RequestID: "req-1"}
 
 	var starts atomic.Int32
-	h1, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
+	h1, _, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
 		starts.Add(1)
 		return testHandle("sess", "run-1"), nil
 	})
@@ -40,7 +40,7 @@ func TestRequestRegistryIdempotentRetry(t *testing.T) {
 		t.Fatalf("Submit #1 runID = %q, want run-1", h1.RunID)
 	}
 
-	h2, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
+	h2, _, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
 		starts.Add(1)
 		return testHandle("sess", "run-2"), nil
 	})
@@ -55,7 +55,7 @@ func TestRequestRegistryIdempotentRetry(t *testing.T) {
 	}
 
 	// 同键不同 Input → 显式冲突,原记账不被覆盖。
-	if _, err := r.Submit(key, "payload-changed", func() (runtimeagent.RunHandle, error) {
+	if _, _, err := r.Submit(key, "payload-changed", func() (runtimeagent.RunHandle, error) {
 		starts.Add(1)
 		return testHandle("sess", "run-3"), nil
 	}); !errors.Is(err, ErrRequestConflict) {
@@ -92,7 +92,7 @@ func TestRequestRegistrySingleFlightConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			h, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
+			h, _, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
 				starts.Add(1)
 				<-release
 				return testHandle("sess", "run-flight"), nil
@@ -129,7 +129,7 @@ func TestRequestRegistryConcurrentDifferentInputConflict(t *testing.T) {
 	leaderDone := make(chan struct{})
 	go func() {
 		defer close(leaderDone)
-		_, _ = r.Submit(key, "leader-input", func() (runtimeagent.RunHandle, error) {
+		_, _, _ = r.Submit(key, "leader-input", func() (runtimeagent.RunHandle, error) {
 			close(entered) // flight 已登记,leader 已进入提交段
 			<-release
 			return testHandle("sess", "run-leader"), nil
@@ -141,7 +141,7 @@ func TestRequestRegistryConcurrentDifferentInputConflict(t *testing.T) {
 	<-entered
 
 	start := time.Now()
-	_, err := r.Submit(key, "joiner-input", func() (runtimeagent.RunHandle, error) {
+	_, _, err := r.Submit(key, "joiner-input", func() (runtimeagent.RunHandle, error) {
 		t.Error("conflicting joiner must not trigger a start")
 		return testHandle("sess", "run-joiner"), nil
 	})
@@ -168,7 +168,7 @@ func TestRequestRegistryDifferentKeysIndependent(t *testing.T) {
 	leaderDone := make(chan struct{})
 	go func() {
 		defer close(leaderDone)
-		_, _ = r.Submit(key1, "slow", func() (runtimeagent.RunHandle, error) {
+		_, _, _ = r.Submit(key1, "slow", func() (runtimeagent.RunHandle, error) {
 			close(entered) // flight 已登记,leader 已进入提交段
 			<-release
 			return testHandle("sess", "run-slow"), nil
@@ -179,7 +179,7 @@ func TestRequestRegistryDifferentKeysIndependent(t *testing.T) {
 	fastDone := make(chan struct{})
 	go func() {
 		defer close(fastDone)
-		h, err := r.Submit(key2, "fast", func() (runtimeagent.RunHandle, error) {
+		h, _, err := r.Submit(key2, "fast", func() (runtimeagent.RunHandle, error) {
 			return testHandle("sess", "run-fast"), nil
 		})
 		if err != nil || h.RunID != "run-fast" {
@@ -207,7 +207,7 @@ func TestRequestRegistryErrorNotRecorded(t *testing.T) {
 
 	cause := errors.New("manager rejected")
 	var starts atomic.Int32
-	_, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
+	_, _, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
 		starts.Add(1)
 		return runtimeagent.RunHandle{}, cause
 	})
@@ -219,7 +219,7 @@ func TestRequestRegistryErrorNotRecorded(t *testing.T) {
 	}
 
 	// 重试:重新成为 leader(新 flight),第二次提交成功。
-	h, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
+	h, _, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
 		starts.Add(1)
 		return testHandle("sess", "run-retry"), nil
 	})
@@ -252,7 +252,7 @@ func TestRequestRegistryJoinerGetsError(t *testing.T) {
 		close(f.done)
 	}()
 
-	h, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
+	h, _, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
 		t.Error("joiner must not trigger its own start")
 		return testHandle("sess", "run-x"), nil
 	})
@@ -269,7 +269,7 @@ func TestRequestRegistryJoinerGetsError(t *testing.T) {
 	r.mu.Lock()
 	delete(r.flights, key)
 	r.mu.Unlock()
-	h2, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
+	h2, _, err := r.Submit(key, "payload", func() (runtimeagent.RunHandle, error) {
 		return testHandle("sess", "run-retry"), nil
 	})
 	if err != nil || h2.RunID != "run-retry" {
@@ -288,7 +288,7 @@ func TestRequestRegistryRingEviction(t *testing.T) {
 	}
 	for i := 0; i < maxTrackedRequestIDs; i++ {
 		key := RequestKey{SessionID: "sess", RequestID: fmt.Sprintf("req-%d", i)}
-		if _, err := r.Submit(key, "payload", start(i)); err != nil {
+		if _, _, err := r.Submit(key, "payload", start(i)); err != nil {
 			t.Fatalf("Submit #%d: %v", i, err)
 		}
 	}
@@ -297,7 +297,7 @@ func TestRequestRegistryRingEviction(t *testing.T) {
 		t.Fatal("req-0 should be tracked at capacity")
 	}
 	// 第 4097 笔:逐出 req-0。
-	if _, err := r.Submit(RequestKey{SessionID: "sess", RequestID: "req-4096"}, "payload", start(4096)); err != nil {
+	if _, _, err := r.Submit(RequestKey{SessionID: "sess", RequestID: "req-4096"}, "payload", start(4096)); err != nil {
 		t.Fatalf("Submit overflow: %v", err)
 	}
 	if _, ok := r.Tracked("sess", "req-0"); ok {
@@ -308,7 +308,7 @@ func TestRequestRegistryRingEviction(t *testing.T) {
 	}
 	// 同键重复提交:幂等短路返回原句柄(表命中路径,不触发底层提交、不重复
 	// 入队);recordLocked 的同键刷新分支是保守自愈,直接在锁内驱动验证。
-	if h2, err := r.Submit(RequestKey{SessionID: "sess", RequestID: "req-4096"}, "payload", func() (runtimeagent.RunHandle, error) {
+	if h2, _, err := r.Submit(RequestKey{SessionID: "sess", RequestID: "req-4096"}, "payload", func() (runtimeagent.RunHandle, error) {
 		t.Error("same-key resubmission must short-circuit on the table hit")
 		return testHandle("sess", "run-refresh"), nil
 	}); err != nil || h2.RunID != "run-4096" {
@@ -336,7 +336,7 @@ func TestRequestRegistryTrackedAndByRun(t *testing.T) {
 		t.Fatal("unknown key must not be tracked")
 	}
 
-	h, err := r.Submit(RequestKey{SessionID: "sess-A", RequestID: "req-a"}, "payload", func() (runtimeagent.RunHandle, error) {
+	h, _, err := r.Submit(RequestKey{SessionID: "sess-A", RequestID: "req-a"}, "payload", func() (runtimeagent.RunHandle, error) {
 		return testHandle("sess-A", "run-a"), nil
 	})
 	if err != nil {

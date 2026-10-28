@@ -95,12 +95,21 @@ func (s *Service) StartRun(sessionID, clientID, input, requestID string, cb runt
 
 	var runID, state string
 	err := s.leases.WithControl(sessionID, clientID, func() error {
-		h, submitErr := s.requests.Submit(key, input, func() (runtimeagent.RunHandle, error) {
+		h, fresh, submitErr := s.requests.Submit(key, input, func() (runtimeagent.RunHandle, error) {
 			s.ensureRegistered(rt)
 			return s.sessions.StartRun(rt.ID, runtimeagent.RunRequest{Input: input}, cb)
 		})
 		if submitErr == nil {
-			runID, state = h.RunID, string(h.State())
+			// 响应状态语义按提交形态区分(第四轮 TestCrossSessionRequestIdempotency
+			// 的两个断言面):fresh 提交 → 接受时刻快照(SubmitState,恒 queued,
+			// 确定性——h.State() 是活快照,fast provider 下 execute 可能已把 run
+			// 推到 completed,会让 run/start 的接受响应非确定);幂等命中 → 活快照
+			//(重试方在问「run 现在怎么样」,completed 是事实而非竞争噪声)。
+			if fresh {
+				runID, state = h.RunID, string(h.SubmitState())
+			} else {
+				runID, state = h.RunID, string(h.State())
+			}
 		}
 		return submitErr
 	})

@@ -135,9 +135,10 @@ func NewRequestRegistry() *RequestRegistry {
 //     属进程级故障,不做恢复语义)。
 //
 // 被拒提交(错误路径)不入表;被拒的 joiner/leader 均不占记账。
-func (r *RequestRegistry) Submit(key RequestKey, input string, start StartFunc) (runtimeagent.RunHandle, error) {
+func (r *RequestRegistry) Submit(key RequestKey, input string, start StartFunc) (h runtimeagent.RunHandle, fresh bool, err error) {
 	if key.RequestID == "" {
-		return start()
+		h, err = start()
+		return h, true, err
 	}
 	fp := inputFingerprint(input)
 
@@ -146,23 +147,23 @@ func (r *RequestRegistry) Submit(key RequestKey, input string, start StartFunc) 
 	if tr, ok := r.table[key]; ok {
 		r.mu.Unlock()
 		if tr.inputHash != fp {
-			return runtimeagent.RunHandle{}, requestConflictErr(key.RequestID)
+			return runtimeagent.RunHandle{}, false, requestConflictErr(key.RequestID)
 		}
-		return tr.handle, nil
+		return tr.handle, false, nil
 	}
 	// ② 在途命中(joiner):指纹一致才等待,不一致立即冲突——等待窗口内 leader
 	// 在 registry.mu 之外提交,本临界区不做任何等待。
 	if f, ok := r.flights[key]; ok {
 		if f.inputHash != fp {
 			r.mu.Unlock()
-			return runtimeagent.RunHandle{}, requestConflictErr(key.RequestID)
+			return runtimeagent.RunHandle{}, false, requestConflictErr(key.RequestID)
 		}
 		r.mu.Unlock()
 		<-f.done
 		if f.err != nil {
-			return runtimeagent.RunHandle{}, f.err
+			return runtimeagent.RunHandle{}, false, f.err
 		}
-		return f.handle, nil
+		return f.handle, false, nil
 	}
 	// ③ 成为 leader:登记 flight 后在 registry.mu 之外执行底层提交(不同 Key
 	// 的提交段互不阻塞的落点)。
@@ -185,7 +186,7 @@ func (r *RequestRegistry) Submit(key RequestKey, input string, start StartFunc) 
 		}
 	}()
 
-	h, err := start()
+	h, err = start()
 	r.mu.Lock()
 	delete(r.flights, key)
 	if err == nil {
@@ -198,9 +199,9 @@ func (r *RequestRegistry) Submit(key RequestKey, input string, start StartFunc) 
 	completed = true
 
 	if err != nil {
-		return runtimeagent.RunHandle{}, err
+		return runtimeagent.RunHandle{}, true, err
 	}
-	return h, nil
+	return h, true, nil
 }
 
 // recordLocked 记录一笔幂等键 → RunHandle + input 指纹,并按容量环形逐出最老

@@ -43,11 +43,23 @@ type RunHandle struct {
 	RunID     string
 
 	run *AgentRun
+	// submitState 是接受时刻的状态快照(同步段内捕获,此后只读)——
+	// SubmitState() 的取值来源;与 State() 的活快照语义区分。
+	submitState RunState
 }
 
-// State 返回运行当前状态快照(queued/running/终态)。
+// State 返回运行当前状态快照(queued/running/终态)。注意这是读取时刻的活
+// 快照——execute goroutine 并发推进,fast provider 下读取时可能已是终态。
 func (h RunHandle) State() RunState {
 	return h.run.snapshot().State
+}
+
+// SubmitState 返回**接受时刻**的状态(总方案 §4.1 RunAccepted{State} 语义):
+// 在 manager.StartRun 同步段内捕获(此时 run 恒为 RunQueued——transition 到
+// running 发生在 execute ④),不接受后续推进,是确定性的提交响应值。查询
+// 运行的当前进度应使用 State() 或 RunStatus,二者语义不同。
+func (h RunHandle) SubmitState() RunState {
+	return h.submitState
 }
 
 // Wait 阻塞至运行终态或 ctx 取消:终态时返回结果快照(done 关闭前 journal 终态
@@ -269,8 +281,14 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 
 	// ⑧ 执行转移给 supervisor goroutine(cb 所有权随之转移,契约①;tee 包装
 	// 不改变所有权归属——execute 仍是 cb 的唯一使用者),立即返回。
+	// 接受时刻状态快照:此刻 run 恒为 RunQueued(transition 到 running 在
+	// execute ④),同步段内捕获后不接受 execute 的并发推进——StartRun 的
+	// 响应状态(总方案 §4.1 RunAccepted)是确定性的提交值,而非与 fast
+	// provider 竞争的活快照(runcontrol_test 断言 queued 即依赖本语义)。
+	submitState := run.snapshot().State
+
 	go m.execute(rt, run, runCtx, cancel, req, cb, hub)
-	return RunHandle{SessionID: sessionID, RunID: run.ID, run: run}, nil
+	return RunHandle{SessionID: sessionID, RunID: run.ID, run: run, submitState: submitState}, nil
 }
 
 // execute 是后台 Run 的单 goroutine 执行体(cb 所有权自 StartRun 返回起归它,
