@@ -13,6 +13,7 @@ import (
 	"github.com/tinguo/goworker/ai-memory"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -27,18 +28,33 @@ import (
 // 流入嵌套 Eval。
 type sessionGateKey struct{}
 
-// withSession 在当前会话的独占执行权下运行 run：互斥点经 p.currentSession()
-// 解析出的 SessionRuntime gate（容量 1，AcquireRun 监听 ctx 取消）——解析与互斥
-// 同源（都取自 current），杜绝「锁在 A 会话、写在 B 会话」。7 个会话命令
-// handler（/agent /new /compact /usage /history /task /rewind）全部经此排队，
-// 同一时刻只有一个命令回合在跑；agent 运行期间 collectTools 嵌套 hub.Eval 执行
-// 这些命令时，靠 sessionGateKey ctx 重入标记放行，绝不在持有 gate 时重复排队
-// （重复取锁即死锁）。current 为 nil（Init 未完成/失败回滚）时不排队，直接报错。
+// withSession 在本命令回合解析出的会话 runtime 的独占执行权下运行 run(PR2 起
+// 解析 binding 优先,总方案 §六):解析点 sessionRuntimeIn——ctx 携带连接级
+// SessionBinding(标准 ACP 的 prompt 链,FrontendHandler 经 agentcontrol.WithBinding
+// 注入)时按 binding 路由(binding 命中 current → current;否则 manager.Get 注册表
+// 权威;悬空 → 诚实错误),无 Binding/空 Binding(CLI 命令、stdio、测试、后台 Run
+// 的嵌套命令)回落 p.currentSession()。互斥点在解析出的同一 runtime 的 gate 上
+// (容量 1,AcquireRun 监听 ctx 取消)——解析与互斥同源,杜绝「锁在 A 会话、写在
+// B 会话」;解析出的 runtime 随注入进 run ctx(resolvedSessionKey),闭包内取数点
+// 与嵌套命令全部读到同一 runtime。7 个会话命令 handler(/agent /new /compact
+// /usage /history /task /rewind)全部经此排队,同一时刻只有一个命令回合在跑;
+// agent 运行期间 collectTools 嵌套 hub.Eval 执行这些命令时,靠 sessionGateKey ctx
+// 重入标记放行,绝不在持有 gate 时重复排队(重复取锁即死锁)——嵌套回合的 ctx
+// 已携带外层注入的 runtime,闭包解析与外层同源。解析结果为 nil(无 Binding 回落
+// 后仍无活动 runtime:Init 未完成/失败回滚)时报错;Binding 悬空(会话已被 /new
+// 收口)诚实报 session not found,不回落 current。
 func (p *AgentPlugin) withSession(ctx context.Context, run func(context.Context) error) error {
+	// nil ctx 归一(既有测试直接构造 Context 不带 Ctx):按无绑定处理。
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if owner, _ := ctx.Value(sessionGateKey{}).(*AgentPlugin); owner == p {
 		return run(ctx)
 	}
-	rt := p.currentSession()
+	rt, err := p.sessionRuntimeIn(ctx)
+	if err != nil {
+		return err
+	}
 	if rt == nil {
 		return fmt.Errorf("agent: no active session")
 	}
@@ -47,7 +63,7 @@ func (p *AgentPlugin) withSession(ctx context.Context, run func(context.Context)
 		return err
 	}
 	defer release()
-	return run(context.WithValue(ctx, sessionGateKey{}, p))
+	return run(injectResolvedSession(context.WithValue(ctx, sessionGateKey{}, p), rt))
 }
 
 func withPluginContext(ctx *model.Context, runCtx context.Context) *model.Context {
@@ -57,19 +73,22 @@ func withPluginContext(ctx *model.Context, runCtx context.Context) *model.Contex
 }
 
 func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
-	// 最近一次会话 cwd 声明未通过 sandbox 边界校验 → 明确报错（无效标记语义，
+	// 最近一次会话 cwd 声明未通过 sandbox 边界校验 → 明确报错（无效声明语义，
 	// 见 SetSession）。/new /compact 等维护命令不受影响，只有真正的 prompt 被挡。
-	if err := p.sessionCWDError(); err != nil {
+	// PR2:binding 形态解析——prompt 链携带连接级 Binding 时查被路由会话的声明,
+	// 悬空 Binding(session 已被 /new 收口)在此诚实报错。
+	if err := p.sessionCWDErrorIn(ctx.Ctx); err != nil {
 		return err
 	}
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		// 解析与互斥同源：gate 在 withSession 已按 current 解析，这里取同一
-		// current runtime 做记账。Run 生命周期记账在 RecordRun（已持 gate，只记账
+		// 解析与互斥同源：gate 在 withSession 已按 binding 优先解析并在该 runtime
+		// 上排队，这里读注入的同一 runtime 做记账(不重读 current——/new 换轨窗口
+		// 劈不进闭包)。Run 生命周期记账在 RecordRun（已持 gate，只记账
 		// 不再排队）；RunResult 进 debug 日志，handleAgent 返回值仍为闭包返回的
 		// error（现状 nil），CLI/ACP 错误面不变。
-		rt := p.currentSession()
-		if rt == nil {
+		rt, err := p.sessionRuntimeIn(runCtx)
+		if err != nil || rt == nil {
 			return fmt.Errorf("agent: no active session")
 		}
 		res := rt.RecordRun(func(s *runtimeagent.Session) (runtimeagent.RunResult, error) {
@@ -109,13 +128,24 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
 		// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
 		// 同步固化旧会话（阻塞，状态栏显示进度）；快照走只读，先取好再重建。
-		// oldRT 与 old 同点捕获：闭包持 gate（withSession），current 在临界区内
-		// 稳定，startSession 换轨前取到的都是同一 runtime（P5-5 收口要用它的 id）。
-		oldRT := p.currentSession()
-		old := p.boundSession()
-		// 当前会话 store 经 current 解析（P1-3）：快照与归档都落在 startSession
-		// 换轨前的同一实例上（闭包持 gate，重建前 current 不变）。
-		oldStore := p.currentStore()
+		// PR2:/new 作用于「发起方的 binding 会话」——binding 优先解析(闭包 ctx 携带
+		// 连接级 Binding 时即该连接选择的会话,含悬空判定),无 Binding(CLI)回落
+		// current,原语义不变。oldRT/old/oldStore 同点捕获:闭包持 gate(withSession),
+		// 本回合解析出的 runtime 在临界区内稳定,startSession 换轨前取到的都是同一
+		// runtime(P5-5 收口要用它的 id)。
+		oldRT, rtErr := p.sessionRuntimeIn(runCtx)
+		if rtErr != nil {
+			// Binding 悬空(指向的会话已被收口)诚实失败:无可换轨的会话,不静默
+			// 回落 current——那会把别人(或新会话)的工作区卷进本连接的 /new。
+			return rtErr
+		}
+		var old *runtimeagent.Session
+		if oldRT != nil {
+			old = oldRT.Session()
+		}
+		// 会话 store 经同一 runtime 解析(P1-3 链,storeFor):快照与归档都落在
+		// startSession 换轨前的同一实例上。
+		oldStore := p.storeFor(oldRT)
 
 		// pending 快照（store 生效时用游标后的增量，否则全量）
 		var pending []core.Message
@@ -181,6 +211,18 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 			if err := oldStore.Close(); err != nil {
 				slog.Warn("session: old store close failed", "err", err)
 			}
+		}
+
+		// PR2 /new 收口的 Binding 面(总方案 §六「只摘发起方的 binding」):仅清除
+		// 发起本命令的连接 Binding(agentcontrol.BindingFromCtx,FrontendHandler 经
+		// prompt 链注入;CLI 无 Binding 时为 nil,零动作)——此后该连接回落 current
+		// 语义,自然落到 startSession 刚换轨的新会话,单连接行为与旧版一致。TEARDOWN
+		// 语义不变:重选/清除 Binding 不删除会话(删除只发生在上面的既有收口)、不
+		// 取消后台 Run、不触碰 control lease(§6.2 四条纪律);其他连接的 Binding
+		// 连接私有、这里不可见也不可触及——指向被收口会话的它们在下次解析时诚实
+		// 失败(sessionRuntimeIn 的悬空分支),不会静默串到新会话。
+		if b := agentcontrol.BindingFromCtx(runCtx); b != nil {
+			b.Set("")
 		}
 		return nil
 	})
@@ -369,8 +411,9 @@ func selectedContextWindow(cfg *runtimeconfig.Config) int {
 func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		// /usage 不执行工具（无嵌套 Eval 可换 current），闭包内一次性解析当前会话。
-		s := p.boundSession()
+		// /usage 不执行工具（无嵌套 Eval 可换会话），闭包内一次性解析本回合会话
+		// (binding 优先,PR2)。
+		s := p.boundSessionIn(runCtx)
 		if s == nil {
 			runContext.Writer("(no active session)\n")
 			return nil
@@ -441,7 +484,7 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 func (p *AgentPlugin) handleCompact(ctx *model.Context) error {
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		s := p.boundSession()
+		s := p.boundSessionIn(runCtx)
 		if s == nil {
 			runContext.Writer("(no active session)\n")
 			return nil
@@ -470,7 +513,7 @@ func (p *AgentPlugin) handleHistory(ctx *model.Context) error {
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
 		var conv []core.Message
-		if s := p.boundSession(); s != nil {
+		if s := p.boundSessionIn(runCtx); s != nil {
 			conv = s.Conversation()
 		}
 		if len(conv) == 0 {

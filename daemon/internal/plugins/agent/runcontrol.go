@@ -372,13 +372,18 @@ func (e deviceToolExecutor) Invoke(ctx context.Context, toolName string, argsJSO
 // 等)不进此路径,零变化;沙箱/HITL 门控面零变化(spec.Metadata 透传,重绑后
 // 照常 per-call 裁决)。无 runtime(Init 未完成/失败回滚)→ nil。
 func (p *AgentPlugin) ClientToolSource(connectionID string, caller model.DeviceCaller) func(context.Context) []core.Tool {
-	return func(_ context.Context) []core.Tool {
+	return func(ctx context.Context) []core.Tool {
 		specs, err := acpworker.SpecDeviceTools(caller)
 		if err != nil || len(specs) == 0 {
 			return nil
 		}
-		rt := p.currentSession()
-		if rt == nil {
+		// PR2:能力绑定跟随本回合实际执行的会话——prompt 链携带连接级 Binding 时,
+		// 命令回合解析出的 runtime(withSession 注入,经 Session.Run 的 toolCtx 流
+		// 入本闭包的 ctx)才是绑定目标;无绑定路径(CLI/stdio/测试)回落 current,
+		// 原语义不变。不跟随的话 prompt 路由到绑定会话、能力却绑在 current 的 id
+		// 上,代理会路由到错误会话的 runtime。
+		rt, rtErr := p.sessionRuntimeIn(ctx)
+		if rtErr != nil || rt == nil {
 			return nil
 		}
 		sessionID := rt.ID

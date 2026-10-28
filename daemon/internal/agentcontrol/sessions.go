@@ -1,7 +1,9 @@
 package agentcontrol
 
 import (
+	"context"
 	"fmt"
+	"sync"
 
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	"github.com/tinguo/goworker/ai-runtime/session"
@@ -11,6 +13,74 @@ import (
 // 「当前会话」选择状态(会话选择属于调用入口,不存在 Daemon 全局事实源),也
 // 不直接持有随会话边界重建的 journal 资源——两者经宿主注入的窄接口解析,接口
 // 定义按方案要求放在 agentcontrol(而不是让 Service 反向依赖 plugin)。
+
+// SessionBinding 是连接级会话选择器(总方案 §6.1,PR2):由每条客户端连接
+// (ACP FrontendHandler;CLI 上下文同型)持有一个实例,记录「本连接当前选择的
+// 会话」。标准 ACP 方法(session/new|load|prompt)使用当前连接的 Binding;
+// x-goworker/* 扩展方法显式携带 sessionId、不经 Binding(CR4 的多会话路由不
+// 变);无 Binding 的调用方(CLI 命令、stdio、测试)回落 current 语义——插件
+// 的 current atomic 保留为「无 Binding 调用方的默认」。
+//
+// 它不是 Session、不是 Run、也不是控制权(总方案 §6.2)——只是一个纯粹的会话
+// 选择器,不持有任何会话状态。对 Binding 的重新选择(Set)只修改本连接自己的
+// 选择状态,四条纪律(§6.2 的四条「不应该」逐条落注释,评审与使用方据此对照):
+//
+//  1. 不删除被放弃的会话——会话生命周期归 SessionManager 与宿主命令(/new 的
+//     TEARDOWN),重选/清除 Binding 绝不触发删除;
+//  2. 不取消该会话的后台 Run——Run 生命周期归 RunSupervisor,与连接解耦
+//     (P2P3 §6:断连不取消;重选同样不取消);
+//  3. 不自动获得新选择会话的 control lease——控制权经 attach(mode=control)
+//     显式获取(§七:会话选择、事件订阅、控制权获取是三个独立操作);
+//  4. 不影响其他连接的 Binding——Binding 连接私有,不存在全局 Binding 注册表,
+//     Service 与插件都不持有跨连接的 Binding 事实源(§二不变量 6)。
+//
+// 不变量(PR2 收口):Binding 指向的会话必须是已注册 runtime。写入点
+// (session/new|load-current 的声明成功后)只 Set 统一解析点可路由的 runtime
+// id(store 的稳定 SessionID;纯内存降级无稳定 id,Binding 保持空 = 回落
+// current 语义)。/new 收口摘除旧 runtime 后,仍指向它的 Binding 解析为 nil,
+// 由消费方诚实失败(不静默回落 current——那会把请求串到别的会话的工作区)。
+type SessionBinding struct {
+	mu        sync.RWMutex
+	sessionID string
+}
+
+// Set 记录本连接选择的会话(runtime id)。空串 = 清除选择(/new 收口摘发起方
+// Binding 的形态),此后 Get 返回空、解析回落 current 语义。线程安全:请求
+// goroutine(声明)与 prompt 执行链(解析)并发访问。
+func (b *SessionBinding) Set(id string) {
+	b.mu.Lock()
+	b.sessionID = id
+	b.mu.Unlock()
+}
+
+// Get 返回本连接当前选择的会话 id;空 = 未选择/已清除(回落 current 语义)。
+func (b *SessionBinding) Get() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.sessionID
+}
+
+// bindingContextKey 是 SessionBinding 的 ctx 载体键(私有):Transport Adapter
+// 把本连接的 Binding 挂上请求 ctx,经 Engine.Eval 直通命令 handler(ctx.Ctx
+// 原样传递,engine.go Eval),插件的 binding 形态解析点据此取回。这是
+// 「标准 ACP 会话解析优先读 Binding」的唯一通道——命令链本身没有会话参数。
+type bindingContextKey struct{}
+
+// WithBinding 把连接的 SessionBinding 挂上请求 ctx。b 为 nil 时不包装(等价
+// 无绑定调用方,回落 current 语义)。
+func WithBinding(ctx context.Context, b *SessionBinding) context.Context {
+	if b == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, bindingContextKey{}, b)
+}
+
+// BindingFromCtx 取回请求携带的连接级 SessionBinding;nil = 无绑定调用方
+// (CLI 命令、stdio、测试、后台 Run 的嵌套命令),消费方回落 current 语义。
+func BindingFromCtx(ctx context.Context) *SessionBinding {
+	b, _ := ctx.Value(bindingContextKey{}).(*SessionBinding)
+	return b
+}
 
 // SessionRouter 是会话寻址的窄接口(宿主注入):把调用方寻址的 sessionID 解析为
 // 权威 runtime。plugin 侧实现 = 原 sessionRuntime 统一解析点原样迁移(current

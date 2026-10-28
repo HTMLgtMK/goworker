@@ -34,9 +34,10 @@ func (p *AgentPlugin) handleRewind(ctx *model.Context) error {
 }
 
 func (p *AgentPlugin) handleRewindLocked(ctx *model.Context) error {
-	// P1-3 起取数经 currentStore() 解析（current runtime → repo 实例唯一缓存），
-	// 与命令互斥同源；nil 降级文案与旧版一致。
-	st := p.currentStore()
+	// P1-3 起取数经 store 解析链（runtime → repo 实例唯一缓存），
+	// 与命令互斥同源；PR2 起经 binding 形态 currentStoreIn(命令回合注入的
+	// runtime,无绑定直接调用回落 current);nil 降级文案与旧版一致。
+	st := p.currentStoreIn(ctx.Ctx)
 	if st == nil {
 		ctx.Writer("会话持久化未启用，/rewind 不可用（检查 config.yaml 的 session.enabled）\n")
 		return nil
@@ -50,9 +51,9 @@ func (p *AgentPlugin) handleRewindLocked(ctx *model.Context) error {
 }
 
 // listRewindPoints 列出最近 10 个检查点。与 handleRewindLocked 同一 gate 临界区，
-// currentStore() 解析恒为同一实例（/new 无法在中途换轨）。
+// currentStoreIn 解析恒为同一实例（/new 无法在中途换轨）。
 func (p *AgentPlugin) listRewindPoints(ctx *model.Context) error {
-	cks := p.currentStore().Checkpoints(10)
+	cks := p.currentStoreIn(ctx.Ctx).Checkpoints(10)
 	if len(cks) == 0 {
 		ctx.Writer("(无检查点 — 先跑几轮 /agent，每次提交会自动打 checkpoint)\n")
 		return nil
@@ -75,7 +76,7 @@ func (p *AgentPlugin) doRewind(ctx *model.Context, arg string) error {
 		return nil
 	}
 
-	cks := p.currentStore().Checkpoints(10)
+	cks := p.currentStoreIn(ctx.Ctx).Checkpoints(10)
 	if n < 1 || n > len(cks) {
 		ctx.Writer(fmt.Sprintf("编号 %d 越界（当前共 %d 个检查点，用 /rewind 查看列表）\n", n, len(cks)))
 		return nil
@@ -86,7 +87,7 @@ func (p *AgentPlugin) doRewind(ctx *model.Context, arg string) error {
 
 	// 已在目标点（比较 conversation 末尾消息 id 是否与 checkpoint.at 一致）
 	var conv []core.Message
-	if s := p.boundSession(); s != nil {
+	if s := p.boundSessionIn(ctx.Ctx); s != nil {
 		conv = s.Conversation()
 	}
 	if len(conv) > 0 && conv[len(conv)-1].MsgID == ck.At {
@@ -95,12 +96,12 @@ func (p *AgentPlugin) doRewind(ctx *model.Context, arg string) error {
 	}
 
 	// 执行回溯：移动 head → 刷新 session
-	if err := p.currentStore().SetHead(ck.At); err != nil {
+	if err := p.currentStoreIn(ctx.Ctx).SetHead(ck.At); err != nil {
 		ctx.Writer(fmt.Sprintf("✘ 回溯失败: %v\n", err))
 		return nil
 	}
 
-	s := p.boundSession()
+	s := p.boundSessionIn(ctx.Ctx)
 	if s == nil {
 		ctx.Writer("✘ 刷新会话失败: no active session\n")
 		return nil

@@ -37,8 +37,9 @@ const (
 // 操作」,不在底层 AgentRuntime 中传播(§4.1:执行平面不知道 ConnectionID)。
 // 本 PR 的 Service 方法以 clientID 字符串入参(与 RunControlSource 现状签名对齐
 // 的最薄委托面,clientID 即 Principal.ClientID=connectionID、Kind=Client);
-// PR2 引入 SessionBinding、PR3 收敛订阅契约时升级为 Principal 携带形(§4.1 的
-// StartRunCommand/RunAccepted 命令对象随 PR2 一并落地)。
+// PR2 已落地连接级 SessionBinding(sessions.go,连接的会话选择器,标准 ACP 经
+// ctx 载体流入插件解析点);Principal 携带形与 §4.1 的 StartRunCommand/
+// RunAccepted 命令对象随 PR3 收敛订阅契约时一并升级。
 type Principal struct {
 	ClientID string
 	Kind     ClientKind

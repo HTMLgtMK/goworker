@@ -13,6 +13,7 @@ import (
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
@@ -567,9 +568,10 @@ func TestPromptOmitsDeviceToolSourceWithoutCapability(t *testing.T) {
 	}
 }
 
-// TestPromptSupersededSessionGuard 单活动会话模型的诚实守卫：两条连接共享同一
-// SessionSource（与装配层接线一致），后声明者顶掉先声明者。fake 的 SetSession
-// 无条件转移 active，cwd 校验与「无效声明不顶掉」语义归 AgentPlugin 侧测试。
+// TestPromptSupersededSessionGuard 连接级 superseded 守卫(PR2 语义变更,总方案
+// §六:会话选择属于调用入口):每连接只认自己的声明——其他连接的 session/new|load
+// 不再顶掉本连接;本连接重声明后的旧 id 仍诚实报错。fake 的 SetSession 无条件
+// 转移 active(共享源),cwd 校验与「无效声明不顶掉」语义归 AgentPlugin 侧测试。
 func TestPromptSupersededSessionGuard(t *testing.T) {
 	newHandler := func(sessions *fakeSessionSource) *FrontendHandler {
 		return &FrontendHandler{
@@ -590,8 +592,11 @@ func TestPromptSupersededSessionGuard(t *testing.T) {
 		}
 	})
 
-	t.Run("second connection displaces first", func(t *testing.T) {
-		sessions := &fakeSessionSource{}
+	t.Run("second connection does not displace first", func(t *testing.T) {
+		// PR2 语义变更(原「second connection displaces first」反转为不顶掉):
+		// 两条连接各自 session/new 后互不影响——A 的 prompt 不被 B 的声明拒绝,
+		// 也不静默串到 B 的会话(Binding 连接级,各自路由)。
+		sessions := &fakeSessionSource{currentID: "store-shared"}
 		a, b := newHandler(sessions), newHandler(sessions)
 		if err := a.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp/a"}, reporter); err != nil {
 			t.Fatalf("CreateSession s1: %v", err)
@@ -600,39 +605,105 @@ func TestPromptSupersededSessionGuard(t *testing.T) {
 			t.Fatalf("CreateSession s2: %v", err)
 		}
 
-		// A 的旧会话已被 B 的声明顶掉：prompt s1 诚实报 superseded，绝不静默串线执行
-		_, err := a.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter)
+		// 两条连接的 Binding 各自指向声明落地的会话(共享同一 current → 同值),
+		// 实例独立(连接私有,§6.2 第 4 条:互不影响)。
+		if got := a.binding.Get(); got != "store-shared" {
+			t.Fatalf("a binding = %q, want store-shared (session/new 后 Set)", got)
+		}
+		if got := b.binding.Get(); got != "store-shared" {
+			t.Fatalf("b binding = %q, want store-shared (session/new 后 Set)", got)
+		}
+		if a.active != "s1" || b.active != "s2" {
+			t.Fatalf("active declarations = %q/%q, want s1/s2 (声明归连接)", a.active, b.active)
+		}
+
+		// A 的会话照常 prompt(B 的 session/new 不再顶掉它);evaluate 收到的 ctx
+		// 携带 A 自己的 Binding(路由面唯一通道)。
+		var aBinding *agentcontrol.SessionBinding
+		a.evaluate = func(ctx *model.Context, input string) error {
+			aBinding = agentcontrol.BindingFromCtx(ctx.Ctx)
+			return nil
+		}
+		if _, err := a.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt s1 after b's session/new = %v, want silent guard (PR2:声明归连接)", err)
+		}
+		if aBinding != &a.binding {
+			t.Fatalf("evaluate ctx binding = %v, want &a.binding", aBinding)
+		}
+
+		// B 的活动会话照常 prompt
+		if _, err := b.Prompt(context.Background(), "s2", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt s2 = %v", err)
+		}
+	})
+
+	t.Run("same connection redeclaration displaces", func(t *testing.T) {
+		// 本连接重声明后的旧 id 诚实报 superseded:单连接行为与旧版一致。
+		handler := newHandler(&fakeSessionSource{})
+		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp/a"}, reporter); err != nil {
+			t.Fatalf("CreateSession s1: %v", err)
+		}
+		if err := handler.CreateSession(context.Background(), "s2", protocol.NewSessionRequest{Cwd: "/tmp/b"}, reporter); err != nil {
+			t.Fatalf("CreateSession s2: %v", err)
+		}
+		_, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter)
 		var rpcErr *protocol.RPCError
 		if !errors.As(err, &rpcErr) {
-			t.Fatalf("Prompt superseded = %v, want *protocol.RPCError", err)
+			t.Fatalf("Prompt stale s1 = %v, want *protocol.RPCError", err)
 		}
 		if rpcErr.Code != -32000 {
 			t.Errorf("code = %d, want -32000", rpcErr.Code)
 		}
 		if !strings.Contains(rpcErr.Message, `"s2"`) {
-			t.Errorf("message = %q, want mention of current active session s2", rpcErr.Message)
-		}
-
-		// B 的活动会话照常 prompt
-		if _, err := b.Prompt(context.Background(), "s2", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
-			t.Fatalf("Prompt current active session = %v", err)
+			t.Errorf("message = %q, want mention of last declared s2", rpcErr.Message)
 		}
 	})
 
-	t.Run("load current displaces", func(t *testing.T) {
+	t.Run("load current displaces and binds", func(t *testing.T) {
 		sessions := &fakeSessionSource{currentID: "s2"}
 		handler := newHandler(sessions)
 		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp/a"}, reporter); err != nil {
 			t.Fatalf("CreateSession s1: %v", err)
 		}
-		// 对 s2 的 load-current 同样经 SetSession 声明，顶掉 s1 的活动身份
+		if got := handler.binding.Get(); got != "s2" {
+			t.Fatalf("binding after session/new = %q, want s2 (声明落地会话的 store id)", got)
+		}
+		// 对 s2 的 load-current 同样经 SetSession 声明，顶掉 s1 的活动身份,
+		// 并把 Binding 指向 s2
 		if err := handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "s2", Cwd: "/tmp"}, reporter); err != nil {
 			t.Fatalf("LoadSession s2: %v", err)
+		}
+		if got := handler.binding.Get(); got != "s2" {
+			t.Fatalf("binding after load-current = %q, want s2", got)
 		}
 		_, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter)
 		var rpcErr *protocol.RPCError
 		if !errors.As(err, &rpcErr) || rpcErr.Code != -32000 || !strings.Contains(rpcErr.Message, `"s2"`) {
 			t.Fatalf("Prompt s1 after load-current s2 = %v, want -32000 superseded error mentioning s2", err)
+		}
+		if _, err := handler.Prompt(context.Background(), "s2", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt s2 after load = %v", err)
+		}
+	})
+
+	t.Run("archived load does not rebind", func(t *testing.T) {
+		// 归档 load 是只读重放:Binding 不变(只读视图不是会话选择)。
+		sessions := &fakeSessionSource{
+			currentID: "cur",
+			list:      []model.SessionSummary{{SessionID: "old"}},
+			archived: map[string][]model.SessionUpdate{
+				"old": {{Kind: model.SessionUpdateUserMessageChunk, Content: &model.SessionContent{Type: "text", Text: "past"}}},
+			},
+		}
+		handler := newHandler(sessions)
+		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp"}, reporter); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		if err := handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "old"}, reporter); err != nil {
+			t.Fatalf("LoadSession archived: %v", err)
+		}
+		if got := handler.binding.Get(); got != "cur" {
+			t.Fatalf("binding after archived load = %q, want cur (unchanged)", got)
 		}
 	})
 

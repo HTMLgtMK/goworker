@@ -48,10 +48,18 @@ type AgentPlugin struct {
 	// 真实 SessionID，新旧 runtime 以不同 id 共存。互斥不直接经过 manager——
 	// 命令一律经 currentSession() 解析出 runtime 再在其 gate 上排队。
 	manager *runtimeagent.SessionManager
-	// current 是当前会话的 runtime。atomic.Pointer：/new 在 REPL goroutine 上换
-	// 指针，ACP service 的 session/list|load 与各命令 handler 在别的 goroutine 上
-	// 读（评审 I4），裸指针读写是没有 happens-before 的数据竞争。会话本体经
-	// currentSession().Session() 取，不再单独持有裸 Session 指针（P0-4 起退役）。
+	// current 是当前会话的 runtime。atomic.Pointer:/new 在 REPL goroutine 上换
+	// 指针,ACP service 的 session/list|load 与各命令 handler 在别的 goroutine 上
+	// 读(评审 I4),裸指针读写是没有 happens-before 的数据竞争。会话本体经
+	// currentSession().Session() 取,不再单独持有裸 Session 指针(P0-4 起退役)。
+	//
+	// PR2(总方案 §六/§八)起它的定位收窄为「无 Binding 调用方的默认事实源」:
+	// 连接级会话选择迁往 SessionBinding(agentcontrol,FrontendHandler 每连接一
+	// 个,经 ctx 载体流入 withSession),标准 ACP 的会话执行路由 binding 优先、
+	// 空则回落本字段(CLI 命令、stdio、测试、后台 Run 的嵌套命令)。§八迁移表
+	// 「Plugin.CurrentSession → CLI/ACP SessionBinding,逐步淘汰」的第一步:本
+	// 字段仍被 /new、startSession、SetSession 等生命周期与无绑定路径消费,不是
+	// 立即删除,而是不再作为跨连接的会话事实源(§二不变量 6)。
 	current atomic.Pointer[runtimeagent.SessionRuntime]
 	// deps 是 Session 的资源依赖，startSession 每次会话边界全量重建（含指令快照
 	// 与当前 store 注入），/new 经同一路径刷新后以新 deps 创建新会话。
@@ -125,16 +133,17 @@ func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *AgentPlugi
 	return p
 }
 
-// currentSession 返回当前会话的 runtime——§1.1 路由规则（命令按 SessionID 路由的
-// 兼容适配器）的统一解析点：内部即 p.current.Load()，nil = 尚无活动会话（Init
-// 未完成或 Init 失败回滚），调用方按约定报「no active session」。P5 显式
-// SessionID 到来时，各 handler 只需把这里换成 p.manager.Get(sid)，命令签名与
-// 互斥结构不变。
+// currentSession 返回当前会话的 runtime——无 Binding 调用方(CLI 命令、stdio、
+// 测试、后台 Run 的嵌套命令)的默认解析点:内部即 p.current.Load(),nil = 尚无
+// 活动会话(Init 未完成或 Init 失败回滚),调用方按约定报「no active session」。
+// PR2(总方案 §六)起标准 ACP 的会话执行路由不再直接取这里——连接级选择经
+// SessionBinding 流入 withSession(binding 优先、空则回落本解析点),SessionSource
+// 的元数据 RPC 面(SetSession/session/list/load 判定)也仍是 current 语义。
 func (p *AgentPlugin) currentSession() *runtimeagent.SessionRuntime {
 	return p.current.Load()
 }
 
-// boundSession 返回当前会话本体（currentSession().Session() 的 nil 防护组合）：
+// boundSession 返回当前会话本体(currentSession().Session() 的 nil 防护组合)：
 // 无活动 runtime 或 runtime 未绑定 Session 时返回 nil，取数点据此跳过会话操作。
 func (p *AgentPlugin) boundSession() *runtimeagent.Session {
 	if rt := p.currentSession(); rt != nil {
@@ -143,7 +152,97 @@ func (p *AgentPlugin) boundSession() *runtimeagent.Session {
 	return nil
 }
 
-// currentStore 返回当前会话的持久化 store——P1-3 的统一取数解析点。Session 本体
+// resolvedSessionKey 是 withSession 注入「已解析会话 runtime」的 ctx 键(包内
+// 私有,与 sessionGateKey 同型):解析与互斥必须同源——withSession 按 ctx 的
+// Binding 解析出 runtime 并在其 gate 上排队后,闭包内的全部取数点(sessionRuntimeIn/
+// boundSessionIn/currentStoreIn)读同一注入值,不再各自重解析(重读 current 会把
+// /new 换轨窗口劈进闭包;注入值在 gate 保护下整个命令回合稳定)。注入值经
+// Session.Run 的 ctx 链(toolCtx)流入嵌套 hub.Eval(commands.go sessionGateKey
+// 同路),嵌套命令解析到同一 runtime——嵌套 /new 作用于发起 run 的会话,与
+// 单活动会话模型的既有语义一致。
+type resolvedSessionKey struct{}
+
+// injectResolvedSession 把解析出的 runtime 挂上命令回合的 ctx(仅 withSession
+// 调用;rt 已判非 nil)。
+func injectResolvedSession(ctx context.Context, rt *runtimeagent.SessionRuntime) context.Context {
+	return context.WithValue(ctx, resolvedSessionKey{}, rt)
+}
+
+// sessionRuntimeIn 是 binding 优先的统一会话解析点(PR2,总方案 §六;currentSession
+// 的 binding 形态)。解析序:
+//  1. withSession 注入的已解析 runtime(命令回合内):直接返回——解析与互斥
+//     同源,闭包内不重解析;
+//  2. ctx 携带的连接级 SessionBinding(agentcontrol.BindingFromCtx):非空 →
+//     RouteSession 同源解析(binding id 命中 current.ID → current runtime;否则
+//     manager.Get 注册表权威,CR4 多会话路由);命中即返回。
+//  3. 无 Binding 或 Binding 为空(未选择/已清除)→ currentSession()回落:无
+//     Binding 调用方(CLI/stdio/测试)的原语义,单连接行为不变。
+//
+// Binding 非空但解析不到 runtime(/new 收口摘除了旧 runtime)→ 显式错误(包裹
+// ErrSessionNotFound,与路由面同文案):诚实失败,绝不静默回落 current——那会把
+// 请求串到别的会话的工作区,正是 superseded 守卫要防的形态。
+func (p *AgentPlugin) sessionRuntimeIn(ctx context.Context) (*runtimeagent.SessionRuntime, error) {
+	// nil ctx 防护:model.Context.Ctx 可为 nil(既有测试直接构造 Context),语义
+	// 等价无绑定调用方,回落 current。
+	if ctx == nil {
+		return p.currentSession(), nil
+	}
+	if rt, ok := ctx.Value(resolvedSessionKey{}).(*runtimeagent.SessionRuntime); ok && rt != nil {
+		return rt, nil
+	}
+	b := agentcontrol.BindingFromCtx(ctx)
+	if b == nil {
+		return p.currentSession(), nil
+	}
+	if id := b.Get(); id != "" {
+		if cur := p.currentSession(); cur != nil && id == cur.ID {
+			return cur, nil
+		}
+		if rt := p.manager.Get(id); rt != nil {
+			return rt, nil
+		}
+		return nil, sessionNotFoundErr(id)
+	}
+	return p.currentSession(), nil
+}
+
+// boundSessionIn 是 boundSession 的 binding 形态(sessionRuntimeIn 的会话本体
+// 防护组合):命令回合闭包内取「本回合解析的会话本体」。
+func (p *AgentPlugin) boundSessionIn(ctx context.Context) *runtimeagent.Session {
+	if rt, err := p.sessionRuntimeIn(ctx); err == nil && rt != nil {
+		return rt.Session()
+	}
+	return nil
+}
+
+// currentStoreIn 是 currentStore 的 binding 形态:按命令回合解析的 runtime 取其
+// 会话 store(经 storeFor → repo 实例唯一缓存,与 current 取数同链)。
+func (p *AgentPlugin) currentStoreIn(ctx context.Context) *session.Store {
+	rt, err := p.sessionRuntimeIn(ctx)
+	if err != nil {
+		return nil
+	}
+	return p.storeFor(rt)
+}
+
+// sessionCWDErrorIn 是 sessionCWDError 的 binding 形态(handleAgent 的 prompt
+// 入口守卫):查命令回合解析的 runtime 最近一次 cwd 声明的校验错误。Binding
+// 悬空(session 已被 /new 收口)按错误返回——会话不存在即无处执行,与路由面
+// 同一诚实语义。
+func (p *AgentPlugin) sessionCWDErrorIn(ctx context.Context) error {
+	rt, err := p.sessionRuntimeIn(ctx)
+	if err != nil {
+		return err
+	}
+	if rt != nil {
+		_, err := rt.DeclaredCWD()
+		return err
+	}
+	return nil
+}
+
+// currentStore 返回当前会话的持久化 store——P1-3 的统一取数解析点(无 Binding
+// 调用方的默认形态;binding 形态见 currentStoreIn)。Session 本体
 // 不持 store（deps.Store 仅构造时注入），解析链是：runtime id 在会话边界上绑定
 // store 的 SessionID（startSession ④），repo.Open 按 id 命中实例唯一缓存，返回的
 // 正是 startSession 打开/创建的那个 *Store——取数与互斥同源于 current 解析，不再
@@ -152,7 +251,14 @@ func (p *AgentPlugin) boundSession() *runtimeagent.Session {
 // 会更换，但缓存键仍是挂载时的 id，解析不受影响。nil = 持久化禁用/无活动会话，
 // 调用方按旧文案降级（/rewind 提示未启用、清单返回空、/new 兜底全量快照）。
 func (p *AgentPlugin) currentStore() *session.Store {
-	rt := p.currentSession()
+	return p.storeFor(p.currentSession())
+}
+
+// storeFor 是按 runtime 解析其会话 store 的统一底座(currentStore/currentStoreIn
+// 共用,PR2 从 currentStore 提取):解析链与 currentStore 注释同源——rt.ID 即
+// 会话边界绑定的 store id,repo.Open 命中实例唯一缓存;未命中即纯内存降级或仓库
+// 已收尾,按无持久化处理。rt 为 nil 直接返回 nil。
+func (p *AgentPlugin) storeFor(rt *runtimeagent.SessionRuntime) *session.Store {
 	if rt == nil || p.repo == nil {
 		return nil
 	}
