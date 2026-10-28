@@ -177,7 +177,8 @@ func (r *SessionRuntime) Hub() *EventHub {
 // 时 hub 未建」的解法):bindEvents 只在 StartRun 同步段触发(supervisor.go ⑥),
 // 重启后的 runtime 若从未 StartRun,events 恒 nil——attach 即建补上该缺口,
 // NewEventHub 构造含 journal.SeqRange 磁盘播种(游标续接既有事件历史)。
-// daemon 的 RunControlSource.Attach(P5-8 的 attach 面)是唯一预期调用点;
+// daemon 侧事件订阅编排(agentcontrol.Service.SubscribeEvents → rt.EnsureHub)
+// 是唯一预期调用点;
 // StartRun 的既有路径不受影响(bindEvents 幂等,创建恰好一次,后续复用)。
 //
 // journal 来源:经 Session deps 读(本方法在 rt.mu 内快照 r.session,取

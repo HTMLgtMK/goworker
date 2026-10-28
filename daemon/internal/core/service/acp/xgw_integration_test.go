@@ -19,6 +19,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-sandbox"
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
@@ -91,7 +92,7 @@ func (p *xgwScriptedProvider) ChatStream(context.Context, *core.ChatRequest) (<-
 // fakeSessionSource 补齐 SessionSource 面(工厂 type-assert 同时命中两接口),
 // RunControlSource 语义 mirror runcontrol.go 的纯内存契约——requestId 幂等表
 // (reqMu + map)、current 会话校验(CurrentSessionID 由 handler 的
-// session/new → SetSession 写入)、lease 三件套、Attach 走 rt.EnsureHub、
+// session/new → SetSession 写入)、lease 三件套、SubscribeEvents 走 rt.EnsureHub、
 // RunStatus 走 rt.Active + 幂等表反查(纯内存分支,无 RunJournalStore)。
 // 与生产实现的差异仅在簿记宿主(测试 shim vs AgentPlugin),管理面
 // (manager.StartRun/ResolveApproval/EnsureHub)全部真实。
@@ -289,24 +290,41 @@ func (f *xgwLiveControl) ResolveApproval(sessionID, connectionID, requestID stri
 	return f.m.ResolveApproval(requestID, decision)
 }
 
-// Attach mirror runcontrol.go:current 校验 → rt.EnsureHub(遗留③解法:attach
-// 即建,含 SeqRange 播种;I3:播种失败显式上抛)→ (hub, latest)。
-func (f *xgwLiveControl) Attach(sessionID string) (*runtimeagent.EventHub, uint64, error) {
+// SubscribeEvents mirror agentcontrol.Service.SubscribeEvents(PR3 订阅契约):
+// requireCurrent(本 shim 的会话路由锚点)→ rt.EnsureHub(遗留③解法:attach
+// 即建,含 SeqRange 播种;I3:播种失败显式上抛)→ hub.Subscribe(afterSeq)
+// (ErrCursorExpired 原样上抛,失败路径 cancel 收 ctx 零残留)→ 创建订阅后读
+// latestSeq/replayIntegrity(第四轮评审:不缓存旧状态)→ rt.Active() 快照。
+func (f *xgwLiveControl) SubscribeEvents(sessionID string, afterSeq uint64) (agentcontrol.AttachResult, error) {
 	if err := f.requireCurrent(sessionID); err != nil {
-		return nil, 0, err
+		return agentcontrol.AttachResult{}, err
 	}
 	rt := f.m.Get(f.sid)
 	if rt == nil {
-		return nil, 0, errors.New("xgwLiveControl: no active runtime")
+		return agentcontrol.AttachResult{}, errors.New("xgwLiveControl: no active runtime")
 	}
 	hub, err := rt.EnsureHub()
 	if err != nil {
-		return nil, 0, fmt.Errorf("xgwLiveControl: ensure event hub: %w", err)
+		return agentcontrol.AttachResult{}, fmt.Errorf("xgwLiveControl: ensure event hub: %w", err)
 	}
 	if hub == nil {
-		return nil, 0, fmt.Errorf("xgwLiveControl: event stream not enabled for session %q", sessionID)
+		return agentcontrol.AttachResult{}, fmt.Errorf("xgwLiveControl: event stream not enabled for session %q", sessionID)
 	}
-	return hub, hub.LatestSeq(), nil
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := hub.Subscribe(ctx, afterSeq)
+	if err != nil {
+		cancel()
+		return agentcontrol.AttachResult{}, err
+	}
+	res := agentcontrol.AttachResult{
+		LatestSeq:       hub.LatestSeq(),
+		ReplayIntegrity: hub.ReplayIntegrity(),
+		Subscription:    &testSubscription{ch: ch, cancel: cancel},
+	}
+	if run := rt.Active(); run != nil {
+		res.CurrentRun = &agentcontrol.RunSnapshot{RunID: run.ID, State: string(run.State())}
+	}
+	return res, nil
 }
 
 // ActiveRun mirror runcontrol.go 的快照观察面。I1 修正后生产按 sessionRuntime

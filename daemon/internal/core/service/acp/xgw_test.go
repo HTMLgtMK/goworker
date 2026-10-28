@@ -16,6 +16,7 @@ import (
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/ai-runtime/session"
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -83,7 +84,8 @@ type fakeRunControl struct {
 
 	// P5-8 附加面:attachHub 配置后,StartRun 在其上产出 3 条 key 事件(建模
 	// 「StartRun 产事件」,事件经真 EventHub 的 Publish 路径)并把活动 run 快照
-	// 置为 (run-N, running) 供 ActiveRun 返回;attachErr 脚本化 Attach 失败。
+	// 置为 (run-N, running) 供 SubscribeEvents 的 CurrentRun 快照返回;attachErr
+	// 脚本化 SubscribeEvents 失败。
 	// I1 修正后 ActiveRun 按会话路由,fake 同型按会话记账(mirror runcontrol.go:
 	// 每会话各自的活动快照,StartRun 置账、本 fake 不清账——快照观察面,对照
 	// 会话查不到即 null)。
@@ -197,17 +199,36 @@ func (f *fakeRunControl) ResolveApproval(sessionID, connectionID, requestID stri
 	return nil
 }
 
-// Attach(P5-8 测试面):返回配置的 attachHub 与其 latest;attachErr 脚本化失败。
-func (f *fakeRunControl) Attach(sessionID string) (*runtimeagent.EventHub, uint64, error) {
+// SubscribeEvents(P5-8 测试面;PR3 订阅契约):mirror agentcontrol.Service.
+// SubscribeEvents 的生产序——hub.Subscribe 建立订阅(配置的 attachHub 充当被
+// 路由会话的 hub,与生产 EnsureHub 同型)→ 创建订阅后读 latestSeq/
+// replayIntegrity(不缓存旧状态)→ activeRuns 快照组 CurrentRun;attachErr
+// 脚本化失败,Subscribe 的 ErrCursorExpired 原样上抛(失败路径 cancel 收 ctx,
+// 零残留)。
+func (f *fakeRunControl) SubscribeEvents(sessionID string, afterSeq uint64) (agentcontrol.AttachResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.attachErr != nil {
-		return nil, 0, f.attachErr
+		return agentcontrol.AttachResult{}, f.attachErr
 	}
 	if f.attachHub == nil {
-		return nil, 0, errors.New("fakeRunControl: no attach hub configured")
+		return agentcontrol.AttachResult{}, errors.New("fakeRunControl: no attach hub configured")
 	}
-	return f.attachHub, f.attachHub.LatestSeq(), nil
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := f.attachHub.Subscribe(ctx, afterSeq)
+	if err != nil {
+		cancel()
+		return agentcontrol.AttachResult{}, err
+	}
+	res := agentcontrol.AttachResult{
+		LatestSeq:       f.attachHub.LatestSeq(),
+		ReplayIntegrity: f.attachHub.ReplayIntegrity(),
+		Subscription:    &testSubscription{ch: ch, cancel: cancel},
+	}
+	if ar, ok := f.activeRuns[sessionID]; ok {
+		res.CurrentRun = &agentcontrol.RunSnapshot{RunID: ar.runID, State: ar.state}
+	}
+	return res, nil
 }
 
 // ActiveRun(P5-8 测试面;I1 修正后按会话路由,fake 同型 mirror runcontrol.go):
@@ -1064,6 +1085,22 @@ func mustNewEventHub(t *testing.T, sessionID string, j runtimeagent.EventJournal
 		t.Fatalf("NewEventHub(%s): %v", sessionID, err)
 	}
 	return hub
+}
+
+// testSubscription 是 agentcontrol.EventSubscription 的测试适配(本包共享:
+// fakeRunControl 与 xgwLiveControl 组装 AttachResult 用),mirror 生产适配
+// agentcontrol.hubSubscription 的形状——hub 通道 + Close=cancel SDK 订阅。
+// 生产适配器在 agentcontrol 内部不导出,接口即契约,测试侧自建同形实现。
+type testSubscription struct {
+	ch     <-chan session.SessionEvent
+	cancel context.CancelFunc
+}
+
+func (s *testSubscription) Events() <-chan session.SessionEvent { return s.ch }
+
+func (s *testSubscription) Close() error {
+	s.cancel()
+	return nil
 }
 
 // xgwEventLog 收集客户端收到的 x-goworker/session/events 通知:原始 params 解回

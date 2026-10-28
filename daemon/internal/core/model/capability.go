@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
-	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 )
 
 const SessionSourceCapability = "session.source"
@@ -144,9 +144,18 @@ type RunControlSource interface {
 	// 持有者)在提交前即被拒绝;匹配才投递,首个有效决策获胜,迟到/重复
 	// 决策返回错误。
 	ResolveApproval(sessionID, connectionID, requestID string, decision hitl.Decision) error
-	// Attach 返回会话事件枢纽与当前 latest seq（P5-8 的 attach 面消费；本步
-	// 落签名与实现——EnsureHub 使「重启后 attach 时 hub 未建」的缺口关闭）。
-	Attach(sessionID string) (hub *runtimeagent.EventHub, latest uint64, err error)
+	// SubscribeEvents 建立会话事件订阅并返回订阅契约(总方案 §七,PR3 收敛:
+	// 原 Attach 返回具体 *runtimeagent.EventHub 的越界面随之移除——EventHub
+	// 从协议面隐藏,ACP 只消费 agentcontrol.AttachResult:游标、回放完整性
+	// 三态、活动 Run 快照与 EventSubscription 回收句柄,事件通道经
+	// Subscription.Events() 供给)。afterSeq 是客户端已确认游标:回放
+	// (afterSeq, 注册点 latest] 后无缝续 live;游标失效(超前/落于保留历史
+	// 之前)→ ErrCursorExpired 语义错误。§七 边界限制:本方法只做数据面订阅,
+	// **不**顺便 AcquireControl——数据面与授权面拆分,attach(mode=control)
+	// 的两动作编排(先订阅成功、再取 lease、失败回滚不动 lease)由调用方
+	// 显式保证。未知会话 → ErrSessionNotFound 语义(CR4 多会话路由);
+	// RunEvents 未接线/纯内存 → 诚实错误(hub 不存在,无事件流可订阅)。
+	SubscribeEvents(sessionID string, afterSeq uint64) (agentcontrol.AttachResult, error)
 	// ActiveRun 返回会话当前活动 Run 的 (runID, state) 快照（P5-8 attach 响应
 	// 的 currentRun 字段消费；RunControlSource 在 P5-6 未备该访问器，P5-8 按
 	// 响应契约最小补齐——RunStatus 需 runID 寻址，无法充当）。无活动 Run 或无

@@ -9,6 +9,7 @@ import (
 
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-runtime/session"
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 )
 
 // xgw.go 是 FrontendHandler 的 x-goworker 扩展协议面(P5-7/P5-8):run/start|get|
@@ -56,26 +57,28 @@ type xgwEventSink interface {
 	Notify(method string, params any) error
 }
 
-// xgwSubscription 是一条会话订阅的回收句柄(P5-8)。Go 函数值不可比较(func 只
-// 能与 nil 比较相等),泵退出自清需要身份判定,故 CancelFunc 包一层取指针身份:
-// 换代后的旧泵退出时不会误删新泵的表项。done 是 cancel 信号(close-only):
-// 泵对它做优先检查——cancel 后立即退出并丢弃在途缓冲,不把旧订阅残存事件与新
-// 订阅的 replay/live 叠成重复投递(换代路径的缺口由新泵按调用方游标 replay
-// 补齐,detach/Close 本就是客户端终事);cancel 是异步收尾(唤醒 SDK 泵 → 关
-// 闭投递通道),stop 用 Once 保证幂等。
+// xgwSubscription 是一条会话订阅的回收句柄(P5-8;PR3 起包住订阅契约
+// agentcontrol.EventSubscription——订阅的 SDK 侧 ctx/cancel 内聚在契约实现里,
+// handler 不再自持 cancel func)。Go 函数值不可比较(func 只能与 nil 比较相等),
+// 泵退出自清需要身份判定,故包一层取指针身份:换代后的旧泵退出时不会误删新泵
+// 的表项。done 是 cancel 信号(close-only):泵对它做优先检查——stop 后立即退出
+// 并丢弃在途缓冲,不把旧订阅残存事件与新订阅的 replay/live 叠成重复投递(换代
+// 路径的缺口由新泵按调用方游标 replay 补齐,detach/Close 本就是客户端终事);
+// stop 是异步收尾(关 done → Close 契约取消 SDK 订阅,唤醒 SDK 泵 → 关闭投递
+// 通道),用 Once 保证幂等。
 type xgwSubscription struct {
-	cancel   context.CancelFunc
+	sub      agentcontrol.EventSubscription
 	done     chan struct{}
 	stopOnce sync.Once
 }
 
-// stop 收掉一条订阅:先关 done(协议泵就此退出,不再消费)、再 cancel(handler
-// 作用域 ctx,SDK 泵随之退出并关闭投递通道)。幂等:detach 与断连 Close 对同
-// 一订阅的竞争收敛到恰好一次。
+// stop 收掉一条订阅:先关 done(协议泵就此退出,不再消费)、再 Close 订阅契约
+// (SDK 订阅的 ctx cancel,hub 泵随之退出并关闭投递通道)。幂等:detach 与断连
+// Close 对同一订阅的竞争收敛到恰好一次。
 func (s *xgwSubscription) stop() {
 	s.stopOnce.Do(func() {
 		close(s.done)
-		s.cancel()
+		_ = s.sub.Close()
 	})
 }
 
@@ -195,23 +198,29 @@ func (h *FrontendHandler) xgwApprovalRespond(_ context.Context, params json.RawM
 	return XApprovalRespondResult{Accepted: true}, nil
 }
 
-// xgwSessionAttach 处理 x-goworker/session/attach(P5-8):原子建立 Replay+Live
-// 订阅(总方案 §7)。I4 修正后是准备/提交两阶段:
+// xgwSessionAttach 处理 x-goworker/session/attach(P5-8;PR3 收敛为订阅契约):
+// 原子建立 Replay+Live 订阅(总方案 §7)。EventHub 从协议面隐藏(总方案 §七):
+// 数据面经 runs.SubscribeEvents 返回 agentcontrol.AttachResult(订阅句柄 + 游标
+// + 回放完整性 + 活动 Run 快照),handler 只负责订阅泵与 wire 转换,不再触碰
+// hub 具体类型。I4 修正后仍是准备/提交两阶段:
 //
-//	准备(不触碰任何既有状态):mode 白名单校验 → runs.Attach(sessionID)(会话
-//	校验 + EnsureHub——遗留③「重启后 attach 时 hub 未建」的解法;RunEvents 未
-//	接线/纯内存诚实报错)→ hub.Subscribe(ctx, afterSeq)(窗口校验/
-//	ErrCursorExpired 原样上抛为 -32000)。任一步失败 → 旧订阅与 control lease
-//	原样保持,本请求零副作用。
-//	提交(I2 生命周期屏障,单临界区事务):h.mu 内一次性完成 closed 检查 →
-//	换入新订阅句柄(表内每会话恒一条,并发 attach 串行换入,被换下者由换入者
-//	收泵)→ mode=control 才 AcquireControl(接管;同持有者重复 acquire 幂等)。
-//	订阅表更新与 control lease 获取同临界区(评审 I2 建议四的事务语义):二者
-//	对并发 detach/Close 要么整体先提交、要么整体被拒,不存在「订阅已死而
-//	lease 复活」的中间态;提交临界区保持纯原子,无中途解锁。测试钩子
-//	(preCommitHook,仅测试注入)挂在 Subscribe 成功与提交临界区之间的锁外
-//	边界——该窗口生产真实存在(Close/detach 可并发插入),钩子复现的交错即
-//	生产可达;生产恒 nil。锁外:收被换下的旧泵 → 起新泵。
+//	准备(不触碰任何既有状态):mode 白名单校验 → runs.SubscribeEvents(
+//	sessionID, afterSeq)——会话校验 + EnsureHub(遗留③「重启后 attach 时
+//	hub 未建」的解法;RunEvents 未接线/纯内存诚实报错)+ hub.Subscribe(窗口
+//	校验/ErrCursorExpired 原样上抛为 -32000)+ 完整性/游标/活动 Run 快照,整体
+//	在 control 层完成。任一步失败 → 订阅未建立(或契约内部 ctx 已收),旧订阅
+//	与 control lease 原样保持,本请求零副作用。
+//	提交(I2 生命周期屏障,单临界区事务):h.mu 内一次性完成 closed 检查(失败
+//	回滚:Close 刚建立的订阅契约——这是 handler 侧唯一的订阅回收点,回滚不动
+//	lease)→ 换入新订阅句柄(表内每会话恒一条,并发 attach 串行换入,被换下者
+//	由换入者收泵)→ mode=control 才 AcquireControl(接管;同持有者重复 acquire
+//	幂等)。订阅表更新与 control lease 获取同临界区(评审 I2 建议四的事务语义,
+//	§七「两动作的顺序与失败回滚由明确的用例保证」:先订阅成功、再取 lease,失败
+//	回滚不动 lease):二者对并发 detach/Close 要么整体先提交、要么整体被拒,不
+//	存在「订阅已死而 lease 复活」的中间态;提交临界区保持纯原子,无中途解锁。
+//	测试钩子(preCommitHook,仅测试注入)挂在 SubscribeEvents 成功与提交临界区
+//	之间的锁外边界——该窗口生产真实存在(Close/detach 可并发插入),钩子复现的
+//	交错即生产可达;生产恒 nil。锁外:收被换下的旧泵 → 起新泵。
 //	C1 修复后 approval/respond 的会话归属授权在 source 侧按服务端记录校验
 //	(第三轮评审 I4 起 lease 守卫同样内移 source,与提交原子);无需 handler
 //	侧候选集簿记(旧 controlSessions 已清退)。
@@ -219,28 +228,23 @@ func (h *FrontendHandler) xgwApprovalRespond(_ context.Context, params json.RawM
 //	closed 屏障(I2,评审的 Close/Attach 竞态):Close 在 h.mu 内置位 closed 并
 //	清空订阅表,本提交段与之同锁串行——要么提交段先入(其订阅与 lease 随后
 //	被 Close 一并回收:表内句柄被 stop、ReleaseConnection 归还全部租约),要么
-//	Close 先入(closed 已置位,提交段拒绝)。两序下 Close 返回后都不会有新的
-//	订阅提交或 lease 获取。
+//	Close 先入(closed 已置位,提交段拒绝并回滚本请求刚建立的订阅)。两序下
+//	Close 返回后都不会有新的订阅提交或 lease 获取。
 //
-// 控制权后置的理由(I4 评审点一):Acquire 在订阅准备成功之后——Attach/Subscribe
+// 控制权后置的理由(I4 评审点一):Acquire 在订阅准备成功之后——SubscribeEvents
 // 失败(如 ErrCursorExpired)绝不夺走原持有者的 lease;旧序(先 Acquire 后
 // Attach)会在 attach 失败时把 lease 无谓易主。
 //
-// 换代语义的窗口论证:新 Subscribe 与旧泵 stop 之间存在 μs 级窗口,窗内发布的
+// 换代语义的窗口论证:新订阅与旧泵 stop 之间存在 μs 级窗口,窗内发布的
 // 事件可能被旧泵(其 done 检查先于 stop 完成)与新泵各投递一次——换取的是
-// Subscribe 失败时旧订阅完整保持(I4 评审点二:旧序先 cancel 旧泵,Subscribe
+// 订阅失败时旧订阅完整保持(I4 评审点二:旧序先 cancel 旧泵,Subscribe
 // 失败即毁掉正常订阅)。detach/Close 是客户端终事,不换代,无此窗口。
 //
-// 泵 ctx 是 handler 作用域的 WithCancel(context.Background() 派生),不是每请求
-// ctx——ai-acp 的 dispatchRequest 在响应返回时即 cancel 请求 ctx
-// (protocol/jsonrpc.go:281-283 defer cancel),订阅必须活过本请求,直到 detach/
-// 换代/断连(handler.Close)统一回收。
-//
-// 并发与锁:subs 表在 h.mu 内;runs.Attach 与 hub.Subscribe 在锁外(各自内部
-// 锁序见 P5-6/event_hub.go,与 h.mu 无嵌套),提交段的 AcquireControl 在 h.mu
-// 内嵌套取被操作会话的 source 侧 session guard(单向 h.mu→session guard,
-// Close 侧同向,见 FrontendHandler subs 字段注释);泵退出自清仅短暂取 h.mu
-// 做指针身份判重。
+// 并发与锁:subs 表在 h.mu 内;runs.SubscribeEvents 在锁外(control 侧内部锁序
+// 见 agentcontrol/P5-6/event_hub.go,与 h.mu 无嵌套),提交段的 AcquireControl
+// 在 h.mu 内嵌套取被操作会话的 source 侧 session lease(单向 h.mu→session
+// lease,Close 侧同向,见 FrontendHandler subs 字段注释);泵退出自清仅短暂取
+// h.mu 做指针身份判重。
 func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMessage) (any, error) {
 	if h.runs == nil {
 		return nil, xgwNotAvailableError(XMethodSessionAttach)
@@ -257,39 +261,33 @@ func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMes
 		return nil, err
 	}
 
-	// 准备阶段(零副作用):Attach(会话校验 + EnsureHub)→ Subscribe(游标
-	// 校验 + Replay+Live 注册)。失败路径只回收本请求自建的 ctx。
-	hub, latest, err := h.runs.Attach(req.SessionID)
+	// 准备阶段(零副作用):SubscribeEvents(会话校验 + EnsureHub + Replay+Live
+	// 订阅 + 快照,数据面整体在 control 层)。失败路径订阅未建立,旧订阅与
+	// lease 原样保持。
+	res, err := h.runs.SubscribeEvents(req.SessionID, req.AfterSeq)
 	if err != nil {
 		return nil, xgwError("%s: %v", XMethodSessionAttach, err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	ch, err := hub.Subscribe(ctx, req.AfterSeq)
-	if err != nil {
-		cancel()
-		return nil, xgwError("%s: %v", XMethodSessionAttach, err)
-	}
-	// 测试钩子(第三轮评审 I2):挂在 Subscribe 成功与提交临界区之间的真实锁外
-	// 边界——此处 Close/detach 并发插入即生产可达交错;钩子内跑 Close/detach
-	//(它们取 h.mu,本 goroutine 未持锁,不会自锁)。生产恒 nil;提交临界区
-	// 内的 closed 检查负责把钩子期间发生的状态变化收束为显式拒绝。
+	// 测试钩子(第三轮评审 I2):挂在 SubscribeEvents 成功与提交临界区之间的
+	// 真实锁外边界——此处 Close/detach 并发插入即生产可达交错;钩子内跑
+	// Close/detach(它们取 h.mu,本 goroutine 未持锁,不会自锁)。生产恒 nil;
+	// 提交临界区内的 closed 检查负责把钩子期间发生的状态变化收束为显式拒绝。
 	if h.preCommitHook != nil {
 		h.preCommitHook()
 	}
 
 	// 提交阶段(I2 生命周期屏障):closed 检查 → 换入新句柄 → (control)取
 	// lease,同一 h.mu 临界区内完成——对并发 detach/Close 是单事务:表内恒恰一
-	// 「现任」句柄,且订阅提交与 lease 获取同生同死。临界区纯原子,无中途解锁
-	//(第三轮评审 I2:提交中途释放锁的测试插桩验证的是生产不存在的分支,钩子
-	// 已迁移到 Subscribe 与本临界区之间的真实锁外边界)。
-	sub := &xgwSubscription{cancel: cancel, done: make(chan struct{})}
+	// 「现任」句柄,且订阅提交与 lease 获取同生同死。临界区纯原子,无中途解锁。
+	sub := &xgwSubscription{sub: res.Subscription, done: make(chan struct{})}
 	h.mu.Lock()
 	if h.closed {
 		// closed 屏障:Close 已置位(其清表已发生过或正在进行),本请求拒绝,
-		// 绝不复活订阅与 lease。刚建的 SDK 订阅经已持有的 cancel 收掉(订阅未
-		// 入表、泵未启动,无 handler 侧残留)。
+		// 绝不复活订阅与 lease。刚建立的订阅契约经 Close 收掉(订阅未入表、泵
+		// 未启动,无 handler 侧残留)——失败回滚只动本请求自建的订阅,不动
+		// lease(第四轮 I4:回滚不夺原持有者的租约)。
 		h.mu.Unlock()
-		cancel()
+		_ = res.Subscription.Close()
 		return nil, xgwError("%s: connection closed", XMethodSessionAttach)
 	}
 	if h.subs == nil {
@@ -300,7 +298,7 @@ func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMes
 	// 控制权变更与订阅提交同一临界区(I4:订阅准备成功后才 Acquire/接管,失败
 	// 路径绝不夺走原持有者的 lease;I2:closed 置位后一律拒绝,Close 返回后
 	// 不会有新的 lease 获取——AcquireControl 内部取 source 侧本会话的 session
-	// guard,锁序 h.mu→session guard 单向,与 Close 侧同向,无环)。
+	// lease,锁序 h.mu→session lease 单向,与 Close 侧同向,无环)。
 	tookOver := false
 	if mode == XAttachModeControl {
 		tookOver = h.runs.AcquireControl(req.SessionID, h.connectionID)
@@ -309,19 +307,20 @@ func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMes
 	if old != nil {
 		old.stop()
 	}
-	go h.pumpSessionEvents(req.SessionID, sub, ch, h.events)
+	go h.pumpSessionEvents(req.SessionID, sub, res.Subscription.Events(), h.events)
 
-	// currentRun:attach 时刻的活动 Run 快照(ActiveRun,ok=false → null);
-	// latestSeq 仅描述位置,客户端不得跳游标(XSessionAttachResult 注释);
-	// replayIntegrity(I4):attach 时刻 hub 的回放完整性三态——本进程纪元内
-	// 任何 key 事件落盘失败/合并 flush 失败 → incomplete(粘滞永不复位);
-	// journal 播种发现既有历史(重启后 attach)→ unknown(跨纪元完整性不可
-	// 验证);两者都提示客户端不得把收到的事件当完整历史。
-	res := XSessionAttachResult{LatestSeq: latest, ReplayIntegrity: hub.ReplayIntegrity(), TookOver: tookOver}
-	if runID, state, ok := h.runs.ActiveRun(req.SessionID); ok {
-		res.CurrentRun = &XSessionAttachRun{RunID: runID, State: state}
+	// currentRun/latestSeq/replayIntegrity 都来自订阅契约快照(SubscribeEvents
+	// 在创建订阅之后读取,第四轮评审:不缓存旧状态):currentRun 无活动 Run 为
+	// null;latestSeq 仅描述位置,客户端不得跳游标(XSessionAttachResult 注释);
+	// replayIntegrity(I4):attach 时刻事件流的回放完整性三态——本进程纪元内
+	// 任何 key 事件落盘失败/合并 flush 失败/回放期损坏批次 → incomplete(粘滞
+	// 永不复位);journal 播种发现既有历史(重启后 attach)→ unknown(跨纪元
+	// 完整性不可验证);两者都提示客户端不得把收到的事件当完整历史。
+	resp := XSessionAttachResult{LatestSeq: res.LatestSeq, ReplayIntegrity: res.ReplayIntegrity, TookOver: tookOver}
+	if res.CurrentRun != nil {
+		resp.CurrentRun = &XSessionAttachRun{RunID: res.CurrentRun.RunID, State: res.CurrentRun.State}
 	}
-	return res, nil
+	return resp, nil
 }
 
 // pumpSessionEvents 是一条会话订阅的通知泵(P5-8):消费 hub 投递通道,逐事件

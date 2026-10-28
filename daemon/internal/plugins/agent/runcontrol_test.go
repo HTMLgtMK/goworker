@@ -284,11 +284,11 @@ func TestControlLeasePerSession(t *testing.T) {
 }
 
 // TestAttachEnsureHubAndJournalStatus(P5-6 追加覆盖,持久化变体):① attach
-// 先于任何 StartRun → EnsureHub 即建 hub(遗留③「重启后 attach 时 hub 未建」
-// 的解法,SeqRange 磁盘播种 latest=0);② StartRun 完成后 active 已清,
-// RunStatus 走 journal 权威路径返回 completed 且 latestSeq > 0(事件已落盘);
-// ③ hub 复用同一实例(bindEvents 创建恰好一次);④ RunStatus/Attach 对非
-// current 会话诚实报错。
+// 先于任何 StartRun → SubscribeEvents 经 EnsureHub 即建 hub(遗留③「重启后
+// attach 时 hub 未建」的解法,SeqRange 磁盘播种 latest=0);② StartRun 完成后
+// active 已清,RunStatus 走 journal 权威路径返回 completed 且 latestSeq > 0
+// (事件已落盘);③ hub 复用同一实例(bindEvents 创建恰好一次);④
+// RunStatus/SubscribeEvents 对非 current 会话诚实报错。
 func TestAttachEnsureHubAndJournalStatus(t *testing.T) {
 	root := t.TempDir()
 	cfg := runtimeconfig.Default()
@@ -315,16 +315,23 @@ func TestAttachEnsureHubAndJournalStatus(t *testing.T) {
 		t.Fatalf("CapabilityWaitTimeout = %v, want 45s (拍板③默认)", got)
 	}
 
-	// ① attach 即建 hub:任何 StartRun 之前 hub 为 nil,EnsureHub 补建。
-	evHub, latest, err := p.Attach(sid)
+	// ① attach 即建 hub:任何 StartRun 之前 hub 为 nil,SubscribeEvents 经
+	// EnsureHub 补建(PR3 订阅契约:返回订阅句柄与游标,hub 指针经 rt.Hub()
+	// 观测;EnsureHub 语义由 Service 侧编排,plugin 只余委托)。
+	res, err := p.SubscribeEvents(sid, 0)
 	if err != nil {
-		t.Fatalf("Attach: %v", err)
+		t.Fatalf("SubscribeEvents: %v", err)
 	}
+	if res.Subscription == nil {
+		t.Fatal("SubscribeEvents returned nil subscription")
+	}
+	defer func() { _ = res.Subscription.Close() }()
+	evHub := p.currentSession().Hub()
 	if evHub == nil {
-		t.Fatal("Attach returned nil hub")
+		t.Fatal("SubscribeEvents did not create the event hub")
 	}
-	if latest != 0 {
-		t.Fatalf("fresh attach latest = %d, want 0 (no events yet)", latest)
+	if res.LatestSeq != 0 {
+		t.Fatalf("fresh attach latestSeq = %d, want 0 (no events yet)", res.LatestSeq)
 	}
 
 	// ② 后台 Run 完成 → RunStatus 经 journal 路径返回 completed + latestSeq>0。
@@ -347,8 +354,10 @@ func TestAttachEnsureHubAndJournalStatus(t *testing.T) {
 	if _, _, _, err := p.RunStatus("bogus-session", runID); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
 		t.Fatalf("RunStatus with unknown sessionID err = %v, want ErrSessionNotFound", err)
 	}
-	if _, _, err := p.Attach("bogus-session"); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
-		t.Fatalf("Attach with unknown sessionID err = %v, want ErrSessionNotFound", err)
+	if res, err := p.SubscribeEvents("bogus-session", 0); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
+		t.Fatalf("SubscribeEvents with unknown sessionID err = %v, want ErrSessionNotFound", err)
+	} else if res.Subscription != nil {
+		t.Fatal("SubscribeEvents with unknown sessionID must not return a subscription")
 	}
 	if _, _, _, err := p.RunStatus(sid, "run-1-1"); err == nil {
 		t.Fatal("RunStatus with unknown runID should fail")
@@ -407,10 +416,10 @@ func (j *failingSeedJournal) SeqRange() (earliest, latest uint64, ok bool, err e
 }
 
 // TestEnsureHubSeedErrorPropagates(第三轮评审 I3 修复验收,daemon 面):会话
-// deps.RunEvents 的 SeqRange 播种失败 → Attach(rt.EnsureHub)与 StartRun(
-// manager.StartRun ⑥ bindEvents)显式报错——绝不返回看似健康的 hub 或句柄;
-// StartRun 拒绝后零残留(active 已清、幂等表未记账),恢复播种后重提成功
-// (pending/active 无残留的联合证明,同 I1 断言形态)。
+// deps.RunEvents 的 SeqRange 播种失败 → SubscribeEvents(Service 经 rt.EnsureHub
+// 编排)与 StartRun(manager.StartRun ⑥ bindEvents)显式报错——绝不返回看似
+// 健康的订阅或句柄;StartRun 拒绝后零残留(active 已清、幂等表未记账),恢复
+// 播种后重提成功(pending/active 无残留的联合证明,同 I1 断言形态)。
 func TestEnsureHubSeedErrorPropagates(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	cfg.Session.Enabled = false
@@ -426,16 +435,16 @@ func TestEnsureHubSeedErrorPropagates(t *testing.T) {
 	p.deps.RunEvents = ej
 	p.refreshSession()
 
-	// Attach:EnsureHub → NewEventHub 播种失败 → 显式错误,无 hub。
-	evHub, _, err := p.Attach(sid)
+	// SubscribeEvents:EnsureHub → NewEventHub 播种失败 → 显式错误,无订阅。
+	res, err := p.SubscribeEvents(sid, 0)
 	if err == nil {
-		t.Fatal("Attach with failing SeqRange = nil error, want error(I3:绝不返回看似健康的 hub)")
+		t.Fatal("SubscribeEvents with failing SeqRange = nil error, want error(I3:绝不返回看似健康的订阅)")
 	}
 	if !errors.Is(err, cause) {
-		t.Fatalf("Attach err = %v, want wrap of %v", err, cause)
+		t.Fatalf("SubscribeEvents err = %v, want wrap of %v", err, cause)
 	}
-	if evHub != nil {
-		t.Fatalf("Attach returned hub %+v, want nil", evHub)
+	if res.Subscription != nil {
+		t.Fatalf("SubscribeEvents returned subscription %+v, want nil", res.Subscription)
 	}
 
 	// StartRun:lease 照常(fencing 校验与播种无关),manager.StartRun ⑥ 接线
@@ -552,9 +561,9 @@ func newPersistedPlugin(t *testing.T, pv core.Provider) *AgentPlugin {
 }
 
 // TestCrossSessionRunControl(C3 修复验收):Session A 后台 run 运行中,创建
-// Session B 使 CurrentSessionID 已是 B → CancelRun(A)/RunStatus(A)/Attach(A)/
-// PendingApprovals(A) 全部可达且作用于 A(A 的 hub 被复用、A 的 run 被取消且
-// 对 B 不可见),B 的控制面不受影响。
+// Session B 使 CurrentSessionID 已是 B → CancelRun(A)/RunStatus(A)/
+// SubscribeEvents(A)/PendingApprovals(A) 全部可达且作用于 A(A 的 hub 被复用、
+// A 的 run 被取消且对 B 不可见),B 的控制面不受影响。
 func TestCrossSessionRunControl(t *testing.T) {
 	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
 	p := newPersistedPlugin(t, gated)
@@ -584,16 +593,21 @@ func TestCrossSessionRunControl(t *testing.T) {
 	}
 
 	// C3:current=B 时,A 的控制面全部可达,且作用于 A 自己的 runtime/journal。
-	hubA, latest, err := p.Attach(sidA)
-	if err != nil {
-		t.Fatalf("Attach(A): %v", err)
+	hubA := p.manager.Get(sidA).Hub() // StartRun 已建;PR3 起经订阅契约观察复用
+	if hubA == nil {
+		t.Fatal("setup: session A's hub not created by StartRun")
 	}
-	if latest == 0 {
-		t.Fatal("Attach(A) latest = 0, want > 0 (run.started was published before the provider gate)")
+	res, err := p.SubscribeEvents(sidA, 0)
+	if err != nil {
+		t.Fatalf("SubscribeEvents(A): %v", err)
+	}
+	if res.LatestSeq == 0 {
+		t.Fatal("SubscribeEvents(A) latestSeq = 0, want > 0 (run.started was published before the provider gate)")
 	}
 	if got := p.manager.Get(sidA).Hub(); got != hubA {
-		t.Fatal("Attach(A) must resolve session A's runtime and reuse its own EventHub")
+		t.Fatal("SubscribeEvents(A) must resolve session A's runtime and reuse its own EventHub")
 	}
+	_ = res.Subscription.Close()
 
 	state, _, _, err := p.RunStatus(sidA, runA)
 	if err != nil {
@@ -768,8 +782,10 @@ func TestCrossSessionApprovalOwnership(t *testing.T) {
 // requireCurrentSession 对非 current 会话恒 ok=false,attach 响应的
 // currentRun=null 与「A 确有在途 run」的事实不符);对照:B 无在途 run →
 // false;未知会话 → false;A 的 run 终态后 active 清空 → ActiveRun(A) 归位
-// false。ActiveRun 的快照即 attach 响应 currentRun 字段的事实源(wire 面转发
-// 契约由 service/acp 的 TestXGWSessionAttachCrossConnectionCurrentRun 钉住)。
+// false。ActiveRun 的快照与 attach 响应 currentRun 的事实源同观察点
+// (rt.Active();PR3 起后者经 SubscribeEvents 的 CurrentRun 快照上 wire,
+// wire 面转发契约由 service/acp 的 TestXGWSessionAttachCrossConnectionCurrentRun
+// 钉住)。
 func TestActiveRunNonCurrentSession(t *testing.T) {
 	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
 	p := newPersistedPlugin(t, gated)

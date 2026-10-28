@@ -25,8 +25,9 @@ import (
 // agentcontrol.Service(plugin.go 装配,§4.2)——Lease fencing、幂等 per-key
 // single-flight、审批归属校验的实现迁入该包,plugin 不再直接维护 Lease 和幂等表
 // (reqMu/runRequests/requestOrder/guardsMu/controlGuards 字段与实现随迁删除)。
-// 暂留本文件的面:Attach/ActiveRun/PendingApprovals(PR3 收敛事件订阅、PR4 统一
-// 同步路径时迁)、CapabilityRegistry 面(UnbindCapabilities/CapabilityWaitTimeout/
+// 暂留本文件的面:ActiveRun/PendingApprovals(PR4 统一 Run 观测面时迁;事件
+// 订阅的 Attach 已随 PR3 收敛为 Service.SubscribeEvents 的订阅契约并整体迁入
+// agentcontrol,本文件只余委托)、CapabilityRegistry 面(UnbindCapabilities/CapabilityWaitTimeout/
 // ClientToolSource——总方案 §八:能力桥接不进控制层)。会话寻址与 journal 解析经
 // agentcontrol.SessionRouter/agentcontrol.JournalSource 窄接口注入(RouteSession/
 // RunJournal,接口定义在 agentcontrol)。
@@ -109,8 +110,9 @@ func (p *AgentPlugin) RunJournal(rt *runtimeagent.SessionRuntime) agentcontrol.R
 // 错误:包裹 manager 的 ErrSessionNotFound sentinel(errors.Is 可判,P5-7 协议
 // 面映射 -32000)。覆盖三种形态:任意未注册 id、/new 已收口的旧 id(诚实失败)、
 // 无活动 runtime(Init 未完成/失败回滚——原「no active session」并入同一语义,
-// 路由面 nil 即 not found)。供暂留本文件的 Attach/PendingApprovals 消费;
-// agentcontrol 内部有同语义 helper(错误文案与 sentinel 一致)。
+// 路由面 nil 即 not found)。供暂留本文件的 PendingApprovals 消费(Attach 随
+// PR3 迁入 agentcontrol,同语义 helper 在彼处);agentcontrol 内部有同语义
+// helper(错误文案与 sentinel 一致)。
 func sessionNotFoundErr(sessionID string) error {
 	return fmt.Errorf("agent: session %q: %w", sessionID, runtimeagent.ErrSessionNotFound)
 }
@@ -259,28 +261,17 @@ func flattenPendingApprovals(pending []runtimeagent.PendingApproval) []model.Pen
 	return out
 }
 
-// Attach 实现 RunControlSource(P5-6,P5-8 的 attach 面消费;C3 修正;PR1 暂留
-// plugin,PR3 收敛为 Service.SubscribeEvents 的事件订阅契约):多会话路由 →
-// rt.EnsureHub()——遗留③「重启后 attach 时 hub 未建」的解法,attach 即建(含
-// SeqRange 磁盘播种,游标续接既有历史;hub 由被路由会话自己的 deps.RunEvents
-// 供给,事件流天然按会话隔离);RunEvents 未接线/纯内存 → 诚实错误(P5-8 起
-// 映射 -32000,客户端指引 session/load);hub 构造失败(第三轮评审 I3:SeqRange
-// 播种的 Journal I/O 错误)→ 错误原样上抛——绝不返回看似健康的 hub。latest 是
-// 当前事件流位置:仅描述,客户端不得跳游标(总方案 §7 :586-589,P5-10 写入
-// PROTOCOL.md)。
-func (p *AgentPlugin) Attach(sessionID string) (*runtimeagent.EventHub, uint64, error) {
-	rt := p.RouteSession(sessionID)
-	if rt == nil {
-		return nil, 0, sessionNotFoundErr(sessionID)
-	}
-	hub, err := rt.EnsureHub()
-	if err != nil {
-		return nil, 0, fmt.Errorf("agent: session %q: ensure event hub: %w", sessionID, err)
-	}
-	if hub == nil {
-		return nil, 0, fmt.Errorf("agent: event stream not enabled for session %q (persistence disabled)", sessionID)
-	}
-	return hub, hub.LatestSeq(), nil
+// SubscribeEvents 实现 RunControlSource(总方案 §七,PR3 收敛事件订阅接口;
+// PR1 暂留 plugin 的 Attach 随契约收敛迁出):事件订阅的完整编排(多会话路由 →
+// rt.EnsureHub(I3:journal 播种失败上抛)→ hub.Subscribe → 订阅后读
+// replayIntegrity(第四轮评审:不缓存旧状态)→ rt.Active() 快照)整体在
+// agentcontrol.Service 内完成,本层只做签名透传——返回订阅契约
+// agentcontrol.AttachResult,不向协议面暴露具体 EventHub。§七 边界限制:本方法
+// **不** AcquireControl(数据面与授权面拆分);attach(mode=control) 的两动作
+// 编排(先订阅成功、再取 lease、失败回滚不动 lease,第四轮 I4 语义)由 ACP
+// handler 显式保证。
+func (p *AgentPlugin) SubscribeEvents(sessionID string, afterSeq uint64) (agentcontrol.AttachResult, error) {
+	return p.control.SubscribeEvents(sessionID, afterSeq)
 }
 
 // ActiveRun 实现 RunControlSource(P5-8;第二轮评审 I1 修正;PR1 暂留 plugin,

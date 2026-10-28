@@ -79,7 +79,8 @@ func (p bindingFixedProvider) ChatStream(context.Context, *core.ChatRequest) (<-
 
 // pr2DualControl 是双 runtime 的 SessionSource + RunControlSource + SessionRouter
 // 测试 shim:控制操作全部委托真实 agentcontrol.Service(per-session lease、幂等
-// single-flight 与生产同源);Attach 走 rt.EnsureHub(真实 hub)。current 由测试
+// single-flight 与生产同源);SubscribeEvents 走真实 Service(路由/EnsureHub/
+// hub.Subscribe/完整性快照与生产同源)。current 由测试
 // 经 switchCurrent 驱动(模拟 /new 换轨),SetSession 只记 transport 活动声明
 // (与生产 SetSession 的 activeTransportSession 语义一致,不推 current)。
 type pr2DualControl struct {
@@ -182,19 +183,11 @@ func (f *pr2DualControl) ReleaseConnection(connectionID string) {
 	f.control.ReleaseConnection(connectionID)
 }
 
-func (f *pr2DualControl) Attach(sessionID string) (*runtimeagent.EventHub, uint64, error) {
-	rt, err := f.routeOrErr(sessionID)
-	if err != nil {
-		return nil, 0, err
-	}
-	hub, err := rt.EnsureHub()
-	if err != nil {
-		return nil, 0, err
-	}
-	if hub == nil {
-		return nil, 0, errors.New("pr2DualControl: event stream not enabled")
-	}
-	return hub, hub.LatestSeq(), nil
+// SubscribeEvents(P5-8 测试面;PR3 订阅契约):薄委托真实 agentcontrol.Service
+// ——路由/EnsureHub/hub.Subscribe/订阅后完整性快照与生产逐字同源,Attach 的
+// shim 级 mirror 随契约收敛删除。
+func (f *pr2DualControl) SubscribeEvents(sessionID string, afterSeq uint64) (agentcontrol.AttachResult, error) {
+	return f.control.SubscribeEvents(sessionID, afterSeq)
 }
 
 func (f *pr2DualControl) ActiveRun(sessionID string) (string, string, bool) {

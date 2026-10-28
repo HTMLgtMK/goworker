@@ -146,9 +146,10 @@ type XSessionAttachRun struct {
 
 // XSessionAttachResult 是 x-goworker/session/attach 的响应。latestSeq 是
 // attach 时刻会话事件流的位置快照,**仅描述当前位置,客户端不得跳游标**——
-// 只有真正应用了对应事件才能推进本地 cursor(总方案 §7 :586-589);订阅注册
-// 水位可能高于本值(attach 与 Subscribe 之间发布的事件由 live 侧续传),客户端
-// 按逐事件 seq 记账,不据此批量前移。replayIntegrity(I4)恒显式携带:attach
+// 只有真正应用了对应事件才能推进本地 cursor(总方案 §7 :586-589)。快照取于
+// 订阅注册之后(PR3:SubscribeEvents 的收敛序——先 Subscribe 后读游标与完整
+// 性),故恒不低于订阅注册水位;注册点与响应之间发布的事件仍由 live 侧续传,
+// 客户端按逐事件 seq 记账,不据此批量前移。replayIntegrity(I4)恒显式携带:attach
 // 时刻事件流的回放完整性三态(complete/unknown/incomplete,语义见
 // XRunGetResult 注释)——unknown = 跨进程纪元的既有历史不可验证,incomplete =
 // 本进程发生过事件落盘失败(标记粘滞永不复位),两者都不得把收到的事件当
