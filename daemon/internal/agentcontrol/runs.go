@@ -15,7 +15,30 @@ import (
 // 偏差:回调由调用方传入,本 PR 的 plugin 委托传零值回调,语义与迁移前逐字一致
 // ——事件采集由 supervisor 的 tee 自行供给,Decide 留 nil → P4-2 审批回退接管,
 // 决策经 ResolveApproval 跨连接投递)。StartRunSync/CancelRunSync 是 PR4(§九)
-// 的同步宿主入口形态:无 fencing、无幂等、返回 RunHandle,见各方法注释。
+// 的同步宿主入口形态:无 fencing、无幂等、返回 RunHandle,见各方法注释。R3 起
+// (第四轮评审)两方法经受限接口 InternalRunner 暴露——不进 model.RunControlSource
+// 或任何公共能力面,Transport Adapter 结构性触达不到。
+
+// InternalRunner 是同步宿主入口的受限内部提交面(第四轮评审 R3):StartRunSync/
+// CancelRunSync 只经本接口提供给宿主组装面注入的可信本地命令 Adapter——CLI 命令
+// 与嵌入式命令(生产调用方:AgentPlugin.handleAgent,commands.go 的 prompt 提交
+// 与 Legacy 取消);Transport Adapter(ACP/x-goworker 协议面及未来新增)一律走
+// RunControlSource 的 fencing 面(model.RunControlSource 的 StartRun/CancelRun,
+// Connection Lease 校验与提交同临界区)。接口收敛的意义:两个面的方法集分离——
+// RunControlSource 刻意不含两个 Sync 方法,其消费者(acp handler 的 h.runs)静态
+// 类型拿不到本接口 ⇒ ACP 面结构性无法绕过 fencing;未来 Adapter 需要同步提交时,
+// 必须经宿主组装面显式注入 InternalRunner,而不是在公共能力接口上再开一个无
+// fencing 入口。分离的钉死点:本断言与插件侧 var _ InternalRunner = (*AgentPlugin)
+// (nil)(runcontrol.go)正向钉住 InternalRunner 面;model.RunControlSource 不含
+// Sync 方法由 acp 包反射守卫钉死(Go 无编译期负断言)。
+type InternalRunner interface {
+	StartRunSync(sessionID string, req runtimeagent.RunRequest, cb runtimeagent.RunCallbacks) (runtimeagent.RunHandle, error)
+	CancelRunSync(sessionID, runID string) error
+}
+
+// InternalRunner 编译期断言:Service 是该面的唯一实现方,方法集或签名漂移即
+// 编译失败。
+var _ InternalRunner = (*Service)(nil)
 
 // ensureRegistered 修复「current runtime 已注册」不变量(原 runcontrol.go 的
 // registerCurrentRuntime 迁入;修复所需的两步操作只经 Service 持有的 manager,
@@ -99,7 +122,9 @@ func (s *Service) StartRun(sessionID, clientID, input, requestID string, cb runt
 //     Connection Control Lease——§4.1「内部调度可以不依赖 Connection Lease,
 //     但仍需要明确它具有启动 Run 的权限」,本方法即该内部执行身份(service.go
 //     ClientKindInternal 预留)的提交入口;协议面 StartRun 仍强制 lease,两不
-//     混淆;
+//     混淆。R3 收敛(第四轮评审):本方法只在 InternalRunner 受限面暴露,不进
+//     model.RunControlSource——其消费者 type-assert 不到 InternalRunner,ACP 面
+//     结构性无法绕过 fencing;
 //   - 无幂等记账:同步 prompt 无 requestID(空键从不入 RequestRegistry,每次
 //     新起跑),直接 manager.StartRun;
 //   - 返回 RunHandle 而非 (runID, state) 快照:同步形态的调用方需要 Wait 阻塞
@@ -122,7 +147,8 @@ func (s *Service) StartRunSync(sessionID string, req runtimeagent.RunRequest, cb
 // CancelRunSync 取消一个内部(同步宿主入口)Run(PR4,总方案 §九的 Legacy 取消
 // 语义):同步 Run 的 runCtx 来自宿主,调用方请求 ctx 的取消不传播——Adapter
 // 在等待面(handleAgent 的 select)显式转本方法落地取消。与 CancelRun 的唯一
-// 差异是无 fencing(内部执行身份不持 Connection Lease,同 StartRunSync);
+// 差异是无 fencing(内部执行身份不持 Connection Lease,同 StartRunSync——R3 起
+// 同经 InternalRunner 受限面暴露,不入 model.RunControlSource);
 // ensureRegistered 的不变量修复同源。manager 的拒绝语义原样上抛:run 已终态
 // (与取消竞争落败)→ ErrRunNotFound,Adapter 视为幂等空操作。
 func (s *Service) CancelRunSync(sessionID, runID string) error {

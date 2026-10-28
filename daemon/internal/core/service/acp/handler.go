@@ -144,6 +144,12 @@ func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Comma
 			connectionID: newConnectionID(),
 		}
 		if sessions != nil {
+			// R3(第四轮评审):断言面是 model.RunControlSource——刻意不含
+			// StartRunSync/CancelRunSync(那是 agentcontrol.InternalRunner 受限
+			// 内部面,仅宿主组装面注入可信本地命令 Adapter,见 capability.go 方法
+			// 集纪律)。h.runs 的静态类型拿不到 InternalRunner ⇒ ACP/x-goworker
+			// 面结构性无法绕过 fencing:run/start|cancel 一律走 StartRun/CancelRun
+			// 的 Connection Lease 临界区,同步宿主入口对本协议面不可达。
 			if runs, ok := sessions.(model.RunControlSource); ok {
 				handler.runs = runs
 			}

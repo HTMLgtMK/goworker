@@ -1,13 +1,16 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
+	"github.com/tinguo/goworker/ai-runtime/session"
 )
 
 // stop_test.go 是 PR5 Stop 收口（总方案 §十测试矩阵「Plugin Stop:不遗留失控
@@ -22,6 +25,11 @@ import (
 // Store 句柄释放面（flock 已释放）在 daemon 根 e2e 以包外视角断言
 // （e2e_plugin_stop_test.go：session.Open 同目录重开成功 ⇒ 锁已释放）；
 // 本包内 currentStore 经 repo 缓存取数，锁释放不构成可观测差异。
+//
+// TestStopWaitsForInFlightMaintenance 是 S1（第四轮评审）的插件侧验收：
+// Stop 的等待面除 manager 的 AgentRun 外，还必须覆盖 withSession 维护闭包
+// （/new /compact 等经 Session Gate 但不在 Manager 活跃集的执行面）——
+// store.Close 不得早于在飞维护操作完成。
 //
 // goroutine 收敛不直接用 runtime.NumGoroutine 断言（并行测试下基线不可靠）：
 // 在飞 Run 的执行 goroutine 以「journal 终态 + active 清空」收敛为证，订阅
@@ -144,5 +152,103 @@ func TestStopIdempotentAfterClose(t *testing.T) {
 	}
 	if _, err := p.manager.StartRun("any", runtimeagent.RunRequest{Input: "x"}, runtimeagent.RunCallbacks{}); !errors.Is(err, runtimeagent.ErrManagerClosed) {
 		t.Fatalf("manager.StartRun after second Stop = %v, want ErrManagerClosed", err)
+	}
+}
+
+// TestStopWaitsForInFlightMaintenance(S1 验收,第四轮评审):withSession 维护闭包
+// (/compact 等命令的执行面)持有 store 操作期间触发 Stop → store.Close 不早于
+// 维护操作完成。确定性交错(生产可达面:CLI stdin 信号路径在 Eval 在飞时即可
+// 进入 appl.Stop → Engine.StopAll → Plugin.Stop,Engine 层无排空屏障):
+//  1. 闭包在 gate 内登记完成(inFlight 已 Add)后挂起(close(entered) 钩子);
+//  2. Stop 并发启动(此刻起 inFlight closed,新维护回合被拒绝);
+//  3. 放行闭包 → 闭包对 store 真实 Commit——若 Stop 先于闭包关掉 store,
+//     Commit 以错误可观测(Store 关闭后 appendRecord 落在已关句柄上);
+//  4. Stop 返回后断言:闭包先于 Stop 返回完成(happens-before 经
+//     inFlight.wait 的 WaitGroup 建立:闭包 return → exit/Done → wait 返回
+//     → Stop 返回 → stopped 关闭),store 写成功,且重启文件视图可见写入。
+func TestStopWaitsForInFlightMaintenance(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "maint-stop"})
+	sid := p.CurrentSessionID()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	closureDone := make(chan struct{})
+	var storeOpErr error
+
+	// 模拟 /compact 的执行面:withSession 闭包持 gate + inFlight 登记,钩子处
+	// 挂起等待 Stop 进入收口,放行后做与 /compact 同型的真实 store 写。
+	go func() {
+		defer close(closureDone)
+		_ = p.withSession(context.Background(), func(runCtx context.Context) error {
+			close(entered)
+			<-release
+			st := p.currentStoreIn(runCtx)
+			if st == nil {
+				storeOpErr = errors.New("maintenance closure: store resolved nil (repo finalized under the closure?)")
+				return storeOpErr
+			}
+			if _, err := st.Commit([]core.Message{{Role: "user", MsgID: "maint-1", Content: "maintenance write during stop"}}); err != nil {
+				storeOpErr = err
+				return err
+			}
+			return nil
+		})
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("maintenance closure did not enter withSession in time")
+	}
+
+	// Stop 并发启动;此刻闭包仍在飞(已登记)。闭包所有权归本测试:release 的
+	// close 用 Once 收口(正常路径与兜底分支都可能触达,双重 close 即 panic)。
+	releaseClosure := sync.OnceFunc(func() { close(release) })
+	stopped := make(chan struct{})
+	go func() { _ = p.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+		releaseClosure() // 兜底:Stop 不该先于闭包返回;放行防泄漏
+		<-closureDone
+		t.Fatal("Stop returned before the in-flight maintenance closure completed (inFlight wait missing?)")
+	case <-time.After(50 * time.Millisecond):
+		// Stop 尚未返回 = 修复的等待面在工作(非判定性早退检查,真正的判定
+		// 断言在下方 happens-before 检查)。
+	}
+	close(release) // 放行闭包:它与 Stop 的收尾步骤从此刻起真实并发
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not return in time (inFlight wait stuck?)")
+	}
+
+	// ① 次序:Stop 返回 ⇒ inFlight.wait 返回 ⇒ 闭包已返回 ⇒ closureDone 已关。
+	select {
+	case <-closureDone:
+	default:
+		t.Fatal("Stop returned before the maintenance closure completed (store.Close would precede the maintenance op)")
+	}
+	// ② 闭包内的 store 写在 Stop 收尾期间成功(无「写已关闭 store」错误)。
+	if storeOpErr != nil {
+		t.Fatalf("store write inside maintenance closure failed while Stop was winding down: %v", storeOpErr)
+	}
+	// ③ 写入已落盘:Close 的 Sync 之后从磁盘重读,消息在活跃视图中。
+	view, err := session.OpenArchiveView(filepath.Join(p.cfg.Session.Dir, sid, "current.jsonl"))
+	if err != nil {
+		t.Fatalf("reopen persisted store file after Stop: %v", err)
+	}
+	found := false
+	for _, m := range view.ActiveView() {
+		if m.MsgID == "maint-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("maintenance write missing from the persisted active view after Stop (store closed before the op landed)")
+	}
+	// ④ 收口开始后的新维护回合诚实拒绝(S1 拒绝语义,与 ErrManagerClosed 同族):
+	// withSession 在 AcquireRun 成功后被 inFlightTracker 拒绝,不触碰任何持久化面。
+	if err := p.withSession(context.Background(), func(context.Context) error { return nil }); !errors.Is(err, errAgentStopping) {
+		t.Fatalf("withSession after Stop = %v, want errAgentStopping", err)
 	}
 }

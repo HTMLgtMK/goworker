@@ -822,6 +822,12 @@ Run Journal 还需要额外保证：
 - [ ] 支持 CLI/ACP/Android 多 Session 切换
 - [ ] 更新 mobile/PROTOCOL.md 和集成测试
 
+**P6 · 两阶段停机契约（第四轮评审 S2 设计声明；Graceful 阶段已落地，见
+daemon/internal/plugins/agent/plugin.go Stop 注释）**
+
+- [x] Graceful Shutdown：停止接受请求（Run 提交/注册被 manager 关闭态拒绝；维护命令回合被插件 inFlightTracker 拒绝）→ 取消在飞 Run → 等待终态持久化（Run 终态与在飞维护命令两个等待面）→ 收口事件枢纽与持久化句柄。全程协作式、无超时，与 Manager.Close 同语义
+- [ ] Forced Shutdown：超过关闭期限后报告未收敛 Run（RunID + 「终态未落盘」事实，客户端经 run/get 或重启恢复面查询），进入明确的强制终止或宿主退出策略。实现约束：Go 无法安全强杀任意 goroutine，给 Stop 外包 WithTimeout 而不等执行协程返回就关闭 Store 会重引入写入竞态（PR5 专门修复项），不是可选项；正确路径是给外部工具调用配置强制超时、必要时以可终止的子进程隔离执行，使协作式取消在有限时间内真实收敛
+
 ### 推荐目录结构
 
 ```text

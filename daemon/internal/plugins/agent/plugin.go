@@ -102,6 +102,14 @@ type AgentPlugin struct {
 	// 路由会话的 journal,不反向持有插件状态;锁序 lease.mu→registry.mu→manager
 	// 单向,跨层 h.mu→session lease 单向(DE2-I1 论证随方法整体迁入)。
 	control *agentcontrol.Service
+
+	// inFlight 是在飞维护命令计数(commands.go inFlightTracker,S1 第四轮评审):
+	// /new /compact 等 withSession 闭包经 Session Gate 但不是 AgentRun,不在
+	// manager.Close 的等待面内;Engine 层亦无「停止接受→排空 Eval」屏障(CLI
+	// stdin 信号路径可在 Eval 在飞时触发 Stop)。Stop 在 manager.Close 之后
+	// wait 本计数,再收尾 MCP/记忆/Store——闭包的持久化访问不与收尾竞争。
+	// 零值可用。
+	inFlight inFlightTracker
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
@@ -390,6 +398,32 @@ func (p *AgentPlugin) Init(h *model.Hub) error {
 
 func (p *AgentPlugin) Start() error { return nil }
 
+// Stop 实现插件停机收口，同时留档两阶段停机契约（S2，第四轮评审；总方案 §十
+// P6 清单为设计声明，本版本只实现 Graceful 阶段）：
+//
+//	Graceful（当前实现，全协作式、无超时）：
+//	  ① 停止接受：维护回合经 inFlightTracker 拒绝（errAgentStopping，commands.go
+//	    withSession），Run 经 manager 关闭态拒绝（Register/StartRun 一律
+//	    ErrManagerClosed）——但 ACP/CLI 传输层的「停止接受新 Eval」在宿主侧
+//	    （Application.Stop 先 Services.Stop 排空 ACP prompt；CLI stdin 信号路径
+//	    不排空，见 ③），Engine 与插件没有统一的入口闸门；
+//	  ② 取消在飞 Run：manager.Close 取消宿主 runCtx，等待全部 Run 终态落盘
+//	    （run.done 等待面）并收口事件枢纽；
+//	  ③ 等待在飞维护命令：inFlight.wait（/new /compact 等非 AgentRun 的 store/
+//	    记忆访问先于持久化句柄收尾完成；覆盖 CLI stdin 信号路径等不经 ACP 排空
+//	    的执行面）；
+//	  ④ 收口：MCP 进程、memory、当前 store 与 repo 缓存逐层关闭。
+//
+//	Forced（P6 设计声明，未实现）：
+//	  Graceful 的 ②③ 等待都是协作式——非协作式 Provider/Tool 卡死（本地命令、
+//	  MCP 调用、不响应 ctx 的第三方 Provider）会让 Stop 长期不返回，阻塞整个
+//	  daemon 停机。设计上的第二级：超过关闭期限后报告未收敛 Run（RunID 与
+//	  「终态未落盘」事实，客户端经 run/get 或重启恢复面查询），交宿主退出策略。
+//	  实现约束（P6 落地时必须遵守）：Go 无法安全强杀任意 goroutine，给本方法
+//	  外包一层 WithTimeout、不等执行协程返回就继续关 Store，会重引入 PR5 专门
+//	  修复的「Store 已关闭仍被写」竞态——不是可选项。正确路径是给外部工具调用
+//	  配置强制超时、必要时以可终止的子进程隔离执行，使协作式取消在有限时间内
+//	  真实收敛。
 func (p *AgentPlugin) Stop() error {
 	if p.hub != nil && p.hub.UnregisterCapability != nil {
 		p.hub.UnregisterCapability(model.SessionSourceCapability)
@@ -405,6 +439,18 @@ func (p *AgentPlugin) Stop() error {
 	// 客户端超时约束）；Close 幂等（Init 失败回滚路径尚无会话同样安全），Close
 	// 之后 Register/StartRun 一律 ErrManagerClosed——停机后不再接受新成员。
 	p.manager.Close()
+	// S1(第四轮评审):wait 在飞维护命令(withSession 闭包)。/new /compact 等
+	// 维护回合经 Session Gate 但不是 AgentRun,manager.Close 的等待面不覆盖
+	// 它们;Engine 层无「停止接受→排空 Eval」屏障(engine.go StopAll 只逆序
+	// 调插件 Stop),CLI stdin 的信号路径更是在 Eval 在飞时即可进入 appl.Stop
+	// (cmd/goworker runFrontends 收到 SIGINT/SIGTERM 即返回,不等 stdin 回合)。
+	// 故插件自持第二道屏障:此刻起新维护回合被拒绝(errAgentStopping),在飞
+	// 闭包全部返回后才继续——必须先于 closeMCP(闭包 /new 的 loadMCP 写
+	// mcpClients map)、memory 收尾(/memory /task 闭包访问 memory client)与
+	// 下方 store/repo 收尾(闭包读写 conversation store)。等待面语义与
+	// manager.Close 同为协作式无超时:闭包落点(store 写 / LLM 调用)受自身
+	// 超时约束,最终自会返回。
+	p.inFlight.wait()
 	// MCP server 是外部进程，退出时统一回收，避免残留孤儿进程
 	p.closeMCP()
 	if p.memory != nil {

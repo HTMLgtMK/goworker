@@ -49,6 +49,17 @@ import (
 // 以 type-assert 获取(SessionSource 先例,capability.go:61-78)。
 var _ model.RunControlSource = (*AgentPlugin)(nil)
 
+// InternalRunner 编译期断言(第四轮评审 R3):AgentPlugin 以受限内部提交面形态
+// 自持——StartRunSync/CancelRunSync(commands.go 的 handleAgent 是唯一生产调用
+// 方)只供宿主组装面的可信本地命令 Adapter(CLI/嵌入命令)消费,不入
+// model.RunControlSource。两个面的方法集分离由三处钉死:此处与上行断言正向钉住
+// 插件同时满足两面;agentcontrol.runs.go 的 var _ InternalRunner = (*Service)(nil)
+// 正向钉住 Service;acp 包 constraint_test.go 的反射守卫负向钉死 RunControlSource
+// 不含 Sync 方法(Go 无编译期负断言)。handler.go 的 h.runs 静态类型是
+// model.RunControlSource,type-assert 不到 InternalRunner ⇒ ACP 面结构性无法
+// 绕过 fencing。
+var _ agentcontrol.InternalRunner = (*AgentPlugin)(nil)
+
 // ClientToolBinder 编译期断言(P5-9):AgentPlugin 同时满足设备工具的能力代理
 // 面,ACP handler 优先 type-assert 它走 CapabilityRegistry + proxy(P5 显式
 // 可见变化 #1 的生产者),断言失败回落原始 relay。

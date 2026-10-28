@@ -110,6 +110,18 @@ type PendingApprovalInfo struct {
 // 持有者（两连接各控各会话互不影响）、断开即释放（handler.Close 经
 // ReleaseConnection 释放该连接全部租约）、后到连接对同一会话显式接管
 // （tookOver=true + slog 审计）。
+//
+// 方法集纪律(第四轮评审 R3):本接口刻意**不含** StartRunSync/CancelRunSync——
+// 同步宿主入口(/agent、session/prompt、CLI prompt)的提交/取消是
+// agentcontrol.InternalRunner 受限内部面,仅供宿主组装面注入可信的本地命令
+// Adapter(CLI/嵌入命令);Transport Adapter(含未来新增)一律走本接口的 fencing
+// 面(StartRun/CancelRun:Connection Lease 校验与提交同一临界区)。消费者
+// (acp handler 的 h.runs)type-assert 到的是本接口 ⇒ 拿不到 InternalRunner,
+// ACP 面结构性无法绕过 fencing。分离的钉死点:agentcontrol 与插件侧的编译期
+// 断言(var _ agentcontrol.InternalRunner = (*Service)(nil) /
+// (*AgentPlugin)(nil))正向钉住受限面;本接口不含 Sync 方法由 acp 包反射守卫
+// (constraint_test.go)钉死——Go 无编译期负断言,反射守卫 + CI 是可落地的最强
+// 钉法,改动本方法集时两处都会拦。
 type RunControlSource interface {
 	// StartRun 提交一次后台 Run 并立即返回 (runID, 提交时状态)。connectionID
 	// 是调用方连接句柄(fencing,第三轮评审 I4):实现必须把「lease 校验

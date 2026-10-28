@@ -2,12 +2,15 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
 	"github.com/tinguo/goworker/ai-memory"
@@ -28,6 +31,55 @@ import (
 // 流入嵌套 Eval。
 type sessionGateKey struct{}
 
+// errAgentStopping 是 Stop 收口开始后新维护回合的诚实拒绝（S1，第四轮评审）：
+// inFlightTracker 已 closed，放行会让闭包与 Stop 的 store/memory/MCP 收尾并发
+// （重引入 PR5 修掉的「Store 已关闭仍被写」竞态）。与 manager 的
+// ErrManagerClosed 同一语义家族：停机后不再接受新成员。
+var errAgentStopping = errors.New("agent: plugin is stopping")
+
+// inFlightTracker 是插件级在飞维护命令计数（S1，第四轮评审）：/new /compact
+// /usage /history /task /rewind 等 withSession 闭包不是 AgentRun、不在 manager
+// 活跃集内，manager.Close 不等它们——Engine 层也没有「停止接受→排空 Eval」
+// 屏障（engine.go StopAll 只逆序调用各插件 Stop；CLI stdin 信号路径在 Eval 在飞
+// 时即可触发 appl.Stop，ACP 的 prompt 排空只覆盖 session/prompt 一条路）。
+// 因此插件自带第二道屏障：闭包在 gate 内登记，Stop 在 manager.Close 之后、
+// MCP/记忆/Store 收尾之前 wait 全部在飞闭包，闭包内的 store/记忆访问不与收尾
+// 竞争。计数与 closed 标志同锁（mu）：closed 后 enter 一律拒绝，保证 Wait 与
+// Add 永不并发（WaitGroup 的「计数从零开始的 Add 必须先于 Wait」纪律，否则
+// Wait 的返回可与并发 Add 竞争）。零值可用（测试直接构造 AgentPlugin 的字面量
+// 无需感知）；嵌套 Eval（owner == p 重入）不计数——那些闭包跑在 Run goroutine
+// 内，已由 manager.Close 的 run.done 等待面覆盖。
+type inFlightTracker struct {
+	mu     sync.Mutex
+	wg     sync.WaitGroup
+	closed bool
+}
+
+// enter 登记一个在飞维护命令；Stop 已开始收口（closed）时拒绝并返回 false。
+func (f *inFlightTracker) enter() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return false
+	}
+	f.wg.Add(1)
+	return true
+}
+
+// exit 摘除登记；必须与成功的 enter 一一配对（调用方以 defer 持有）。
+func (f *inFlightTracker) exit() { f.wg.Done() }
+
+// wait 先置 closed（此后 enter 一律拒绝，不再有新 Add）再等待全部在飞闭包返回。
+// 幂等（closed 幂等 + WaitGroup.Wait 幂等）；仅 Stop 调用，调用方保证自身只在
+// 收口路径上执行。不设超时：与 manager.Close 同语义——取消是协作式的，闭包
+// 的落点（store 写/LLM 调用受 HTTP 客户端超时约束）最终自会返回。
+func (f *inFlightTracker) wait() {
+	f.mu.Lock()
+	f.closed = true
+	f.mu.Unlock()
+	f.wg.Wait()
+}
+
 // withSession 在本命令回合解析出的会话 runtime 的独占执行权下运行 run(PR2 起
 // 解析 binding 优先,总方案 §六):解析点 sessionRuntimeIn——ctx 携带连接级
 // SessionBinding(标准 ACP 的 prompt 链,FrontendHandler 经 agentcontrol.WithBinding
@@ -47,6 +99,12 @@ type sessionGateKey struct{}
 // 外层注入的 runtime,闭包解析与外层同源。解析结果为 nil(无 Binding 回落后
 // 仍无活动 runtime:Init 未完成/失败回滚)时报错;Binding 悬空(会话已被 /new
 // 收口)诚实报 session not found,不回落 current。
+//
+// S1(第四轮评审):gate 内闭包还向 p.inFlight 登记在飞计数——闭包不是
+// AgentRun、不在 manager.Close 的等待面内,Stop 在 manager.Close 之后
+// wait 该计数,保证闭包内的 store/记忆访问先于 Stop 的持久化句柄收尾;
+// 收口开始后的新维护回合以 errAgentStopping 诚实拒绝(嵌套重入不计数,
+// 由 manager.Close 的 run 等待面覆盖)。
 func (p *AgentPlugin) withSession(ctx context.Context, run func(context.Context) error) error {
 	// nil ctx 归一(既有测试直接构造 Context 不带 Ctx):按无绑定处理。
 	if ctx == nil {
@@ -67,6 +125,15 @@ func (p *AgentPlugin) withSession(ctx context.Context, run func(context.Context)
 		return err
 	}
 	defer release()
+	// S1 登记(必须先于闭包执行、晚于 gate 获取:登记失败的拒绝不携带任何会话
+	// 状态突变,defer release 把 gate 还回去)。Stop 的 wait 与本登记经
+	// inFlightTracker.mu 全序:要么闭包先登记(Stop 等它跑完才收尾持久化句柄),
+	// 要么 closed 先置位(本回合被拒绝,不触碰 store/记忆)——不存在闭包在飞而
+	// Stop 已关 store 的中间态。
+	if !p.inFlight.enter() {
+		return errAgentStopping
+	}
+	defer p.inFlight.exit()
 	return run(injectResolvedSession(context.WithValue(ctx, sessionGateKey{}, p), rt))
 }
 
@@ -87,17 +154,39 @@ func withPluginContext(ctx *model.Context, runCtx context.Context) *model.Contex
 //
 // 流序:cwd 守卫(不变)→ binding 优先解析本回合会话(不再经 withSession 排队
 // ——会话互斥由 execute 的 AcquireRun 承担,提交即占位)→ StartRunSync 提交
-// (立即返回句柄;拒绝显式上抛)→ Legacy 等待面:
+// (立即返回句柄;拒绝显式上抛)→ Legacy 等待面(取消契约:第四轮评审 R1/R2):
 //   - Wait 阻塞至终态:「prompt 返回 = run 完成」语义保留(CLI/stdio);
 //   - 请求 ctx 取消 → 显式 CancelRunSync(总方案 §九:StartRun 的 runCtx 来自
 //     宿主,请求 ctx 不传播,Legacy CLI 的「取消即终止 Agent」由 Adapter 显式
-//     实现,不依赖请求 ctx 传播)→ 换无取消上下文收尾等待终态落盘;
-//   - 取消与完成竞争:CancelRun 对已终态 Run 返回 ErrRunNotFound(幂等空操作),
-//     收尾 Wait 返回真实终态,两种交错同收敛。
+//     实现,不依赖请求 ctx 传播),结果分类(R2):
+//     成功 → 有界收尾等待(cancelCleanupTimeout);
+//     ErrRunNotFound(取消与完成竞争落败,run 已终态)→ 收尾 Wait 立即返回
+//     真实终态,不虚构取消结果(finalizeRun 先关 done 再清 active,active 已清
+//     ⇒ 终态已可读);
+//     ErrManagerClosed(宿主已关闭)→ 等待宿主关闭驱动的收敛结果(manager.
+//     Close 取消全部在途 Run 并等终态落盘);
+//     其他失败 → 不假设取消已发出,slog.Error 留痕(sessionID/runID/原因)并
+//     显式上抛,绝不静默吞掉(R2)——继续等待会在 Run 未收到取消信号时无限
+//     阻塞;
+//   - 有界收尾等待:以 cancelCleanupTimeout 为上限。窗口内终态落盘,「prompt
+//     返回 = run 完成」照旧成立;超时(典型:非协作式 Provider/Tool 不响应
+//     runCtx 取消)→ 以 cancellation_pending 错误显式返回,**不伪装已完成**
+//     (R1):run 继续在后台收敛,客户端可经 xgw run/get(RunStatus)或重启后
+//     恢复按 runID 查询真实终态。这是「同步 Prompt 恒等待至终态」的显式语义
+//     变更:无限等待使用户取消后 prompt 永不返回;活性让位于诚实性。
 //
 // 错误面:提交拒绝(ErrRunActive/ErrSessionNotFound 等)上抛;Run 执行结果与
-// 迁移前同型——res 进 debug 日志,handleAgent 恒返回 nil(CLI/ACP 错误面不变,
-// 取消路径亦然)。
+// 迁移前同型——res 进 debug 日志,取消收敛窗口内 handleAgent 返回 nil(CLI/
+// ACP 错误面不变);取消失败上抛与 cancellation_pending 超时是显式新增的错误
+// 形态(见上)。
+// cancelCleanupTimeout 是 Legacy 取消(请求 ctx 取消 → CancelRunSync 成功)后
+// 有界收尾等待的上限(第四轮评审 R1):窗口内 run 收敛终态则「prompt 返回 =
+// run 完成」照旧成立;超时以 cancellation_pending 显式返回,不伪装完成。10s 是
+// 示例配置而非所有 Provider 的统一 SLA——取消是协作式的,非协作式 Provider/
+// Tool(阻塞在不响应 ctx 的外部调用上)视为不支持有界取消,超时路径是它们的
+// 显式语义出口,run 的真实终态留给 RunStatus 查询面。
+const cancelCleanupTimeout = 10 * time.Second
+
 func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
 	// 最近一次会话 cwd 声明未通过 sandbox 边界校验 → 明确报错（无效声明语义，
 	// 见 SetSession）。/new /compact 等维护命令不受影响，只有真正的 prompt 被挡。
@@ -130,13 +219,38 @@ func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
 	res, waitErr := handle.Wait(reqCtx)
 	if waitErr != nil {
 		// Wait 仅以 ctx.Err() 失败(RunHandle.Wait 契约)⇒ 请求 ctx 已取消:
-		// Legacy 取消语义显式落地(§九 Adapter 形态)。
+		// Legacy 取消语义显式落地(§九 Adapter 形态)。取消结果分类(R2):只有
+		// 「取消已发出(成功)」与「可证实的幂等空操作」才继续收尾等待,其余
+		// 失败不假设取消已发出。
 		if cerr := p.CancelRunSync(rt.ID, handle.RunID); cerr != nil {
-			slog.Debug("agent: prompt cancel", "err", cerr, "run", handle.RunID)
+			switch {
+			case errors.Is(cerr, runtimeagent.ErrRunNotFound):
+				// 取消与完成竞争落败:对已终态 Run 的取消是幂等空操作。
+				// finalizeRun 先 run.finish 关 done 再清 active(runtime.go),
+				// Active() 已清 ⇒ 终态已落盘,收尾 Wait 立即返回真实终态。
+			case errors.Is(cerr, runtimeagent.ErrManagerClosed):
+				// 宿主已关闭:manager.Close 取消全部在途 Run 并等待终态落盘,
+				// 收尾等待消费的正是宿主关闭驱动的收敛结果。
+			default:
+				// 非预期失败(路由丢失等):取消是否落地不可知,继续等待可能在
+				// Run 未收到取消信号时无限阻塞。slog.Error 留痕(sessionID/
+				// runID/取消原因)并显式上抛,绝不静默吞掉、不伪装已取消(R2)。
+				slog.Error("agent: prompt cancel failed", "session", rt.ID, "run", handle.RunID, "err", cerr)
+				return fmt.Errorf("agent: cancel run %s in session %s after caller cancel: %w", handle.RunID, rt.ID, cerr)
+			}
 		}
-		// 换无取消上下文收尾:阻塞至 run 终态(终态 journal 落盘先于 done 关闭,
-		// finalizeRun 次序不变量)——「prompt 返回 = run 完成」在取消路径同样成立。
-		res, _ = handle.Wait(context.Background())
+		// 有界收尾等待(R1):换无取消上下文 + cancelCleanupTimeout 上限,等待
+		// run 终态落盘(终态 journal 落盘先于 done 关闭,finalizeRun 次序不变量)
+		// ——窗口内「prompt 返回 = run 完成」在取消路径同样成立;超时说明取消
+		// 未收敛(非协作式 Provider/Tool),以 cancellation_pending 显式返回,
+		// 绝不伪装已完成——run 继续在后台执行,真实终态经 RunStatus(RunID)
+		// 查询,或重启后由恢复面读取。
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), cancelCleanupTimeout)
+		res, waitErr = handle.Wait(cleanupCtx)
+		cancelCleanup()
+		if waitErr != nil {
+			return fmt.Errorf("run %s cancellation pending: %w", handle.RunID, waitErr)
+		}
 	}
 	slog.Debug("agent: run finished", "state", res.State, "persisted", res.Persisted, "err", res.Err)
 	return nil
