@@ -257,9 +257,11 @@ func (m *SessionManager) contextOf() context.Context {
 //     面,先于 finalizeRun 关闭 run.done),等待完成后再关 hub ⇒ 执行中的
 //     Publish 不可能写已关闭的 journal;Close 后 hub 一律拒绝新 Subscribe
 //     (ErrHubClosed),事件流随 manager 生命周期终结;
-//   - P2-7 起 daemon 在 Stop 时**不**调用它:同步路径(daemon 现状唯一调用
-//     形态)没有 manager 持有的 run,等待在途 prompt 反而拖慢停机——Stop 的
-//     收尾仍是各 store/repo 各自 Close,P5 StartRun 接入前端后再接线。
+//   - P2-7 曾约定 daemon Stop 不调用它（当时同步 RecordRun 是唯一调用形态，
+//     manager 不持有 run，等待在途 prompt 反而拖慢停机）；PR4 起 daemon 全部
+//     入口的 Run 都经 manager.StartRun 提交（runCtx 归宿主），PR5 起 daemon 的
+//     插件 Stop 调用本方法统一收口：取消收敛在飞 Run → 等待终态落盘 → 收口
+//     事件面，随后才关闭各 store/repo——Close 返回后无任何 Run 在写持久化句柄。
 func (m *SessionManager) Close() {
 	m.mu.Lock()
 	if m.closed { // 幂等:重复 Close 直接返回

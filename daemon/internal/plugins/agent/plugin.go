@@ -1,6 +1,13 @@
 // Package service 是 goworker 宿主侧的 /agent 插件适配器：把 ai-runtime 的 Session SDK
-// 装配成 model.Plugin 接入 daemon Engine。Session 本体在 ai-runtime/agent（SDK），
-// 这里只做资源装载（skill/MCP/memory/store/指令快照）、命令注册与生命周期管理。
+// 装配成 model.Plugin 接入 daemon Engine。重构后（总方案 §一/§八）本插件只负责
+// 三类事：① 组装与注册——资源装载（skill/MCP/memory/store/指令快照）、会话边界
+// 生命周期（startSession / /new 收口）、命令注册与 NewPlugin 内装配应用内唯一的
+// agentcontrol.Service（Application Control Plane）；② 兼容适配——SessionSource/
+// RunControlSource/ClientToolBinder 能力面对协议层的委托转发与 wire 扁平化
+// （runcontrol.go），无 Binding 调用方（CLI/stdio/测试）的 current 回落语义；
+// ③ 关闭——Stop 经 manager.Close 收口执行平面后回收 MCP/记忆/持久化句柄。
+// Run 控制编排（Lease fencing、幂等、审批授权）在 agentcontrol，执行在
+// ai-runtime/agent（SessionManager），本插件不实现核心业务用例（§二不变量 8）。
 package service
 
 import (
@@ -43,23 +50,20 @@ type AgentPlugin struct {
 	hub   *model.Hub
 	// manager 是多会话执行内核的注册表（§1.1 路由规则的解析点之一）：每个会话
 	// 一个 SessionRuntime（独占执行权 gate + 运行记账），经 startSession 注册。
-	// P0-4 阶段 runtime id 固定 "current" 单例，/new 重建时同 id 注册冲突、旧
-	// runtime 保留在册（归档固化窗口内仍可 Get 触达）；P1-3 起 id 换 store 的
-	// 真实 SessionID，新旧 runtime 以不同 id 共存。互斥不直接经过 manager——
-	// 命令一律经 currentSession() 解析出 runtime 再在其 gate 上排队。
+	// P1-3 起 id 取 store 的真实 SessionID，新旧 runtime 以不同 id 共存；PR4 起
+	// prompt 的 Run 提交直接经它（StartRunSync → manager.StartRun），维护类命令
+	// 经 withSession 的 binding 形态解析点在目标 runtime 的 gate 上排队。Stop 时
+	// 经 manager.Close 统一收口执行平面（PR5）。
 	manager *runtimeagent.SessionManager
-	// current 是当前会话的 runtime。atomic.Pointer:/new 在 REPL goroutine 上换
-	// 指针,ACP service 的 session/list|load 与各命令 handler 在别的 goroutine 上
+	// current 是「无 Binding 调用方的默认会话」(PR5 注释收窄;总方案 §六/§八:
+	// Plugin.CurrentSession → CLI/ACP SessionBinding 逐步淘汰后的兼容残留面)。
+	// atomic.Pointer:/new 在 REPL goroutine 上换指针,读方在别的 goroutine 上
 	// 读(评审 I4),裸指针读写是没有 happens-before 的数据竞争。会话本体经
-	// currentSession().Session() 取,不再单独持有裸 Session 指针(P0-4 起退役)。
-	//
-	// PR2(总方案 §六/§八)起它的定位收窄为「无 Binding 调用方的默认事实源」:
-	// 连接级会话选择迁往 SessionBinding(agentcontrol,FrontendHandler 每连接一
-	// 个,经 ctx 载体流入 withSession),标准 ACP 的会话执行路由 binding 优先、
-	// 空则回落本字段(CLI 命令、stdio、测试、后台 Run 的嵌套命令)。§八迁移表
-	// 「Plugin.CurrentSession → CLI/ACP SessionBinding,逐步淘汰」的第一步:本
-	// 字段仍被 /new、startSession、SetSession 等生命周期与无绑定路径消费,不是
-	// 立即删除,而是不再作为跨连接的会话事实源(§二不变量 6)。
+	// currentSession().Session() 取。PR2 起标准 ACP 的会话执行路由 binding 优先
+	// (连接级 SessionBinding 经 ctx 流入 sessionRuntimeIn),本字段只服务回落
+	// 路径:CLI 命令、stdio、测试、后台 Run 的嵌套命令,以及 /new、startSession、
+	// SetSession、RouteSession 的「current 优先」等生命周期与寻址消费点。它不再
+	// 是跨连接的会话事实源(§二不变量 6),也不是立即可删——回落路径仍需要它。
 	current atomic.Pointer[runtimeagent.SessionRuntime]
 	// deps 是 Session 的资源依赖，startSession 每次会话边界全量重建（含指令快照
 	// 与当前 store 注入），/new 经同一路径刷新后以新 deps 创建新会话。
@@ -390,6 +394,17 @@ func (p *AgentPlugin) Stop() error {
 	if p.hub != nil && p.hub.UnregisterCapability != nil {
 		p.hub.UnregisterCapability(model.SessionSourceCapability)
 	}
+	// 执行平面统一收口（PR5 Stop 接线，总方案 §十「Plugin Stop 不遗留失控
+	// goroutine、连接订阅或 Store 句柄」；P4 报备的「P5 再接线」）：manager.Close
+	// 取消宿主 runCtx——在飞 Run 不分同步/后台一律收敛为取消终态（runCtx 是
+	// 宿主 ctx 的子，PR4 起全部入口的 Run 都经 manager.StartRun 提交）——等待
+	// 全部 Run 终态落盘，再逐 runtime 收口事件枢纽（订阅通道随 hub 关闭）并清
+	// 注册表。必须先于下方 consolidate/store/repo 收尾：Close 返回 ⇒ 无任何 Run
+	// 在写 journal/conversation，持久化句柄关闭不与执行平面竞争。停机语义有界：
+	// 取消的落点是 execute 的 runCtx 分支，provider 调用随 ctx 中断（受 HTTP
+	// 客户端超时约束）；Close 幂等（Init 失败回滚路径尚无会话同样安全），Close
+	// 之后 Register/StartRun 一律 ErrManagerClosed——停机后不再接受新成员。
+	p.manager.Close()
 	// MCP server 是外部进程，退出时统一回收，避免残留孤儿进程
 	p.closeMCP()
 	if p.memory != nil {

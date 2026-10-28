@@ -15,33 +15,35 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// runcontrol.go 是 RunControlSource(P5-6)的 AgentPlugin 实现面:x-goworker 扩展
-// 协议(P5-7/P5-8 接线)消费的后台 Run 控制、审批直转、事件 attach 与 control
-// lease。
+// runcontrol.go 是 AgentPlugin 的控制面适配文件（PR5 重构后职责收口）：x-goworker
+// 扩展协议（P5-7/P5-8 接线）消费的 model.RunControlSource/ClientToolBinder 能力
+// 面在这里实现为对 agentcontrol.Service（plugin.go 装配，PR1 建立的控制平面）的
+// 薄委托 + wire 扁平化。执行编排（Lease fencing、(sessionID, requestID) 幂等
+// per-key single-flight、审批归属校验、事件订阅编排）全部在 agentcontrol 包；
+// 本文件不再维护任何 Lease 表、幂等表或事件订阅状态（原 reqMu/runRequests/
+// requestOrder/guardsMu/controlGuards 字段与 sessionControlGuard 实现随 PR1
+// 迁入 agentcontrol；Attach 具体句柄形态随 PR3 收敛为 Service.SubscribeEvents
+// 的订阅契约）。
 //
-// PR1(总方案 §四/§五/§八「建立 Application Control Plane」)起本文件是控制平面
-// 的「薄委托 + 兼容面」:StartRun/CancelRun/RunStatus/ResolveApproval 与 control
-// lease 四操作(Acquire/Release/Hold/ReleaseConnection)全部委托应用内唯一的
-// agentcontrol.Service(plugin.go 装配,§4.2)——Lease fencing、幂等 per-key
-// single-flight、审批归属校验的实现迁入该包,plugin 不再直接维护 Lease 和幂等表
-// (reqMu/runRequests/requestOrder/guardsMu/controlGuards 字段与实现随迁删除)。
-// 暂留本文件的面:ActiveRun/PendingApprovals(PR4 统一 Run 观测面时迁;事件
-// 订阅的 Attach 已随 PR3 收敛为 Service.SubscribeEvents 的订阅契约并整体迁入
-// agentcontrol,本文件只余委托)、CapabilityRegistry 面(UnbindCapabilities/CapabilityWaitTimeout/
-// ClientToolSource——总方案 §八:能力桥接不进控制层)。会话寻址与 journal 解析经
-// agentcontrol.SessionRouter/agentcontrol.JournalSource 窄接口注入(RouteSession/
-// RunJournal,接口定义在 agentcontrol)。
+// 为什么这些面留在插件而不进 agentcontrol（总方案 §三/§八 依赖方向）：
+//   - RouteSession/RunJournal：SessionRouter/JournalSource 窄接口的宿主实现——
+//     Service 经此取 current 权威路由与被路由会话的 journal，会话寻址语义属于
+//     调用入口，Service 不持有会话选择状态；
+//   - PendingApprovals/ActiveRun：wire 扁平化面——把 runtime 观测结构压成
+//     model.PendingApprovalInfo / agentcontrol.RunSnapshot，agent 包结构不进
+//     model，agentcontrol 也不得 import core/model（constraint_test.go 钉死）；
+//   - UnbindCapabilities/CapabilityWaitTimeout/ClientToolSource：CapabilityRegistry
+//     是 Runtime 执行过程的外部能力桥接（§八「能力桥接不进控制层」），只由
+//     控制层协调授权、不归其实现。
 //
-// 锁序变化:本文件不再持有幂等表锁与 guard 表锁(迁入 agentcontrol,锁序
-// lease.mu→registry.mu→manager 单向);fenced 控制操作的临界区在 Service 的
-// per-session lease 内,跨层锁序 h.mu→session lease 单向(DE2-I1 论证随方法
-// 整体迁入,guard 换名 lease,语义不变——lease 是叶锁,不回调 handler)。
+// 锁序：本文件不持有任何锁（委托面无状态；跨层锁序 lease.mu→registry.mu→
+// manager 单向、h.mu→session lease 单向，论证随方法迁入 agentcontrol）。
 //
-// 行为变化声明(PR1):委托面以下逐字保留原契约——错误 sentinel
+// 行为契约（PR1 起委托面以下逐字保留）：错误 sentinel
 // (ErrControlLeaseLost/ErrRequestConflict/ErrApprovalOwnership)与错误文案原样
-// 迁入 agentcontrol,ACP 协议面的 -32000 映射零感知;唯一计划内升级是幂等注册表
-// 的 per-key single-flight(§4.3:同键并发提交收敛为一次底层 StartRun,跨别名
-// 形态不再得 ErrRunActive,见 agentcontrol.RequestRegistry 论证)。
+// 在 agentcontrol 产生，ACP 协议面的 -32000 映射零感知；幂等注册表的 per-key
+// single-flight（§4.3）是唯一计划内升级。RecordRun（ai-runtime 的同步记账形态）
+// 在 daemon 无生产调用方（PR4 起 prompt 走 StartRunSync），仅存于 SDK 与测试。
 
 // RunControlSource 编译期断言(P5-6):AgentPlugin 满足可选能力接口,handler
 // 以 type-assert 获取(SessionSource 先例,capability.go:61-78)。
@@ -110,9 +112,9 @@ func (p *AgentPlugin) RunJournal(rt *runtimeagent.SessionRuntime) agentcontrol.R
 // 错误:包裹 manager 的 ErrSessionNotFound sentinel(errors.Is 可判,P5-7 协议
 // 面映射 -32000)。覆盖三种形态:任意未注册 id、/new 已收口的旧 id(诚实失败)、
 // 无活动 runtime(Init 未完成/失败回滚——原「no active session」并入同一语义,
-// 路由面 nil 即 not found)。供暂留本文件的 PendingApprovals 消费(Attach 随
-// PR3 迁入 agentcontrol,同语义 helper 在彼处);agentcontrol 内部有同语义
-// helper(错误文案与 sentinel 一致)。
+// 路由面 nil 即 not found)。供本文件的 PendingApprovals 与 plugin.go 的
+// sessionRuntimeIn 消费;agentcontrol 内部有同语义 helper(错误文案与 sentinel
+// 一致)。
 func sessionNotFoundErr(sessionID string) error {
 	return fmt.Errorf("agent: session %q: %w", sessionID, runtimeagent.ErrSessionNotFound)
 }
@@ -246,9 +248,9 @@ func (p *AgentPlugin) ReleaseConnection(connectionID string) {
 	p.control.ReleaseConnection(connectionID)
 }
 
-// PendingApprovals 实现 RunControlSource(P5-6;C3 修正;PR1 暂留 plugin,PR4
-// 随审批面收敛迁移):多会话路由 → manager 审批快照 → 扁平化为
-// model.PendingApprovalInfo。内部寻址用 rt.ID 而非调用方 sessionID:审批的
+// PendingApprovals 实现 RunControlSource(P5-6;C3 修正):多会话路由 → manager
+// 审批快照 → 扁平化为 model.PendingApprovalInfo(wire 扁平化留插件,见文件头
+// 依赖方向论证)。内部寻址用 rt.ID 而非调用方 sessionID:审批的
 // SessionID 归属是 StartRun 传入的 runtime id(纯内存下为 "current" 而调用方
 // 寻址空串),按 rt.ID 寻址在两种形态下都正确。未知会话在路由层已报
 // sessionNotFoundErr;已注册会话无审批返回空切片(manager.PendingApprovals 语义)。
@@ -279,8 +281,8 @@ func flattenPendingApprovals(pending []runtimeagent.PendingApproval) []model.Pen
 	return out
 }
 
-// SubscribeEvents 实现 RunControlSource(总方案 §七,PR3 收敛事件订阅接口;
-// PR1 暂留 plugin 的 Attach 随契约收敛迁出):事件订阅的完整编排(多会话路由 →
+// SubscribeEvents 实现 RunControlSource(总方案 §七,PR3 收敛事件订阅接口):
+// 事件订阅的完整编排(多会话路由 →
 // rt.EnsureHub(I3:journal 播种失败上抛)→ hub.Subscribe → 订阅后读
 // replayIntegrity(第四轮评审:不缓存旧状态)→ rt.Active() 快照)整体在
 // agentcontrol.Service 内完成,本层只做签名透传——返回订阅契约
@@ -292,8 +294,8 @@ func (p *AgentPlugin) SubscribeEvents(sessionID string, afterSeq uint64) (agentc
 	return p.control.SubscribeEvents(sessionID, afterSeq)
 }
 
-// ActiveRun 实现 RunControlSource(P5-8;第二轮评审 I1 修正;PR1 暂留 plugin,
-// PR4 随 Run 观测面收敛迁移):RouteSession 多会话路由 → rt.Active() 快照直转,
+// ActiveRun 实现 RunControlSource(P5-8;第二轮评审 I1 修正):RouteSession 多
+// 会话路由 → rt.Active() 快照直转(快照观察面留插件,见文件头),
 // 与 RunStatus 的 active 分支同源(同一观察点)。语义:无 runtime(未注册//
 // new 已收口)或无活动 run → ok=false——attach 响应的 currentRun=null 不是错误。
 // 本访问器只做快照观察,Attach 才是会话路由的权威校验面。
@@ -308,15 +310,14 @@ func (p *AgentPlugin) ActiveRun(sessionID string) (string, string, bool) {
 	return "", "", false
 }
 
-// UnbindCapabilities 实现 RunControlSource(P5-6;PR1 暂留 plugin——CapabilityRegistry
-// 是 Runtime 执行过程的外部能力桥接,不进控制层,总方案 §八):直转 manager 能力
-// 注册表的连接级解绑(P4-3 的 UnbindConnection;P5-9 起 handler.Close 断连收口
+// UnbindCapabilities 实现 RunControlSource(P5-6;CapabilityRegistry 能力桥接
+// 留插件,见文件头):直转 manager 能力注册表的连接级解绑(P4-3 的 UnbindConnection;P5-9 起 handler.Close 断连收口
 // 消费)。连接不存在时幂等空操作。
 func (p *AgentPlugin) UnbindCapabilities(connectionID string) {
 	p.manager.Capabilities().UnbindConnection(connectionID)
 }
 
-// CapabilityWaitTimeout 实现 RunControlSource(P5-6;PR1 暂留 plugin):cfg.Session.
+// CapabilityWaitTimeout 实现 RunControlSource(P5-6):cfg.Session.
 // CapabilityWaitTimeout(秒,P4-4 字段)秒化;<=0 → 45s 兜底(拍板③,硬约束
 // < ai-core 工具执行 60s——SDK defaultCapabilityWaitTimeout 的同值镜像);
 // >55s 钳到 maxCapabilityWaitTimeout 并 slog.Warn(P4 评审 issue2:硬约束
