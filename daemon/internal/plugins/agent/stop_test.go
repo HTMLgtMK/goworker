@@ -155,16 +155,194 @@ func TestStopIdempotentAfterClose(t *testing.T) {
 	}
 }
 
+// shutdownBarrierProvider 让 manager.Close 已经发出取消但仍停在 run.done 等待面，
+// 用于验证 Stop 必须先关闭维护入口，而不是等 manager.Close 返回后才关入口。
+type shutdownBarrierProvider struct {
+	started        chan struct{}
+	cancelObserved chan struct{}
+	release        chan struct{}
+	startOnce      sync.Once
+	cancelOnce     sync.Once
+}
+
+func (p *shutdownBarrierProvider) Name() string  { return "shutdown-barrier" }
+func (p *shutdownBarrierProvider) Model() string { return "m" }
+
+func (p *shutdownBarrierProvider) Chat(ctx context.Context, _ *core.ChatRequest) (*core.ChatResponse, error) {
+	p.startOnce.Do(func() { close(p.started) })
+	go func() {
+		<-ctx.Done()
+		p.cancelOnce.Do(func() { close(p.cancelObserved) })
+	}()
+	<-p.release // 故意忽略取消，保持 manager.Close 的等待面可观测
+	return &core.ChatResponse{Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: "shutdown-barrier"}}}}, nil
+}
+
+func (p *shutdownBarrierProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	return nil, errors.New("not implemented")
+}
+
+// TestStopClosesMaintenanceAdmissionBeforeManagerClose 验证 Stop 在 manager.Close
+// 仍等待 Run 时已经拒绝新的维护请求；否则请求会卡在同一个 Session Gate，无法
+// 证明「Stop 开始后不再接受」这一入口契约。
+func TestStopClosesMaintenanceAdmissionBeforeManagerClose(t *testing.T) {
+	provider := &shutdownBarrierProvider{
+		started:        make(chan struct{}),
+		cancelObserved: make(chan struct{}),
+		release:        make(chan struct{}),
+	}
+	p := newPersistedPlugin(t, provider)
+	releaseRun := sync.OnceFunc(func() { close(provider.release) })
+	t.Cleanup(releaseRun)
+	sid := p.CurrentSessionID()
+	p.AcquireControl(sid, "conn-stop-admission")
+	if _, _, err := p.StartRun(sid, "conn-stop-admission", "hello", "req-stop-admission"); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	select {
+	case <-provider.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background run did not start in time")
+	}
+
+	stopped := make(chan struct{})
+	go func() { _ = p.Stop(); close(stopped) }()
+	defer func() {
+		releaseRun()
+		select {
+		case <-stopped:
+		case <-time.After(10 * time.Second):
+			t.Error("Stop did not return in cleanup")
+		}
+	}()
+
+	// manager.Close 已调用宿主 cancel，但 provider 仍阻塞，所以 Stop 还没有
+	// 走完；这是一个确定的窗口，不靠调度时序猜测。
+	select {
+	case <-provider.cancelObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager.Close did not cancel the in-flight run")
+	}
+
+	maintenanceDone := make(chan error, 1)
+	go func() {
+		maintenanceDone <- p.withSession(context.Background(), func(context.Context) error { return nil })
+	}()
+	var maintenanceErr error
+	select {
+	case maintenanceErr = <-maintenanceDone:
+		if !errors.Is(maintenanceErr, errAgentStopping) {
+			t.Fatalf("maintenance request during manager.Close = %v, want errAgentStopping", maintenanceErr)
+		}
+	case <-stopped:
+		t.Fatal("Stop returned before the shutdown barrier was released")
+	case <-time.After(5 * time.Second):
+		t.Fatal("maintenance request was not rejected while manager.Close was waiting")
+	}
+	releaseRun()
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not return after releasing the run")
+	}
+}
+
+// gateAdmissionContext 在 AcquireRun 读取 Done 时发出屏障信号。withSession 的
+// 新顺序保证此刻请求已经 enter；测试借此证明请求虽尚未执行闭包，Stop 仍需排空。
+type gateAdmissionContext struct {
+	context.Context
+	admitted chan struct{}
+	once     sync.Once
+}
+
+func (c *gateAdmissionContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.admitted) })
+	return c.Context.Done()
+}
+
+// TestStopDrainsMaintenanceWaitingBehindRunGate 验证已在插件入口登记、但仍在
+// Run 持有的 Session Gate 前排队的维护请求：Run 收敛后它必须完成真实 store 写，
+// Stop 才能关闭持久化资源。
+func TestStopDrainsMaintenanceWaitingBehindRunGate(t *testing.T) {
+	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
+	p := newPersistedPlugin(t, gated)
+	sid := p.CurrentSessionID()
+	p.AcquireControl(sid, "conn-gate-drain")
+	if _, _, err := p.StartRun(sid, "conn-gate-drain", "hello", "req-gate-drain"); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	select {
+	case <-gated.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background run did not start in time")
+	}
+
+	ctx := &gateAdmissionContext{Context: context.Background(), admitted: make(chan struct{})}
+	maintenanceEntered := make(chan struct{})
+	maintenanceDone := make(chan struct{})
+	maintenanceRelease := make(chan struct{})
+	releaseMaintenance := sync.OnceFunc(func() { close(maintenanceRelease) })
+	t.Cleanup(releaseMaintenance)
+	var storeOpErr error
+	go func() {
+		_ = p.withSession(ctx, func(runCtx context.Context) error {
+			defer close(maintenanceDone)
+			close(maintenanceEntered)
+			<-maintenanceRelease
+			st := p.currentStoreIn(runCtx)
+			if st == nil {
+				storeOpErr = errors.New("maintenance closure: store resolved nil")
+				return storeOpErr
+			}
+			if _, err := st.Commit([]core.Message{{Role: "user", MsgID: "gate-drain-1", Content: "maintenance write behind run gate"}}); err != nil {
+				storeOpErr = err
+				return err
+			}
+			return nil
+		})
+	}()
+
+	select {
+	case <-ctx.admitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("maintenance request did not reach the Session Gate")
+	}
+	stopped := make(chan struct{})
+	go func() { _ = p.Stop(); close(stopped) }()
+
+	select {
+	case <-maintenanceEntered:
+	case <-stopped:
+		t.Fatal("Stop returned before the admitted maintenance closure ran")
+	case <-time.After(10 * time.Second):
+		t.Fatal("admitted maintenance request was not released after Run shutdown")
+	}
+	releaseMaintenance()
+	select {
+	case <-maintenanceDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("maintenance closure did not finish after release")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not return after draining admitted maintenance")
+	}
+	if storeOpErr != nil {
+		t.Fatalf("store write behind Session Gate failed during Stop: %v", storeOpErr)
+	}
+}
+
 // TestStopWaitsForInFlightMaintenance(S1 验收,第四轮评审):withSession 维护闭包
 // (/compact 等命令的执行面)持有 store 操作期间触发 Stop → store.Close 不早于
 // 维护操作完成。确定性交错(生产可达面:CLI stdin 信号路径在 Eval 在飞时即可
 // 进入 appl.Stop → Engine.StopAll → Plugin.Stop,Engine 层无排空屏障):
-//  1. 闭包在 gate 内登记完成(inFlight 已 Add)后挂起(close(entered) 钩子);
-//  2. Stop 并发启动(此刻起 inFlight closed,新维护回合被拒绝);
+//  1. 请求在 withSession 入口登记后，闭包在 gate 内挂起(close(entered) 钩子);
+//  2. Stop 并发启动(此刻起 inFlight admission closed,新维护回合被拒绝);
 //  3. 放行闭包 → 闭包对 store 真实 Commit——若 Stop 先于闭包关掉 store,
 //     Commit 以错误可观测(Store 关闭后 appendRecord 落在已关句柄上);
-//  4. Stop 返回后断言:闭包先于 Stop 返回完成(happens-before 经
-//     inFlight.wait 的 WaitGroup 建立:闭包 return → exit/Done → wait 返回
+//  4. Stop 返回后断言:闭包内部的生产操作已完成(happens-before 经
+//     inFlight.wait 的 WaitGroup 建立:闭包完成 → exit/Done → wait 返回
 //     → Stop 返回 → stopped 关闭),store 写成功,且重启文件视图可见写入。
 func TestStopWaitsForInFlightMaintenance(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "maint-stop"})
@@ -172,14 +350,17 @@ func TestStopWaitsForInFlightMaintenance(t *testing.T) {
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	closeRelease := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(closeRelease)
 	closureDone := make(chan struct{})
 	var storeOpErr error
 
-	// 模拟 /compact 的执行面:withSession 闭包持 gate + inFlight 登记,钩子处
-	// 挂起等待 Stop 进入收口,放行后做与 /compact 同型的真实 store 写。
+	// 模拟 /compact 的执行面:withSession 在追踪的维护闭包内挂起，放行后做
+	// 与 /compact 同型的真实 store 写。完成信号位于闭包内部，准确对应
+	// inFlight.exit 前的生产工作，而不是外围调用 goroutine 的调度。
 	go func() {
-		defer close(closureDone)
 		_ = p.withSession(context.Background(), func(runCtx context.Context) error {
+			defer close(closureDone)
 			close(entered)
 			<-release
 			st := p.currentStoreIn(runCtx)
@@ -201,21 +382,18 @@ func TestStopWaitsForInFlightMaintenance(t *testing.T) {
 		t.Fatal("maintenance closure did not enter withSession in time")
 	}
 
-	// Stop 并发启动;此刻闭包仍在飞(已登记)。闭包所有权归本测试:release 的
-	// close 用 Once 收口(正常路径与兜底分支都可能触达,双重 close 即 panic)。
-	releaseClosure := sync.OnceFunc(func() { close(release) })
 	stopped := make(chan struct{})
 	go func() { _ = p.Stop(); close(stopped) }()
 	select {
 	case <-stopped:
-		releaseClosure() // 兜底:Stop 不该先于闭包返回;放行防泄漏
+		closeRelease() // 兜底:Stop 不该先于闭包返回;放行防泄漏
 		<-closureDone
 		t.Fatal("Stop returned before the in-flight maintenance closure completed (inFlight wait missing?)")
 	case <-time.After(50 * time.Millisecond):
 		// Stop 尚未返回 = 修复的等待面在工作(非判定性早退检查,真正的判定
 		// 断言在下方 happens-before 检查)。
 	}
-	close(release) // 放行闭包:它与 Stop 的收尾步骤从此刻起真实并发
+	closeRelease() // 放行闭包:它与 Stop 的收尾步骤从此刻起真实并发
 	select {
 	case <-stopped:
 	case <-time.After(10 * time.Second):

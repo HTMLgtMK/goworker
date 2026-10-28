@@ -276,36 +276,54 @@ func TestHandleAgentBusyRejectedWhileRunInFlight(t *testing.T) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 第四轮评审 R1/R2 修复验收:Legacy 取消契约——CancelRunSync 结果分类 + 有界
 // 收尾等待。同步屏障/确定性编排,不用 time.Sleep 对齐:CancelRunSync 的失败
-// 注入经 SessionRouter 窄接口的测试替身(stubRouter,agentcontrol.Service 持
-// 接口、装配点 p.control 可换装)与 provider 闸门完成;换装 p.control 与
-// handleAgent 的读取之间经 gated.started / reqCtx 取消的 channel happens-before
-// 链同步(go execute → close(started) → 测试换装 → cancel() → close(done) →
-// Wait 返回),race 检测下无数据竞争。
+// 注入经 SessionRouter 窄接口的测试替身(stubRouter)与 provider 闸门完成；Service
+// 在 handleAgent 启动前固定，StartRunSync 走 normal 路由后再通过线程安全的模式切换
+// 注入 miss/barrier。channel happens-before 链(go execute → close(started) →
+// setMode → cancel() → close(done) → Wait 返回)在 race 检测下无数据竞争。
 // ─────────────────────────────────────────────────────────────────────────────
 
-// stubRouter 是 CancelRunSync 失败注入的确定性接缝(SessionRouter 单方法窄接口
-// 的测试替身):包裹真实 router(插件自任),按模式改写 RouteSession 返回——
-//   - miss 模式(allMiss):恒返 nil → CancelRunSync 路由失败,返回包裹
-//     ErrSessionNotFound 的非预期错误(handleAgent 分类表的 default 分支);
-//   - barrier 模式(proceed 非 nil):首个调用关闭 entered 并挂起在 proceed 上,
-//     给测试一个「handleAgent 已进 CancelRunSync、尚未读 rt.Active()」的确定性
-//     时序窗——测试在该窗内让 run 收敛终态后放行,manager.CancelRun 对已终态
-//     Run 必报 ErrRunNotFound(竞争落败分支);close(proceed) 后透传真实 router。
+// stubRouter 是 CancelRunSync 故障注入的确定性接缝(SessionRouter 窄接口的测试
+// 替身):Service 在 handleAgent 启动前就固定使用它，测试只在线程安全地切换路由
+// 模式。normal 模式保证 StartRunSync 走真实路由；miss 模式让取消路由失败；
+// barrier 模式在取消路由点挂起，给测试制造完成竞争窗口。
+type stubRouterMode uint8
+
+const (
+	stubRouterNormal stubRouterMode = iota
+	stubRouterMiss
+	stubRouterBarrier
+)
+
 type stubRouter struct {
 	real    agentcontrol.SessionRouter
-	allMiss bool
+	mu      sync.RWMutex
+	mode    stubRouterMode
 	entered chan struct{}
 	proceed chan struct{}
 	once    sync.Once
 }
 
+func (r *stubRouter) setMode(mode stubRouterMode) {
+	r.mu.Lock()
+	r.mode = mode
+	r.mu.Unlock()
+}
+
+func (r *stubRouter) currentMode() stubRouterMode {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.mode
+}
+
 func (r *stubRouter) RouteSession(sessionID string) *runtimeagent.SessionRuntime {
-	if r.proceed != nil {
-		r.once.Do(func() { close(r.entered) })
-		<-r.proceed
-	}
-	if r.allMiss {
+	switch r.currentMode() {
+	case stubRouterMiss:
 		return nil
+	case stubRouterBarrier:
+		if r.proceed != nil {
+			r.once.Do(func() { close(r.entered) })
+			<-r.proceed
+		}
 	}
 	return r.real.RouteSession(sessionID)
 }
@@ -434,6 +452,11 @@ func TestHandleAgentCancelUnexpectedErrorPropagates(t *testing.T) {
 
 	reqCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Service/router 在 handleAgent 启动前固定，避免运行中替换 p.control 形成
+	// 脆弱的字段发布契约；路由先保持 normal，待 StartRunSync 已经正常开工后
+	// 再切到 miss 只影响取消路径。
+	router := &stubRouter{real: p}
+	p.control = agentcontrol.NewService(p.manager, router, p)
 	done := make(chan error, 1)
 	go func() {
 		done <- p.handleAgent(&model.Context{
@@ -453,9 +476,8 @@ func TestHandleAgentCancelUnexpectedErrorPropagates(t *testing.T) {
 	}
 	runID := run.ID
 
-	// 提交走真实 control 面,开工后换装 miss router:此后 CancelRunSync 的路由
-	// 必失败(sessionNotFoundErr,R2 的非预期错误形态)。
-	p.control = agentcontrol.NewService(p.manager, &stubRouter{real: p, allMiss: true}, p)
+	// StartRunSync 已经走过 stable normal router；这里只切换取消路由模式。
+	router.setMode(stubRouterMiss)
 	cancel()
 	select {
 	case err := <-done:
@@ -502,6 +524,9 @@ func TestHandleAgentCancelRunNotFoundRaceReadsRealTerminalState(t *testing.T) {
 
 	reqCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// 固定同一个 Service；StartRunSync 先用 normal 路由，取消路径再切到 barrier。
+	router := &stubRouter{real: p, entered: make(chan struct{}), proceed: make(chan struct{})}
+	p.control = agentcontrol.NewService(p.manager, router, p)
 	done := make(chan error, 1)
 	go func() {
 		done <- p.handleAgent(&model.Context{
@@ -521,10 +546,8 @@ func TestHandleAgentCancelRunNotFoundRaceReadsRealTerminalState(t *testing.T) {
 	}
 	runID := run.ID
 
-	// barrier router:首个 RouteSession(即取消路径的路由点)挂起,给测试
-	// 「Wait(reqCtx) 已因取消返回、CancelRunSync 尚未读 Active()」的时序窗。
-	router := &stubRouter{real: p, entered: make(chan struct{}), proceed: make(chan struct{})}
-	p.control = agentcontrol.NewService(p.manager, router, p)
+	// StartRunSync 已经正常开工；只切换取消路径的 barrier 模式。
+	router.setMode(stubRouterBarrier)
 
 	cancel() // Wait(reqCtx) → Canceled → CancelRunSync → RouteSession 挂起
 	select {

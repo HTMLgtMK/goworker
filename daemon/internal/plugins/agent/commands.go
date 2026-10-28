@@ -37,25 +37,24 @@ type sessionGateKey struct{}
 // ErrManagerClosed 同一语义家族：停机后不再接受新成员。
 var errAgentStopping = errors.New("agent: plugin is stopping")
 
-// inFlightTracker 是插件级在飞维护命令计数（S1，第四轮评审）：/new /compact
-// /usage /history /task /rewind 等 withSession 闭包不是 AgentRun、不在 manager
+// inFlightTracker 是插件级在途维护请求计数（S1，第四轮评审）：/new /compact
+// /usage /history /task /rewind 等 withSession 请求不是 AgentRun、不在 manager
 // 活跃集内，manager.Close 不等它们——Engine 层也没有「停止接受→排空 Eval」
 // 屏障（engine.go StopAll 只逆序调用各插件 Stop；CLI stdin 信号路径在 Eval 在飞
 // 时即可触发 appl.Stop，ACP 的 prompt 排空只覆盖 session/prompt 一条路）。
-// 因此插件自带第二道屏障：闭包在 gate 内登记，Stop 在 manager.Close 之后、
-// MCP/记忆/Store 收尾之前 wait 全部在飞闭包，闭包内的 store/记忆访问不与收尾
-// 竞争。计数与 closed 标志同锁（mu）：closed 后 enter 一律拒绝，保证 Wait 与
-// Add 永不并发（WaitGroup 的「计数从零开始的 Add 必须先于 Wait」纪律，否则
-// Wait 的返回可与并发 Add 竞争）。零值可用（测试直接构造 AgentPlugin 的字面量
-// 无需感知）；嵌套 Eval（owner == p 重入）不计数——那些闭包跑在 Run goroutine
-// 内，已由 manager.Close 的 run.done 等待面覆盖。
+// 因此插件自带第二道屏障：外部请求在进入 Session 解析前登记，Stop 先关闭登记
+// 入口，manager.Close 后再等待全部已登记请求，最后才收尾 MCP/记忆/Store。计数与
+// closed 标志同锁（mu）：closed 后 enter 一律拒绝，保证 closeAdmission 与 enter
+// 全序，WaitGroup 的 Add 永不与 Wait 的零计数边界竞争。零值可用（测试直接构造
+// AgentPlugin 的字面量无需感知）；嵌套 Eval（owner == p 重入）不计数——那些闭包
+// 跑在 Run goroutine 内，已由 manager.Close 的 run.done 等待面覆盖。
 type inFlightTracker struct {
 	mu     sync.Mutex
 	wg     sync.WaitGroup
 	closed bool
 }
 
-// enter 登记一个在飞维护命令；Stop 已开始收口（closed）时拒绝并返回 false。
+// enter 登记一个外部在途维护请求；Stop 已关闭入口（closed）时拒绝并返回 false。
 func (f *inFlightTracker) enter() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -69,16 +68,17 @@ func (f *inFlightTracker) enter() bool {
 // exit 摘除登记；必须与成功的 enter 一一配对（调用方以 defer 持有）。
 func (f *inFlightTracker) exit() { f.wg.Done() }
 
-// wait 先置 closed（此后 enter 一律拒绝，不再有新 Add）再等待全部在飞闭包返回。
-// 幂等（closed 幂等 + WaitGroup.Wait 幂等）；仅 Stop 调用，调用方保证自身只在
-// 收口路径上执行。不设超时：与 manager.Close 同语义——取消是协作式的，闭包
-// 的落点（store 写/LLM 调用受 HTTP 客户端超时约束）最终自会返回。
-func (f *inFlightTracker) wait() {
+// closeAdmission 关闭新的维护请求入口但不等待既有请求。幂等；与 enter 使用
+// 同一把锁，保证请求要么在关闭前完成登记、要么被拒绝。
+func (f *inFlightTracker) closeAdmission() {
 	f.mu.Lock()
 	f.closed = true
 	f.mu.Unlock()
-	f.wg.Wait()
 }
+
+// wait 只等待已经登记的维护请求；入口必须先由 closeAdmission 关闭。这里不持有
+// tracker 锁，避免 Stop 等待请求或 manager 时形成锁环。幂等。
+func (f *inFlightTracker) wait() { f.wg.Wait() }
 
 // withSession 在本命令回合解析出的会话 runtime 的独占执行权下运行 run(PR2 起
 // 解析 binding 优先,总方案 §六):解析点 sessionRuntimeIn——ctx 携带连接级
@@ -100,19 +100,25 @@ func (f *inFlightTracker) wait() {
 // 仍无活动 runtime:Init 未完成/失败回滚)时报错;Binding 悬空(会话已被 /new
 // 收口)诚实报 session not found,不回落 current。
 //
-// S1(第四轮评审):gate 内闭包还向 p.inFlight 登记在飞计数——闭包不是
-// AgentRun、不在 manager.Close 的等待面内,Stop 在 manager.Close 之后
-// wait 该计数,保证闭包内的 store/记忆访问先于 Stop 的持久化句柄收尾;
-// 收口开始后的新维护回合以 errAgentStopping 诚实拒绝(嵌套重入不计数,
-// 由 manager.Close 的 run 等待面覆盖)。
+// S1(第四轮评审):外部请求在解析会话与获取 gate 前向 p.inFlight 登记——等待
+// Session Gate 的请求也属于插件入口生命周期，Stop 必须等它们完成。嵌套重入
+// 不登记，由 manager.Close 的 run 等待面覆盖。
 func (p *AgentPlugin) withSession(ctx context.Context, run func(context.Context) error) error {
 	// nil ctx 归一(既有测试直接构造 Context 不带 Ctx):按无绑定处理。
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Run 内部嵌套 Eval 已经持有 Session Gate，必须绕过 tracker 和再次排队；这类
+	// 闭包属于 manager 管理的 Run 生命周期，manager.Close 会等待其 run.done。
 	if owner, _ := ctx.Value(sessionGateKey{}).(*AgentPlugin); owner == p {
 		return run(ctx)
 	}
+	// 外部维护请求在插件入口即被接受/拒绝，不能等拿到 Session Gate 后才登记。
+	if !p.inFlight.enter() {
+		return errAgentStopping
+	}
+	defer p.inFlight.exit()
+
 	rt, err := p.sessionRuntimeIn(ctx)
 	if err != nil {
 		return err
@@ -125,15 +131,6 @@ func (p *AgentPlugin) withSession(ctx context.Context, run func(context.Context)
 		return err
 	}
 	defer release()
-	// S1 登记(必须先于闭包执行、晚于 gate 获取:登记失败的拒绝不携带任何会话
-	// 状态突变,defer release 把 gate 还回去)。Stop 的 wait 与本登记经
-	// inFlightTracker.mu 全序:要么闭包先登记(Stop 等它跑完才收尾持久化句柄),
-	// 要么 closed 先置位(本回合被拒绝,不触碰 store/记忆)——不存在闭包在飞而
-	// Stop 已关 store 的中间态。
-	if !p.inFlight.enter() {
-		return errAgentStopping
-	}
-	defer p.inFlight.exit()
 	return run(injectResolvedSession(context.WithValue(ctx, sessionGateKey{}, p), rt))
 }
 
