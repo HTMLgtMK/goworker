@@ -67,7 +67,7 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 
 	// 1. 第一轮 /agent
 	var out strings.Builder
-	if err := s.Run(context.Background(), agent.RunRequest{Input: "question one"}, e2eRunCallbacks(&out)); err != nil {
+	if _, err := s.Run(context.Background(), agent.RunRequest{Input: "question one"}, e2eRunCallbacks(&out)); err != nil {
 		t.Fatalf("Run 1: %v", err)
 	}
 	// jsonl 应有消息行 + 自动 checkpoint
@@ -80,7 +80,7 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 	}
 
 	// 2. 第二轮（累积消息）
-	if err := s.Run(context.Background(), agent.RunRequest{Input: "question two"}, e2eRunCallbacks(&out)); err != nil {
+	if _, err := s.Run(context.Background(), agent.RunRequest{Input: "question two"}, e2eRunCallbacks(&out)); err != nil {
 		t.Fatalf("Run 2: %v", err)
 	}
 

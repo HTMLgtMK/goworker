@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -32,6 +33,12 @@ type Metadata struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// ErrStoreLocked 表示会话目录的跨进程文件锁已被占用：另一进程（或本进程的
+// 另一实例）正持有该目录的 Store。总方案第九节「多进程同时打开同一 Session
+// 时拒绝第二个写者」——宁拒勿双写。调用方用 errors.Is 判定；非 unix 平台为
+// 无锁桩（lock_other.go），不会返回该错误。
+var ErrStoreLocked = errors.New("session: store is locked by another holder")
+
 // Store 管理会话的 jsonl 持久化存储。
 type Store struct {
 	mu sync.Mutex
@@ -40,6 +47,7 @@ type Store struct {
 	dir  string // 会话目录
 
 	file *os.File // 追加写入句柄，Open 后保持打开
+	lock *os.File // 跨进程文件锁句柄（flock on <dir>/lock，unix；非 unix 恒 nil）
 
 	recs     []Record // 全部记录（仅加载时填充，后续追加写文件不维护内存全量——但为了回溯便捷保留）
 	metadata Metadata
@@ -48,6 +56,10 @@ type Store struct {
 }
 
 // Open 打开或创建 dir 下的会话存储。目录不存在则创建，jsonl 文件不存在则新建。
+// 目录就绪后对 dir 加跨进程排它文件锁（flock，LOCK_EX|LOCK_NB，见 lock_unix.go）：
+// 已被占用（另一进程或本进程的另一实例正持有）→ ErrStoreLocked，第二写者被拒绝
+// （宁拒勿双写）。锁随 Store 生命周期持有，Close 释放；锁文件常驻不删除
+// （unlink 竞态，见 lock_unix.go 文件头）。
 func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("session: create dir %s: %w", dir, err)
@@ -59,22 +71,50 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 
+	// 跨进程文件锁：目录就绪后、接触任何会话数据前持有。
+	lock, err := acquireDirLock(dir)
+	if err != nil {
+		return nil, err
+	}
+
 	path := filepath.Join(dir, "current.jsonl")
 
-	// 加载已有记录
-	recs, err := loadRecords(path)
+	// 加载已有记录（lastGoodEnd = 最后一条合法记录行末偏移，见 loadRecords）
+	recs, lastGoodEnd, err := loadRecords(path)
 	if err != nil {
+		_ = releaseDirLock(lock)
 		return nil, fmt.Errorf("session: load %s: %w", path, err)
 	}
 
 	// 以 append 模式打开文件句柄
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
+		_ = releaseDirLock(lock)
 		return nil, fmt.Errorf("session: open file %s: %w", path, err)
 	}
 	if err := f.Chmod(0o600); err != nil {
 		f.Close()
+		_ = releaseDirLock(lock)
 		return nil, fmt.Errorf("session: restrict file %s: %w", path, err)
+	}
+
+	// 崩溃恢复：文件在最后一条合法记录之后还有剩余字节 → 末尾是无法解析的
+	// 尾行（appendRecord 单次 Write 写到一半崩溃留下的部分行）→ 截断回最后
+	// 一条合法记录并落盘。lastGoodEnd 语义保证只有「坏行是最后一行」才触发：
+	// 中部坏行之后还有合法记录时 lastGoodEnd == 文件大小，不截断——中部坏行
+	// 维持 loadRecords 的跳过语义不动（纯追加原则，文件头注释）。
+	if info, statErr := f.Stat(); statErr == nil && info.Size() > lastGoodEnd {
+		if truncErr := f.Truncate(lastGoodEnd); truncErr != nil {
+			f.Close()
+			_ = releaseDirLock(lock)
+			return nil, fmt.Errorf("session: repair partial tail %s: %w", path, truncErr)
+		}
+		if syncErr := f.Sync(); syncErr != nil {
+			f.Close()
+			_ = releaseDirLock(lock)
+			return nil, fmt.Errorf("session: sync repaired tail %s: %w", path, syncErr)
+		}
+		slog.Warn("session: repaired partial tail", "path", path, "offset", lastGoodEnd)
 	}
 
 	metadata, hasMetadata := metadataFromRecords(recs)
@@ -108,10 +148,13 @@ func Open(dir string) (*Store, error) {
 		metadataRec := newMetadataRecord(metadata.SessionID, metadata.CreatedAt)
 		if err := s.appendRecord(metadataRec); err != nil {
 			_ = f.Close()
+			_ = releaseDirLock(lock)
 			return nil, fmt.Errorf("session: persist metadata: %w", err)
 		}
 		s.recs = append(s.recs, metadataRec)
 	}
+	// 全部失败路径已走完，锁句柄移交 Store（Close 时经 releaseLockLocked 释放）。
+	s.lock = lock
 
 	// 扫描最后出现的 head / cursor
 	for i := len(s.recs) - 1; i >= 0; i-- {
@@ -130,7 +173,7 @@ func Open(dir string) (*Store, error) {
 	return s, nil
 }
 
-// Close 关闭文件句柄，释放资源。
+// Close 关闭文件句柄并释放目录文件锁，释放资源。对未持锁/已关闭的 Store 幂等。
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -140,9 +183,27 @@ func (s *Store) Close() error {
 			slog.Warn("session: sync on close failed", "err", err)
 		}
 		if err := s.file.Close(); err != nil {
+			_ = s.releaseLockLocked()
 			return fmt.Errorf("session: close file: %w", err)
 		}
 		s.file = nil
+	}
+	if err := s.releaseLockLocked(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// releaseLockLocked 释放目录文件锁（LOCK_UN）并关闭锁句柄，调用方必须持有
+// s.mu。幂等：lock 为 nil（未持锁、非 unix 无锁桩或已释放）时为 no-op。
+func (s *Store) releaseLockLocked() error {
+	if s.lock == nil {
+		return nil
+	}
+	err := releaseDirLock(s.lock)
+	s.lock = nil
+	if err != nil {
+		return fmt.Errorf("session: release lock: %w", err)
 	}
 	return nil
 }
@@ -447,6 +508,7 @@ func (s *Store) AdvanceCursor(id string) error {
 }
 
 // Archive 将 current.jsonl 重命名为 archive/<timestamp>.jsonl，然后打开带有新 metadata 的 current 文件。
+// 跨进程文件锁（s.lock）不随轮转释放：Archive 只轮转数据文件，会话目录仍由本 Store 独占持有。
 func (s *Store) Archive() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -705,36 +767,71 @@ func (s *Store) remapCursor(retainIDs []string, cloneMap map[string]string, last
 // ── 文件操作 ──────────────────────────────────────────────────────────
 
 // loadRecords 从 jsonl 文件加载全部记录，坏行跳过并 warn。
-func loadRecords(path string) ([]Record, error) {
+// 除记录外返回 lastGoodEnd：最后一条合法记录行末的字节偏移（含行尾 '\n'，即
+// 下一条记录应写入的位置；无任何合法记录时为 0）。若文件末尾一行（或半行）
+// 无法解析——进程在 appendRecord 写入中途崩溃留下的部分行——lastGoodEnd 停在
+// 该坏行之前，Open 据此把文件截断回最后一条合法记录；坏行若在文件中部（其后
+// 还有合法记录），lastGoodEnd 会越过它并与文件大小相等，Open 不做任何截断，
+// 中部坏行维持跳过语义（纯追加原则，文件头注释）。文件在最后一条合法记录之后
+// 只剩空白字节时同样会触发截断（本存储从不写空行，此为无害的手工修复）。
+func loadRecords(path string) (recs []Record, lastGoodEnd int64, err error) {
+	lastGoodEnd, err = scanJSONL(path, func(line []byte, lineEnd int64) bool {
+		var r Record
+		if uerr := json.Unmarshal(line, &r); uerr != nil {
+			slog.Warn("session: skip bad jsonl line", "err", uerr, "line_preview", truncate(string(line), 80))
+			return false
+		}
+		recs = append(recs, r)
+		return true
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return recs, lastGoodEnd, nil
+}
+
+// scanJSONL 是 loadRecords 与 run journal 解析（journal.go loadStateRecords）
+// 共用的行扫描骨架：单行最大 1MB，超出视为坏行（由 handle 返回 false 跳过）；
+// 空行跳过。对每个非空行调用 handle(line, lineEnd)，handle 返回 true 表示该行
+// 为合法记录。返回 lastGoodEnd：最后一条合法记录行末的字节偏移（含行尾 '\n'，
+// 即下一条记录应写入的位置；无任何合法记录时为 0）。文件末行无 '\n' 时该行的
+// lineEnd 报到 size+1，循环后统一钳回文件大小（该行合法即无截断需求，钳回后
+// 恰为行末）。扫描 I/O 错误返回 err，此时 lastGoodEnd 为 0。
+func scanJSONL(path string, handle func(line []byte, lineEnd int64) bool) (int64, error) {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
-		return nil, nil
+		return 0, nil
 	}
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	defer f.Close()
 
-	var recs []Record
+	var pos int64 // 已扫描过的字节偏移（行内容 + 行尾分隔符）
+	var lastGoodEnd int64
 	sc := bufio.NewScanner(f)
-	// 单行最大 1MB，超出视为坏行跳过
 	sc.Buffer(make([]byte, 64*1024), 1<<20)
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
+		// Scanner 消费行内容与行尾 '\n'；文件末行无 '\n' 时下面的 +1 会把
+		// lineEnd 报到 size+1，循环后统一钳回文件大小（该行内容合法即无截断
+		// 需求，钳回后恰为行末）。
+		lineEnd := pos + int64(len(sc.Bytes())) + 1
+		pos = lineEnd
 		if len(line) == 0 {
 			continue
 		}
-		var r Record
-		if err := json.Unmarshal(line, &r); err != nil {
-			slog.Warn("session: skip bad jsonl line", "err", err, "line_preview", truncate(string(line), 80))
-			continue
+		if handle(line, lineEnd) {
+			lastGoodEnd = lineEnd
 		}
-		recs = append(recs, r)
 	}
 	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("scan %s: %w", path, err)
+		return 0, fmt.Errorf("scan %s: %w", path, err)
 	}
-	return recs, nil
+	if info, statErr := f.Stat(); statErr == nil && lastGoodEnd > info.Size() {
+		lastGoodEnd = info.Size()
+	}
+	return lastGoodEnd, nil
 }
 
 // truncate 按 rune 截断字符串到 max 长度，中文安全。max <= 0 不截断（防 slice 越界 panic）。

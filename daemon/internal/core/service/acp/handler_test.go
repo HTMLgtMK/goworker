@@ -13,6 +13,7 @@ import (
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
@@ -394,54 +395,141 @@ func decodeCaps(t *testing.T, raw string) protocol.ClientCapabilities {
 	return caps
 }
 
-// TestPromptInjectsDeviceToolSourceWhenCapable：对端声明 x-device 且提供 Call
-// 通道时，Prompt 注入惰性工具源；调用即 probe，工具带 sys_ 前缀。
-func TestPromptInjectsDeviceToolSourceWhenCapable(t *testing.T) {
-	reporter := &capsReporter{caps: decodeCaps(t, `{"x-device": {"tools": true}}`)}
-	var (
-		mu      sync.Mutex
-		toolSrc func(context.Context) []core.Tool
-	)
-	handler := &FrontendHandler{
-		evaluate: func(ctx *model.Context, _ string) error {
-			mu.Lock()
-			toolSrc = ctx.ToolSource
-			mu.Unlock()
-			return nil
-		},
-		gate: NewSessionGate(),
-	}
-	if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	if _, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
-		t.Fatalf("Prompt: %v", err)
-	}
-
-	mu.Lock()
-	ts := toolSrc
-	mu.Unlock()
-	if ts == nil {
-		t.Fatal("Prompt did not inject ToolSource for x-device capable reporter")
-	}
-	tools := ts(context.Background())
-	if len(tools) != 1 {
-		t.Fatalf("tool source returned %d tools, want 1", len(tools))
-	}
-	if tools[0].Name != "sys_vibrate" {
-		t.Fatalf("tool name = %q, want sys_vibrate", tools[0].Name)
-	}
+// binderSessionSource 在 fakeSessionSource 之上实现 model.ClientToolBinder
+// （P5-9）：记录 handler 转发来的 connectionID 与 caller，工具源由测试注入。
+// 真实 binder（AgentPlugin）的编排面在 plugins/agent 的集成测试；此处钉
+// handler 的接线契约：能力门控在前 → binder 优先 → type-assert 失败回落 relay。
+type binderSessionSource struct {
+	fakeSessionSource
+	mu       sync.Mutex
+	lastConn string
+	lastCall model.DeviceCaller
+	source   func(context.Context) []core.Tool
 }
 
-// TestPromptOmitsDeviceToolSourceWithoutCapability：能力门控的两个否定分支 ——
-// caps 不含 x-device，或 reporter 没有反向 Call 通道，都必须零注入、零往返。
+func (b *binderSessionSource) ClientToolSource(connectionID string, caller model.DeviceCaller) func(context.Context) []core.Tool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.lastConn = connectionID
+	b.lastCall = caller
+	return b.source
+}
+
+func (b *binderSessionSource) consulted() (string, model.DeviceCaller) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastConn, b.lastCall
+}
+
+// TestPromptInjectsDeviceToolSourceWhenCapable：对端声明 x-device 且提供 Call
+// 通道时，Prompt 注入惰性工具源。P5-9 两个后端形态：
+//   - sessions 实现 model.ClientToolBinder → 走能力代理面（handler 的
+//     connectionID 与 reporter 的 Call 通道转发给 binder，工具源即 binder 产出）；
+//   - 未实现（纯 SessionSource 测试桩/无 sessions）→ 回落原始 relay 路径
+//     （调用即 probe，工具带 sys_ 前缀）——测试桩兼容语义。
+func TestPromptInjectsDeviceToolSourceWhenCapable(t *testing.T) {
+	reporter := &capsReporter{caps: decodeCaps(t, `{"x-device": {"tools": true}}`)}
+
+	t.Run("binder backend takes priority", func(t *testing.T) {
+		binder := &binderSessionSource{
+			source: func(context.Context) []core.Tool {
+				// 哨兵工具：只有 binder 产出的源能返回它，证明 ToolSource 来自
+				// binder 而非回落路径。
+				return []core.Tool{{Name: "binder-sentinel", Metadata: map[string]string{"goworker.capability_wait": "true"}}}
+			},
+		}
+		var (
+			mu      sync.Mutex
+			toolSrc func(context.Context) []core.Tool
+		)
+		handler := &FrontendHandler{
+			evaluate: func(ctx *model.Context, _ string) error {
+				mu.Lock()
+				toolSrc = ctx.ToolSource
+				mu.Unlock()
+				return nil
+			},
+			sessions:     binder,
+			gate:         NewSessionGate(),
+			connectionID: "conn-test",
+		}
+		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		if _, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt: %v", err)
+		}
+
+		mu.Lock()
+		ts := toolSrc
+		mu.Unlock()
+		if ts == nil {
+			t.Fatal("Prompt did not inject ToolSource for x-device capable reporter with a binder backend")
+		}
+		tools := ts(context.Background())
+		if len(tools) != 1 || tools[0].Name != "binder-sentinel" {
+			t.Fatalf("tool source = %+v, want the binder-produced sentinel tool", tools)
+		}
+		if conn, caller := binder.consulted(); conn != "conn-test" || caller == nil {
+			t.Fatalf("binder consulted with (conn=%q, caller=%v), want (\"conn-test\", non-nil reporter Call channel)", conn, caller)
+		}
+	})
+
+	t.Run("raw relay fallback without binder", func(t *testing.T) {
+		var (
+			mu      sync.Mutex
+			toolSrc func(context.Context) []core.Tool
+		)
+		handler := &FrontendHandler{
+			evaluate: func(ctx *model.Context, _ string) error {
+				mu.Lock()
+				toolSrc = ctx.ToolSource
+				mu.Unlock()
+				return nil
+			},
+			gate: NewSessionGate(),
+		}
+		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		if _, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt: %v", err)
+		}
+
+		mu.Lock()
+		ts := toolSrc
+		mu.Unlock()
+		if ts == nil {
+			t.Fatal("Prompt did not inject ToolSource for x-device capable reporter")
+		}
+		tools := ts(context.Background())
+		if len(tools) != 1 {
+			t.Fatalf("tool source returned %d tools, want 1", len(tools))
+		}
+		if tools[0].Name != "sys_vibrate" {
+			t.Fatalf("tool name = %q, want sys_vibrate", tools[0].Name)
+		}
+	})
+}
+
+// TestPromptOmitsDeviceToolSourceWithoutCapability：能力门控的否定分支 ——
+// caps 不含 x-device、reporter 没有反向 Call 通道、或后端是 binder 但 caps
+// 未声明 x-device，都必须零注入、零往返；binder 路径同样先过 caps 门（未声明
+// 的客户端 VS Code 等零变化，binder 不被征询）。
 func TestPromptOmitsDeviceToolSourceWithoutCapability(t *testing.T) {
+	notConsulted := &binderSessionSource{
+		source: func(context.Context) []core.Tool {
+			return []core.Tool{{Name: "binder-sentinel"}}
+		},
+	}
 	tests := []struct {
 		name     string
 		reporter aiacp.Reporter
+		sessions model.SessionSource
 	}{
 		{name: "caps without x-device", reporter: &capsReporter{caps: decodeCaps(t, `{"fs": {"readTextFile": true}}`)}},
 		{name: "reporter without Call channel", reporter: &recordingReporter{}},
+		{name: "binder backend but caps without x-device", reporter: &capsReporter{caps: decodeCaps(t, `{"fs": {"readTextFile": true}}`)}, sessions: notConsulted},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -456,7 +544,9 @@ func TestPromptOmitsDeviceToolSourceWithoutCapability(t *testing.T) {
 					mu.Unlock()
 					return nil
 				},
-				gate: NewSessionGate(),
+				sessions:     tc.sessions,
+				gate:         NewSessionGate(),
+				connectionID: "conn-omit",
 			}
 			if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, tc.reporter); err != nil {
 				t.Fatalf("CreateSession: %v", err)
@@ -471,13 +561,17 @@ func TestPromptOmitsDeviceToolSourceWithoutCapability(t *testing.T) {
 			if ts != nil {
 				t.Fatal("ToolSource must be nil without x-device capability")
 			}
+			if conn, _ := notConsulted.consulted(); conn == "conn-omit" {
+				t.Fatal("binder must not be consulted without x-device capability")
+			}
 		})
 	}
 }
 
-// TestPromptSupersededSessionGuard 单活动会话模型的诚实守卫：两条连接共享同一
-// SessionSource（与装配层接线一致），后声明者顶掉先声明者。fake 的 SetSession
-// 无条件转移 active，cwd 校验与「无效声明不顶掉」语义归 AgentPlugin 侧测试。
+// TestPromptSupersededSessionGuard 连接级 superseded 守卫(PR2 语义变更,总方案
+// §六:会话选择属于调用入口):每连接只认自己的声明——其他连接的 session/new|load
+// 不再顶掉本连接;本连接重声明后的旧 id 仍诚实报错。fake 的 SetSession 无条件
+// 转移 active(共享源),cwd 校验与「无效声明不顶掉」语义归 AgentPlugin 侧测试。
 func TestPromptSupersededSessionGuard(t *testing.T) {
 	newHandler := func(sessions *fakeSessionSource) *FrontendHandler {
 		return &FrontendHandler{
@@ -498,8 +592,11 @@ func TestPromptSupersededSessionGuard(t *testing.T) {
 		}
 	})
 
-	t.Run("second connection displaces first", func(t *testing.T) {
-		sessions := &fakeSessionSource{}
+	t.Run("second connection does not displace first", func(t *testing.T) {
+		// PR2 语义变更(原「second connection displaces first」反转为不顶掉):
+		// 两条连接各自 session/new 后互不影响——A 的 prompt 不被 B 的声明拒绝,
+		// 也不静默串到 B 的会话(Binding 连接级,各自路由)。
+		sessions := &fakeSessionSource{currentID: "store-shared"}
 		a, b := newHandler(sessions), newHandler(sessions)
 		if err := a.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp/a"}, reporter); err != nil {
 			t.Fatalf("CreateSession s1: %v", err)
@@ -508,39 +605,105 @@ func TestPromptSupersededSessionGuard(t *testing.T) {
 			t.Fatalf("CreateSession s2: %v", err)
 		}
 
-		// A 的旧会话已被 B 的声明顶掉：prompt s1 诚实报 superseded，绝不静默串线执行
-		_, err := a.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter)
+		// 两条连接的 Binding 各自指向声明落地的会话(共享同一 current → 同值),
+		// 实例独立(连接私有,§6.2 第 4 条:互不影响)。
+		if got := a.binding.Get(); got != "store-shared" {
+			t.Fatalf("a binding = %q, want store-shared (session/new 后 Set)", got)
+		}
+		if got := b.binding.Get(); got != "store-shared" {
+			t.Fatalf("b binding = %q, want store-shared (session/new 后 Set)", got)
+		}
+		if a.active != "s1" || b.active != "s2" {
+			t.Fatalf("active declarations = %q/%q, want s1/s2 (声明归连接)", a.active, b.active)
+		}
+
+		// A 的会话照常 prompt(B 的 session/new 不再顶掉它);evaluate 收到的 ctx
+		// 携带 A 自己的 Binding(路由面唯一通道)。
+		var aBinding *agentcontrol.SessionBinding
+		a.evaluate = func(ctx *model.Context, input string) error {
+			aBinding = agentcontrol.BindingFromCtx(ctx.Ctx)
+			return nil
+		}
+		if _, err := a.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt s1 after b's session/new = %v, want silent guard (PR2:声明归连接)", err)
+		}
+		if aBinding != &a.binding {
+			t.Fatalf("evaluate ctx binding = %v, want &a.binding", aBinding)
+		}
+
+		// B 的活动会话照常 prompt
+		if _, err := b.Prompt(context.Background(), "s2", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt s2 = %v", err)
+		}
+	})
+
+	t.Run("same connection redeclaration displaces", func(t *testing.T) {
+		// 本连接重声明后的旧 id 诚实报 superseded:单连接行为与旧版一致。
+		handler := newHandler(&fakeSessionSource{})
+		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp/a"}, reporter); err != nil {
+			t.Fatalf("CreateSession s1: %v", err)
+		}
+		if err := handler.CreateSession(context.Background(), "s2", protocol.NewSessionRequest{Cwd: "/tmp/b"}, reporter); err != nil {
+			t.Fatalf("CreateSession s2: %v", err)
+		}
+		_, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter)
 		var rpcErr *protocol.RPCError
 		if !errors.As(err, &rpcErr) {
-			t.Fatalf("Prompt superseded = %v, want *protocol.RPCError", err)
+			t.Fatalf("Prompt stale s1 = %v, want *protocol.RPCError", err)
 		}
 		if rpcErr.Code != -32000 {
 			t.Errorf("code = %d, want -32000", rpcErr.Code)
 		}
 		if !strings.Contains(rpcErr.Message, `"s2"`) {
-			t.Errorf("message = %q, want mention of current active session s2", rpcErr.Message)
-		}
-
-		// B 的活动会话照常 prompt
-		if _, err := b.Prompt(context.Background(), "s2", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
-			t.Fatalf("Prompt current active session = %v", err)
+			t.Errorf("message = %q, want mention of last declared s2", rpcErr.Message)
 		}
 	})
 
-	t.Run("load current displaces", func(t *testing.T) {
+	t.Run("load current displaces and binds", func(t *testing.T) {
 		sessions := &fakeSessionSource{currentID: "s2"}
 		handler := newHandler(sessions)
 		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp/a"}, reporter); err != nil {
 			t.Fatalf("CreateSession s1: %v", err)
 		}
-		// 对 s2 的 load-current 同样经 SetSession 声明，顶掉 s1 的活动身份
+		if got := handler.binding.Get(); got != "s2" {
+			t.Fatalf("binding after session/new = %q, want s2 (声明落地会话的 store id)", got)
+		}
+		// 对 s2 的 load-current 同样经 SetSession 声明，顶掉 s1 的活动身份,
+		// 并把 Binding 指向 s2
 		if err := handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "s2", Cwd: "/tmp"}, reporter); err != nil {
 			t.Fatalf("LoadSession s2: %v", err)
+		}
+		if got := handler.binding.Get(); got != "s2" {
+			t.Fatalf("binding after load-current = %q, want s2", got)
 		}
 		_, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter)
 		var rpcErr *protocol.RPCError
 		if !errors.As(err, &rpcErr) || rpcErr.Code != -32000 || !strings.Contains(rpcErr.Message, `"s2"`) {
 			t.Fatalf("Prompt s1 after load-current s2 = %v, want -32000 superseded error mentioning s2", err)
+		}
+		if _, err := handler.Prompt(context.Background(), "s2", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+			t.Fatalf("Prompt s2 after load = %v", err)
+		}
+	})
+
+	t.Run("archived load does not rebind", func(t *testing.T) {
+		// 归档 load 是只读重放:Binding 不变(只读视图不是会话选择)。
+		sessions := &fakeSessionSource{
+			currentID: "cur",
+			list:      []model.SessionSummary{{SessionID: "old"}},
+			archived: map[string][]model.SessionUpdate{
+				"old": {{Kind: model.SessionUpdateUserMessageChunk, Content: &model.SessionContent{Type: "text", Text: "past"}}},
+			},
+		}
+		handler := newHandler(sessions)
+		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp"}, reporter); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		if err := handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "old"}, reporter); err != nil {
+			t.Fatalf("LoadSession archived: %v", err)
+		}
+		if got := handler.binding.Get(); got != "cur" {
+			t.Fatalf("binding after archived load = %q, want cur (unchanged)", got)
 		}
 	})
 

@@ -1,6 +1,10 @@
-// sessions.go 提供 agent 插件的会话清单与元数据能力：扫描 Session.Dir（current.jsonl +
+// sessions.go 提供 agent 插件的会话清单与元数据能力：扫描当前会话目录（current.jsonl +
 // archive/*.jsonl）产出 ACP session/list 的会话摘要、session/new|load 响应的 modes
 // 状态与归档只读重放，供主会话 ACP service 做会话列表、load 判定与模型显示。
+// P1-3 起持久化换轨 Repository（每会话独立目录 + legacy 根槽兼容挂载），归档随
+// 会话目录轮转：清单取数经 currentStore() 解析，扫描「当前会话目录」下的
+// current.jsonl 与 archive/（legacy 挂载期即 Session.Dir，与旧布局逐字段一致；
+// 其余 per-id 目录的并集留待 P5 并入）。
 // 只读扫描：不取 store.mu、不触发 Archive、归档文件只读打开
 // ——清单绝不干扰运行中的 store（追加中的半行按坏行跳过，与 store.loadRecords 同策略）。
 package service
@@ -31,6 +35,12 @@ const (
 // ListSessions 汇总会话清单：当前会话（store 有 head 时）置顶且不参与排序，
 // 归档会话按 updatedAt 倒序随后，最多 maxListSessions 条。
 //
+// 数据源（P1-3 换轨）：当前会话 = currentStore()（经 current runtime → repo 实例
+// 唯一缓存解析，与命令互斥同源）；归档 = 当前会话目录（currentSessionDir）的
+// archive/ 扫描——legacy 挂载期即 Session.Dir（与旧布局输出一致），独立目录会话
+// 扫 <root>/<id>/archive/；其余 per-id 目录的并集留待 P5 并入，本步输出逐字段
+// 规则与旧版一致。
+//
 // 取值规则（store 的记录模型不落 cwd）：
 //   - sessionId：当前会话 = store 的稳定 logical SessionID（与 session/load 的「当前会话」
 //     判定同源，保证列表给出的 id 可直接 load）；Store.Head 只用于判断当前文件是否有
@@ -41,11 +51,11 @@ const (
 //   - updatedAt：文件 mtime（RFC3339）。
 func (p *AgentPlugin) ListSessions() []model.SessionSummary {
 	out := make([]model.SessionSummary, 0, 4)
-	store := p.store.Load()
-	if store == nil || p.cfg.Session.Dir == "" {
+	store := p.currentStore()
+	dir := p.currentSessionDir()
+	if store == nil || dir == "" {
 		return out
 	}
-	dir := p.cfg.Session.Dir
 
 	if head := store.Head(); head != "" {
 		if m := describeSessionFile(filepath.Join(dir, "current.jsonl"), store.SessionID()); m != nil {
@@ -89,16 +99,24 @@ func (p *AgentPlugin) SessionModes() *model.SessionModeState {
 	}
 }
 
-// currentSessionCwd 返回最近一次有效声明的会话 cwd（锁内快照，未声明为空）。
+// currentSessionCwd 返回当前会话最近一次有效声明的 cwd（P1-4 起声明随 current
+// runtime 走：无效标记下 cwd 恒空、无活动 runtime 或未声明返回空）。
 func (p *AgentPlugin) currentSessionCwd() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.sessionCwd
+	rt := p.currentSession()
+	if rt == nil {
+		return ""
+	}
+	cwd, err := rt.DeclaredCWD()
+	if err != nil {
+		return "" // 无效标记：DeclareCWD 已保证 cwd 清空，这里防御性兜底
+	}
+	return cwd
 }
 
 // CurrentSessionID returns the stable logical identity, not the mutable head.
+// P1-3 起经 currentStore() 解析（current runtime → repo 缓存），返回值语义不变。
 func (p *AgentPlugin) CurrentSessionID() string {
-	if store := p.store.Load(); store != nil {
+	if store := p.currentStore(); store != nil {
 		return store.SessionID()
 	}
 	return ""
@@ -108,10 +126,11 @@ func (p *AgentPlugin) CurrentSessionID() string {
 // 命中当前会话时调用——单活动会话模型下当前会话始终处于已加载状态，这里只做
 // 视图刷新（ReloadFromStore），不重建会话。
 func (p *AgentPlugin) ReloadCurrentSession() error {
-	if p.session.Load() == nil {
+	s := p.boundSession()
+	if s == nil {
 		return fmt.Errorf("agent: no active session")
 	}
-	return p.session.Load().ReloadFromStore()
+	return s.ReloadFromStore()
 }
 
 // CurrentSessionHistory 导出当前会话的完整对话历史，映射为 ACP session/update
@@ -124,29 +143,56 @@ func (p *AgentPlugin) ReloadCurrentSession() error {
 // 内（rewind/compact 后失效）自然不命中即跳过，checkpoint 漏打的结尾消息如实
 // 并入最后一段。checkpoint 只作边界，不进重放流。
 //
-// 全量重放，不设轮次/条数上限。无持久化（store 为 nil）或空会话返回非 nil 空切片。
+// 全量重放，不设轮次/条数上限。无持久化（currentStore 为 nil）或空会话返回非 nil 空切片。
 func (p *AgentPlugin) CurrentSessionHistory() []model.SessionUpdate {
-	if p.store.Load() == nil {
+	store := p.currentStore()
+	if store == nil {
 		return []model.SessionUpdate{}
 	}
-	view := p.store.Load().ActiveView()
+	view := store.ActiveView()
 	if len(view) == 0 {
 		return []model.SessionUpdate{}
 	}
-	return replayUpdates(view, checkpointAnchors(p.store.Load()))
+	return replayUpdates(view, checkpointAnchors(store))
 }
 
 // ArchivedSessionHistory 只读解析归档会话并映射为 ACP 重放通知序列（方案 B
-// 「归档只读查看」的数据面）：按 archiveId 定位归档文件（Session.Dir/archive/<id>.jsonl，
-// id 校验防 traversal），OpenArchiveView 构建 ActiveView 与 checkpoint 锚点，
-// 经与 CurrentSessionHistory 相同的 segmentByCheckpoints + roundUpdates 管线输出。
-// 不持写句柄、不 rename、不触碰 current 与 store。
+// 「归档只读查看」的数据面）：按 archiveId 定位归档文件，OpenArchiveView 构建
+// ActiveView 与 checkpoint 锚点，经与 CurrentSessionHistory 相同的
+// segmentByCheckpoints + roundUpdates 管线输出。不持写句柄、不 rename、不触碰
+// current 与 store。
+//
+// 归档路径解析（P1-3）：归档随会话目录轮转（Archive 以 store 自身 dir 为基准），
+// 先查当前会话目录的 archive/，legacy 根槽（<Session.Dir>/archive/，兼容挂载的
+// 既有归档）次之；两处都只读 OpenArchiveView，其余 per-id 目录的并集留待 P5。
 func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]model.SessionUpdate, error) {
 	if p.cfg == nil || p.cfg.Session.Dir == "" {
 		return nil, fmt.Errorf("agent: session persistence disabled")
 	}
-	path, ok := archivePathForSession(p.cfg.Session.Dir, sessionID)
-	if !ok {
+	// id 校验前置（防 traversal）：非法 id 在触碰任何文件前拒绝，报错文案与旧版一致。
+	if _, ok := archiveFilePath(p.cfg.Session.Dir, sessionID); !ok {
+		return nil, fmt.Errorf("agent: invalid archive session id %q", sessionID)
+	}
+	dirs := make([]string, 0, 2)
+	if dir := p.currentSessionDir(); dir != "" && dir != p.cfg.Session.Dir {
+		dirs = append(dirs, dir)
+	}
+	dirs = append(dirs, p.cfg.Session.Dir)
+	path := ""
+	for _, dir := range dirs {
+		candidate, ok := archivePathForSession(dir, sessionID)
+		if !ok {
+			continue // 已前置校验，防御分支
+		}
+		if path == "" {
+			path = candidate // 保留首个候选：全部未命中时按它给出 open archive 报错
+		}
+		if _, err := os.Stat(candidate); err == nil {
+			path = candidate
+			break
+		}
+	}
+	if path == "" {
 		return nil, fmt.Errorf("agent: invalid archive session id %q", sessionID)
 	}
 	view, err := session.OpenArchiveView(path)
@@ -154,6 +200,38 @@ func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]model.SessionU
 		return nil, fmt.Errorf("agent: open archive %q: %w", sessionID, err)
 	}
 	return replayUpdates(view.ActiveView(), anchorSet(view.Checkpoints(0))), nil
+}
+
+// currentSessionDir 返回当前会话的会话目录（P1-3 归档扫描基准）。归档随会话目录
+// 轮转，目录两种形态：
+//   - 新布局 <Session.Dir>/<store SessionID>/（Repository.Create 创建，目录名即
+//     文件内 SessionID）；
+//   - legacy 根槽 = Session.Dir 本身（兼容挂载，current.jsonl 直在根下）。
+//
+// 判定：会话 id 命中新布局目录（其下有 current.jsonl）取该目录；否则根下有
+// legacy 槽取根；都没有返回空串。store 被 Archive 轮转的瞬间 metadata id 会换成
+// 新随机 id 而 store 目录不变，新 id 不命中任何目录 → 短暂返回空串；/new 在同一
+// gate 临界区内随即换轨新会话，窗口只暴露给无锁的只读清单方，与旧版在归档瞬间
+// 读清单的抖动同级。
+func (p *AgentPlugin) currentSessionDir() string {
+	root := p.cfg.Session.Dir
+	store := p.currentStore()
+	if root == "" || store == nil {
+		return ""
+	}
+	if d := filepath.Join(root, store.SessionID()); hasCurrentFile(d) {
+		return d
+	}
+	if hasCurrentFile(root) {
+		return root
+	}
+	return ""
+}
+
+// hasCurrentFile 报告 dir 下是否存在 current.jsonl。
+func hasCurrentFile(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, "current.jsonl"))
+	return err == nil
 }
 
 // archiveFilePath 按 archiveId 定位归档文件路径。id 必须是不含路径分隔符、

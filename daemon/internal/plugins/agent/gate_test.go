@@ -6,13 +6,20 @@ import (
 	"testing"
 	"time"
 
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 )
 
-// newGatedPlugin 构造仅用于 gate 测试的插件：NewPlugin 不触碰 cfg/paths、不创建会话，
-// acquire/release 只操作 runGate 信号量，全程无 LLM 网络调用。
+// newGatedPlugin 构造仅用于 gate 测试的插件：NewPlugin 只建 manager，不跑 Init/
+// startSession；这里手工接线一个未绑定 Session 的 current runtime（与 startSession
+// 的 Register + current.Store 同构）。互斥只经过 currentSession() 解析出的
+// runtime gate，全程无 LLM 网络调用。
 func newGatedPlugin() *AgentPlugin {
-	return NewPlugin(&runtimeconfig.Config{}, runtimeconfig.Paths{})
+	p := NewPlugin(&runtimeconfig.Config{}, runtimeconfig.Paths{})
+	rt := runtimeagent.NewSessionRuntime("current", nil)
+	_ = p.manager.Register(rt) // 全新 manager 注册必成功；冲突只发生在 /new 重建
+	p.current.Store(rt)
+	return p
 }
 
 func TestWithSession_ReentrantContextDoesNotBlock(t *testing.T) {
@@ -77,17 +84,26 @@ func TestWithSession_WaitsForOtherOwnerAndRespectsCancellation(t *testing.T) {
 	}
 }
 
-// 第一个持有者未释放时，第二个 acquire 必须阻塞；release 后阻塞者立即进入。
+// 第一个持有者未释放时，第二个 AcquireRun 必须阻塞；release 后阻塞者立即进入。
+// P0-4 起互斥点经 p.currentSession() 解析（current 指向的 runtime，与 withSession
+// 的取锁同源），对当前 runtime 实例做等价断言。
 func TestRunGate_SecondAcquireBlocksUntilRelease(t *testing.T) {
 	p := newGatedPlugin()
 	ctx := context.Background()
 
-	if err := p.acquireRun(ctx); err != nil {
+	release, err := p.currentSession().AcquireRun(ctx)
+	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 
 	acquired := make(chan error, 1)
-	go func() { acquired <- p.acquireRun(ctx) }()
+	go func() {
+		r, err := p.currentSession().AcquireRun(ctx)
+		if err == nil {
+			defer r()
+		}
+		acquired <- err
+	}()
 
 	select {
 	case err := <-acquired:
@@ -96,7 +112,7 @@ func TestRunGate_SecondAcquireBlocksUntilRelease(t *testing.T) {
 		// 预期：仍阻塞在 gate 上
 	}
 
-	p.releaseRun()
+	release()
 	select {
 	case err := <-acquired:
 		if err != nil {
@@ -105,20 +121,23 @@ func TestRunGate_SecondAcquireBlocksUntilRelease(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("blocked acquirer did not enter after release")
 	}
-	p.releaseRun()
 }
 
 // gate 被持有且不释放时，排队者 ctx 取消后必须立即返回 ctx.Err()。
 func TestRunGate_AcquireReturnsContextErrorOnCancel(t *testing.T) {
 	p := newGatedPlugin()
-	if err := p.acquireRun(context.Background()); err != nil {
+	release, err := p.currentSession().AcquireRun(context.Background())
+	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
-	defer p.releaseRun()
+	defer release()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	acquired := make(chan error, 1)
-	go func() { acquired <- p.acquireRun(ctx) }()
+	go func() {
+		_, err := p.currentSession().AcquireRun(ctx)
+		acquired <- err
+	}()
 	time.Sleep(20 * time.Millisecond) // 给排队者时间进入阻塞
 	cancel()
 

@@ -20,8 +20,10 @@ import (
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/mcp"
 	runtimeopenai "github.com/tinguo/goworker/ai-runtime/provider/openai"
+	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/ai-sandbox"
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -172,7 +174,11 @@ func TestAgentPluginPersistToolAllowRuleRollsBackOnSaveFailure(t *testing.T) {
 // 需要固定 provider 的测试用 newAgentPluginP。
 func newAgentPlugin(hub *model.Hub) *AgentPlugin {
 	cfg, _ := hub.Config.(*runtimeconfig.Config)
-	p := &AgentPlugin{hub: hub, cfg: cfg, runGate: make(chan struct{}, 1)}
+	p := &AgentPlugin{hub: hub, cfg: cfg, manager: runtimeagent.NewSessionManager()}
+	// PR1:与 NewPlugin 同形装配 Application Control Plane(runcontrol_test 等经
+	// 委托面调用控制操作;直接构造 AgentPlugin 的测试桩必须自行接线,否则委托
+	// 面解引用 nil control)。
+	p.control = agentcontrol.NewService(p.manager, p, p)
 	// 与 Init 编排一致：资源确认后组装 deps + 创建会话
 	p.deps = runtimeagent.SessionDeps{
 		Config:       cfg,
@@ -195,7 +201,10 @@ func newAgentPlugin(hub *model.Hub) *AgentPlugin {
 // newAgentPluginP 注入固定 provider：深播种测试不依赖真实 LLM 端点。
 func newAgentPluginP(hub *model.Hub, pv core.Provider) *AgentPlugin {
 	cfg, _ := hub.Config.(*runtimeconfig.Config)
-	p := &AgentPlugin{hub: hub, cfg: cfg, runGate: make(chan struct{}, 1)}
+	p := &AgentPlugin{hub: hub, cfg: cfg, manager: runtimeagent.NewSessionManager()}
+	// PR1:与 NewPlugin 同形装配 Application Control Plane(控制操作的委托面
+	// 消费方;直接构造 AgentPlugin 的测试桩必须自行接线)。
+	p.control = agentcontrol.NewService(p.manager, p, p)
 	p.deps = runtimeagent.SessionDeps{
 		Config:       cfg,
 		AuditDir:     "",
@@ -226,8 +235,9 @@ func (p fixedProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan co
 // daemon 拿不到 Session 内部字段，这是唯一正当的填充路径。
 func seedRuns(p *AgentPlugin, inputs ...string) {
 	var out strings.Builder
+	s := p.boundSession()
 	for _, in := range inputs {
-		_ = p.session.Load().Run(context.Background(), runtimeagent.RunRequest{Input: in}, runtimeagent.RunCallbacks{
+		_, _ = s.Run(context.Background(), runtimeagent.RunRequest{Input: in}, runtimeagent.RunCallbacks{
 			Write: func(s string) { out.WriteString(s) },
 		})
 	}
@@ -241,10 +251,21 @@ func (p *AgentPlugin) setMemory(c *memory.Client) {
 	p.refreshSession()
 }
 
-// refreshSession 用当前 deps 重建会话，对齐 startSession 的会话边界构造
-// （测试不读真实文件 —— deps 由测试直接注入）。
+// refreshSession 用当前 deps 重建会话并接线 current runtime，对齐 startSession
+// 的会话边界构造（Register 进 manager + 置为 current；测试不读真实文件 ——
+// deps 由测试直接注入）。runtime id 与生产同规则（P1-3 ④）：deps 注入了
+// *session.Store 时取其 SessionID（currentStore() 经 repo 缓存解析取数的键），
+// 纯内存维持 "current" 稳定单例。重复调用（setMemory 等）即 /new 式重建：同 id
+// 注册冲突时旧 runtime 保留在 manager，current 换新。
 func (p *AgentPlugin) refreshSession() {
-	p.session.Store(runtimeagent.NewSession(p.deps))
+	s := runtimeagent.NewSession(p.deps)
+	id := "current"
+	if st, ok := p.deps.Store.(*session.Store); ok && st != nil {
+		id = st.SessionID()
+	}
+	rt := runtimeagent.NewSessionRuntime(id, s)
+	_ = p.manager.Register(rt)
+	p.current.Store(rt)
 }
 
 // newContext 构造带输出捕获的 model.Context。
@@ -406,7 +427,7 @@ func TestHandleCompact_CompressesConversation(t *testing.T) {
 
 	// 播种 3 轮 user/assistant 对（走公开 Run API）
 	seedRuns(p, "q", "q", "q")
-	if n := len(p.session.Load().Conversation()); n != 6 {
+	if n := len(p.boundSession().Conversation()); n != 6 {
 		t.Fatalf("seeded conversation = %d msgs, want 6", n)
 	}
 
@@ -415,7 +436,7 @@ func TestHandleCompact_CompressesConversation(t *testing.T) {
 		t.Fatalf("handleCompact: %v", err)
 	}
 
-	conv := p.session.Load().Conversation()
+	conv := p.boundSession().Conversation()
 	if len(conv) >= 6 {
 		t.Fatalf("conversation not shrunk: %d → %d", 6, len(conv))
 	}
@@ -870,8 +891,8 @@ func TestHandleNew_EmptyConversationSkipsCheckpoint(t *testing.T) {
 	if err := p.handleNew(ctx); err != nil {
 		t.Fatalf("handleNew: %v", err)
 	}
-	if len(p.session.Load().Conversation()) != 0 {
-		t.Errorf("conversation not cleared: %d", len(p.session.Load().Conversation()))
+	if len(p.boundSession().Conversation()) != 0 {
+		t.Errorf("conversation not cleared: %d", len(p.boundSession().Conversation()))
 	}
 	if !strings.Contains(buf.String(), "New session started") {
 		t.Errorf("output = %q", buf.String())
@@ -917,8 +938,8 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	}
 
 	// STM 立即清空（同步路径，不等后台）
-	if len(p.session.Load().Conversation()) != 0 {
-		t.Errorf("conversation not cleared: %d", len(p.session.Load().Conversation()))
+	if len(p.boundSession().Conversation()) != 0 {
+		t.Errorf("conversation not cleared: %d", len(p.boundSession().Conversation()))
 	}
 	if !strings.Contains(out.String(), "New session started") {
 		t.Errorf("output = %q", out.String())
@@ -995,7 +1016,7 @@ func TestInit_OpensMemory(t *testing.T) {
 		SetFallbackHandler: func(func(*model.Context) error) {},
 		Tools:              func() []model.Tool { return nil },
 	}
-	p := &AgentPlugin{cfg: cfg}
+	p := NewPlugin(cfg, runtimeconfig.Paths{})
 	if err := p.Init(hub); err != nil {
 		t.Fatalf("Init: %v", err)
 	}

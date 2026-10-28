@@ -277,6 +277,19 @@ func (c *Conn) dispatch(line []byte) {
 }
 
 func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.RawMessage) {
+	// 通知(id 为空/null):FIFO 链位必须在读循环内同步获取。链位决定 handler
+	// 的启动顺序——若在下方新起的 goroutine 里才取(历史实现),相邻通知的
+	// goroutine 调度竞争会让链位与线上顺序脱钩:读循环按序 spawn,但两个
+	// goroutine 各自穿过 registerRequest/methods 查找后竞争 notifMu,后发的
+	// 通知可能先占链位,handler 乱序执行(回归测试
+	// TestNotificationsDeliveredInWireOrder 在历史实现上即时复现)。
+	// dispatchNotification 自身把 handler 挂上 FIFO 链、由后台 goroutine 依次
+	// 执行,读循环不阻塞于 handler 执行;通知无响应、无需 ctx 取消,不占用
+	// registerRequest 的 cancel 表。
+	if len(id) == 0 || string(id) == "null" {
+		c.dispatchNotification(method, params)
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	requestID, ok := c.registerRequest(cancel)
 	if !ok {
@@ -305,10 +318,6 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 		var response Response
 		response.JSONRPC = JSONRPCVersion
 		response.ID = id
-		if len(id) == 0 || string(id) == "null" {
-			c.dispatchNotification(method, params)
-			return
-		}
 		if h == nil {
 			response.Error = &RPCError{Code: CodeMethodNotFound, Message: "method not found: " + method}
 		} else {

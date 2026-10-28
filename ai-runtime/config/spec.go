@@ -96,6 +96,23 @@ type MemoryConfig struct {
 type SessionConfig struct {
 	Dir     string `yaml:"dir"`     // 会话 jsonl 存储目录
 	Enabled bool   `yaml:"enabled"` // false = 会话持久化关闭，走纯内存逻辑
+	// MaxConcurrentRuns/MaxPendingRuns 是后台 Run 的全局并发配额（P2-5 两级
+	// 调度：runSlots 容量 / 排队面 pending 容量，P2-7 接入本配置，openQuestion ③）。
+	// 0 值经 omitempty 省略——旧二进制读含新字段的配置安全（未识别键被忽略）；
+	// 消费侧 WithRunLimits 对 <=0 回落默认 4/16（agent/manager.go 默认常量），
+	// 不依赖 yaml 载入路径，构造点 0 值双保险。
+	MaxConcurrentRuns int `yaml:"max_concurrent_runs,omitempty"`
+	MaxPendingRuns    int `yaml:"max_pending_runs,omitempty"`
+	// CapabilityWaitTimeout 是客户端工具能力等待重绑的预算(秒,P4-4;
+	// openQuestions ③ 拍板默认 45)。硬约束:必须 < ai-core 工具执行硬超时
+	// 60s(ai-core/agent/agent.go:147-153 的 toolCtx)——等待发生在代理工具的
+	// Execute 内(agent.go:149 的 tool.Execute 调用点),预算无余量会被 60s
+	// 掐断、呈现为普通工具超时(勘察 risk)。0 值经 omitempty 省略——旧二进制
+	// 读含新字段的配置安全(未识别键被忽略);消费侧钳制已落为代码(P4 评审
+	// issue2):resolveCapabilityWait(agent/capability.go)对 <=0 回落常量 45s、
+	// >55s 钳到 55s 并 slog.Warn(daemon 侧 CapabilityWaitTimeout 出口同型
+	// 钳制,不依赖 yaml 载入路径,MaxConcurrentRuns/MaxPendingRuns 同型先例)。
+	CapabilityWaitTimeout int `yaml:"capability_wait_timeout,omitempty"`
 }
 
 // MCPConfig 是 MCP server 连接配置。

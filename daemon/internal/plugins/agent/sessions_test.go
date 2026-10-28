@@ -19,33 +19,31 @@ import (
 
 // sessionFixture 用真实 Store 生成 current + archive 数据：归档 archives 条
 // （每条一条 user 消息），current 留一条 user 消息且 head 停在其上。
-// 返回插件、store 与会话目录。
+// 返回插件、挂载 store（= currentStore() 解析实例）与会话根目录。
+// P1-3 起按生产 repo 接线：先在种子句柄上造数（legacy 根槽布局），关闭释放
+// 文件锁后经 Repository 原地挂载，Session 绑定挂载实例（构造即水合）。
 func sessionFixture(t *testing.T, archives int) (*AgentPlugin, *session.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := session.Open(dir)
-	if err != nil {
-		t.Fatalf("session open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-
-	for i := 0; i < archives; i++ {
-		msg := core.Message{Role: "user", Content: "历史会话标题\n第二行", MsgID: session.NewMsgID()}
-		if _, err := st.Commit([]core.Message{msg}); err != nil {
-			t.Fatalf("commit archive %d: %v", i, err)
-		}
-		// 拉开归档文件 mtime，让倒序排序可断言
-		time.Sleep(5 * time.Millisecond)
-		if err := st.Archive(); err != nil {
-			t.Fatalf("archive %d: %v", i, err)
-		}
-	}
-	if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
-		t.Fatalf("commit current: %v", err)
-	}
-
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
-	return withStore(cfg, st), st, dir
+	mountID := seedLegacySlot(t, dir, func(st *session.Store) {
+		for i := 0; i < archives; i++ {
+			msg := core.Message{Role: "user", Content: "历史会话标题\n第二行", MsgID: session.NewMsgID()}
+			if _, err := st.Commit([]core.Message{msg}); err != nil {
+				t.Fatalf("commit archive %d: %v", i, err)
+			}
+			// 拉开归档文件 mtime，让倒序排序可断言
+			time.Sleep(5 * time.Millisecond)
+			if err := st.Archive(); err != nil {
+				t.Fatalf("archive %d: %v", i, err)
+			}
+		}
+		if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
+			t.Fatalf("commit current: %v", err)
+		}
+	})
+	p, st := wireLegacyStore(t, cfg, mountID)
+	return p, st, dir
 }
 
 // archiveIDs 返回归档目录下的 sessionId（文件名去 .jsonl），按文件名排序。
@@ -149,12 +147,9 @@ func TestAgentPlugin_ListSessionsKeepsCurrentFirstEvenWhenArchiveIsNewer(t *test
 func TestAgentPlugin_ListSessionsWithoutCurrentOrPersistence(t *testing.T) {
 	// 空会话（无 head）：current 不出现，返回非 nil 空清单
 	dir := t.TempDir()
-	st, err := session.Open(dir)
-	if err != nil {
-		t.Fatalf("session open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	p := withStore(&runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}, st)
+	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
+	mountID := seedLegacySlot(t, dir, nil)
+	p, st := wireLegacyStore(t, cfg, mountID)
 	if got := p.ListSessions(); got == nil || len(got) != 0 {
 		t.Errorf("ListSessions = %#v, want non-nil empty", got)
 	}
@@ -173,17 +168,18 @@ func TestAgentPlugin_ListSessionsWithoutCurrentOrPersistence(t *testing.T) {
 }
 
 func TestAgentPlugin_ReloadCurrentSessionRefreshesView(t *testing.T) {
+	// P1-3 起接线由 sessionFixture 完成（deps.Store 注入 + Session 绑定挂载实例），
+	// 挂载 store 即 currentStore() 的解析对象，对它的提交与生产同轨。
 	p, st, _ := sessionFixture(t, 0)
-	p.session.Store(runtimeagent.NewSession(runtimeagent.SessionDeps{Config: p.cfg, Store: st}))
 
-	before := len(p.session.Load().Conversation())
+	before := len(p.boundSession().Conversation())
 	if _, err := st.Commit([]core.Message{{Role: "user", Content: "追加一条", MsgID: session.NewMsgID()}}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	if err := p.ReloadCurrentSession(); err != nil {
 		t.Fatalf("ReloadCurrentSession: %v", err)
 	}
-	if after := len(p.session.Load().Conversation()); after != before+1 {
+	if after := len(p.boundSession().Conversation()); after != before+1 {
 		t.Errorf("conversation length = %d after reload, want %d", after, before+1)
 	}
 
@@ -201,70 +197,65 @@ func TestAgentPlugin_ReloadCurrentSessionRefreshesView(t *testing.T) {
 //	轮3（ckpt）：user → assistant 正文
 //	尾段（checkpoint 漏打）：user → 孤立 tool（配不到 tool_call）→ system（compact 摘要）
 //
-// 返回插件与 store。视图共 12 条消息、3 个 checkpoint。
+// 返回插件与挂载 store（= currentStore() 解析实例）。视图共 12 条消息、3 个 checkpoint。
 func historyFixture(t *testing.T) (*AgentPlugin, *session.Store) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := session.Open(dir)
-	if err != nil {
-		t.Fatalf("session open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-
-	commit := func(msgs ...core.Message) {
-		t.Helper()
-		if _, err := st.Commit(msgs); err != nil {
-			t.Fatalf("commit: %v", err)
-		}
-	}
-	checkpoint := func() {
-		t.Helper()
-		if err := st.Checkpoint("preview"); err != nil {
-			t.Fatalf("checkpoint: %v", err)
-		}
-	}
-
-	// 轮 1：多工具轮（连续两个 tool_calls + 对应 tool 消息）
-	commit(
-		core.Message{Role: "user", Content: "第一轮：帮我看看", MsgID: session.NewMsgID()},
-		core.Message{
-			Role: "assistant",
-			ToolCalls: []core.ToolCall{
-				{ID: "call_1", Type: "function", Function: core.ToolCallFunction{Name: "read_file", Arguments: `{"path":"a.go"}`}},
-				{ID: "call_2", Type: "function", Function: core.ToolCallFunction{Name: "grep", Arguments: `not-json`}},
-			},
-			MsgID: session.NewMsgID(),
-		},
-		core.Message{Role: "tool", Content: "文件内容A", ToolCallID: "call_1", MsgID: session.NewMsgID()},
-		core.Message{Role: "tool", Content: "匹配结果B", ToolCallID: "call_2", MsgID: session.NewMsgID()},
-		core.Message{Role: "assistant", Content: "第一轮结论", MsgID: session.NewMsgID()},
-	)
-	checkpoint()
-
-	// 轮 2：空 assistant（空正文且无 tool_calls，重放时跳过）
-	commit(
-		core.Message{Role: "user", Content: "第二轮：空的助手", MsgID: session.NewMsgID()},
-		core.Message{Role: "assistant", Content: "", MsgID: session.NewMsgID()},
-	)
-	checkpoint()
-
-	// 轮 3：纯对话轮
-	commit(
-		core.Message{Role: "user", Content: "第三轮", MsgID: session.NewMsgID()},
-		core.Message{Role: "assistant", Content: "第三轮回答", MsgID: session.NewMsgID()},
-	)
-	checkpoint()
-
-	// 尾段：checkpoint 漏打；孤立 tool 消息（call_orphan 无配对 tool_call）+
-	// system（compact 摘要，重放时跳过）
-	commit(
-		core.Message{Role: "user", Content: "第四轮（漏打）", MsgID: session.NewMsgID()},
-		core.Message{Role: "tool", Content: "孤立输出", ToolCallID: "call_orphan", MsgID: session.NewMsgID()},
-		core.Message{Role: "system", Content: "compact 摘要", MsgID: session.NewMsgID()},
-	)
-
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
-	return withStore(cfg, st), st
+	mountID := seedLegacySlot(t, dir, func(st *session.Store) {
+		commit := func(msgs ...core.Message) {
+			t.Helper()
+			if _, err := st.Commit(msgs); err != nil {
+				t.Fatalf("commit: %v", err)
+			}
+		}
+		checkpoint := func() {
+			t.Helper()
+			if err := st.Checkpoint("preview"); err != nil {
+				t.Fatalf("checkpoint: %v", err)
+			}
+		}
+
+		// 轮 1：多工具轮（连续两个 tool_calls + 对应 tool 消息）
+		commit(
+			core.Message{Role: "user", Content: "第一轮：帮我看看", MsgID: session.NewMsgID()},
+			core.Message{
+				Role: "assistant",
+				ToolCalls: []core.ToolCall{
+					{ID: "call_1", Type: "function", Function: core.ToolCallFunction{Name: "read_file", Arguments: `{"path":"a.go"}`}},
+					{ID: "call_2", Type: "function", Function: core.ToolCallFunction{Name: "grep", Arguments: `not-json`}},
+				},
+				MsgID: session.NewMsgID(),
+			},
+			core.Message{Role: "tool", Content: "文件内容A", ToolCallID: "call_1", MsgID: session.NewMsgID()},
+			core.Message{Role: "tool", Content: "匹配结果B", ToolCallID: "call_2", MsgID: session.NewMsgID()},
+			core.Message{Role: "assistant", Content: "第一轮结论", MsgID: session.NewMsgID()},
+		)
+		checkpoint()
+
+		// 轮 2：空 assistant（空正文且无 tool_calls，重放时跳过）
+		commit(
+			core.Message{Role: "user", Content: "第二轮：空的助手", MsgID: session.NewMsgID()},
+			core.Message{Role: "assistant", Content: "", MsgID: session.NewMsgID()},
+		)
+		checkpoint()
+
+		// 轮 3：纯对话轮
+		commit(
+			core.Message{Role: "user", Content: "第三轮", MsgID: session.NewMsgID()},
+			core.Message{Role: "assistant", Content: "第三轮回答", MsgID: session.NewMsgID()},
+		)
+		checkpoint()
+
+		// 尾段：checkpoint 漏打；孤立 tool 消息（call_orphan 无配对 tool_call）+
+		// system（compact 摘要，重放时跳过）
+		commit(
+			core.Message{Role: "user", Content: "第四轮（漏打）", MsgID: session.NewMsgID()},
+			core.Message{Role: "tool", Content: "孤立输出", ToolCallID: "call_orphan", MsgID: session.NewMsgID()},
+			core.Message{Role: "system", Content: "compact 摘要", MsgID: session.NewMsgID()},
+		)
+	})
+	return wireLegacyStore(t, cfg, mountID)
 }
 
 // rawBodyFields 解码 Raw 透传体为字段表，便于逐字段断言 wire 形状。
@@ -507,12 +498,9 @@ func TestSegmentByCheckpoints(t *testing.T) {
 func TestAgentPlugin_CurrentSessionHistoryEmpty(t *testing.T) {
 	// 空会话（无 head）：非 nil 空切片
 	dir := t.TempDir()
-	st, err := session.Open(dir)
-	if err != nil {
-		t.Fatalf("session open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	p := withStore(&runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}, st)
+	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
+	mountID := seedLegacySlot(t, dir, nil)
+	p, _ := wireLegacyStore(t, cfg, mountID)
 	if got := p.CurrentSessionHistory(); got == nil || len(got) != 0 {
 		t.Errorf("CurrentSessionHistory = %#v, want non-nil empty", got)
 	}
@@ -526,45 +514,43 @@ func TestAgentPlugin_CurrentSessionHistoryEmpty(t *testing.T) {
 
 // archiveFixture 在 current 提交一整轮（user → assistant(2 tool_calls + thinking)
 // → tool → assistant 收尾）并打 checkpoint，随后 Archive 归档，再为 current 提交
-// 一条新消息。返回插件、store、归档文件 id 与归档前视图。
+// 一条新消息。返回插件、挂载 store（= currentStore() 解析实例）、归档文件 id 与
+// 归档前视图。
 func archiveFixture(t *testing.T) (*AgentPlugin, *session.Store, string, []core.Message) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := session.Open(dir)
-	if err != nil {
-		t.Fatalf("session open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-
-	if _, err := st.Commit([]core.Message{
-		core.Message{Role: "user", Content: "归档里的问题", MsgID: session.NewMsgID()},
-		core.Message{
-			Role: "assistant",
-			ToolCalls: []core.ToolCall{
-				{ID: "call_arch_1", Type: "function", Function: core.ToolCallFunction{Name: "read_file", Arguments: `{"path":"a.go"}`}},
-			},
-			Thinking: core.Thinking{Text: "归档里的思考"},
-			MsgID:    session.NewMsgID(),
-		},
-		core.Message{Role: "tool", Content: "归档里的工具输出", ToolCallID: "call_arch_1", MsgID: session.NewMsgID()},
-		core.Message{Role: "assistant", Content: "归档里的回答", MsgID: session.NewMsgID()},
-	}); err != nil {
-		t.Fatalf("commit archive round: %v", err)
-	}
-	if err := st.Checkpoint("archive round"); err != nil {
-		t.Fatalf("checkpoint: %v", err)
-	}
-	want := st.ActiveView()
-	if err := st.Archive(); err != nil {
-		t.Fatalf("archive: %v", err)
-	}
-	// 归档后 current 提交新消息，保证清单有「当前会话」条目可断言
-	if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
-		t.Fatalf("commit current: %v", err)
-	}
-
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
-	return withStore(cfg, st), st, archiveIDs(t, dir)[0], want
+	var want []core.Message
+	mountID := seedLegacySlot(t, dir, func(st *session.Store) {
+		if _, err := st.Commit([]core.Message{
+			core.Message{Role: "user", Content: "归档里的问题", MsgID: session.NewMsgID()},
+			core.Message{
+				Role: "assistant",
+				ToolCalls: []core.ToolCall{
+					{ID: "call_arch_1", Type: "function", Function: core.ToolCallFunction{Name: "read_file", Arguments: `{"path":"a.go"}`}},
+				},
+				Thinking: core.Thinking{Text: "归档里的思考"},
+				MsgID:    session.NewMsgID(),
+			},
+			core.Message{Role: "tool", Content: "归档里的工具输出", ToolCallID: "call_arch_1", MsgID: session.NewMsgID()},
+			core.Message{Role: "assistant", Content: "归档里的回答", MsgID: session.NewMsgID()},
+		}); err != nil {
+			t.Fatalf("commit archive round: %v", err)
+		}
+		if err := st.Checkpoint("archive round"); err != nil {
+			t.Fatalf("checkpoint: %v", err)
+		}
+		want = st.ActiveView()
+		if err := st.Archive(); err != nil {
+			t.Fatalf("archive: %v", err)
+		}
+		// 归档后 current 提交新消息，保证清单有「当前会话」条目可断言
+		if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
+			t.Fatalf("commit current: %v", err)
+		}
+	})
+	p, st := wireLegacyStore(t, cfg, mountID)
+	return p, st, archiveIDs(t, dir)[0], want
 }
 
 // TestAgentPlugin_ArchivedSessionHistoryReplaysArchive 对真实归档文件做重放映射：
@@ -714,20 +700,17 @@ func TestAgentPlugin_SetSessionValidatesSandboxBoundary(t *testing.T) {
 	outside := t.TempDir()
 
 	dir := t.TempDir()
-	st, err := session.Open(dir)
-	if err != nil {
-		t.Fatalf("session open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
 	cfg := &runtimeconfig.Config{
 		Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir},
 		Sandbox: sandbox.SandboxConfig{AllowedWorkDir: boundary},
 	}
-	p := withStore(cfg, st)
-	p.session.Store(runtimeagent.NewSession(runtimeagent.SessionDeps{Config: cfg, Store: st}))
+	mountID := seedLegacySlot(t, dir, func(st *session.Store) {
+		if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	})
+	// P1-3 起接线由 wireLegacyStore 完成（deps.Store 注入 + Session 绑定挂载实例）。
+	p, _ := wireLegacyStore(t, cfg, mountID)
 
 	// 界内：接受，cwd 落到插件与会话
 	p.SetSession("sess_a", inside)
@@ -844,20 +827,17 @@ func TestAgentPlugin_ActiveSessionIDSemantics(t *testing.T) {
 	outside := t.TempDir()
 
 	dir := t.TempDir()
-	st, err := session.Open(dir)
-	if err != nil {
-		t.Fatalf("session open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
 	cfg := &runtimeconfig.Config{
 		Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir},
 		Sandbox: sandbox.SandboxConfig{AllowedWorkDir: boundary},
 	}
-	p := withStore(cfg, st)
-	p.session.Store(runtimeagent.NewSession(runtimeagent.SessionDeps{Config: cfg, Store: st}))
+	mountID := seedLegacySlot(t, dir, func(st *session.Store) {
+		if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	})
+	// P1-3 起接线由 wireLegacyStore 完成（deps.Store 注入 + Session 绑定挂载实例）。
+	p, _ := wireLegacyStore(t, cfg, mountID)
 
 	if got := p.ActiveSessionID(); got != "" {
 		t.Fatalf("ActiveSessionID before any declaration = %q, want empty", got)
@@ -904,9 +884,53 @@ func TestAgentPlugin_ActiveSessionIDSemantics(t *testing.T) {
 	}
 }
 
-// withStore 测试构造辅助：atomic.Pointer 字段无法在 struct 字面量里直接赋值。
-func withStore(cfg *runtimeconfig.Config, st *session.Store) *AgentPlugin {
-	p := &AgentPlugin{cfg: cfg}
-	p.store.Store(st)
-	return p
+// seedLegacySlot 在 dir 播种 legacy 根槽（一次性 Open 生成 metadata），在种子句柄
+// 上跑 seedFn（提交/归档造数），随后关闭句柄释放文件锁，返回文件当前的 metadata
+// 会话 id（即 wireLegacyStore 的挂载键；归档轮转会更换 metadata id，以关闭时的
+// 最新值为准）。
+func seedLegacySlot(t *testing.T, dir string, seedFn func(st *session.Store)) string {
+	t.Helper()
+	seed, err := session.Open(dir)
+	if err != nil {
+		t.Fatalf("seed legacy slot: %v", err)
+	}
+	if seedFn != nil {
+		seedFn(seed)
+	}
+	id := seed.SessionID()
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+	return id
+}
+
+// wireLegacyStore 把 cfg.Session.Dir 下的 legacy 根槽（id = mountID）按生产
+// startSession 的装配形态接线进插件（P1-3 取数换轨后的测试基座）：
+//  1. OpenRepository + repo.Open(mountID) 原地挂载——实例进 open 缓存，即
+//     currentStore() 的解析对象；
+//  2. deps.Store 注入 + runtime id = store SessionID（生产 ④ 的同款规则）；
+//  3. Session 绑定挂载实例（构造即水合，与重启恢复同路径）。
+//
+// 返回的挂载实例与插件视图是同一对象：测试对它的 Commit/Archive 与生产同轨。
+// 仓库经 t.Cleanup 关闭（连带释放目录文件锁）。
+func wireLegacyStore(t *testing.T, cfg *runtimeconfig.Config, mountID string) (*AgentPlugin, *session.Store) {
+	t.Helper()
+	repo, err := session.OpenRepository(cfg.Session.Dir)
+	if err != nil {
+		t.Fatalf("open repository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	st, err := repo.Open(mountID)
+	if err != nil {
+		t.Fatalf("mount legacy store %s: %v", mountID, err)
+	}
+	p := &AgentPlugin{cfg: cfg, manager: runtimeagent.NewSessionManager(), repo: repo}
+	p.deps = runtimeagent.SessionDeps{Config: cfg, Store: st}
+	s := runtimeagent.NewSession(p.deps)
+	rt := runtimeagent.NewSessionRuntime(st.SessionID(), s)
+	if err := p.manager.Register(rt); err != nil {
+		t.Fatalf("register runtime: %v", err)
+	}
+	p.current.Store(rt)
+	return p, st
 }

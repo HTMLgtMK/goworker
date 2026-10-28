@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
@@ -15,15 +17,46 @@ import (
 )
 
 type captureEmitter struct {
+	mu     sync.Mutex
 	tokens []core.Token
+	ids    chan string // 每观测到一个 interrupt 事件,送入其 InterruptRequest.ID
 }
 
 func (e *captureEmitter) Emit(_ context.Context, tok core.Token) {
+	e.mu.Lock()
 	e.tokens = append(e.tokens, tok)
+	e.mu.Unlock()
+	if tok.Type == core.TokenTypeEvent && tok.Event != nil && tok.Event.Type == hitl.EventInterrupt {
+		var req hitl.InterruptRequest
+		if err := json.Unmarshal(tok.Event.Data, &req); err == nil {
+			// 决策回执契约:Decision.InterruptID 必须等于 InterruptRequest.ID
+			// (GetDecision 仅消费 InterruptID 匹配的决策,P4 评审 issue1 的
+			// 排空语义)。测试按真实 ID 回执,不猜测 req-N(进程级原子计数,
+			// 序号随测试执行序漂移)。
+			select {
+			case e.ids <- req.ID:
+			default:
+			}
+		}
+	}
+}
+
+// pushDecisionFor 按真实中断 ID 回执决策:后台等待 em 发出的第一个 interrupt,
+// 用其 ID 填充 d 后投进 decisions(主 goroutine 此刻阻塞在 GetDecision 的
+// select 上)。5s 等不到即放弃——测试主体会按超时拒绝收敛,断言自会失败。
+func pushDecisionFor(decisions chan hitl.Decision, em *captureEmitter, d hitl.Decision) {
+	go func() {
+		select {
+		case id := <-em.ids:
+			d.InterruptID = id
+			decisions <- d
+		case <-time.After(5 * time.Second):
+		}
+	}()
 }
 
 func newToolEvent(name string, args map[string]any) (*core.BeforeToolEvent, *captureEmitter) {
-	em := &captureEmitter{}
+	em := &captureEmitter{ids: make(chan string, 8)}
 	return &core.BeforeToolEvent{
 		Ctx:  context.Background(),
 		Tool: &core.ToolCall{ID: "t1", Type: "function", Function: core.ToolCallFunction{Name: name}},
@@ -55,7 +88,7 @@ func TestHITL_BashRiskyConfirmsAndApproves(t *testing.T) {
 	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
 	ev, em := newToolEvent("bash", map[string]any{"command": "rm -rf /tmp/goworker-test"})
 
-	go func() { decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionApprove} }()
+	pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionApprove})
 	mw.OnBeforeTool(ev)
 
 	if ev.Abort != nil {
@@ -102,7 +135,7 @@ func TestHITL_MCPConfirmsInNormalMode(t *testing.T) {
 	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
 	ev, em := newToolEvent("mcp_fs_write", map[string]any{"path": "/tmp/x", "content": "hi"})
 
-	go func() { decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionApprove} }()
+	pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionApprove})
 	mw.OnBeforeTool(ev)
 
 	if ev.Abort != nil {
@@ -145,13 +178,13 @@ func TestHITL_MCPAllowedInAutoMode(t *testing.T) {
 func TestHITL_AllowAlwaysPersistsRuleBeforeExecution(t *testing.T) {
 	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
 	decisions := make(chan hitl.Decision, 1)
-	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
 	var saved sandbox.AllowRule
 	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithAllowAlways(func(rule sandbox.AllowRule) error {
 		saved = rule
 		return nil
 	}))
-	ev, _ := newToolEvent("bash", map[string]any{"command": "git push origin main"})
+	ev, em := newToolEvent("bash", map[string]any{"command": "git push origin main"})
+	pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionApproveAlways})
 
 	mw.OnBeforeTool(ev)
 
@@ -166,11 +199,11 @@ func TestHITL_AllowAlwaysPersistsRuleBeforeExecution(t *testing.T) {
 func TestHITL_AllowAlwaysPersistenceFailureRejects(t *testing.T) {
 	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
 	decisions := make(chan hitl.Decision, 1)
-	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
 	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithAllowAlways(func(sandbox.AllowRule) error {
 		return errors.New("save failed")
 	}))
-	ev, _ := newToolEvent("bash", map[string]any{"command": "git push origin main"})
+	ev, em := newToolEvent("bash", map[string]any{"command": "git push origin main"})
+	pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionApproveAlways})
 
 	mw.OnBeforeTool(ev)
 
@@ -182,13 +215,13 @@ func TestHITL_AllowAlwaysPersistenceFailureRejects(t *testing.T) {
 func TestHITL_EditDoesNotPersistAlwaysRule(t *testing.T) {
 	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
 	decisions := make(chan hitl.Decision, 1)
-	decisions <- hitl.Decision{Type: hitl.DecisionEdit, Command: "echo safe"}
 	persisted := false
 	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithAllowAlways(func(sandbox.AllowRule) error {
 		persisted = true
 		return nil
 	}))
-	ev, _ := newToolEvent("bash", map[string]any{"command": "rm -rf /tmp/goworker-test"})
+	ev, em := newToolEvent("bash", map[string]any{"command": "rm -rf /tmp/goworker-test"})
+	pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionEdit, Command: "echo safe"})
 
 	mw.OnBeforeTool(ev)
 
@@ -204,11 +237,9 @@ func TestHITL_RespondBackfillsToolMessageWithCallID(t *testing.T) {
 	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
 	decisions := make(chan hitl.Decision, 1)
 	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
-	ev, _ := newToolEvent("bash", map[string]any{"command": "rm -rf /tmp/goworker-test"})
+	ev, em := newToolEvent("bash", map[string]any{"command": "rm -rf /tmp/goworker-test"})
 
-	go func() {
-		decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionRespond, Message: "别删"}
-	}()
+	pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionRespond, Message: "别删"})
 	mw.OnBeforeTool(ev)
 
 	if ev.Abort == nil {
@@ -235,7 +266,7 @@ func TestHITL_BashInterruptCarriesRiskInfo(t *testing.T) {
 	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
 	ev, em := newToolEvent("bash", map[string]any{"command": "rm -rf /tmp/goworker-test"})
 
-	go func() { decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionApprove} }()
+	pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionApprove})
 	mw.OnBeforeTool(ev)
 
 	if ev.Abort != nil {
@@ -264,9 +295,9 @@ func TestHITL_AuditRecordsUserDecision(t *testing.T) {
 	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
 	decisions := make(chan hitl.Decision, 1)
 	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithAudit(audit))
-	ev, _ := newToolEvent("bash", map[string]any{"command": "rm -rf /tmp/goworker-test"})
+	ev, em := newToolEvent("bash", map[string]any{"command": "rm -rf /tmp/goworker-test"})
 
-	go func() { decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionApprove} }()
+	pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionApprove})
 	mw.OnBeforeTool(ev)
 
 	b, err := os.ReadFile(filepath.Join(dir, "audit.jsonl"))
@@ -342,7 +373,7 @@ func TestHITL_SysRiskLevelMatrix(t *testing.T) {
 					t.Fatal("want deny (Abort), got pass-through")
 				}
 			case "hitl":
-				go func() { decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionApprove} }()
+				pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionApprove})
 				mw.OnBeforeTool(ev)
 				if ev.Abort != nil {
 					t.Fatalf("want confirm then approve, got aborted: %+v", ev.Abort)
@@ -362,7 +393,7 @@ func TestHITL_SysHitlCarriesDeclaredLevel(t *testing.T) {
 	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions))
 	ev, em := newSysToolEvent("sys_send_sms", map[string]any{"to": "x"}, "critical")
 
-	go func() { decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionReject} }()
+	pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionReject})
 	mw.OnBeforeTool(ev)
 
 	req, ok := interruptFor(t, em.tokens, "sys_send_sms")
@@ -415,7 +446,7 @@ func TestHITL_MarkedToolRiskMatrix(t *testing.T) {
 					t.Fatal("want deny, got pass-through")
 				}
 			case "hitl":
-				decisions <- hitl.Decision{InterruptID: "req-1", Type: hitl.DecisionApprove}
+				pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionApprove})
 				mw.OnBeforeTool(ev)
 				if ev.Abort != nil {
 					t.Fatalf("approved tool aborted: %+v", ev.Abort)
@@ -439,7 +470,7 @@ func TestHITL_MissingOrInvalidMarkedRiskFailsClosedThroughHITL(t *testing.T) {
 				sandbox.ToolMetadataRiskLevel:          risk,
 				sandbox.ToolMetadataRequiresPermission: "true",
 			}}
-			decisions <- hitl.Decision{Type: hitl.DecisionReject}
+			pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionReject})
 			mw.OnBeforeTool(ev)
 			if ev.Abort == nil {
 				t.Fatal("unclassified marked tool must not pass through")
@@ -485,7 +516,7 @@ func TestHITL_ExternalAllowAlwaysPersistsStableRuleAndBypassesNextCall(t *testin
 
 	ev, em := newSysToolEvent("custom_operation", map[string]any{"secret": "must-not-persist"}, "elevated")
 	ev.ToolDef.Metadata[sandbox.ToolMetadataAllowAlwaysKey] = "custom-operation"
-	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
+	pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionApproveAlways})
 	mw.OnBeforeTool(ev)
 	if ev.Abort != nil {
 		t.Fatalf("approved external tool aborted: %+v", ev.Abort)
@@ -518,12 +549,12 @@ func TestHITL_ExternalAllowAlwaysPersistsStableRuleAndBypassesNextCall(t *testin
 func TestHITL_ExternalAllowAlwaysPersistenceFailureRejects(t *testing.T) {
 	cfg := sandbox.NewFromConfig(&sandbox.SandboxConfig{Mode: "normal"})
 	decisions := make(chan hitl.Decision, 1)
-	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
 	mw := NewHITLMiddleware(*cfg, hitl.NewChannelDecisionProvider(decisions), WithToolAllowAlways(func(sandbox.ToolAllowRule) error {
 		return errors.New("save failed")
 	}))
-	ev, _ := newSysToolEvent("custom_operation", nil, "elevated")
+	ev, em := newSysToolEvent("custom_operation", nil, "elevated")
 	ev.ToolDef.Metadata[sandbox.ToolMetadataAllowAlwaysKey] = "custom-operation"
+	pushDecisionFor(decisions, em, hitl.Decision{Type: hitl.DecisionApproveAlways})
 
 	mw.OnBeforeTool(ev)
 	if ev.Abort == nil {

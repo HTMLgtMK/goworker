@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
@@ -29,6 +31,26 @@ func testSession(pv core.Provider) (*Session, *runtimeconfig.Config) {
 	return s, cfg
 }
 
+// interruptIDEmitter 捕获 interrupt 事件的请求 ID:决策回执契约要求
+// Decision.InterruptID == InterruptRequest.ID(GetDecision 仅消费 InterruptID
+// 匹配的决策,P4 评审 issue1 的排空语义),测试按真实 ID 回执而非猜测 req-N
+// (进程级原子计数,序号随测试执行序漂移)。
+type interruptIDEmitter struct {
+	ids chan string
+}
+
+func (e *interruptIDEmitter) Emit(_ context.Context, tok core.Token) {
+	if tok.Type == core.TokenTypeEvent && tok.Event != nil && tok.Event.Type == hitl.EventInterrupt {
+		var req hitl.InterruptRequest
+		if err := json.Unmarshal(tok.Event.Data, &req); err == nil {
+			select {
+			case e.ids <- req.ID:
+			default:
+			}
+		}
+	}
+}
+
 func TestSessionToolAllowRulesSnapshotAndRefresh(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	persisted := 0
@@ -50,12 +72,13 @@ func TestSessionToolAllowRulesSnapshotAndRefresh(t *testing.T) {
 	provider := &captureProvider{}
 	sandboxCfg := sandbox.NewFromConfig(&cfg.Sandbox)
 	decisions := make(chan hitl.Decision, 1)
-	mws := s.buildMiddlewareChain(RunCallbacks{}, provider, sandboxCfg, cfg, decisions)
+	mws := s.buildMiddlewareChain(RunCallbacks{}, provider, sandboxCfg, cfg, decisions, &runErrorCapture{})
 	mw := mws[0].(*middlewares.HITLMiddleware)
-	decisions <- hitl.Decision{Type: hitl.DecisionApproveAlways}
+	em := &interruptIDEmitter{ids: make(chan string, 1)}
 	ev := &core.BeforeToolEvent{
 		Ctx:  context.Background(),
 		Tool: &core.ToolCall{ID: "call-1", Function: core.ToolCallFunction{Name: "custom_write"}},
+		Emit: em,
 		ToolDef: &core.Tool{
 			Name: "custom_write",
 			Metadata: map[string]string{
@@ -65,6 +88,15 @@ func TestSessionToolAllowRulesSnapshotAndRefresh(t *testing.T) {
 			},
 		},
 	}
+	// 决策按真实中断 ID 回执:主 goroutine 阻塞在 GetDecision,后台等
+	// interrupt 事件拿到 ID 后投递;5s 等不到即放弃,断言自会失败。
+	go func() {
+		select {
+		case id := <-em.ids:
+			decisions <- hitl.Decision{InterruptID: id, Type: hitl.DecisionApproveAlways}
+		case <-time.After(5 * time.Second):
+		}
+	}()
 	mw.OnBeforeTool(ev)
 	if ev.Abort != nil {
 		t.Fatalf("allow_always aborted: %+v", ev.Abort)
@@ -112,7 +144,7 @@ func TestSessionRun_HidesThinkingWithoutDroppingHistory(t *testing.T) {
 			output.WriteString(content)
 		},
 	}
-	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, callbacks); err != nil {
+	if _, err := s.Run(context.Background(), RunRequest{Input: "hello"}, callbacks); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	for _, kind := range kinds {
@@ -141,7 +173,7 @@ func TestSessionRun_ShowsThinkingByDefault(t *testing.T) {
 	callbacks := RunCallbacks{
 		WriteToken: func(kind RenderKind, _ string, _ bool) { kinds = append(kinds, kind) },
 	}
-	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, callbacks); err != nil {
+	if _, err := s.Run(context.Background(), RunRequest{Input: "hello"}, callbacks); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if len(kinds) < 2 || kinds[0] != KindThinking || kinds[1] != KindText {
@@ -154,7 +186,7 @@ func TestSessionRun_MergesToolSourceTools(t *testing.T) {
 	s, _ := testSession(provider)
 
 	var probes int
-	err := s.Run(context.Background(), RunRequest{
+	_, err := s.Run(context.Background(), RunRequest{
 		Input: "hello",
 		ToolSource: func(context.Context) []core.Tool {
 			probes++
@@ -195,7 +227,7 @@ func TestSessionRun_WritesBackConversation(t *testing.T) {
 	s, _ := testSession(&captureProvider{})
 
 	var buf strings.Builder
-	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
+	if _, err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -221,7 +253,7 @@ func TestSessionRun_AccumulatesUsageAcrossRuns(t *testing.T) {
 	}
 
 	var buf strings.Builder
-	if err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
+	if _, err := s.Run(context.Background(), RunRequest{Input: "hello"}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	// 本轮 captureProvider 记 1 次 → 累计 2 次
@@ -254,7 +286,7 @@ func TestSessionRun_EmptyInputShowsUsage(t *testing.T) {
 	s, _ := testSession(&captureProvider{})
 
 	var buf strings.Builder
-	if err := s.Run(context.Background(), RunRequest{}, testRunCallbacks(&buf)); err != nil {
+	if _, err := s.Run(context.Background(), RunRequest{}, testRunCallbacks(&buf)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if !strings.Contains(buf.String(), "用法: /agent") {
