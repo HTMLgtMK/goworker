@@ -175,10 +175,28 @@ func (p *AgentPlugin) StartRun(sessionID, connectionID, input, requestID string)
 	return p.control.StartRun(sessionID, connectionID, input, requestID, runtimeagent.RunCallbacks{})
 }
 
+// StartRunSync 是同步宿主入口(/agent、session/prompt、CLI prompt)的 Run 提交
+// 委托(PR4,总方案 §九):handleAgent 经此进入与后台路径同一的统一门禁
+// (manager.StartRun:每会话 active 占位、ErrRunActive 拒绝第二 Run、runSlots/
+// pending 配额、queued→running→终态 journal、hub tee 事件面)。无 Connection
+// Lease/幂等记账——那是协议面 StartRun 的契约,同步入口是 §4.1 的内部执行身份
+// (ClientKindInternal 预留的启用点)。会话寻址由调用方先经 binding 形态解析点
+// (sessionRuntimeIn)解析出 rt 再传 rt.ID,与互斥/记账同源。
+func (p *AgentPlugin) StartRunSync(sessionID string, req runtimeagent.RunRequest, cb runtimeagent.RunCallbacks) (runtimeagent.RunHandle, error) {
+	return p.control.StartRunSync(sessionID, req, cb)
+}
+
+// CancelRunSync 是同步入口的 Run 取消委托(PR4,总方案 §九 Legacy 取消语义):
+// StartRun 的 runCtx 来自宿主,请求 ctx 取消不传播——handleAgent 的等待面显式
+// 转本方法落地「调用方 ctx 取消 → 终止 Agent」。
+func (p *AgentPlugin) CancelRunSync(sessionID, runID string) error {
+	return p.control.CancelRunSync(sessionID, runID)
+}
+
 // CancelRun 实现 RunControlSource(P5-6;PR1 起薄委托):多会话路由 → fencing
 // 校验与取消提交原子 → 直转 manager。manager 的拒绝语义原样上抛(未知 run →
-// ErrRunNotFound;同步 RecordRun 路径的 run 无 cancel → ErrRunNotCancellable,
-// 其取消入口是调用方请求 ctx,P2-6 契约)。
+// ErrRunNotFound;PR4 起 daemon 全部入口的 Run 均经 manager.StartRun 提交、均可
+// 取消,ErrRunNotCancellable 仅剩 RecordRun 记账形态)。
 func (p *AgentPlugin) CancelRun(sessionID, connectionID, runID string) error {
 	return p.control.CancelRun(sessionID, connectionID, runID)
 }

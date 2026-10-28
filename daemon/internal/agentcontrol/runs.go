@@ -6,14 +6,16 @@ import (
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 )
 
-// runs.go 是 Run 控制操作(StartRun/CancelRun/RunStatus)的编排面:多会话寻址
-// (SessionRouter)→ fencing 校验(LeaseRegistry.WithControl)→ 幂等 single-flight
-// (RequestRegistry)→ 直转 runtimeagent.SessionManager。与迁移前的行为契约逐条
-// 对齐,差异仅两处且均为方案要求:①幂等注册表按 Key single-flight(§4.3,跨
-// 别名同键并发重试收敛为一次底层提交,见 RequestRegistry 论证);②StartRun 签名
-// 增 cb 参数(§4.1 草案允许的偏差:回调由调用方传入,本 PR 的 plugin 委托传零值
-// 回调,语义与迁移前逐字一致——事件采集由 supervisor 的 tee 自行供给,Decide
-// 留 nil → P4-2 审批回退接管,决策经 ResolveApproval 跨连接投递)。
+// runs.go 是 Run 控制操作(StartRun/StartRunSync/CancelRun/CancelRunSync/
+// RunStatus)的编排面:多会话寻址(SessionRouter)→ fencing 校验(LeaseRegistry.
+// WithControl)→ 幂等 single-flight(RequestRegistry)→ 直转
+// runtimeagent.SessionManager。与迁移前的行为契约逐条对齐,差异仅两处且均为方案
+// 要求:①幂等注册表按 Key single-flight(§4.3,跨别名同键并发重试收敛为一次底层
+// 提交,见 RequestRegistry 论证);②StartRun 签名增 cb 参数(§4.1 草案允许的
+// 偏差:回调由调用方传入,本 PR 的 plugin 委托传零值回调,语义与迁移前逐字一致
+// ——事件采集由 supervisor 的 tee 自行供给,Decide 留 nil → P4-2 审批回退接管,
+// 决策经 ResolveApproval 跨连接投递)。StartRunSync/CancelRunSync 是 PR4(§九)
+// 的同步宿主入口形态:无 fencing、无幂等、返回 RunHandle,见各方法注释。
 
 // ensureRegistered 修复「current runtime 已注册」不变量(原 runcontrol.go 的
 // registerCurrentRuntime 迁入;修复所需的两步操作只经 Service 持有的 manager,
@@ -85,15 +87,62 @@ func (s *Service) StartRun(sessionID, clientID, input, requestID string, cb runt
 	return runID, state, nil
 }
 
+// StartRunSync 提交一次内部(同步宿主入口)Run 并返回句柄(PR4,总方案 §九「同
+// 步与后台 Run 最终统一」):/agent 与 session/prompt 的统一提交面——handleAgent
+// 经 plugin 委托调用,与后台路径共用 manager.StartRun 的同一套记账(per-session
+// active 占位)、门禁(每会话至多一个活动 Run,第二提交 ErrRunActive)、全局
+// runSlots/pending 配额、journal 记账(queued→running→终态)、事件面(hub tee)
+// 与终态化(finalizeRun),不复制任何执行流程。
+//
+// 与 StartRun(后台/xgw 面)的三点差异,均为「同步宿主入口」的身份使然:
+//   - 无 fencing:调用方是进程内同步入口(CLI 命令/嵌入式 Eval),不持有任何
+//     Connection Control Lease——§4.1「内部调度可以不依赖 Connection Lease,
+//     但仍需要明确它具有启动 Run 的权限」,本方法即该内部执行身份(service.go
+//     ClientKindInternal 预留)的提交入口;协议面 StartRun 仍强制 lease,两不
+//     混淆;
+//   - 无幂等记账:同步 prompt 无 requestID(空键从不入 RequestRegistry,每次
+//     新起跑),直接 manager.StartRun;
+//   - 返回 RunHandle 而非 (runID, state) 快照:同步形态的调用方需要 Wait 阻塞
+//     至终态(「prompt 返回 = run 完成」),句柄是唯一等待面;Legacy 取消语义
+//     (调用方 ctx 取消 → 显式取消)由 Adapter 经 CancelRunSync 落地——runCtx
+//     来自宿主(StartRun 契约②),请求 ctx 不参与。
+//
+// 路由与不变量修复与 StartRun 同源:route(sessionID) nil → sessionNotFoundErr;
+// ensureRegistered 修复「current runtime 已注册」(纯内存 /new 同 id 重建窗口,
+// 提交不可落到注销的旧 runtime)。
+func (s *Service) StartRunSync(sessionID string, req runtimeagent.RunRequest, cb runtimeagent.RunCallbacks) (runtimeagent.RunHandle, error) {
+	rt := s.route(sessionID)
+	if rt == nil {
+		return runtimeagent.RunHandle{}, sessionNotFoundErr(sessionID)
+	}
+	s.ensureRegistered(rt)
+	return s.sessions.StartRun(rt.ID, req, cb)
+}
+
+// CancelRunSync 取消一个内部(同步宿主入口)Run(PR4,总方案 §九的 Legacy 取消
+// 语义):同步 Run 的 runCtx 来自宿主,调用方请求 ctx 的取消不传播——Adapter
+// 在等待面(handleAgent 的 select)显式转本方法落地取消。与 CancelRun 的唯一
+// 差异是无 fencing(内部执行身份不持 Connection Lease,同 StartRunSync);
+// ensureRegistered 的不变量修复同源。manager 的拒绝语义原样上抛:run 已终态
+// (与取消竞争落败)→ ErrRunNotFound,Adapter 视为幂等空操作。
+func (s *Service) CancelRunSync(sessionID, runID string) error {
+	rt := s.route(sessionID)
+	if rt == nil {
+		return sessionNotFoundErr(sessionID)
+	}
+	s.ensureRegistered(rt)
+	return s.sessions.CancelRun(rt.ID, runID)
+}
+
 // CancelRun 取消一个后台 Run:多会话寻址 → 本会话 lease 临界区内原子完成
 // 「lease 校验 + 取消提交」→ 直转 manager(与 StartRun 同构的 fencing:校验通过
 // 后不可能被接管,未持有 → ErrControlLeaseLost)。不变量修复的必要性同迁移前
 // (registerCurrentRuntime → ensureRegistered):current 会话的 runtime 在同 id
 // 重建窗口(纯内存 /new)下可能未在册,同步 run 活跃其上时不经修复会被误报
 // ErrRunNotFound;跨会话路由的 runtime 本就来自注册表,修复为幂等空操作。
-// manager 的拒绝语义原样上抛:未知 run → ErrRunNotFound;同步 RecordRun 路径
-// 的 run 无 cancel → ErrRunNotCancellable(其取消入口是调用方请求 ctx,P2-6
-// 契约)。
+// manager 的拒绝语义原样上抛:未知 run → ErrRunNotFound;PR4 起 daemon 全部
+// 入口(sync/background)的 Run 都经 manager.StartRun 提交、均可取消,
+// ErrRunNotCancellable 仅剩 RecordRun 记账形态(测试/内部细节,无 cancel)。
 func (s *Service) CancelRun(sessionID, clientID, runID string) error {
 	rt := s.route(sessionID)
 	if rt == nil {

@@ -315,13 +315,14 @@ func finalizeRun(r *SessionRuntime, run *AgentRun, res RunResult) RunResult {
 	return res
 }
 
-// RecordRun 在「调用方已持 gate」的前提下执行一轮会话并记账——withSession 的
-// 临界区是唯一预期调用点,这里绝不再 AcquireRun(二次排队即死锁)。流程:创建
-// AgentRun 存入 r.active → 执行 fn → finalizeRun 终态化(归一+journal 终态+
-// finish+清 active)→ 返回归一后结果。
+// RecordRun 在「调用方已持 gate」的前提下执行一轮会话并记账——这里绝不再
+// AcquireRun(二次排队即死锁)。流程:创建 AgentRun 存入 r.active → 执行 fn →
+// finalizeRun 终态化(归一+journal 终态+finish+清 active)→ 返回归一后结果。
 //
-// 这是 P0 阶段 daemon 同步调用形态的适配;后台形态(StartRun)由 P2-5 的
-// RunSupervisor 提供,二者经 finalizeRun 共享终态化。
+// 这是 P0 阶段 daemon 同步调用形态的适配。PR4(总方案 §九)起 daemon 的同步
+// 入口(handleAgent)已迁移到 StartRun 统一门禁,本方法不再有生产调用方,仅作
+// 测试/内部记账细节保留(最小 diff:ai-runtime 既有测试面大量消费);后台形态
+// (StartRun)由 P2-5 的 RunSupervisor 提供,二者经 finalizeRun 共享终态化。
 func (r *SessionRuntime) RecordRun(fn func(*Session) (RunResult, error)) RunResult {
 	// SessionID 暂以 runtime id 充当("current");store 的稳定 SessionID 在 P1-3 接线。
 	run := newAgentRun(newRunID(), r.ID)

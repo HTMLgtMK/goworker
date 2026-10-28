@@ -36,12 +36,16 @@ type sessionGateKey struct{}
 // 的嵌套命令)回落 p.currentSession()。互斥点在解析出的同一 runtime 的 gate 上
 // (容量 1,AcquireRun 监听 ctx 取消)——解析与互斥同源,杜绝「锁在 A 会话、写在
 // B 会话」;解析出的 runtime 随注入进 run ctx(resolvedSessionKey),闭包内取数点
-// 与嵌套命令全部读到同一 runtime。7 个会话命令 handler(/agent /new /compact
-// /usage /history /task /rewind)全部经此排队,同一时刻只有一个命令回合在跑;
-// agent 运行期间 collectTools 嵌套 hub.Eval 执行这些命令时,靠 sessionGateKey ctx
-// 重入标记放行,绝不在持有 gate 时重复排队(重复取锁即死锁)——嵌套回合的 ctx
-// 已携带外层注入的 runtime,闭包解析与外层同源。解析结果为 nil(无 Binding 回落
-// 后仍无活动 runtime:Init 未完成/失败回滚)时报错;Binding 悬空(会话已被 /new
+// 与嵌套命令全部读到同一 runtime。6 个维护类会话命令 handler(/new /compact
+// /usage /history /task /rewind)经此排队,同一时刻命令回合与在途 Run(execute
+// 持 gate)互斥;PR4 起 /agent(handleAgent)不经此排队——prompt 的提交走
+// manager.StartRun,互斥由 execute 的 AcquireRun 承担、占位拒绝由 active 检查
+// 承担(总方案 §九统一门禁),运行中的嵌套命令靠 manager runCtx 携带的
+// sessionGateKey 重入标记(WithRunContext,P5-1)放行。agent 运行期间
+// collectTools 嵌套 hub.Eval 执行这些命令时,靠 sessionGateKey ctx 重入标记
+// 放行,绝不在持有 gate 时重复排队(重复取锁即死锁)——嵌套回合的 ctx 已携带
+// 外层注入的 runtime,闭包解析与外层同源。解析结果为 nil(无 Binding 回落后
+// 仍无活动 runtime:Init 未完成/失败回滚)时报错;Binding 悬空(会话已被 /new
 // 收口)诚实报 session not found,不回落 current。
 func (p *AgentPlugin) withSession(ctx context.Context, run func(context.Context) error) error {
 	// nil ctx 归一(既有测试直接构造 Context 不带 Ctx):按无绑定处理。
@@ -72,6 +76,28 @@ func withPluginContext(ctx *model.Context, runCtx context.Context) *model.Contex
 	return &copy
 }
 
+// handleAgent 是 /agent、未匹配输入(fallback)与标准 ACP session/prompt 的统一
+// 执行终点(Engine.Eval → fallback)。PR4(总方案 §九「同步与后台 Run 最终统一」)
+// 起 Run 提交与结果结算统一到 manager.StartRun:同步 prompt 与 xgw 后台 run 共用
+// 同一套 per-session 门禁(每会话至多一个活动 Run,第二提交 ErrRunActive)、
+// 全局 runSlots/pending 配额、journal 记账(queued→running→终态)、事件面(hub
+// tee:token/审批/usage 照常进事件流,CLI/ACP 前端回调经 tee 原样转发)与终态化
+// (finalizeRun)——RecordRun 记账形态退役;既有能力(Checkpoint、Error Capture、
+// Usage Commit、HITL 链)全部在 Session.Run 内沿用,无复制执行流程。
+//
+// 流序:cwd 守卫(不变)→ binding 优先解析本回合会话(不再经 withSession 排队
+// ——会话互斥由 execute 的 AcquireRun 承担,提交即占位)→ StartRunSync 提交
+// (立即返回句柄;拒绝显式上抛)→ Legacy 等待面:
+//   - Wait 阻塞至终态:「prompt 返回 = run 完成」语义保留(CLI/stdio);
+//   - 请求 ctx 取消 → 显式 CancelRunSync(总方案 §九:StartRun 的 runCtx 来自
+//     宿主,请求 ctx 不传播,Legacy CLI 的「取消即终止 Agent」由 Adapter 显式
+//     实现,不依赖请求 ctx 传播)→ 换无取消上下文收尾等待终态落盘;
+//   - 取消与完成竞争:CancelRun 对已终态 Run 返回 ErrRunNotFound(幂等空操作),
+//     收尾 Wait 返回真实终态,两种交错同收敛。
+//
+// 错误面:提交拒绝(ErrRunActive/ErrSessionNotFound 等)上抛;Run 执行结果与
+// 迁移前同型——res 进 debug 日志,handleAgent 恒返回 nil(CLI/ACP 错误面不变,
+// 取消路径亦然)。
 func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
 	// 最近一次会话 cwd 声明未通过 sandbox 边界校验 → 明确报错（无效声明语义，
 	// 见 SetSession）。/new /compact 等维护命令不受影响，只有真正的 prompt 被挡。
@@ -80,26 +106,40 @@ func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
 	if err := p.sessionCWDErrorIn(ctx.Ctx); err != nil {
 		return err
 	}
-	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
-		runContext := withPluginContext(ctx, runCtx)
-		// 解析与互斥同源：gate 在 withSession 已按 binding 优先解析并在该 runtime
-		// 上排队，这里读注入的同一 runtime 做记账(不重读 current——/new 换轨窗口
-		// 劈不进闭包)。Run 生命周期记账在 RecordRun（已持 gate，只记账
-		// 不再排队）；RunResult 进 debug 日志，handleAgent 返回值仍为闭包返回的
-		// error（现状 nil），CLI/ACP 错误面不变。
-		rt, err := p.sessionRuntimeIn(runCtx)
-		if err != nil || rt == nil {
-			return fmt.Errorf("agent: no active session")
+	// nil ctx 归一(既有测试直接构造 Context 不带 Ctx):按不可取消的请求处理。
+	reqCtx := ctx.Ctx
+	if reqCtx == nil {
+		reqCtx = context.Background()
+	}
+	// 解析与提交同源(binding 优先,PR2 形态解析点):解析出的 runtime 即提交
+	// 目标(rt.ID 经 Service 路由回同一 runtime),闭包内不再重读 current。
+	rt, err := p.sessionRuntimeIn(reqCtx)
+	if err != nil {
+		return err
+	}
+	if rt == nil {
+		return fmt.Errorf("agent: no active session")
+	}
+	handle, err := p.StartRunSync(rt.ID, runtimeagent.RunRequest{
+		Input:      strings.Join(ctx.Args, " "),
+		ToolSource: ctx.ToolSource,
+	}, callbacksFromPlugin(ctx))
+	if err != nil {
+		return err
+	}
+	res, waitErr := handle.Wait(reqCtx)
+	if waitErr != nil {
+		// Wait 仅以 ctx.Err() 失败(RunHandle.Wait 契约)⇒ 请求 ctx 已取消:
+		// Legacy 取消语义显式落地(§九 Adapter 形态)。
+		if cerr := p.CancelRunSync(rt.ID, handle.RunID); cerr != nil {
+			slog.Debug("agent: prompt cancel", "err", cerr, "run", handle.RunID)
 		}
-		res := rt.RecordRun(func(s *runtimeagent.Session) (runtimeagent.RunResult, error) {
-			return s.Run(runCtx, runtimeagent.RunRequest{
-				Input:      strings.Join(ctx.Args, " "),
-				ToolSource: ctx.ToolSource,
-			}, callbacksFromPlugin(runContext))
-		})
-		slog.Debug("agent: run finished", "state", res.State, "persisted", res.Persisted, "err", res.Err)
-		return nil
-	})
+		// 换无取消上下文收尾:阻塞至 run 终态(终态 journal 落盘先于 done 关闭,
+		// finalizeRun 次序不变量)——「prompt 返回 = run 完成」在取消路径同样成立。
+		res, _ = handle.Wait(context.Background())
+	}
+	slog.Debug("agent: run finished", "state", res.State, "persisted", res.Persisted, "err", res.Err)
+	return nil
 }
 
 // callbacksFromPlugin 把 model.Context 的 I/O 回调适配成 runtimeagent.RunCallbacks。

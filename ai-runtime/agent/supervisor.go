@@ -155,8 +155,8 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	// deps.RunEvents 非 nil 时惰性创建会话级 EventHub(runtime.bindEvents,创建
 	// 一次后续 run 复用),本 run 的产生边界由 ⑤ 之后的 BeginRun 括起(设
 	// AppendEvent 目标兜底 + 防御性 flush 上一 run 残留合并缓冲)。RunEvents 为
-	// nil 时 hub 为 nil——零开销路径,同步 RecordRun 路径完全不经此处(行为零
-	// 变化)。tee 包装(cb = teeRunCallbacks)已下移到 ⑦.6:P4-2 的审批回退(⑦.5)
+	// nil 时 hub 为 nil——零开销路径(未接线事件流的宿主/测试路径)。tee 包装
+	// (cb = teeRunCallbacks)已下移到 ⑦.6:P4-2 的审批回退(⑦.5)
 	// 须先于 tee——tee 检测 cb.Decide 非 nil 才包 permission.requested/resolved,
 	// 次序颠倒会漏掉审批事件对。
 	//
@@ -237,8 +237,8 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	// 命中)。runCtx 以宿主 ctx 为父(契约②:调用方 ctx 不参与);P5-1 起先逐项
 	// WithValue 注入 WithRunContext 声明的键值对(构造期写定、此处只读,无锁),
 	// 再 WithCancel——取消传播不变(WithCancel 的父是注入链,根仍是宿主 ctx)。
-	// 同步 RecordRun 路径不经此处,run.cancel 恒 nil 的语义不变
-	// (ErrRunNotCancellable 的产生面仍只有同步路径)。
+	// RecordRun 记账形态(PR4 起仅测试/内部细节)不经此处,其 run.cancel 恒 nil
+	// (ErrRunNotCancellable 的唯一产生面)。
 	runCtx := m.contextOf()
 	for _, kv := range m.runCtxValues {
 		runCtx = context.WithValue(runCtx, kv.Key, kv.Value)

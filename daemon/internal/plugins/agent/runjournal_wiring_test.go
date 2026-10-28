@@ -150,10 +150,13 @@ func TestStartSessionMarksInterruptedRuns(t *testing.T) {
 	}
 }
 
-// TestAgentRunJournalsThroughDaemon 验证 P2-7 的 journal 接线穿透 daemon 全链：
-// 持久化启用路径跑一轮 /agent（handleAgent → withSession → RecordRun），当前
-// 会话 runs/ 下出现恰一个 run 文件，记录序 running → completed（RecordRun 同步
-// 路径无 queued——queued 是 P2-5 StartRun 的记录，daemon 不经它）。
+// TestAgentRunJournalsThroughDaemon 验证 PR4(总方案 §九)的 journal 接线穿透
+// daemon 全链:持久化启用路径跑一轮 /agent(handleAgent → StartRunSync →
+// manager.StartRun),当前会话 runs/ 下出现恰一个 run 文件,state 记录序
+// queued → running → completed(与后台 Run 同型——queued 是 StartRun 的
+// durable-first 接受记录,PR4 起同步 prompt 与后台 run 同一记账面;RecordRun
+// 形态的 running 起跑记录已退役)。事件记录与 state 记录同文件混存
+// (journal_store.go P3-1),断言只认 kind=="state" 的行。
 //
 // 固定 provider 经 setMemory 同款手法注入（plugin_test.go:240-244）：SessionDeps
 // 是值拷贝，改 p.deps 后必须 refreshSession 重建会话生效；refreshSession 与
@@ -208,19 +211,27 @@ func TestAgentRunJournalsThroughDaemon(t *testing.T) {
 		t.Fatalf("runs dir has %d entries, want 1", len(entries))
 	}
 	recs := readRunJournalFile(t, filepath.Join(runsDir, entries[0].Name()))
-	if len(recs) != 2 {
-		t.Fatalf("run records = %d (%+v), want 2", len(recs), recs)
+	// 事件记录与 state 记录同文件混存(P3-1):只断言 kind=="state" 的行。
+	var states []session.RunStateRecord
+	for _, rec := range recs {
+		if rec.Kind == "state" {
+			states = append(states, rec)
+		}
 	}
-	if recs[0].State != "running" || recs[1].State != "completed" {
-		t.Fatalf("record states = [%s %s], want [running completed]（RecordRun 无 queued）", recs[0].State, recs[1].State)
+	if len(states) != 3 {
+		t.Fatalf("run state records = %d (%+v), want 3", len(states), recs)
 	}
-	if recs[0].RunID == "" || recs[0].RunID != recs[1].RunID {
-		t.Fatalf("run ids = [%s %s], want same non-empty id", recs[0].RunID, recs[1].RunID)
+	if states[0].State != "queued" || states[1].State != "running" || states[2].State != "completed" {
+		t.Fatalf("record states = [%s %s %s], want [queued running completed]（StartRun 统一记账面）",
+			states[0].State, states[1].State, states[2].State)
 	}
-	if recs[0].SessionID != sid || recs[1].SessionID != sid {
-		t.Fatalf("record session ids = [%s %s], want %s", recs[0].SessionID, recs[1].SessionID, sid)
+	if states[0].RunID == "" || states[0].RunID != states[1].RunID || states[1].RunID != states[2].RunID {
+		t.Fatalf("run ids = [%s %s %s], want same non-empty id", states[0].RunID, states[1].RunID, states[2].RunID)
 	}
-	if !recs[1].Persisted {
+	if states[0].SessionID != sid || states[1].SessionID != sid || states[2].SessionID != sid {
+		t.Fatalf("record session ids = [%s %s %s], want %s", states[0].SessionID, states[1].SessionID, states[2].SessionID, sid)
+	}
+	if !states[2].Persisted {
 		t.Fatalf("completed record Persisted = false, want true（Conversation Commit 成功后才记 completed）")
 	}
 }

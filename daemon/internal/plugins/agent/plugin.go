@@ -577,9 +577,9 @@ func (p *AgentPlugin) startSession() {
 	//（P3-1 起该类型同时实现 AppendState/AppendEvent/ReadEvents/SeqRange，编译断言
 	// event_hub.go:62）——事件持久化与 run 状态 journal 同文件同源。typed-nil 纪律
 	// 同 spec.go:96：st == nil 不设，RunEvents 的「nil = 不启用事件流」判断保持真
-	// nil。零行为：bindEvents 仅 StartRun 触发（supervisor.go:147），daemon 现无
-	// StartRun 调用方；同步 RecordRun 路径不建 hub、不写事件（P5-6/7 起
-	// x-goworker 路径改变）。
+	// nil。PR4(总方案 §九)起 daemon 全部入口(/agent、session/prompt 与 xgw 后台
+	// run)的 Run 都经 manager.StartRun 提交——hub 随首个 Run 惰性创建(bindEvents),
+	// 同步 run 与后台 run 的事件语义一致(token/审批/usage/run.* 全进事件流)。
 	if st != nil {
 		p.deps.Store = st
 		journalStore := session.NewRunJournalStore(p.repo, st)
