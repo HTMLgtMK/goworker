@@ -21,6 +21,9 @@ func TestRecord_MarshalFlatFormat(t *testing.T) {
 		newHeadRecord("m_08", now),
 		newCheckpointRecord("ck_1", "m_08", "preview", now),
 		newCursorRecord("m_08", now),
+		// Plan A1 新增 kind：workspace（path + created_at）、archived（仅 created_at）
+		newWorkspaceRecord("/tmp/wk/demo", now),
+		newArchivedRecord(now),
 	}
 	want := []string{
 		`{"kind":"msg","id":"m_01","parent":"s_01","role":"assistant","content":"hello","tool_calls":[{"id":"t1","type":"function","function":{"name":"","arguments":""}}],"tool_call_id":"tc1","created_at":"2024-01-01T00:00:00Z"}`,
@@ -28,6 +31,8 @@ func TestRecord_MarshalFlatFormat(t *testing.T) {
 		`{"kind":"head","tail":"m_08","created_at":"2024-01-01T00:00:00Z"}`,
 		`{"kind":"checkpoint","id":"ck_1","at":"m_08","preview":"preview","created_at":"2024-01-01T00:00:00Z"}`,
 		`{"kind":"cursor","msg_id":"m_08","created_at":"2024-01-01T00:00:00Z"}`,
+		`{"kind":"workspace","path":"/tmp/wk/demo","created_at":"2024-01-01T00:00:00Z"}`,
+		`{"kind":"archived","created_at":"2024-01-01T00:00:00Z"}`,
 	}
 
 	for i, r := range recs {
@@ -61,5 +66,66 @@ func TestRecord_UnmarshalOldFormat(t *testing.T) {
 	}
 	if c.Comp == nil || c.Comp.Summary != "s" || c.Comp.CoveredFrom != "a" || c.Comp.CoveredTo != "b" {
 		t.Errorf("compact fields wrong: %+v", c.Comp)
+	}
+}
+
+// TestRecord_WorkspaceArchivedRoundtrip Plan A1 新增 kind 的读回往返：
+// marshal → unmarshal 后字段组与 Created() 时间戳保真。
+func TestRecord_WorkspaceArchivedRoundtrip(t *testing.T) {
+	now := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	var w Record
+	wLine := `{"kind":"workspace","path":"/tmp/wk/x","created_at":"2024-06-01T12:00:00Z"}`
+	if err := json.Unmarshal([]byte(wLine), &w); err != nil {
+		t.Fatalf("unmarshal workspace: %v", err)
+	}
+	if w.Kind != kindWorkspace || w.Ws == nil || w.Ws.Path != "/tmp/wk/x" {
+		t.Fatalf("workspace record = %+v, want Ws.Path=/tmp/wk/x", w)
+	}
+	if !w.Created().Equal(now) {
+		t.Errorf("workspace Created() = %v, want %v", w.Created(), now)
+	}
+	// 往返一致（字节级断言已由 TestRecord_MarshalFlatFormat 覆盖，这里验结构等价）
+	b, err := json.Marshal(w)
+	if err != nil {
+		t.Fatalf("marshal workspace: %v", err)
+	}
+	if string(b) != wLine {
+		t.Errorf("workspace roundtrip mismatch:\n got  %s\n want %s", string(b), wLine)
+	}
+
+	var a Record
+	aLine := `{"kind":"archived","created_at":"2024-06-01T12:00:00Z"}`
+	if err := json.Unmarshal([]byte(aLine), &a); err != nil {
+		t.Fatalf("unmarshal archived: %v", err)
+	}
+	if a.Kind != kindArchived || a.Arc == nil {
+		t.Fatalf("archived record = %+v, want Arc set", a)
+	}
+	if !a.Created().Equal(now) {
+		t.Errorf("archived Created() = %v, want %v", a.Created(), now)
+	}
+	b, err = json.Marshal(a)
+	if err != nil {
+		t.Fatalf("marshal archived: %v", err)
+	}
+	if string(b) != aLine {
+		t.Errorf("archived roundtrip mismatch:\n got  %s\n want %s", string(b), aLine)
+	}
+}
+
+// TestRecord_UnknownKindTolerated 关闭 Plan A1 的兼容确认项：旧版 daemon 读到
+// 新 kind（此处模拟未来 kind）不报错、按无字段组记录收下、不进坏行跳过路径
+// ——旧版读新文件只是看不到新声明，无害。
+func TestRecord_UnknownKindTolerated(t *testing.T) {
+	var r Record
+	if err := json.Unmarshal([]byte(`{"kind":"future_kind","x":1,"created_at":"2024-06-01T12:00:00Z"}`), &r); err != nil {
+		t.Fatalf("unknown kind must not error: %v", err)
+	}
+	if r.Kind != "future_kind" {
+		t.Errorf("kind = %q, want preserved as-is", r.Kind)
+	}
+	if r.Msg != nil || r.Comp != nil || r.Head != nil || r.CK != nil || r.Cur != nil || r.Meta != nil || r.Ws != nil || r.Arc != nil {
+		t.Errorf("unknown kind must not populate any field group: %+v", r)
 	}
 }

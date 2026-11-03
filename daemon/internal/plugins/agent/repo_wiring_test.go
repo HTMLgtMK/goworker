@@ -14,7 +14,7 @@ import (
 // P1-3 接线测试：plugin 的持久化从全局单 Store 换轨 Repository（每会话独立目录
 // + legacy 根槽兼容挂载）。本文件锁死 P1-3 验收要求的两条语义：
 //   - /new 在 legacy 槽上归档后，新会话经 Repository.Create 产出独立目录
-//     （<root>/<新id>/current.jsonl），与旧会话数据互不串扰；
+//     （<root>/<新id>/<新id>.jsonl，Plan A1 v2 文件名），与旧会话数据互不串扰；
 //   - ReloadCurrentSession / CurrentSessionHistory 的取数随 current 换轨，
 //     /new 前后各自返回所属会话的数据。
 //
@@ -41,8 +41,8 @@ func seedLegacySession(t *testing.T, root, userText string) string {
 }
 
 // TestNewCreatesIndependentStore：临时 Session.Dir 造 legacy 槽 → /new（经 handler）
-// → ① 新会话目录 <root>/<新id>/current.jsonl 存在且 id ≠ 旧 id；② 旧会话归档文件
-// 仍在（legacy 槽内轮转）；③ 新 store ActiveView 为空（旧历史不串入）。
+// → ① 新会话目录 <root>/<新id>/<新id>.jsonl 存在且 id ≠ 旧 id（Plan A1 v2 文件名）；
+// ② 旧会话归档文件仍在（legacy 槽内轮转）；③ 新 store ActiveView 为空（旧历史不串入）。
 func TestNewCreatesIndependentStore(t *testing.T) {
 	root := t.TempDir()
 	oldID := seedLegacySession(t, root, "旧会话的问题")
@@ -68,7 +68,8 @@ func TestNewCreatesIndependentStore(t *testing.T) {
 		t.Errorf("handleNew output = %q, want success message", buf.String())
 	}
 
-	// ① 新会话独立目录：Create 产出 <root>/<新id>/current.jsonl，id 与旧会话不同
+	// ① 新会话独立目录：Create 产出 <root>/<新id>/<新id>.jsonl（Plan A1 v2 文件名，
+	// 目录 basename 是合法 session id），id 与旧会话不同
 	fresh := p.currentStore()
 	if fresh == nil {
 		t.Fatal("no current store after /new")
@@ -80,7 +81,7 @@ func TestNewCreatesIndependentStore(t *testing.T) {
 	if newID == oldID {
 		t.Fatalf("new session id %q equals legacy id", newID)
 	}
-	if _, err := os.Stat(filepath.Join(root, newID, "current.jsonl")); err != nil {
+	if _, err := os.Stat(filepath.Join(root, newID, newID+".jsonl")); err != nil {
 		t.Fatalf("new session dir %s missing: %v", filepath.Join(root, newID), err)
 	}
 

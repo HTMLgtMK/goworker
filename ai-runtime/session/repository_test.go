@@ -2,7 +2,9 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -321,5 +323,281 @@ func TestLegacyRootMount(t *testing.T) {
 	}
 	if _, err := mounted.Commit([]core.Message{commMsg("m_legacy2", "user", "post rotation")}); err != nil {
 		t.Fatalf("Commit on mounted legacy after rotation: %v", err)
+	}
+}
+
+// ── Plan A1 / A2.1①：CWD 接通、v2 双探测、CloseSession 逐出 ──────────────
+
+// TestRepositoryCreateDeclaresWorkspace 验证 Create 接通 CWD（Plan A1「创建即声明」）：
+// CWD 非空 → workspace 记录落 v2 数据文件、Workspace() 可读、跨重启可恢复；
+// CWD 为空 → 不落记录（「未声明」= 不写记录，DeclareWorkspace 注释论证）；
+// Title 仍被忽略（决策 1）。
+func TestRepositoryCreateDeclaresWorkspace(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+
+	s, err := repo.Create(ctx, CreateOptions{Title: "ignored title", CWD: "/tmp/wk/x"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got := s.Workspace(); got != "/tmp/wk/x" {
+		t.Fatalf("Workspace after Create = %q, want /tmp/wk/x", got)
+	}
+
+	// workspace 记录落在 v2 数据文件里（Create 产出 session_<hex> 目录）
+	v2Path := filepath.Join(root, s.SessionID(), s.SessionID()+".jsonl")
+	lines := readJSONLFile(t, v2Path)
+	if len(lines) < 2 {
+		t.Fatalf("v2 file %s has %d lines, want >= 2 (metadata + workspace)", v2Path, len(lines))
+	}
+	var last Record
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &last); err != nil {
+		t.Fatalf("unmarshal last line: %v", err)
+	}
+	if last.Kind != kindWorkspace || last.Ws == nil || last.Ws.Path != "/tmp/wk/x" {
+		t.Fatalf("last record = %+v, want workspace with path /tmp/wk/x", last)
+	}
+
+	// 空 CWD：不落 workspace 记录
+	bare, err := repo.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("Create without CWD: %v", err)
+	}
+	if got := bare.Workspace(); got != "" {
+		t.Fatalf("Workspace without CWD = %q, want empty", got)
+	}
+
+	// 跨重启：workspace 声明从记录恢复（A7 设计点 5 清单 cwd 的取数前提）
+	if err := repo.Close(); err != nil {
+		t.Fatalf("repo.Close: %v", err)
+	}
+	repo2, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("reopen OpenRepository: %v", err)
+	}
+	defer repo2.Close()
+	got, err := repo2.Open(s.SessionID())
+	if err != nil {
+		t.Fatalf("Open after restart: %v", err)
+	}
+	if got.Workspace() != "/tmp/wk/x" {
+		t.Fatalf("Workspace after restart = %q, want /tmp/wk/x (记录持久)", got.Workspace())
+	}
+}
+
+// TestRepositoryOpenListDualProbe 验证 Open/List 的数据文件双探测（Plan A1）：
+// ① Create 产出 v2 名后重开 Repository，Open/List 均命中（v2 探测）；
+// ② 手工造 <id>/current.jsonl 存量形态，Open/List 同样命中（兼容探测），且读路径不创建 v2 文件（不隐性迁移，改名归 A4）。
+func TestRepositoryOpenListDualProbe(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+
+	// 经 tmpRepo 落盘一个 v2 会话
+	tmpRepo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("tmp OpenRepository: %v", err)
+	}
+	created, err := tmpRepo.Create(ctx, CreateOptions{CWD: "/tmp/wk/probe"})
+	if err != nil {
+		t.Fatalf("tmp Create: %v", err)
+	}
+	id := created.SessionID()
+	if err := tmpRepo.Close(); err != nil {
+		t.Fatalf("tmpRepo.Close: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, id, id+".jsonl")); err != nil {
+		t.Fatalf("fixture: v2 file missing: %v", err)
+	}
+
+	repo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+	defer repo.Close()
+
+	// ① v2 探测
+	list, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if !listContains(list, id) {
+		t.Fatalf("List = %v, want v2 session %s", list, id)
+	}
+	got, err := repo.Open(id)
+	if err != nil {
+		t.Fatalf("Open v2 session: %v", err)
+	}
+	if got.SessionID() != id || got.Workspace() != "/tmp/wk/probe" {
+		t.Fatalf("Open v2 session = {id %s ws %q}, want {id %s ws /tmp/wk/probe}",
+			got.SessionID(), got.Workspace(), id)
+	}
+
+	// ② 存量 current.jsonl 兼容探测
+	legacyID := NewSessionID()
+	legacyDir := filepath.Join(root, legacyID)
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatalf("mkdir legacy dir: %v", err)
+	}
+	seed := fmt.Sprintf(`{"kind":"metadata","session_id":%q,"created_at":"2024-01-01T00:00:00Z"}`+"\n", legacyID)
+	if err := os.WriteFile(filepath.Join(legacyDir, "current.jsonl"), []byte(seed), 0o600); err != nil {
+		t.Fatalf("write legacy current.jsonl: %v", err)
+	}
+	list, err = repo.List(ctx)
+	if err != nil {
+		t.Fatalf("List after legacy dir: %v", err)
+	}
+	if !listContains(list, legacyID) {
+		t.Fatalf("List = %v, want legacy-slot session %s", list, legacyID)
+	}
+	mounted, err := repo.Open(legacyID)
+	if err != nil {
+		t.Fatalf("Open legacy-slot session: %v", err)
+	}
+	if mounted.SessionID() != legacyID {
+		t.Fatalf("Open legacy slot: SessionID = %q, want %q", mounted.SessionID(), legacyID)
+	}
+	if _, err := os.Stat(filepath.Join(legacyDir, legacyID+".jsonl")); !os.IsNotExist(err) {
+		t.Errorf("compat probe must not create the v2 file (rename 归 A4): stat err = %v", err)
+	}
+}
+
+// TestRepositoryCloseSessionReopen 验证 A2.1① 死实例修复：
+// CloseSession 关闭实例并逐出缓存；再次 Open 走 flock 慢路径拿到活的新实例
+// （锁已释放即可重开——session/load 重开需要的语义）；旧实例已 Close 不可写；
+// 对不在缓存中的 id 幂等返回 nil。
+func TestRepositoryCloseSessionReopen(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+
+	// 经 tmpRepo 落盘会话，保证被测 repo 的首次 Open 走慢路径
+	tmpRepo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("tmp OpenRepository: %v", err)
+	}
+	seeded, err := tmpRepo.Create(ctx, CreateOptions{})
+	if err != nil {
+		t.Fatalf("tmp Create: %v", err)
+	}
+	id := seeded.SessionID()
+	if err := tmpRepo.Close(); err != nil {
+		t.Fatalf("tmpRepo.Close: %v", err)
+	}
+
+	repo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+	defer repo.Close()
+
+	s1, err := repo.Open(id)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if s2, err := repo.Open(id); err != nil || s2 != s1 {
+		t.Fatalf("second Open = (%p, %v), want same instance %p", s2, err, s1)
+	}
+
+	// 幂等：不在缓存中的 id 返回 nil（调用方无需先探测）
+	if err := repo.CloseSession("session_00000000000000000000000000000000"); err != nil {
+		t.Fatalf("CloseSession(unknown id) = %v, want nil", err)
+	}
+
+	// 逐出 + 关闭
+	if err := repo.CloseSession(id); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+	// 再次逐出同样幂等（id 已不在缓存）
+	if err := repo.CloseSession(id); err != nil {
+		t.Fatalf("second CloseSession = %v, want nil (idempotent)", err)
+	}
+	// 旧实例已关闭：不再可写（句柄已释放）
+	if _, err := s1.Commit(msgs("user", "dead write")); err == nil {
+		t.Error("Commit on closed instance = nil error, want error")
+	}
+
+	// 重开：新实例、活实例（flock 已释放，慢路径可直接重开）
+	s3, err := repo.Open(id)
+	if err != nil {
+		t.Fatalf("Open after CloseSession: %v", err)
+	}
+	if s3 == s1 {
+		t.Fatal("Open after CloseSession returned the closed instance")
+	}
+	if _, err := s3.Commit(msgs("user", "alive again")); err != nil {
+		t.Fatalf("Commit on reopened store: %v", err)
+	}
+	if view := s3.ActiveView(); len(view) != 1 || view[0].Content != "alive again" {
+		t.Fatalf("ActiveView on reopened store = %v, want ['alive again']", viewContent(view))
+	}
+}
+
+// TestRepositoryCloseSessionEvictsAliasEntries 验证别名条目一并逐出：
+// legacy 槽轮转换 id 后同一 *Store 挂在多个 id 下（Open 的同目录别名机制），
+// CloseSession(任一 id) 必须把全部别名条目逐出并只关闭一次——留任一条目都会
+// 让该 id 的 Open 命中已关闭实例，死实例问题换个 id 复发。
+func TestRepositoryCloseSessionEvictsAliasEntries(t *testing.T) {
+	root := t.TempDir()
+
+	// 造 legacy 槽夹具：root 自身即会话槽（同 TestLegacyRootMount）
+	legacy, err := Open(root)
+	if err != nil {
+		t.Fatalf("legacy Open: %v", err)
+	}
+	if _, err := legacy.Commit(msgs("user", "alias fixture")); err != nil {
+		t.Fatalf("legacy Commit: %v", err)
+	}
+	if err := legacy.Archive(); err != nil {
+		t.Fatalf("legacy Archive: %v", err)
+	}
+	legacyID := legacy.SessionID()
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("legacy Close: %v", err)
+	}
+
+	repo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+	defer repo.Close()
+
+	mounted, err := repo.Open(legacyID)
+	if err != nil {
+		t.Fatalf("Open legacy slot: %v", err)
+	}
+	// 槽内再轮转一次换 id → Open(新 id) 走别名机制复用同一实例
+	if err := mounted.Archive(); err != nil {
+		t.Fatalf("Archive on mounted legacy: %v", err)
+	}
+	newID := mounted.SessionID()
+	again, err := repo.Open(newID)
+	if err != nil {
+		t.Fatalf("Open rotated id: %v", err)
+	}
+	if again != mounted {
+		t.Fatal("fixture broken: rotated id did not reuse the mounted instance (alias)")
+	}
+
+	// CloseSession(旧 id) → 实例关闭、{旧 id, 新 id} 两个条目全部逐出
+	if err := repo.CloseSession(legacyID); err != nil {
+		t.Fatalf("CloseSession(alias id): %v", err)
+	}
+	if _, err := mounted.Commit(msgs("user", "dead alias")); err == nil {
+		t.Error("Commit on closed alias instance = nil error, want error")
+	}
+
+	// 重开：新实例、活实例（legacy 根槽 current.jsonl 重新挂载）
+	fresh, err := repo.Open(newID)
+	if err != nil {
+		t.Fatalf("Open newID after CloseSession: %v", err)
+	}
+	if fresh == mounted {
+		t.Fatal("Open after CloseSession returned the closed alias instance")
+	}
+	if _, err := fresh.Commit(msgs("user", "fresh mount")); err != nil {
+		t.Fatalf("Commit on fresh mount: %v", err)
 	}
 }

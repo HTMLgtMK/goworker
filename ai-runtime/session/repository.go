@@ -3,7 +3,9 @@
 //
 // 目录布局：
 //
-//	<root>/<sessionID>/current.jsonl        新布局（P1 起创建，目录名即会话 id）
+//	<root>/<sessionID>/<sessionID>.jsonl    新布局（A1 起 v2 文件名，目录名即会话 id）
+//	<root>/<sessionID>/current.jsonl        v1 文件名（存量数据兼容读，A4 迁移改名；
+//	                                        非会话形态目录恒用此名，见 store.go resolveDataFilePath）
 //	<root>/<sessionID>/runs/<runID>.jsonl   run 状态 journal（P2-2 起，每 run 一文件；legacy 槽落 <root>/runs/）
 //	<root>/current.jsonl + <root>/archive/  legacy 布局（现有用户数据，只读兼容挂载）
 //
@@ -25,7 +27,11 @@
 //  3. 实例唯一：Repository 对同一 SessionID 恒返回同一 *Store（总方案第九节
 //     「Repository 对同一 SessionID 保证唯一的 Store 实例」），避免多次 Open 产生
 //     不同文件句柄共同写同一文件。open 缓存即唯一事实源；跨进程互斥不在此层，
-//     由 P1-2 的文件锁（flock + ErrStoreLocked）兜底。
+//     由 P1-2 的文件锁（flock + ErrStoreLocked）兜底。缓存里只有活实例（A2.1①）：
+//     Store 生命周期收口改为 CloseSession（关闭 + 逐出缓存）——死实例留缓存会让
+//     session/load 重开命中死对象（旧方案「已关闭实例留缓存防二次 ErrStoreLocked」
+//     随之作废：逐出后再次 Open 走 flock 慢路径，锁空闲即可重开，这正是重开需要
+//     的语义；实例唯一不变量不变——缓存里同 id 至多一个实例）。
 //
 // 附加不变量（由 Create 保证）：新布局下目录名 == 文件内 metadata.SessionID。
 // Store.Open 对全新空文件会自行生成随机 id（store.go:92-94），与目录名无关；因此
@@ -64,9 +70,10 @@ var (
 	ErrRunExists = errors.New("session: run journal already exists")
 )
 
-// CreateOptions 是 Create 的选项。Title/CWD 按 P1-1 计划仅作接口占位：本层不持久化
-// （决策 1：不新增 metadata.json，避免第二个身份事实源）——Title 由清单方按需扫描
-// 首条 user 消息得出，CWD 在 P1-4 作为会话运行态绑定。字段被接受但当前会被忽略。
+// CreateOptions 是 Create 的选项。Title 仍按 P1-1 计划仅作接口占位：本层不持久化
+// （决策 1：不新增 metadata.json，避免第二个身份事实源）——标题由清单方按需扫描
+// 首条 user 消息得出。CWD 自 Plan A1 起接通：cwd 兼任 workspace（定案需求 #4），
+// Create 以 workspace 记录「创建即声明」持久化到会话 jsonl。
 type CreateOptions struct {
 	Title string
 	CWD   string
@@ -94,14 +101,18 @@ func OpenRepository(root string) (*Repository, error) {
 
 // Create 新建一个会话：id = session.NewSessionID()，确认 <root>/<id>/ 不存在后
 // 种入首行 metadata（保证目录名 == 文件内 SessionID，见文件头「附加不变量」），
-// 再 Open 该目录并进缓存。返回的 Store 的 SessionID() 即新会话 id。
+// CWD 非空时追加 workspace 记录（Plan A1「创建即声明」），再 Open 该目录并进
+// 缓存。返回的 Store 的 SessionID() 即新会话 id。
 func (r *Repository) Create(ctx context.Context, opts CreateOptions) (*Store, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	// opts.Title/CWD 在 P1 被有意忽略（决策 1），_ = opts 显式表明这不是遗漏。
-	_ = opts
+	// opts.Title 仍被有意忽略（决策 1），_ = 显式表明这不是遗漏；
+	// opts.CWD 已接通（Plan A1）：空 CWD 不落 workspace 记录——「未声明」的表达
+	// 是不写记录而非空声明（DeclareWorkspace 注释），执行域语义（A4 空 cwd 注入
+	// tmp）落地前维持现状。
+	_ = opts.Title
 
 	id := NewSessionID()
 	dir := filepath.Join(r.root, id)
@@ -119,6 +130,12 @@ func (r *Repository) Create(ctx context.Context, opts CreateOptions) (*Store, er
 	if err != nil {
 		return nil, err
 	}
+	if opts.CWD != "" {
+		if err := s.DeclareWorkspace(opts.CWD); err != nil {
+			_ = s.Close()
+			return nil, fmt.Errorf("session: create %s: %w", id, err)
+		}
+	}
 
 	// 防御性双检：全新随机 id 正常不会已有实例；万一命中以先注册者为准（决策 3）。
 	r.mu.Lock()
@@ -135,7 +152,9 @@ func (r *Repository) Create(ctx context.Context, opts CreateOptions) (*Store, er
 }
 
 // Open 按 id 打开会话。解析顺序（未命中缓存时）：
-//  1. <root>/<id>/current.jsonl 存在 → 新布局，Open(<root>/<id>)；
+//  1. <root>/<id>/ 的数据文件存在 → 新布局，Open(<root>/<id>)。数据文件按 v2
+//     决议双探测（Plan A1）：先 <id>.jsonl（v2 名）后 current.jsonl（存量兼容），
+//     见 store.go resolveDataFilePath；
 //  2. 否则 legacy 根槽：<root>/current.jsonl 存在且其 metadata.SessionID == id →
 //     Open(root) 原地挂载（决策 2，不移动文件，Archive 仍在槽内轮转）；
 //  3. 否则 ErrSessionNotFound。
@@ -162,13 +181,13 @@ func (r *Repository) Open(id string) (*Store, error) {
 		return s, nil
 	}
 
-	// 解析 id → 目标目录
+	// 解析 id → 目标目录（数据文件双探测：先 v2 名后 current.jsonl，Plan A1）
 	target := ""
 	dir := filepath.Join(r.root, id)
-	if _, err := os.Stat(filepath.Join(dir, "current.jsonl")); err == nil {
+	if _, err := os.Stat(resolveDataFilePath(dir)); err == nil {
 		target = dir
 	} else if m, ok := resolveSlotMetadata(filepath.Join(r.root, "current.jsonl")); ok && m.SessionID == id {
-		target = r.root // legacy 根槽原地挂载（决策 2）
+		target = r.root // legacy 根槽原地挂载（决策 2；根槽恒为 current.jsonl，不做 v2 探测）
 	}
 	if target == "" {
 		return nil, fmt.Errorf("session: open %s: %w", id, ErrSessionNotFound)
@@ -191,10 +210,12 @@ func (r *Repository) Open(id string) (*Store, error) {
 	return s, nil
 }
 
-// List 扫描 <root>/*/current.jsonl 的 metadata（复用 Store.Open 的
-// metadataFromRecords/legacySessionID 机制，store.go:80-114）+ legacy 根槽。
-// 归档文件不计入：只认 current.jsonl，<root>/<id>/archive/*.jsonl 与 legacy 的
-// root/archive/ 天然被跳过（归档清单仍是 plugin 层扫描，见 sessions.go:42-64）。
+// List 扫描 <root>/*/<数据文件> 的 metadata（复用 Store.Open 的
+// metadataFromRecords/legacySessionID 机制）+ legacy 根槽。数据文件按 v2 决议
+// 双探测（Plan A1）：先 <目录名>.jsonl 后 current.jsonl（非会话形态目录名恒为
+// current.jsonl，见 store.go resolveDataFilePath）。
+// 归档文件不计入：只认会话目录直下的数据文件，<root>/<id>/archive/*.jsonl 与
+// legacy 的 root/archive/ 天然被跳过（归档清单仍是 plugin 层扫描，见 sessions.go:42-64）。
 // 新布局下目录名 == 文件内 SessionID（Create 种入保证）；legacy 槽的 id 来自文件
 // metadata（或 legacy 合成规则）。返回顺序为目录名序（os.ReadDir 语义）。
 func (r *Repository) List(ctx context.Context) ([]Metadata, error) {
@@ -211,7 +232,7 @@ func (r *Repository) List(ctx context.Context) ([]Metadata, error) {
 		if !e.IsDir() {
 			continue
 		}
-		if m, ok := resolveSlotMetadata(filepath.Join(r.root, e.Name(), "current.jsonl")); ok {
+		if m, ok := resolveSlotMetadata(resolveDataFilePath(filepath.Join(r.root, e.Name()))); ok {
 			out = append(out, m)
 		}
 	}
@@ -275,11 +296,62 @@ func (r *Repository) Close() error {
 	return errors.Join(errs...)
 }
 
+// CloseSession 关闭 id 对应的 Store 实例并把该实例在 open 缓存中的全部条目逐出
+// （Plan A2.1①「repo.Open 死实例」修复）。
+//
+// 为什么逐出而不是留缓存：旧论证（daemon commands.go /new 收口）认为已关闭实例
+// 留缓存可防二次 Open 的 ErrStoreLocked（Open 命中缓存不触碰文件锁）。但留缓存
+// 的代价是缓存命中方拿到死实例（句柄已关、锁已释放），而多 session 化后
+// session/load 重开必须拿到活实例——Open 侧无法可靠区分「缓存里的活实例」与
+// 「死实例」（Store 无 closed 标志，加标志又要处理 Close 竞态面），故采用
+// 「Close 时显式逐出」：缓存里只有活实例这一不变量改由 Repository 层维护，
+// 重开语义 = 逐出后再次 Open 走 flock 慢路径，锁已释放即可重开。实例唯一
+// 不变量（决策 3）不变：缓存里同 id 至多一个实例，Open 的并发双检原样保留。
+//
+// 别名条目：legacy 槽 Archive 换 id 后同一 *Store 以多个 id 注册（Open 的同目录
+// 别名机制），逐出按实例指针把全部别名条目一并移除——留任一条目都会让该 id 的
+// Open 命中已关闭实例，死实例问题换个 id 复发。
+//
+// 顺序论证：先逐出（r.mu 内）后 Close（r.mu 外，对齐 Repository.Close 的
+// 「先收集后关闭」锁序，不在持 r.mu 时等 s.mu）。逐出与锁释放之间有窗口：并发
+// Open(id) 会缓存未命中走 Store.Open 慢路径并被 flock 拒绝（ErrStoreLocked）——
+// 此刻锁确实仍被旧实例持有，宁拒勿双写是正确呈现而非缺陷；后续 session/load
+// 重开路径持全局管理 gate（Plan A2），窗口内的拒绝由调用方按既有错误语义处理。
+// 反序（先关后逐出）则有真缺陷：Close 释放锁到逐出之间，并发 Open 可重建新
+// 实例并入缓存，随后本函数的逐出会误删新实例条目，缓存与存活实例脱钩，
+// 实例唯一被破坏。
+//
+// 幂等：id 不在缓存中返回 nil——调用方无需先探测（Store.Close 本身幂等，对
+// 被外部直接 Close 过的实例再调也只是 no-op），这与「缓存里只有活实例」不
+// 冲突：不在缓存说明本 Repository 已无该 id 的实例责任。
+func (r *Repository) CloseSession(id string) error {
+	r.mu.Lock()
+	s, ok := r.open[id]
+	if ok {
+		for key, cached := range r.open {
+			if cached == s { // 指针比较：同目录别名的全部条目一并逐出
+				delete(r.open, key)
+			}
+		}
+	}
+	r.mu.Unlock()
+	if !ok {
+		return nil
+	}
+
+	if err := s.Close(); err != nil {
+		return fmt.Errorf("session: close session %s: %w", id, err)
+	}
+	return nil
+}
+
 // ── 内部辅助 ──────────────────────────────────────────────────────────
 
-// seedSessionMetadata 在新会话目录的 current.jsonl 写入首行 metadata 记录，
-// 使 Store.Open 采纳目录名约定的 id（否则空文件会被赋予另一个随机 id，
-// store.go:92-94，破坏「目录名 == 文件内 SessionID」不变量）。字节格式与
+// seedSessionMetadata 在新会话目录写入首行 metadata 记录，使 Store.Open 采纳
+// 目录名约定的 id（否则空文件会被赋予另一个随机 id，store.go:92-94，破坏
+// 「目录名 == 文件内 SessionID」不变量）。文件名走 v2 决议的「新建」分支：
+// Create 产出的目录 basename 是合法 session id（session_<hex>），落
+// <id>.jsonl（Plan A1；非会话形态目录才回落 current.jsonl）。字节格式与
 // Store.appendRecord 一致（json 单行 + '\n'，0600），后续由 Open 正常接管。
 func seedSessionMetadata(dir, id string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -290,7 +362,7 @@ func seedSessionMetadata(dir, id string) error {
 		return fmt.Errorf("session: marshal seed metadata: %w", err)
 	}
 	data = append(data, '\n')
-	path := filepath.Join(dir, "current.jsonl")
+	path := filepath.Join(dir, newDataFileName(dir))
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("session: seed metadata %s: %w", path, err)
 	}

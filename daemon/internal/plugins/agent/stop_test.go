@@ -411,7 +411,8 @@ func TestStopWaitsForInFlightMaintenance(t *testing.T) {
 		t.Fatalf("store write inside maintenance closure failed while Stop was winding down: %v", storeOpErr)
 	}
 	// ③ 写入已落盘:Close 的 Sync 之后从磁盘重读,消息在活跃视图中。
-	view, err := session.OpenArchiveView(filepath.Join(p.cfg.Session.Dir, sid, "current.jsonl"))
+	// 数据文件为 Plan A1 v2 名 <sid>.jsonl（Create 产出的 session 形态目录）。
+	view, err := session.OpenArchiveView(filepath.Join(p.cfg.Session.Dir, sid, sid+".jsonl"))
 	if err != nil {
 		t.Fatalf("reopen persisted store file after Stop: %v", err)
 	}
