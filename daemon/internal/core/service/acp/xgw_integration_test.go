@@ -186,6 +186,38 @@ func (f *xgwLiveControl) SessionArchived(sessionID string) bool {
 	return ok
 }
 
+// ArchiveSession shim(A3):归档动作落 f.archived 终态标记(值为 nil 的脚本
+// 项——SessionArchived 据此为真,ArchivedSessionHistory 无脚本按其既有报错
+// 形态走);run 在飞拒绝镜像生产语义——判据直接查注册表 rt.Active() 非 nil
+// (与生产 boundsession.go ArchiveSession 同一谓词;不走 f.ActiveRun,它前置
+// requireCurrent 的 V1 校验,而生产的归档寻址没有该限制);lease fencing 不
+// 模拟(见 pr2DualControl 同名注释,真插件链路的 fencing 验收在 plugins/agent
+// 的 ArchiveSession 测试)。未知会话诚实未知。
+//
+// 锁序注意:在飞检查只触 manager 内部锁,与本 shim 的 f.mu 无嵌套;终态落回
+// 持 f.mu(short critical section)。在飞检查与落标记之间的窗口对本 shim 的
+// 单线程用例无影响(生产侧的同类窗口由生产实现的 WithControl 临界区封闭)。
+func (f *xgwLiveControl) ArchiveSession(sessionID, clientID string) error {
+	if rt := f.m.Get(f.sid); rt != nil {
+		if run := rt.Active(); run != nil {
+			return fmt.Errorf("xgwLiveControl: session %q is busy: run in flight (state %s)", sessionID, run.State())
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.archived == nil {
+		f.archived = make(map[string][]model.SessionUpdate) // 惰性建表:仅归档用例消费
+	}
+	if _, ok := f.archived[sessionID]; ok {
+		return nil // 幂等:已终态
+	}
+	if sessionID != f.sid {
+		return fmt.Errorf("xgwLiveControl: session %q: %w", sessionID, model.ErrSessionUnknown)
+	}
+	f.archived[sessionID] = nil
+	return nil
+}
+
 // requireCurrent mirror runcontrol.go 的 V1 路由校验(拍板⑤):非 current 会话
 // 一律拒绝,错误文案与生产同形(客户端按 -32000 透传感知)。
 func (f *xgwLiveControl) requireCurrent(sessionID string) error {
@@ -1230,6 +1262,66 @@ func TestXGWIntegrationStandardMethodShapes(t *testing.T) {
 	}
 	if string(raw) != `{"stopReason":"end_turn"}` {
 		t.Fatalf("session/prompt response = %s, want exactly end_turn shape", raw)
+	}
+}
+
+// TestXGWIntegrationSessionArchive(Plan A3):x-goworker/session/archive 的协议
+// 级契约——响应形状逐字 {"archived":true}(重复归档幂等同形)、缺参与未知会话
+// 归一 -32000、管理门禁满即 busy(与 session/new|load 互斥的 wire 面);归档后
+// SessionArchived 探测为真,session/load 随即走只读重放分支(既有归档 load 用例
+// 的脚本面由本命令真实驱动)。run 在飞 busy 与 lease fencing 的语义验收在
+// plugins/agent 的 ArchiveSession 测试(真插件链路),shim 不模拟。
+func TestXGWIntegrationSessionArchive(t *testing.T) {
+	src := newXGWLiveControl(t, "xgw-proto-archive", &xgwScriptedProvider{}, nil)
+	l := newXGWLiveStack(t, nil, src)
+	l.liveInitialize(t)
+	l.liveNewSession(t)
+
+	// 缺 sessionId:参数校验先于 source,协议面诚实拒绝。
+	_, err := l.liveCallRaw(t, XMethodSessionArchive, map[string]any{})
+	rpcErr := wantXGWError(t, "archive without sessionId", err)
+	if !strings.Contains(rpcErr.Message, "sessionId") {
+		t.Fatalf("missing sessionId message = %q, want sessionId mention", rpcErr.Message)
+	}
+
+	// 未知会话:source 的 ErrSessionUnknown 归一 -32000。
+	_, err = l.liveCallRaw(t, XMethodSessionArchive, map[string]any{"sessionId": "session_ffffffffffffffffffffffffffffffff"})
+	rpcErr = wantXGWError(t, "archive unknown session", err)
+	if !strings.Contains(rpcErr.Message, "unknown session") {
+		t.Fatalf("unknown session message = %q, want unknown session mention", rpcErr.Message)
+	}
+
+	// 管理门禁:满即 busy(tryAcquire 语义,绝不排队攥住门禁)。
+	if !l.handler.gate.tryAcquire() {
+		t.Fatal("setup: gate acquire failed")
+	}
+	_, err = l.liveCallRaw(t, XMethodSessionArchive, map[string]any{"sessionId": src.sid})
+	rpcErr = wantXGWError(t, "archive while gate held", err)
+	if !strings.Contains(rpcErr.Message, "busy") {
+		t.Fatalf("gate-busy message = %q, want busy mention", rpcErr.Message)
+	}
+	l.handler.gate.release()
+
+	// 归档成功:响应逐字 {"archived":true};重复归档幂等同形。
+	raw, err := l.liveCallRaw(t, XMethodSessionArchive, map[string]any{"sessionId": src.sid})
+	if err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if string(raw) != `{"archived":true}` {
+		t.Fatalf("archive response = %s, want exactly {\"archived\":true}", raw)
+	}
+	raw, err = l.liveCallRaw(t, XMethodSessionArchive, map[string]any{"sessionId": src.sid})
+	if err != nil || string(raw) != `{"archived":true}` {
+		t.Fatalf("re-archive = %s, %v, want idempotent {\"archived\":true}", raw, err)
+	}
+
+	// 终态可观测:SessionArchived 探测为真(session/load 只读分流的前提),
+	// session/load 随即走归档只读重放(不注册 runtime、Binding 不动)。
+	if !src.SessionArchived(src.sid) {
+		t.Fatal("SessionArchived after archive = false, want true")
+	}
+	if _, err := l.client.SessionLoad(context.Background(), src.sid, ""); err != nil {
+		t.Fatalf("session/load of archived session: %v", err)
 	}
 }
 

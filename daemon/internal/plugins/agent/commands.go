@@ -211,6 +211,19 @@ func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
 	if rt == nil {
 		return fmt.Errorf("agent: no active session")
 	}
+	// Plan A3 只读执法（A7 设计点 4，定案需求 #1）：archived 终态会话拒绝 prompt
+	// ——执法数据源统一为 store 查询（持久事实，重启后依然拒），不依赖 handler
+	// 的连接级 readOnly 集合（只覆盖「load 过归档的连接」——归档一个仍有绑定的
+	// 会话后，未 load 过它的连接 prompt 也会到达这里，集合面漏拦）。错误文案与
+	// handler 的归档拒写同形（read-only），客户端按同一契约分流。范围：写提交
+	// 面全查——prompt（/agent 与 fallback 同路，本处）与后台 run（runcontrol.go
+	// StartRun 的同源执法，堵 xgw run/start 写 archived store 的旁路）；维护命令
+	// 不查——/history /usage 是只读观察面，/new 是新建（不写 archived store），
+	// /compact /rewind 的终态拒写属 A3 后续收紧点（plan 只点名 prompt 与 run
+	// 提交，本步不扩）。
+	if st := p.storeFor(rt); st != nil && st.Archived() {
+		return fmt.Errorf("agent: session %q is archived and read-only", rt.ID)
+	}
 	handle, err := p.StartRunSync(rt.ID, runtimeagent.RunRequest{
 		Input:      strings.Join(ctx.Args, " "),
 		ToolSource: ctx.ToolSource,

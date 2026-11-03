@@ -164,6 +164,20 @@ func (s *Service) SessionBindings(sessionID string) []string {
 	return s.bindings.Bindings(sessionID)
 }
 
+// WithControl 是受 lease 保护的操作提交入口的宿主面(LeaseRegistry.WithControl
+// 的 Service 透传;Plan A3 的归档 fencing 消费——run/cancel/审批的 fencing 编排
+// 都封装在 Service 的对应方法内,归档的动作面(MarkArchived)持在宿主(plugin),
+// 编排经本方法回到同一 lease 临界区):本会话 lease.mu 临界区内先校验 holder
+// 再执行 fn——校验通过后到 fn 返回之间不可能被接管,旧持有者绝不能在失权后
+// 落地归档。fn 必须是短提交操作(一次校验 + 一次文件突变,如 MarkArchived 的
+// append+fsync——与 manager.StartRun 同步段的 journal fsync 同款先例),绝不是
+// 整个 AgentRun;后台执行仍在锁外完成。仅宿主消费——协议层经
+// BoundSessionSource.ArchiveSession 的方法面触达,静态类型拿不到本方法,
+// 「不向协议层暴露任意长 callback 注入口」的边界(R3 纪律)不变。
+func (s *Service) WithControl(sessionID, clientID string, fn func() error) error {
+	return s.leases.WithControl(sessionID, clientID, fn)
+}
+
 // TrackedRequest 返回 (sessionID, requestID) 的已记账 RunHandle(幂等表按键直查
 // 的观测面):RunStatus 的纯内存回退消费按 (sessionID, runID) 的反查
 // (RequestRegistry.byRun),本方法供「按 requestId 观测」与测试断言

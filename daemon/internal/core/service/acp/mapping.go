@@ -17,13 +17,16 @@ import (
 // FrontendHandler 的序列化层。
 
 // SessionInfoFromDomain 把 daemon 会话摘要映射为 wire SessionInfo。domain 的
-// Active 是业务标记，不进 wire DTO（ACP SessionInfo 保持纯协议语义）。
+// Active 是业务标记，不进 wire DTO（ACP SessionInfo 保持纯协议语义）；三态
+// State 直接透传（Plan A3/定案需求 #3，active/idle/archived，omitempty——
+// 判定与取值语义归 plugin 清单方，mapping 只做形状搬运）。
 func SessionInfoFromDomain(info model.SessionSummary) protocol.SessionInfo {
 	return protocol.SessionInfo{
 		SessionID: info.SessionID,
 		Cwd:       info.Cwd,
 		Title:     info.Title,
 		UpdatedAt: info.UpdatedAt,
+		State:     info.State,
 	}
 }
 

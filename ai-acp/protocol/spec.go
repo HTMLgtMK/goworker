@@ -118,6 +118,10 @@ type SessionInfo struct {
 	Cwd       string `json:"cwd"`
 	Title     string `json:"title,omitempty"`
 	UpdatedAt string `json:"updatedAt,omitempty"` // RFC3339
+	// State 是会话三态（Plan A3/定案需求 #3）：active（有连接绑定或 run 在飞）、
+	// idle（无引用无在飞）、archived（终态标记，只读保留、不可逆）。omitempty
+	// 保持旧客户端兼容：不理解该字段的实现按无字段组收下（A1 未知字段结论）。
+	State string `json:"state,omitempty"`
 }
 
 type ListSessionsResponse struct {

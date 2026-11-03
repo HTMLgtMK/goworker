@@ -288,3 +288,85 @@ func normalizeSessionCWDSilent(cwd string) string {
 	}
 	return normalized
 }
+
+// ArchiveSession 实现 model.BoundSessionSource 的归档执行面（Plan A3，
+// x-goworker/session/archive；定案需求 #1：archive = 只读保留终态，不可逆、
+// 无 unarchive）。fencing 双保险的分工：全局管理门禁由调用方（handler）持有
+// （归档是管理操作，与 session/new|load 互斥——A2b2 收窄后的 gate），本方法
+// 在门禁内被调；control lease fencing 在本方法内完成（route → WithControl，
+// 与 run/cancel/审批同款——lease 校验与提交同临界区，接管后旧持有者一律
+// 拒绝；MarkArchived 的一次 append+fsync 与 StartRun 同步段 journal fsync
+// 同款先例，lease 临界区容纳毫秒级文件突变）。
+//
+// 动作语义：
+//   - run 在飞拒绝（定案需求 #8：在飞即活跃）：终态标记与在飞 run 并存会让
+//     只读执法（A7④）与事件面失真——瞬态 busy，等 run 终态（挂起收口的会话
+//     同样在飞，同样拒）后重试；客户端契约与 new/load 的 busy 同款。
+//   - 绑定中的会话**允许**归档（任务书定调）：绑定保留、prompt 转为只读拒绝
+//     （A7④ store 执法，handleAgent 入口）、生命周期收口等引用归零（A2a
+//     机制自然处理——归档不改变引用计数）。
+//   - 已收口（不在册）的会话同样可归档：repo 层打开落标记后释放（探测性
+//     打开的缓存副作用与 SessionArchived 同款取舍；归档后无后续使用面，
+//     用后即释）。不在册会话的 lease 残留仍有效（LeaseRegistry 条目只增不
+//     删，曾 attach 的连接 fencing 照常）。
+//   - 幂等：MarkArchived 对已终态会话 no-op（A1 语义——归档时间定格首次），
+//     重复归档安全。
+func (p *AgentPlugin) ArchiveSession(sessionID, clientID string) error {
+	if p.repo == nil {
+		return fmt.Errorf("agent: session persistence disabled")
+	}
+	if p.control == nil {
+		return fmt.Errorf("agent: archive session: control plane unavailable")
+	}
+	// ① 寻址（先于 fence：未知会话诚实拒绝，ErrSessionUnknown 契约）。
+	//    在册 runtime 的 store 经实例唯一缓存（runtime 持有的活实例，不重复
+	//    打开）；不在册走 repo.Open（flock 空闲即活实例，与 LoadBoundSession
+	//    重开同链）。
+	rt := p.RouteSession(sessionID)
+	var st *session.Store
+	if rt != nil {
+		st = p.storeFor(rt)
+		if st == nil {
+			// 纯内存降级的 runtime（id 非 store id）：无持久化事实可标记，
+			// 终态无处落——诚实报错而非静默 no-op。
+			return fmt.Errorf("agent: session %q has no persisted store (纯内存降级，无法归档)", sessionID)
+		}
+	} else {
+		opened, err := p.repo.Open(sessionID)
+		if err != nil {
+			if errors.Is(err, session.ErrSessionNotFound) {
+				return boundSessionUnknownErr(sessionID)
+			}
+			return fmt.Errorf("agent: archive session %s: %w", sessionID, err)
+		}
+		st = opened
+	}
+	// ②-④ fencing 临界区：lease 校验 + run 在飞拒绝 + MarkArchived 原子完成。
+	//   在飞判据是双查（rt.Active() 与挂起台账）：finalizeRun 先清 active 再触发
+	//   收口回调，两者的瞬间窗口里 run 刚终态、reaper（tryReleaseSession 的
+	//   Remove+CloseSession）尚未执行——此刻落 MarkArchived 会与 reaper 的 store
+	//   关闭并发（赢家不确定，输家撞已关句柄）。挂起台账命中即 busy：该会话
+	//   马上消失，归档等它收口后按「不在册」路径落标记（同幂等终态）。
+	err := p.control.WithControl(sessionID, clientID, func() error {
+		if rt != nil {
+			if run := rt.Active(); run != nil {
+				return fmt.Errorf("agent: session %q is busy: run in flight (archive after the run reaches terminal state)", sessionID)
+			}
+			if p.isSuspendedRelease(sessionID) {
+				return fmt.Errorf("agent: session %q is busy: pending release after a run just finished (retry once the session settles)", sessionID)
+			}
+		}
+		return st.MarkArchived()
+	})
+	// ⑤ 不在册探测 store 用后即释（fence 拒绝路径同样释放——探测句柄不残留）。
+	if rt == nil {
+		if cerr := p.repo.CloseSession(sessionID); cerr != nil {
+			slog.Warn("agent: archived session store release failed", "session", sessionID, "err", cerr)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	slog.Info("agent: session archived", "session", sessionID, "client", clientID)
+	return nil
+}

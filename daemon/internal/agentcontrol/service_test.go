@@ -278,3 +278,30 @@ func TestServiceLeaseControls(t *testing.T) {
 		t.Fatal("ReleaseConnection must clear every lease held by the connection")
 	}
 }
+
+// TestServiceWithControlFencing:Service.WithControl 是 LeaseRegistry.WithControl
+// 的宿主透传面(Plan A3 的归档执行面消费——MarkArchived 动作面持在宿主 plugin,
+// 编排经本方法回到同一 lease 临界区):未持照拒绝且不执行、持照临界区内执行且
+// 返回值原样透传、接管后旧持有者一律失权。
+func TestServiceWithControlFencing(t *testing.T) {
+	s, _ := newTestService(t, fixedProvider{content: "svc-withctl"})
+
+	ran := false
+	if err := s.WithControl("sess", "conn-A", func() error { ran = true; return nil }); !errors.Is(err, ErrControlLeaseLost) || ran {
+		t.Fatalf("WithControl without lease = %v ran=%v, want ErrControlLeaseLost and no execution", err, ran)
+	}
+
+	s.AcquireControl("sess", "conn-A")
+	sentinel := errors.New("submit failed")
+	err := s.WithControl("sess", "conn-A", func() error { ran = true; return sentinel })
+	if !ran || !errors.Is(err, sentinel) {
+		t.Fatalf("WithControl with lease = %v ran=%v, want execution and sentinel passthrough", err, ran)
+	}
+
+	// 接管后旧持有者失权:同锁串行,被接管的 WithControl 一律拒绝。
+	s.AcquireControl("sess", "conn-B")
+	ran = false
+	if err := s.WithControl("sess", "conn-A", func() error { ran = true; return nil }); !errors.Is(err, ErrControlLeaseLost) || ran {
+		t.Fatalf("WithControl after takeover = %v ran=%v, want ErrControlLeaseLost and no execution", err, ran)
+	}
+}

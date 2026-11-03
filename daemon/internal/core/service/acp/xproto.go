@@ -22,6 +22,7 @@ const (
 	XMethodSessionAttach   = "x-goworker/session/attach"   // P5-8
 	XMethodSessionDetach   = "x-goworker/session/detach"   // P5-8
 	XMethodSessionEvents   = "x-goworker/session/events"   // 服务端通知(P5-8,Send only)
+	XMethodSessionArchive  = "x-goworker/session/archive"  // Plan A3:{sessionId} → {archived}
 )
 
 // xgwErrorCode 是 x-goworker 方法面的统一 JSON-RPC 错误码:沿用既有 -32000
@@ -176,6 +177,22 @@ type XSessionDetachParams struct {
 // detach 同样返回 detached=true(幂等,总方案 §7 响应形状)。
 type XSessionDetachResult struct {
 	Detached bool `json:"detached"`
+}
+
+// XSessionArchiveParams 是 x-goworker/session/archive 的入参（Plan A3）：
+// 终态归档（只读保留、不可逆、无 unarchive——定案需求 #1）。fencing 双保险：
+// 全局管理门禁（归档是管理操作，与 session/new|load 互斥——满即 busy）+ 该
+// 会话 control lease（与 run/cancel 同款，实现侧 WithControl 同临界区）。
+type XSessionArchiveParams struct {
+	SessionID string `json:"sessionId"`
+}
+
+// XSessionArchiveResult 是 x-goworker/session/archive 的响应：archived=true
+// 表示终态标记已持久化（幂等——重复归档 no-op 返回 true）；session/list 随即
+// 反映 state=archived。绑定中的会话允许归档（绑定保留、prompt 转为只读拒绝、
+// 生命周期收口等引用归零）；run 在飞 → -32000 busy（瞬态，终态后重试）。
+type XSessionArchiveResult struct {
+	Archived bool `json:"archived"`
 }
 
 // xgwError 按本协议错误约定构造 -32000 RPC 错误。

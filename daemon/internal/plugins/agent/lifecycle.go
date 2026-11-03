@@ -57,6 +57,18 @@ func (p *AgentPlugin) takeSuspendedRelease(sessionID string) bool {
 	return true
 }
 
+// isSuspendedRelease 报告会话是否处于挂起收口台账(只读取数面,Plan A3):清单
+// state=active 判定消费——挂起中(引用归零但 run 在飞)的会话 run 一旦终态即被
+// 收口注销,若 state 只看 rt.Active() 会读到「终态已清、台账未摘」的瞬间窗口
+// (onSessionRunDone 尚未执行),清单把一个即将消失的会话标成 idle 产生 UI 抖动
+// (定案需求 #8 的反面);台账判定让该会话在收口发生前恒为 active。
+func (p *AgentPlugin) isSuspendedRelease(sessionID string) bool {
+	p.suspendMu.Lock()
+	defer p.suspendMu.Unlock()
+	_, ok := p.suspendedReaps[sessionID]
+	return ok
+}
+
 // onSessionRunDone 是 manager.WithRunDoneHook 注入的 run 终态通知(Plan A2,
 // A7 设计点 2 的完成通知面):仅唤醒挂起中的收口——重判在 tryReleaseSession 的
 // 收口执行点做(原子复查,见其注释),本回调只做闸门,不在 execute goroutine 上
@@ -151,6 +163,17 @@ func (p *AgentPlugin) tryReleaseSession(sessionID string) {
 	p.clearSuspendedRelease(sessionID)
 
 	p.manager.Remove(sessionID)
+	// 事件枢纽收口（A7 设计点 3）：订阅随 runtime 注销诚实断开——hub.Close 关
+	// 闭全部订阅通道，daemon 侧通知泵经「通道关闭 → 泵退出自清」收敛，订阅不
+	// 泄漏、客户端经事件流停止 + session/list 状态变化 + attach 的
+	// ErrSessionNotFound 可感知结束（不 panic、不静默悬挂）。重开路径
+	// （session/load → mountRuntime）构造新 runtime 与新 hub，EnsureHub 经
+	// journal.SeqRange 磁盘播种续接既有事件历史——Seq 不从零，重连按 afterSeq
+	// 续放。次序：先关 hub 再关 store——hub 桥接（RunJournalStore）不实现
+	// io.Closer，两步无交互，但 hub 若晚于 store 关闭，残余 Publish 会撞已关
+	// 句柄（warn 噪音）；此刻不可能有在飞 Publish（挂起判定已排除在飞 run，
+	// 本路径只在终态后到达）。
+	rt.CloseEvents()
 	if run := rt.Active(); run != nil {
 		// 防御复查(Remove 前后的 queued-run 竞态窗口,论证见函数头)。
 		if run.Cancel() {

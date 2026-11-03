@@ -14,15 +14,32 @@ import (
 const SessionSourceCapability = "session.source"
 
 // SessionSummary is the daemon's protocol-neutral view of one persisted
-// session. Active is intentionally a domain flag; ACP SessionInfo must remain
-// a pure wire DTO and does not carry it.
+// session. Active is a domain convenience flag (业务标记，wire 不透传)；三态
+// 归属由 State 给出（Plan A3：active/idle/archived，mapping 透传 wire）。
+// Archived 是 archived 终态标记的 domain 形（Plan A1 记录模型），清单据此
+// 分流只读语义。
 type SessionSummary struct {
 	SessionID string
 	Cwd       string
 	Title     string
 	UpdatedAt string
 	Active    bool
+	// Archived 报告会话是否已落 archived 终态标记（Plan A3；与 State=archived
+	// 同源——终态是互斥三态的一支，字段冗余是为 wire 之外的 domain 消费方
+	// （load 分流）提供不解析 State 字符串的直读面）。
+	Archived bool
+	// State 是三态归属（Plan A3/定案需求 #3）：active（连接绑定或 run 在飞）、
+	// idle（无引用无在飞）、archived（终态标记）。空串 = 清单方未判定（仅降级
+	// 形态可能产生）。
+	State string
 }
+
+// 会话三态（Plan A3/定案需求 #3）：wire 的 SessionInfo.state 直接取这三值。
+const (
+	SessionStateActive   = "active"
+	SessionStateIdle     = "idle"
+	SessionStateArchived = "archived"
+)
 
 // SessionMode is a protocol-neutral model/provider choice.
 type SessionMode struct {
@@ -283,6 +300,16 @@ type BoundSessionSource interface {
 	// 点 4 的只读执法数据源统一）。未知会话/持久化禁用返回 false——交由
 	// LoadBoundSession 诚实报错，探测不吞掉「不存在」与「非终态」的差别。
 	SessionArchived(sessionID string) bool
+	// ArchiveSession 落 archived 终态标记（Plan A3 的 x-goworker/session/archive
+	// 执行面，定案需求 #1：只读保留、不可逆、无 unarchive）。实现侧职责：
+	// fencing（该会话 control lease，与 run/cancel 同款——全局管理门禁由调用方
+	// handler 持有，本方法在门禁内被调）、run 在飞拒绝（定案需求 #8：在飞即
+	// 活跃，终态会话与在飞 run 并存会让只读执法与事件面失真——瞬态 busy，等
+	// run 终态后重试）、MarkArchived（幂等，重复归档 no-op）。绑定中的会话
+	// **允许**归档：绑定保留、prompt 转为只读拒绝（A7④ store 执法）、生命周期
+	// 收口等引用归零（A2a 机制自然处理）。已收口（不在册）的会话同样可归档
+	// （repo 层打开落标记后释放）。
+	ArchiveSession(sessionID, clientID string) error
 }
 
 // ConnectionBinder 是连接级会话绑定登记的可选能力面（Plan A2 生命周期半边，

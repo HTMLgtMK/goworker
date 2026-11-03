@@ -186,6 +186,23 @@ func (r *SessionRuntime) Hub() *EventHub {
 	return r.eventHub()
 }
 
+// CloseEvents 收口本 runtime 的事件枢纽(closeEvents 的导出形,A7 设计点 3):
+// 宿主侧会话生命周期收口(引用归零注销,lifecycle.go tryReleaseSession)时调用
+// ——EndRun+Close 幂等,订阅通道全部关闭,daemon 侧的通知泵(pumpSessionEvents)
+// 经「通道关闭 → range 结束 → 自清」诚实退出,订阅不泄漏;hub 关闭后
+// Subscribe/Publish 一律 ErrHubClosed(可观测),重开路径(session/load →
+// mountRuntime)构造新 runtime 与新 hub,EnsureHub 经 journal.SeqRange 磁盘播种
+// 续接既有事件历史——Seq 不从零,重连客户端按 afterSeq 续放即可(事件 journal
+// 是持久事实,收口不删数据)。
+//
+// 调用时序约束:必须在「该 runtime 不可能有在飞 Publish」之后调用——宿主收口
+// 路径已保证(run 在飞时收口被挂起,终态通知触发时 finalizeRun 已过、execute
+// 的事件面已收口);manager.Close 内部的 closeEvents(P3-5)语义不变。events 为
+// nil(纯内存/未启用 RunEvents/从未 StartRun)时幂等空操作。
+func (r *SessionRuntime) CloseEvents() {
+	r.closeEvents()
+}
+
 // EnsureHub 惰性创建并返回本 runtime 的 EventHub(P5-6,遗留③「重启后 attach
 // 时 hub 未建」的解法):bindEvents 只在 StartRun 同步段触发(supervisor.go ⑥),
 // 重启后的 runtime 若从未 StartRun,events 恒 nil——attach 即建补上该缺口,

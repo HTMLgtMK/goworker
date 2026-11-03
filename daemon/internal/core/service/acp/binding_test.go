@@ -188,6 +188,16 @@ func (f *pr2DualControl) SessionHistory(sessionID string) ([]model.SessionUpdate
 // LoadBoundSession 分流,与生产 SessionArchived 的降级语义一致)。
 func (f *pr2DualControl) SessionArchived(sessionID string) bool { return false }
 
+// ArchiveSession 纯内存 shim:镜像生产「已注册可归档(纯内存无标记可落,no-op)、
+// 未注册诚实未知」的分支;lease fencing(run/cancel 同款)在 plugin 实现侧,
+// shim 不模拟(真插件链路的 fencing 验收在 plugins/agent 的 archive 集成测试)。
+func (f *pr2DualControl) ArchiveSession(sessionID, clientID string) error {
+	if f.m.Get(sessionID) == nil {
+		return fmt.Errorf("acp shim: session %q: %w", sessionID, model.ErrSessionUnknown)
+	}
+	return nil
+}
+
 // ---- SessionSource 面(最小空实现;PR2 binding 面只消费 CurrentSessionID) ----
 
 func (f *pr2DualControl) ListSessions() []model.SessionSummary { return []model.SessionSummary{} }
