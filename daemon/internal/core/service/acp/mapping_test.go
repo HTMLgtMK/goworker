@@ -18,7 +18,6 @@ func TestSessionInfoFromDomainStatePassthrough(t *testing.T) {
 		Cwd:       "/repo",
 		Title:     "标题",
 		UpdatedAt: "2026-01-01T00:00:00Z",
-		Active:    true,  // domain 便利标记：wire 不透传
 		Archived:  false, // domain 直读面：wire 不透传（wire 走 State）
 		State:     model.SessionStateActive,
 	})

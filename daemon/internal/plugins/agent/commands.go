@@ -218,9 +218,9 @@ func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
 	// handler 的归档拒写同形（read-only），客户端按同一契约分流。范围：写提交
 	// 面全查——prompt（/agent 与 fallback 同路，本处）与后台 run（runcontrol.go
 	// StartRun 的同源执法，堵 xgw run/start 写 archived store 的旁路）；维护命令
-	// 不查——/history /usage 是只读观察面，/new 是新建（不写 archived store），
-	// /compact /rewind 的终态拒写属 A3 后续收紧点（plan 只点名 prompt 与 run
-	// 提交，本步不扩）。
+	// 不查——/history /usage 是只读观察面，/new 是新建（不写 archived store）；
+	// 写型维护命令（/compact /rewind 回溯）由评审收尾补齐同源执法
+	// （handleCompact / rewind.go doRewind）。
 	if st := p.storeFor(rt); st != nil && st.Archived() {
 		return fmt.Errorf("agent: session %q is archived and read-only", rt.ID)
 	}
@@ -699,6 +699,13 @@ func (p *AgentPlugin) handleCompact(ctx *model.Context) error {
 		if s == nil {
 			runContext.Writer("(no active session)\n")
 			return nil
+		}
+		// Plan A3 只读执法收尾（定案需求 #1「只读保留终态」）：写型维护命令与
+		// prompt/run 提交同源拒 archived（store 持久事实，重启后依然拒）——
+		// ACP 客户端归档一个 CLI 正在用的会话后，/compact 不再能写穿终态。
+		// 取数用本命令既有的 currentStoreIn 解析链（同一 gate 临界区、同一会话）。
+		if st := p.currentStoreIn(runCtx); st != nil && st.Archived() {
+			return fmt.Errorf("agent: session %q is archived and read-only", st.SessionID())
 		}
 		return s.Compact(runCtx, callbacksFromPlugin(runContext))
 	})

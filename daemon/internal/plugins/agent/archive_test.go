@@ -212,3 +212,57 @@ func TestStartRunArchivedSessionRejected(t *testing.T) {
 		t.Fatalf("CancelRun on archived session = %v, want honest not-found (control surface not blocked)", err)
 	}
 }
+
+// TestArchivedSessionMaintenanceWritesRejected（评审收尾，定案需求 #1）：写型
+// 维护命令与 prompt/run 提交同源拒 archived——/compact 与 /rewind <n> 在落
+// store 写面前被拒；/rewind 无参的检查点列表是只读观察面，保留对 archived
+// 会话可用（查看历史不是写）。
+func TestArchivedSessionMaintenanceWritesRejected(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "ok"})
+	sid := p.CurrentSessionID()
+	rt := p.manager.Get(sid)
+	if rt == nil {
+		t.Fatal("current runtime not registered")
+	}
+	st := p.storeFor(rt)
+	if st == nil {
+		t.Fatal("no store for current session")
+	}
+	// 造写面前置：一轮消息 + checkpoint（/rewind <n> 需要可回溯的锚点）。
+	committed, err := st.Commit(commMsgs([]string{"user", "assistant"}))
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := st.Checkpoint("before archive"); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	p.AcquireControl(sid, "conn-A")
+	if err := p.ArchiveSession(sid, "conn-A"); err != nil {
+		t.Fatalf("ArchiveSession: %v", err)
+	}
+
+	// /compact 拒写（错误先于 Session.Compact，不触 provider）。
+	compactCtx, _ := newContext()
+	if err := p.handleCompact(compactCtx); err == nil || !strings.Contains(err.Error(), "archived and read-only") {
+		t.Fatalf("handleCompact on archived session = %v, want archived and read-only", err)
+	}
+
+	// /rewind 列表（无参）仍可用：只读观察面不查。
+	listCtx, listBuf := newContext()
+	if err := p.handleRewind(listCtx); err != nil {
+		t.Fatalf("handleRewind list on archived session: %v", err)
+	}
+	if !strings.Contains(listBuf.String(), "#1") {
+		t.Fatalf("archived session checkpoint list should render, got:\n%s", listBuf.String())
+	}
+
+	// /rewind 1 拒写：SetHead 不落地（活跃视图停在归档前的 head）。
+	rwCtx, _ := newContext("1")
+	if err := p.handleRewind(rwCtx); err == nil || !strings.Contains(err.Error(), "archived and read-only") {
+		t.Fatalf("handleRewind write on archived session = %v, want archived and read-only", err)
+	}
+	view := st.ActiveView()
+	if view[len(view)-1].MsgID != committed[len(committed)-1].MsgID {
+		t.Fatalf("head moved on archived session despite rejection")
+	}
+}

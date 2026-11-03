@@ -161,9 +161,6 @@ func TestAgentPlugin_ListSessionsUnionScanSortsByUpdatedAt(t *testing.T) {
 	if got[0].State != model.SessionStateIdle || got[1].State != model.SessionStateIdle || got[2].State != model.SessionStateActive {
 		t.Errorf("states = [%q %q %q], want [idle idle active]", got[0].State, got[1].State, got[2].State)
 	}
-	if !got[2].Active || got[0].Active || got[1].Active {
-		t.Errorf("active flags = [%v %v %v], want [false false true]", got[0].Active, got[1].Active, got[2].Active)
-	}
 
 	// 清单是只读扫描：不得改动 store 状态
 	if after := st.Head(); after == "" {
@@ -247,13 +244,13 @@ func TestAgentPlugin_ListSessionsBindingActive(t *testing.T) {
 	}
 	// 绑定到达（连接登记，无 run、非 current）：A 转 active。
 	p.BindConnectionSession("conn-1", sidA)
-	if got := stateOf(t, sidA); got.State != model.SessionStateActive || !got.Active {
-		t.Fatalf("bound A state = %q active = %v, want active/true", got.State, got.Active)
+	if got := stateOf(t, sidA); got.State != model.SessionStateActive {
+		t.Fatalf("bound A state = %q, want active", got.State)
 	}
 	// 解绑（空 sessionID = 解除绑定）：引用归零触发收口，A 转回 idle。
 	p.BindConnectionSession("conn-1", "")
-	if got := stateOf(t, sidA); got.State != model.SessionStateIdle || got.Active {
-		t.Fatalf("released A state = %q active = %v, want idle/false", got.State, got.Active)
+	if got := stateOf(t, sidA); got.State != model.SessionStateIdle {
+		t.Fatalf("released A state = %q, want idle", got.State)
 	}
 }
 
@@ -792,9 +789,6 @@ func TestAgentPlugin_ListSessionsMarksCurrentAndCwd(t *testing.T) {
 	}
 	if got[0].SessionID != sideID || got[1].SessionID != logicalID {
 		t.Fatalf("sessionIds = [%q %q], want [side current]", got[0].SessionID, got[1].SessionID)
-	}
-	if !got[1].Active || got[0].Active {
-		t.Errorf("active flags = [%v %v], want [false true]", got[0].Active, got[1].Active)
 	}
 	if got[0].Cwd != "/tmp/wk-record" {
 		t.Errorf("side cwd = %q, want workspace record /tmp/wk-record", got[0].Cwd)

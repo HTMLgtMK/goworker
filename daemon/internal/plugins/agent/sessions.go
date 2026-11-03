@@ -92,7 +92,6 @@ func (p *AgentPlugin) ListSessions() []model.SessionSummary {
 			info.State = model.SessionStateArchived
 		case p.sessionIsLive(id):
 			info.State = model.SessionStateActive
-			info.Active = true
 			if id == currentID {
 				// A7⑤：current 会话的 cwd 以 runtime 声明为最新事实（声明迁移
 				// 不落记录）；无效声明下 currentSessionCwd 返回空（cwdErr 标记）。

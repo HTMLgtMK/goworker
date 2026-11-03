@@ -281,7 +281,7 @@ func TestLoadSessionUnknownSession(t *testing.T) {
 
 func TestListSessionsAndModesMapDomain(t *testing.T) {
 	sessions := &fakeSessionSource{
-		list: []model.SessionSummary{{SessionID: "s1", Title: "t", UpdatedAt: "2026-01-01T00:00:00Z", Active: true}},
+		list: []model.SessionSummary{{SessionID: "s1", Title: "t", UpdatedAt: "2026-01-01T00:00:00Z", State: model.SessionStateActive}},
 		modes: &model.SessionModeState{
 			CurrentModeID:  "m1",
 			AvailableModes: []model.SessionMode{{ID: "m1", Name: "mode one"}},

@@ -14,16 +14,15 @@ import (
 const SessionSourceCapability = "session.source"
 
 // SessionSummary is the daemon's protocol-neutral view of one persisted
-// session. Active is a domain convenience flag (业务标记，wire 不透传)；三态
-// 归属由 State 给出（Plan A3：active/idle/archived，mapping 透传 wire）。
-// Archived 是 archived 终态标记的 domain 形（Plan A1 记录模型），清单据此
-// 分流只读语义。
+// session. 三态归属由 State 给出（Plan A3：active/idle/archived，mapping 透传
+// wire；评审收尾删除了旧 Active 布尔位——它与 State=active 完全同源，全仓无
+// 读者，双事实源是腐化面）。Archived 是 archived 终态标记的 domain 形（Plan A1
+// 记录模型），清单据此分流只读语义。
 type SessionSummary struct {
 	SessionID string
 	Cwd       string
 	Title     string
 	UpdatedAt string
-	Active    bool
 	// Archived 报告会话是否已落 archived 终态标记（Plan A3；与 State=archived
 	// 同源——终态是互斥三态的一支，字段冗余是为 wire 之外的 domain 消费方
 	// （load 分流）提供不解析 State 字符串的直读面）。

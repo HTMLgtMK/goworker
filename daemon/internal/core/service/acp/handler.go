@@ -149,15 +149,17 @@ type FrontendHandler struct {
 	mu         sync.Mutex
 	promptable map[string]struct{} // 可 prompt 集合：session/new 与当前会话 load 记入
 	readOnly   map[string]struct{} // 只读集合：归档 load 记入，prompt 诚实报错
-	// active 是本连接最近一次有效声明的 transport 会话 id(PR2 前是 daemon 全局
-	// 单值——plugin 的 activeTransportSession;PR2 起声明归属连接,守卫只认本连接
-	// 自己的声明,其他连接的 session/new|load 不再顶掉本连接)。空 = 本连接尚未
-	// 声明:守卫回落全局 ActiveSessionID()(**A2b2 将拆**,见 Prompt 内注释;
-	// 兼容不走 CreateSession 的测试桩与简化壳)。与 promptable/readOnly 共用
-	// h.mu。注意:A2b1 起声明落地是 BoundSessionSource(boundTo = store 稳定 id,
-	// 记入 Binding),transport 会话 id(session/new 的服务端签发 id)只进本字段
-	// 与 promptable——load 分支 remember 的是 store id,连接的活动身份随 load
-	// 换轨到 store id(与 PR2 的 load-current 行为一致)。
+	// active 是本连接最近一次有效声明的会话 id(PR2 前是 daemon 全局单值——plugin
+	// 的 activeTransportSession;PR2 起声明归属连接,守卫只认本连接自己的声明,
+	// 其他连接的 session/new|load 不再顶掉本连接)。A2b2 起守卫无回落:原「空则
+	// 回落全局 ActiveSessionID」分支随全局门禁一并删除(见 Prompt 内注释)——
+	// 空 = 本连接尚未声明,任何 id 的 prompt 都先过 membership 守卫(本连接
+	// remember 过才在 promptable 集合),未声明即 unknown session 诚实拒绝。
+	// 与 promptable/readOnly 共用 h.mu。注意:A2b1 起声明落地是
+	// BoundSessionSource(boundTo = store 稳定 id,记入 Binding),transport 会话
+	// id(session/new 的服务端签发 id)只进本字段与 promptable——load 分支
+	// remember 的是 store id,连接的活动身份随 load 换轨到 store id(与 PR2 的
+	// load-current 行为一致)。
 	active string
 }
 
