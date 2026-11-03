@@ -48,6 +48,11 @@ var errAgentStopping = errors.New("agent: plugin is stopping")
 // 全序，WaitGroup 的 Add 永不与 Wait 的零计数边界竞争。零值可用（测试直接构造
 // AgentPlugin 的字面量无需感知）；嵌套 Eval（owner == p 重入）不计数——那些闭包
 // 跑在 Run goroutine 内，已由 manager.Close 的 run.done 等待面覆盖。
+//
+// 措辞消歧（A2b2）：本文件与 plugin.go 提到的「Session Gate」一律指插件内
+// withSession 的 per-runtime 执行 gate（AcquireRun，容量 1，解析即互斥）——与
+// acp 包的全局管理门禁 SessionGate（coordinator.go，只守会话管理操作）是同名
+// 异物；后者自 A2b2 起 prompt 已退出，与插件的维护请求排队面无关。
 type inFlightTracker struct {
 	mu     sync.Mutex
 	wg     sync.WaitGroup
@@ -333,12 +338,41 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 
 		runContext.Writer("✔ STM cleared, memory will be retrieved on every query\n")
 
-		// 同步固化旧会话：阻塞至完成（内部 120s 超时），进度经 ctx.Publish 进状态栏，
-		// 结果/警告经 ctx.Writer 回显。主 goroutine 执行，可直接读共享配置。
-		// Plan A2 注：本步保留在 /new 主流程同步执行（A2b 拆 SessionGate 时与关
-		// store 一并挪出全局临界区、走异步收尾——plan A2 的锁序论证）。
+		// 后台固化旧会话（A2b2：CheckpointSync 挪出全局临界区——plan A2 锁序
+		// 论证「/new 的 CheckpointSync（阻塞至 120s）与关 store 挪出临界区，走
+		// 引用计数归零路径异步收尾」）：/new 的命令回合到此只做过状态突变
+		// （ACP 面在全局管理临界区内被 evaluate 调起；CLI 面无门禁同型执行），
+		// LLM 固化最长阻塞 120s，若同步执行会把全局管理门禁攥住 120s、阻塞全
+		// daemon 的会话管理操作。异步化的四个面：
+		//   - ctx 用 Background：不传播请求 ctx——/new 返回即请求生命周期结束，
+		//     连接断开/请求取消不得中断固化；CheckpointSync 内部自包 120s 上限
+		//     （checkpoint.go）。同步旧路径的「用户 Esc 中断固化」语义随异步化
+		//     退役：固化只有成功/失败两种收场，失败经回调回显并留痕（其内部
+		//     ⚠ 前缀警告）。
+		//   - 回调保留（callbacksFromPlugin）：CLI 面照常回显进度/结果；ACP 面的
+		//     Writer（commandOutput）自 evaluate 返回起由本 goroutine 独占——
+		//     handler 在 evaluate 返回后只调 output.Close()（写闭合围栏，与本
+		//     goroutine 的写入经 reporter 串行下发，无共享可变状态的并发写——
+		//     commandOutput 字段只被 evaluate 链触碰，此后封闭）；连接已断开时
+		//     ai-acp 的 Notify 对写失败静默忽略（server.go Update 的 _ = 丢弃），
+		//     安全降级。ACP 面的固化输出在命令代码围栏闭合之后到达（裸流）——
+		//     排版降级不丢内容，是有意接受的形态。
+		//   - 与 P5-5 收口并发安全：CheckpointSync 只消费 pending 快照（值切片）
+		//     与 old Session 对象（cwd/usage 锁内快照读、deps.Config/Memory 构造
+		//     后只读），固化不写会话 store（AdvanceCursor 仅 Consolidate 路径）——
+		//     下方收口的 CloseSession 关闭 store 句柄与固化无共享写面；old Session
+		//     对象在收口后无人再写（runtime 已注销，无新 run 可达）。
+		//   - Stop 覆盖：goroutine 登记 p.bgFinalizers（plugin.go Stop 在 memory
+		//     收尾前 Wait，固化是 memory.Client 的使用方，先于其 Close 完成——
+		//     绝不因停机丢固化）。不放进 inFlightTracker：其 closeAdmission 后
+		//     enter 一律拒绝，停机窗口内 spawn 的固化将登记失败而丢失；且语义
+		//     不同——inFlight 是外部请求屏障，bgFinalizers 是插件派生的后台收尾。
 		if consolidate {
-			old.CheckpointSync(runCtx, pending, callbacksFromPlugin(runContext))
+			p.bgFinalizers.Add(1)
+			go func() {
+				defer p.bgFinalizers.Done()
+				old.CheckpointSync(context.Background(), pending, callbacksFromPlugin(runContext))
+			}()
 		}
 
 		// P5-5 收口（遗留①；Plan A2 生命周期半边改写为引用计数判定）。

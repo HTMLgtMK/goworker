@@ -87,9 +87,9 @@ type AgentPlugin struct {
 	mu          sync.Mutex
 	allowRuleMu sync.Mutex
 	// activeTransportSession 是最近一次有效声明的 transport 会话 id(连接方自造
-	// 的 UUID,与 store 的稳定 id 不同源)。空 = 尚无 ACP 会话声明。单活动会话
-	// 模式下它是「谁拥有 daemon 当前活动状态」的记号:FrontendHandler.Prompt 据此
-	// 拒绝已被其他连接顶掉的旧会话,而不是让 prompt 静默串到新声明的工作区里跑。
+	// 的 UUID,与 store 的稳定 id 不同源)。空 = 尚无 ACP 会话声明。A2b2 起它是
+	// 零生产调用方的兼容残留(ActiveSessionID 注释):原消费方 Prompt 的全局
+	// 回落守卫已删除,写入点只剩 SetSession(接口兑现面),字段随接口保留。
 	activeTransportSession string
 
 	// control 是应用内唯一的 Application Control Plane(总方案 §4.2,PR1 建立):
@@ -117,6 +117,13 @@ type AgentPlugin struct {
 	// 零值可用(测试直构插件)。
 	suspendMu      sync.Mutex
 	suspendedReaps map[string]struct{}
+
+	// bgFinalizers 是插件派生的后台收尾计数(A2b2:/new 的 CheckpointSync 挪出
+	// 全局临界区,commands.go):固化 goroutine spawn 前登记、退出时摘除,Stop 在
+	// memory 收尾前 Wait——固化是 memory.Client 的使用方,必须先于其 Close 完成,
+	// 绝不因停机丢固化。不放进 inFlightTracker 的论证见 commands.go 的异步化
+	// 注释(closeAdmission 拒绝语义 vs 后台收尾的语义差异)。零值可用。
+	bgFinalizers sync.WaitGroup
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
@@ -420,6 +427,11 @@ func (p *AgentPlugin) Start() error { return nil }
 //	    收口事件枢纽；
 //	  ③ 等待已登记的维护请求：inFlight.wait，覆盖仍在 Session Gate 前排队的
 //	    /new /compact 等非 AgentRun 执行面；
+//	  ③.5 等待后台固化收尾（A2b2）：bgFinalizers.wait——/new 的 CheckpointSync
+//	    已挪出命令回合异步执行（commands.go），spawn 即登记、完成即摘除；
+//	    固化是 memory.Client 的使用方，必须先于 memory.Close 完成（绝不因停机
+//	    丢固化）。等待放在 manager.Close 之后：固化不依赖执行平面；不与 inFlight
+//	    合并的语义差异见 commands.go 异步化注释；
 //	  ④ 收口：MCP 进程、memory、当前 store 与 repo 缓存逐层关闭。
 //
 //	Forced（P6 设计声明，未实现）：
@@ -447,6 +459,10 @@ func (p *AgentPlugin) Stop() error {
 	p.inFlight.wait()
 	// MCP server 是外部进程，退出时统一回收，避免残留孤儿进程
 	p.closeMCP()
+	// A2b2：等待 /new 派生的后台固化完成（③.5）——固化 goroutine 是
+	// memory.Client 的最后使用方之一，先于下方 memory.Close 收敛；固化不触
+	// store/MCP，放在 closeMCP 之后仅是次序习惯（MCP 先收、固化后等，互不依赖）。
+	p.bgFinalizers.Wait()
 	if p.memory != nil {
 		// 进程退出 = 会话结束，把当前 conversation 固化进任务档案，供下次会话恢复。
 		// 同步等一次 LLM（带超时），否则后台 goroutine 会被进程退出杀掉，固化直接丢。
@@ -722,13 +738,16 @@ func (p *AgentPlugin) openSessionStore(firstCycle bool) *session.Store {
 // SetSession 记录 ACP 提交方声明的会话工作目录并应用到当前会话（单活动会话模型：
 // transport sessionID 与 store 的 head id 不同源，cwd 一律落当前活动会话）。
 //
-// **Plan A2b1 起本方法是 current 语义的兼容残留面，不在 ACP 声明路径上**：
-// handler 的 session/new|load 已切换到 BoundSessionSource（boundsession.go——
-// session/new 真新建、load 走 reload/重开，cwd 是会话属性而非 daemon 全局
-// 单值），本方法不再有任何生产调用方；保留它（a）兑现 SessionSource 接口
-// （CLI/stdio 面的既有契约），（b）承载 cwd 校验语义的既有测试面
-// （sessions_test/cwd_migration_test）。A4 反转空 cwd 语义（注入 tmp）时本
-// 方法与 declareSessionCWD 一并重审（plan A2 实施注意点 3）。
+// **Plan A2b2 起本方法是零生产调用方的接口兑现残留面**（A2b1 把 ACP 声明切换到
+// BoundSessionSource、A2b2 删除 Prompt 守卫的全局回落分支——原「唯一消费面」
+// 已清零）：全仓库生产代码对 AgentPlugin.SetSession 的调用为零（grep 钉死；
+// handler 的 session/new|load 走 boundsession.go，CLI/stdin 从不调用）。保留它
+// 的理由：(a) model.SessionSource 是接口方法——dispatcher 链路的 acpIngress/
+// acpWorker 各有同名实现消费于 orchestrator 派发（与本插件无关），删本实现即
+// 破坏接口；(b) 承载 cwd 校验语义的既有测试面（sessions_test/cwd_migration_test
+// 的 P1-4 边界用例）。A4 反转空 cwd 语义（注入 tmp）时本方法与 declareSessionCWD
+// 一并重审（plan A2 实施注意点 3）；届时若测试面也迁移完毕，本方法按接口演进
+// 评估删除。
 //
 // sandbox 边界在插件侧校验：cfg.Sandbox.AllowedWorkDir 非空时，声明的 cwd 必须
 // 落在它之下（Abs + EvalSymlinks 解析后判断前缀，符号链接与相对路径钉到真实
@@ -777,13 +796,14 @@ func (p *AgentPlugin) SetSession(sessionID, cwd string) {
 // ActiveSessionID 实现 model.SessionSource 的 transport 活动会话语义：返回最近
 // 一次经 session/new|load 有效声明的 transport 会话 id（锁内快照，空 = 未声明）。
 // 注意与 CurrentSessionID 的区别：那边是 store 的稳定逻辑 id，这边是连接方
-// 自造的会话句柄；FrontendHandler.Prompt 用它做 superseded 守卫。
+// 自造的会话句柄。
 //
-// **A2b2 将拆**：A2b1 起 session/new|load 不再经过 SetSession（声明切换到
-// BoundSessionSource，boundsession.go），本字段的写入点只剩 SetSession 的
-// 兼容调用（测试/CLI 面）——多 session 下它是跨连接单值，Prompt 的回落分支
-// 消费它会被其他连接的声明误拒（plan A2「superseded 守卫删除空则回落」），
-// A2b2 收缩 SessionGate 时连同消费点一并清理；本步保持现状（任务边界）。
+// **A2b2 起零生产调用方的接口兑现残留面**：唯一消费方是 Prompt superseded 守卫
+// 的「空则回落全局 ActiveSessionID」分支，该分支已随全局门禁一并删除（plan A2
+// 「superseded 守卫删除空则回落全局 ActiveSessionID 分支」——多 session 下它是
+// 跨连接单值，回落会被别的连接的声明误拒；连接级 h.active 是唯一守卫事实源）。
+// 写入点只剩 SetSession 的兼容调用（测试面）。保留：接口方法（dispatcher 同款
+// 兑现）；A3 清单重写/接口演进时一并评估删除。
 func (p *AgentPlugin) ActiveSessionID() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()

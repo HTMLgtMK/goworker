@@ -719,6 +719,9 @@ func TestPromptSupersededSessionGuard(t *testing.T) {
 	})
 
 	t.Run("empty active skips guard", func(t *testing.T) {
+		// A2b2:回落全局 ActiveSessionID 的分支已删除——h.active 为空 = 本连接
+		// 从未声明,守卫直接放行,不再消费跨连接单值(plan A2「superseded 守卫
+		// 删除空则回落」);路由由 Binding(空 → current 回落)决定。
 		sessions := &fakeSessionSource{} // activeID 空 = 从未有 ACP 会话声明
 		handler := newHandler(sessions)
 		// 不走 CreateSession（那会进 SetSession 声明活动会话），直接记入可 prompt 集合
@@ -758,15 +761,17 @@ func waitPrompt(t *testing.T, h *FrontendHandler, sessionID string, reporter aia
 	return done
 }
 
-// TestPromptInFlightBlocksCreateSession 评审 P1 场景 1（TOCTOU 封闭）：A 的 prompt
-// 在飞（持有门禁）时，B 的 session/new 必须收到 -32000 busy 而非把新 cwd 应用到
-// 在飞会话上；A 释放后 B 重试成功，且 busy 拒绝不得留下任何副作用。
-func TestPromptInFlightBlocksCreateSession(t *testing.T) {
+// TestPromptInFlightDoesNotBlockCreateSession（A2b2 语义翻转，取代评审 P1 场景 1
+// 的 busy 断言）：A 的 prompt 在飞时 B 的 session/new 立即成功——prompt 已退出
+// 全局门禁（执行互斥下沉 per-runtime gate，插件 withSession 的 AcquireRun），
+// 管理操作不再被在飞 prompt 阻塞（plan A2「busy 语义改善：new/load 不再被在飞
+// prompt 阻塞」）。B 的 new 不触碰 A 的会话：真新建只 Create 新 store + 注册新
+// runtime（A2b1 语义），在飞执行不受影响。
+func TestPromptInFlightDoesNotBlockCreateSession(t *testing.T) {
 	sessions := &fakeSessionSource{}
-	gate := NewSessionGate()
 	reporter := &recordingReporter{}
 	newHandler := func(evaluate Evaluator) *FrontendHandler {
-		return &FrontendHandler{evaluate: evaluate, sessions: sessions, gate: gate}
+		return &FrontendHandler{evaluate: evaluate, sessions: sessions, gate: NewSessionGate()}
 	}
 
 	aEval := newBlockedEval()
@@ -774,51 +779,36 @@ func TestPromptInFlightBlocksCreateSession(t *testing.T) {
 	if err := a.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp/a"}, reporter); err != nil {
 		t.Fatalf("CreateSession s1: %v", err)
 	}
-	// B 的 evaluate 一旦被调用即是失败：busy 场景里 B 的 prompt 根本不该提交
-	b := newHandler(func(ctx *model.Context, _ string) error {
-		t.Error("B's evaluate must not run in this scenario")
-		return nil
-	})
+	b := newHandler(func(ctx *model.Context, _ string) error { return nil })
 
 	aDone := waitPrompt(t, a, "s1", reporter)
-	<-aEval.started // A 已持有门禁、卡在 evaluate 里
+	<-aEval.started // A 的 prompt 已推进到 evaluate（在飞）
 
-	// B 的 session/new：busy 诚实拒绝
-	err := b.CreateSession(context.Background(), "s2", protocol.NewSessionRequest{Cwd: "/tmp/b"}, reporter)
-	var rpcErr *protocol.RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != -32000 || !strings.Contains(rpcErr.Message, "busy") {
-		t.Fatalf("CreateSession while prompt in flight = %v, want -32000 busy error", err)
+	// B 的 session/new：立即成功（不再 busy）——管理面与 prompt 面解耦。
+	if err := b.CreateSession(context.Background(), "s2", protocol.NewSessionRequest{Cwd: "/tmp/b"}, reporter); err != nil {
+		t.Fatalf("CreateSession while prompt in flight = %v, want immediate success (A2b2:prompt 退出门禁)", err)
 	}
-	// busy 拒绝不得留下副作用：A2b1 起声明面是 BoundSessionSource(本 fake 无
-	// 该能力,不存在 SetSession 侧的共享状态突变)——busy 路径必须零 source
-	// 调用、活动声明仍是 A 的 s1。
+	// 声明面零 source 调用（A2b1 降级语义不变：fake 无 BoundSessionSource，
+	// 声明走降级路径不触碰 source）。
 	sessions.mu.Lock()
 	declared := append([]string(nil), sessions.setSessionCalls...)
 	sessions.mu.Unlock()
 	if len(declared) != 0 {
-		t.Fatalf("SetSession calls = %v, want none (A2b1:声明面已切换,busy CreateSession 必须零副作用)", declared)
+		t.Fatalf("SetSession calls = %v, want none (声明面已切换 BoundSessionSource)", declared)
 	}
 
-	// 放行 A：prompt 正常完成
+	// A 的 prompt 照常完成（B 的 new 不影响在飞执行）。
 	close(aEval.release)
 	if err := <-aDone; err != nil {
 		t.Fatalf("Prompt s1 = %v", err)
 	}
-
-	// A 结束后 B 重试成功(降级形态下同样零 source 侧声明调用)。
-	if err := b.CreateSession(context.Background(), "s2", protocol.NewSessionRequest{Cwd: "/tmp/b"}, reporter); err != nil {
-		t.Fatalf("CreateSession s2 after release = %v", err)
-	}
-	sessions.mu.Lock()
-	defer sessions.mu.Unlock()
-	if len(sessions.setSessionCalls) != 0 {
-		t.Fatalf("SetSession calls = %v, want none after retry (A2b1 降级语义)", sessions.setSessionCalls)
-	}
 }
 
-// TestPromptInFlightBlocksLoadCurrent 评审 P1 场景 2：prompt 在飞时对当前会话的
-// session/load 报 busy；归档 load 是只读重放、不碰共享会话状态，不受门禁限制。
-func TestPromptInFlightBlocksLoadCurrent(t *testing.T) {
+// TestPromptInFlightDoesNotBlockLoadCurrent（A2b2 语义翻转，取代评审 P1 场景 2
+// 的 busy 断言）：prompt 在飞时 session/load 的可 prompt 分支立即成功——prompt
+// 已退出全局门禁，load（降级路径仍走管理门禁 tryAcquire）在空闲门禁上立即通过；
+// 归档 load 只读重放照旧不经门禁。
+func TestPromptInFlightDoesNotBlockLoadCurrent(t *testing.T) {
 	sessions := &fakeSessionSource{
 		currentID: "s1",
 		list:      []model.SessionSummary{{SessionID: "old"}},
@@ -826,10 +816,9 @@ func TestPromptInFlightBlocksLoadCurrent(t *testing.T) {
 			"old": {{Kind: model.SessionUpdateUserMessageChunk, Content: &model.SessionContent{Type: "text", Text: "past"}}},
 		},
 	}
-	gate := NewSessionGate()
 	reporter := &recordingReporter{}
 	newHandler := func(evaluate Evaluator) *FrontendHandler {
-		return &FrontendHandler{evaluate: evaluate, sessions: sessions, gate: gate}
+		return &FrontendHandler{evaluate: evaluate, sessions: sessions, gate: NewSessionGate()}
 	}
 
 	aEval := newBlockedEval()
@@ -837,43 +826,37 @@ func TestPromptInFlightBlocksLoadCurrent(t *testing.T) {
 	if err := a.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp/a"}, reporter); err != nil {
 		t.Fatalf("CreateSession s1: %v", err)
 	}
-	b := newHandler(func(ctx *model.Context, _ string) error {
-		t.Error("B's evaluate must not run in this scenario")
-		return nil
-	})
+	b := newHandler(func(ctx *model.Context, _ string) error { return nil })
 
 	aDone := waitPrompt(t, a, "s1", reporter)
 	<-aEval.started
 
-	// load-current 会 SetSession + reload，必须被 busy 拒绝
-	err := b.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "s1", Cwd: "/tmp/b"}, reporter)
-	var rpcErr *protocol.RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != -32000 || !strings.Contains(rpcErr.Message, "busy") {
-		t.Fatalf("LoadSession current while prompt in flight = %v, want -32000 busy error", err)
+	// load-current：立即成功（不再 busy——prompt 不持门禁，管理门禁空闲）。
+	if err := b.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "s1", Cwd: "/tmp/b"}, reporter); err != nil {
+		t.Fatalf("LoadSession current while prompt in flight = %v, want immediate success (A2b2:prompt 退出门禁)", err)
 	}
-	// 归档 load 只读：prompt 在飞也照常重放
+	// 归档 load 只读：prompt 在飞也照常重放（不经门禁，语义不变）。
 	if err := b.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "old"}, reporter); err != nil {
 		t.Fatalf("LoadSession archived while prompt in flight = %v, want read-only replay to bypass the gate", err)
 	}
 
-	// 放行 A 后，load-current 成功
+	// A 的 prompt 照常完成（B 的 load 只 reload 视图，不影响在飞执行）。
 	close(aEval.release)
 	if err := <-aDone; err != nil {
 		t.Fatalf("Prompt s1 = %v", err)
 	}
-	if err := b.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "s1", Cwd: "/tmp/b"}, reporter); err != nil {
-		t.Fatalf("LoadSession current after release = %v", err)
-	}
 }
 
-// TestPromptsSerializeAcrossConnections 门禁对 prompt 本身也是互斥的：A 的 prompt
-// 在飞时 B 的 prompt（同一活动会话）排队等待，A 释放后 B 才开始执行。
-func TestPromptsSerializeAcrossConnections(t *testing.T) {
-	gate := NewSessionGate()
+// TestPromptsRunConcurrentlyAcrossConnections（A2b2 语义翻转，取代原「门禁对
+// prompt 互斥」的串行断言）：prompt 退出全局门禁后跨连接并行——A 的 prompt
+// 阻塞在 evaluate 时 B 的 prompt 照常启动（旧版在此排队于门禁）。同一 session
+// 的执行互斥由 per-runtime gate（插件 withSession 的 AcquireRun）承担，本测试
+// 的 fake evaluate 不经过插件链，验证的是 handler 层不再有全局串行点。
+func TestPromptsRunConcurrentlyAcrossConnections(t *testing.T) {
 	reporter := &recordingReporter{}
 	aEval, bEval := newBlockedEval(), newBlockedEval()
-	a := &FrontendHandler{evaluate: aEval.run, gate: gate}
-	b := &FrontendHandler{evaluate: bEval.run, gate: gate}
+	a := &FrontendHandler{evaluate: aEval.run, gate: NewSessionGate()}
+	b := &FrontendHandler{evaluate: bEval.run, gate: NewSessionGate()}
 	// 同一活动会话的双连接：两侧都记入各自的可 prompt 集合（B 经 load-current 进入）
 	a.remember("s1")
 	b.remember("s1")
@@ -882,73 +865,65 @@ func TestPromptsSerializeAcrossConnections(t *testing.T) {
 	<-aEval.started
 
 	bDone := waitPrompt(t, b, "s1", reporter)
-	time.Sleep(50 * time.Millisecond) // 给调度器充分机会；B 仍不得越过门禁启动
+	// B 的 evaluate 必须启动（A 阻塞中）——旧版此处 B 排队于全局门禁、绝不启动。
 	select {
 	case <-bEval.started:
-		t.Fatal("B's evaluate started while A still holds the gate")
-	default:
+	case <-time.After(2 * time.Second):
+		t.Fatal("B's evaluate did not start while A is in flight (A2b2:prompt 必须跨连接并行)")
 	}
 
 	close(aEval.release)
 	if err := <-aDone; err != nil {
 		t.Fatalf("Prompt A = %v", err)
 	}
-	<-bEval.started // A 释放后 B 才启动
 	close(bEval.release)
 	if err := <-bDone; err != nil {
 		t.Fatalf("Prompt B = %v", err)
 	}
 }
 
-// TestPromptCancelWhileQueued 连接断开（ctx 取消）时排队中的 prompt 必须立即以
-// 错误退出而不是永远悬在门禁上；且 evaluate 不得再被调用。
-func TestPromptCancelWhileQueued(t *testing.T) {
-	gate := NewSessionGate()
+// TestPromptCancelWhileQueued 已随全局门禁的 prompt 排队面一并删除（A2b2）：
+// 其验证的「连接断开时排队 prompt 立即以错误退出」原是 SessionGate.acquire 的
+// ctx 取消语义——acquire 随 prompt 退出门禁而退役（coordinator.go），断连不
+// 悬挂改由请求 ctx 传入 evaluate 链、经 SDK 的 AgentRun 取消语义承担（与 xgw
+// 后台 run 的 ctx 取消同源）；ai-acp 的请求 goroutine（dispatchRequest）在
+// handler 返回后自然收敛，无门禁可悬挂。
+
+// TestManagementGateSerializesManagementOps（A2b2 管理互斥面的确定性断言）：
+// 全局门禁被另一管理操作占住（tryAcquire 模拟）时，session/new 收到 -32000
+// busy——管理操作互斥的实现是非阻塞 busy 拒绝（tryAcquire，coordinator.go），
+// 绝不排队；释放后重试成功。这是并发管理操作 busy 语义的 gate 级验证（真插件
+// 链路的并发正确性面在 plugins/agent 的 TestACPManagementOpsConcurrentCreateSerializes）。
+func TestManagementGateSerializesManagementOps(t *testing.T) {
+	sessions := &fakeSessionSource{}
 	reporter := &recordingReporter{}
-	aEval := newBlockedEval()
-	a := &FrontendHandler{evaluate: aEval.run, gate: gate}
-	var (
-		bMu  sync.Mutex
-		bRan bool
-	)
-	b := &FrontendHandler{
-		evaluate: func(ctx *model.Context, _ string) error {
-			bMu.Lock()
-			bRan = true
-			bMu.Unlock()
-			return nil
-		},
-		gate: gate,
+	handler := &FrontendHandler{
+		evaluate: func(ctx *model.Context, _ string) error { return nil },
+		sessions: sessions,
+		gate:     NewSessionGate(),
 	}
-	a.remember("s1")
-	b.remember("s1")
 
-	aDone := waitPrompt(t, a, "s1", reporter)
-	<-aEval.started
-
-	ctx, cancel := context.WithCancel(context.Background())
-	bDone := make(chan error, 1)
-	go func() {
-		_, err := b.Prompt(ctx, "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter)
-		bDone <- err
-	}()
-	time.Sleep(50 * time.Millisecond) // 让 B 真正排到门禁上，而非取消先于提交
-	cancel()
-
-	err := <-bDone
+	// 模拟另一管理操作占住临界区（其临界区只含注册表/repo 突变，持有时长极短）。
+	if !handler.gate.tryAcquire() {
+		t.Fatal("setup: idle gate must be acquirable")
+	}
+	err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp"}, reporter)
 	var rpcErr *protocol.RPCError
-	if !errors.As(err, &rpcErr) || rpcErr.Code != -32000 || !strings.Contains(rpcErr.Message, "gate") {
-		t.Fatalf("Prompt canceled while queued = %v, want -32000 gate-canceled error", err)
+	if !errors.As(err, &rpcErr) || rpcErr.Code != -32000 || !strings.Contains(rpcErr.Message, "busy") {
+		t.Fatalf("CreateSession while management gate held = %v, want -32000 busy", err)
 	}
+	// busy 拒绝零副作用：声明面没有触碰 source（A2b1 起声明走 BoundSessionSource，
+	// 本 fake 无该能力；降级形态的断言与生产同形——拒绝路径不产生任何声明）。
+	sessions.mu.Lock()
+	if len(sessions.setSessionCalls) != 0 {
+		sessions.mu.Unlock()
+		t.Fatalf("SetSession calls = %v, want none on busy rejection", sessions.setSessionCalls)
+	}
+	sessions.mu.Unlock()
 
-	// 放行 A：B 的 evaluate 必须从未运行
-	close(aEval.release)
-	if err := <-aDone; err != nil {
-		t.Fatalf("Prompt A = %v", err)
-	}
-	bMu.Lock()
-	defer bMu.Unlock()
-	if bRan {
-		t.Fatal("B's evaluate ran despite ctx cancellation while queued")
+	// 释放后重试成功（瞬态错误的客户端契约）。
+	handler.gate.release()
+	if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp"}, reporter); err != nil {
+		t.Fatalf("CreateSession after gate release = %v, want success", err)
 	}
 }

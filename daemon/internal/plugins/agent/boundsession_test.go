@@ -2,13 +2,16 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
@@ -470,4 +473,181 @@ func conversationHasUserText(conv []core.Message, want string) bool {
 		}
 	}
 	return false
+}
+
+// ── A2b2 并行验收（plan A6：两连接并行 prompt 互不阻塞、在飞 prompt 不阻塞
+// 管理操作；执行互斥下沉 per-runtime gate 后的跨会话并行形态）────────────────
+
+// promptAsync 在后台 goroutine 跑一轮 prompt，返回完成 err 的接收通道
+// （waitPrompt 的 acpStack 形态；并行断言需要非阻塞观察面）。
+func (s *acpStack) promptAsync(t *testing.T, sessionID, input string) <-chan error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.handler.Prompt(context.Background(), sessionID, []protocol.ContentBlock{protocol.TextBlock(input)}, s.rep)
+		done <- err
+	}()
+	return done
+}
+
+// TestACPCrossSessionPromptsRunInParallel(任务书验收①):两连接各绑不同会话,
+// 连接 1 的 prompt 阻塞在 provider(真实链路:handleAgent → manager.StartRun →
+// Session.Run → provider.Chat,即「工具执行慢」的形态),连接 2 的 prompt 在其
+// 阻塞期间正常完成——跨 session 并行。拆除 prompt 全局门禁(A2b2)之前,B 会在
+// handler.Prompt 的 gate.acquire 排队到 A 释放,不可能先完成;拆除后 B 的执行
+// 全程持有自己会话的 runtime gate(withSession → AcquireRun),与 A 的 gate 无嵌套。
+func TestACPCrossSessionPromptsRunInParallel(t *testing.T) {
+	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
+	p, newStack := newACPStack(t, fixedProvider{content: "ack"})
+	currentID := p.CurrentSessionID()
+	conn1, conn2 := newStack(), newStack()
+
+	// 逐会话注入 provider 工厂:mountRuntime 以创建时刻的 p.deps 为底座(值拷贝
+	// 换绑,CreateBoundSession 内部冻结),conn1 的会话绑阻塞 provider、conn2 的
+	// 绑立即完成 provider——并行断言的两个角色。
+	p.deps.NewProvider = func(*runtimeconfig.Config) (core.Provider, error) { return gated, nil }
+	sid1 := conn1.create(t, "transport-1")
+	p.deps.NewProvider = func(*runtimeconfig.Config) (core.Provider, error) { return fixedProvider{content: "ack"}, nil }
+	sid2 := conn2.create(t, "transport-2")
+	if sid1 == sid2 || sid1 == currentID || sid2 == currentID {
+		t.Fatalf("created sessions = %q/%q, want two fresh distinct ids", sid1, sid2)
+	}
+
+	// 连接 1 的长 prompt:阻塞在 provider(started 关闭 = 已推进到模型调用)。
+	p1 := conn1.promptAsync(t, "transport-1", "slow-one")
+	select {
+	case <-gated.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("conn1 prompt did not reach the gated provider in time")
+	}
+
+	// 连接 2 的 prompt:必须在 A 阻塞期间完成(旧全局门禁下此处排队到 A 释放)。
+	p2 := conn2.promptAsync(t, "transport-2", "fast-two")
+	select {
+	case err := <-p2:
+		if err != nil {
+			t.Fatalf("conn2 prompt while conn1 in flight: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("conn2 prompt did not finish while conn1 is in flight (A2b2:跨会话必须并行)")
+	}
+	if conv2 := p.manager.Get(sid2).Session().Conversation(); len(conv2) == 0 || conv2[0].Content != "fast-two" {
+		t.Fatalf("session two conversation = %v, want its own round", conv2)
+	}
+
+	// A 仍在飞:放行后收敛。
+	select {
+	case <-gated.release:
+	default:
+	}
+	close(gated.release)
+	if err := <-p1; err != nil {
+		t.Fatalf("conn1 prompt = %v", err)
+	}
+	if conv1 := p.manager.Get(sid1).Session().Conversation(); len(conv1) == 0 || conv1[0].Content != "slow-one" {
+		t.Fatalf("session one conversation = %v, want its own round", conv1)
+	}
+}
+
+// TestACPCreateSessionImmediateWhilePromptInFlight(任务书验收②):prompt 在飞时
+// 另一连接的 session/new 立即成功——管理面与 prompt 面解耦(A2b2 拆除 prompt
+// 全局门禁;拆除前 new 会收到 -32000 busy 拒绝)。
+func TestACPCreateSessionImmediateWhilePromptInFlight(t *testing.T) {
+	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
+	p, newStack := newACPStack(t, fixedProvider{content: "ack"})
+	conn1, conn2 := newStack(), newStack()
+
+	p.deps.NewProvider = func(*runtimeconfig.Config) (core.Provider, error) { return gated, nil }
+	sid1 := conn1.create(t, "transport-1")
+
+	p1 := conn1.promptAsync(t, "transport-1", "long-running")
+	select {
+	case <-gated.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("conn1 prompt did not reach the gated provider in time")
+	}
+
+	// A 在飞时 B 的 session/new:立即返回(时限断言的失败即「门禁仍被 prompt
+	// 攥住」的回归)。
+	created := make(chan string, 1)
+	go func() {
+		created <- conn2.create(t, "transport-2")
+	}()
+	select {
+	case sid2 := <-created:
+		if sid2 == "" || sid2 == sid1 {
+			t.Fatalf("created session = %q, want a fresh id", sid2)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session/new did not return while a prompt is in flight (A2b2:管理操作不得被在飞 prompt 阻塞)")
+	}
+
+	close(gated.release)
+	if err := <-p1; err != nil {
+		t.Fatalf("conn1 prompt = %v", err)
+	}
+}
+
+// TestACPManagementOpsConcurrentCreateSerializes(任务书验收③,配合注释论证):
+// 两条连接**并发** session/new。管理操作在全局门禁上互斥(coordinator.go 的
+// 容量 1 channel;临界区只含注册表/repo 突变,无 I/O 无 LLM 调用),互斥的实现
+// 是**非阻塞 busy 拒绝**(tryAcquire,满即 sessionBusyError)而非排队——并发
+// 竞争下败者收到瞬态 busy、按客户端契约重试(测试内建模:busy 重试收敛),
+// 成功者携全序突变落地。断言:并发下两者最终都成功、绑定不同新会话、注册表
+// 恰好新增两条(突变全序,无竞态损坏)。「互斥本身」的确定性断言由 handler 层
+// 持有门禁时的 busy 拒绝承担(handler_test.go TestManagementGateSerializesManagementOps);
+// 本测试补真插件链路下并发管理操作的正确性面。
+func TestACPManagementOpsConcurrentCreateSerializes(t *testing.T) {
+	p, newStack := newACPStack(t, fixedProvider{content: "ack"})
+	conn1, conn2 := newStack(), newStack()
+	before := registeredSessionIDs(p)
+
+	// createWithRetry 建模客户端契约:busy 是瞬态错误,稍后重试直至成功(2s 上限)。
+	// 新会话 id 不从连接 Binding 读取(handler 的连接私有字段,跨包不可达)——
+	// 并发下两连接的新增会话由 wg 汇合后的注册表差集给出(恰两条,见下)。
+	createWithRetry := func(s *acpStack, transportID string) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			err := s.handler.CreateSession(context.Background(), transportID, protocol.NewSessionRequest{}, s.rep)
+			if err == nil {
+				return
+			}
+			var rpcErr *protocol.RPCError
+			if !errors.As(err, &rpcErr) || !strings.Contains(rpcErr.Message, "busy") {
+				t.Fatalf("CreateSession(%s): %v", transportID, err)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("CreateSession(%s) still busy after retry window: %v", transportID, err)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); createWithRetry(conn1, "transport-c1") }()
+	go func() { defer wg.Done(); createWithRetry(conn2, "transport-c2") }()
+	wg.Wait()
+
+	// 注册表差集 = 恰两条新会话(并发下互斥保证突变全序,不丢不重);每条新会话
+	// 恰有一条连接绑定(各连接的改绑各落各的)。
+	var fresh []string
+	after := registeredSessionIDs(p)
+	if len(after) != len(before)+2 {
+		t.Fatalf("registry = %d entries, want %d (exactly two new sessions)", len(after), len(before)+2)
+	}
+	for id := range after {
+		if !before[id] {
+			fresh = append(fresh, id)
+		}
+	}
+	if len(fresh) != 2 {
+		t.Fatalf("fresh sessions = %v, want exactly two (并发 create 的注册表突变必须全序收敛)", fresh)
+	}
+	for _, id := range fresh {
+		if got := p.control.SessionBindings(id); len(got) != 1 {
+			t.Fatalf("bindings(%s) = %v, want exactly one connection", id, got)
+		}
+	}
 }

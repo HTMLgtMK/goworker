@@ -27,11 +27,13 @@ type Evaluator = func(ctx *model.Context, input string) error
 //     下发命令补全，把连接级 SessionBinding 指向新会话（store 稳定 id）——
 //     **current 不动**（plan A2「current 收缩为 CLI/stdin 便利指针」），发起方
 //     此前绑定的会话由登记面的改绑评估走引用计数（A2a 机制）；
-//   - Prompt：known/read-only 守卫 → 连接级 superseded 守卫（PR2：只认本连接
-//     自己的声明，其他连接的 session/new|load 不再顶掉本连接）→ 会话门禁（跨
-//     连接互斥）→ 连接级 Binding 随 ctx 注入执行链（prompt 路由到 binding 指向
-//     的会话，总方案 §六）→ 命令输出围栏 + token→update 映射、HITL 授权经
-//     Reporter.RequestPermission（model.DecideViaACP）；
+//   - Prompt（A2b2 起退出全局门禁）：known/read-only 守卫 → 连接级 superseded
+//     守卫（PR2：只认本连接自己的声明，其他连接的 session/new|load 不再顶掉本
+//     连接）→ 连接级 Binding 随 ctx 注入执行链（prompt 路由到 binding 指向的
+//     会话，总方案 §六）→ 命令输出围栏 + token→update 映射、HITL 授权经
+//     Reporter.RequestPermission（model.DecideViaACP）。执行互斥下沉 per-runtime
+//     gate（插件 withSession 的 AcquireRun）：同 session prompt 串行、跨 session
+//     并行——TOCTOU 论证见 Prompt 函数头；
 //   - LoadSession（Plan A2b1 重写）：绑定/已注册会话 reload+重放（进可 prompt
 //     集合，Binding 改绑登记——共享会话多连接同绑），持久化不在册会话重开
 //     （repo.Open 拿活实例 → 新 runtime → cwd 恢复 → 重放），归档终态只读重放
@@ -39,7 +41,9 @@ type Evaluator = func(ctx *model.Context, input string) error
 //   - ListSessions/SessionModes：domain → wire 映射转发。
 //
 // 它放在本包而非装配层：session 语义是 daemon domain 逻辑，所有壳层共用；
-// 装配层只接线。gate 由装配层创建、全 daemon 一份（见 coordinator.go）。
+// 装配层只接线。gate 由装配层创建、全 daemon 一份（见 coordinator.go）——
+// A2b2 起它只守会话管理操作（session/new、session/load 可 prompt 分支；prompt
+// 已退出），短临界区互斥，见 coordinator.go 的职责声明。
 //
 // PR2 语义变更声明（总方案 §六，重构方案明确要求的可见变化）：连接级
 // SessionBinding 取代全局 CurrentSession 成为标准 ACP 方法的会话选择事实源
@@ -60,7 +64,11 @@ type FrontendHandler struct {
 	evaluate Evaluator
 	commands func() []model.Command
 	sessions model.SessionSource
-	gate     *SessionGate
+	// gate 是全局会话管理门禁(A2b2 起职责收窄,coordinator.go):只守会话管理
+	// 操作(session/new、session/load 可 prompt 分支;A3 的 session/archive 落地
+	// 后加入)。prompt 已退出门禁——执行互斥下沉 per-runtime gate(插件 withSession
+	// 的 AcquireRun),在飞 prompt 不再阻塞管理操作,反之亦然。
+	gate *SessionGate
 
 	// binding 是本连接的会话选择器(PR2,总方案 §6.1,agentcontrol.SessionBinding):
 	// session/new|load-current 声明成功后 Set(声明落地的已注册 runtime id,即
@@ -241,8 +249,12 @@ func (h *FrontendHandler) membership(sessionID string) (promptable, readOnly boo
 	return promptable, readOnly
 }
 
-// sessionBusyError 是 prompt 在飞时会话切换请求（session/new、load-current）收到的
-// 诚实拒绝：busy 是瞬态错误，客户端取消在飞 prompt 或稍后重试即可。
+// sessionBusyError 是管理操作（session/new、session/load 可 prompt 分支）在
+// 全局管理门禁被另一管理操作占住时收到的诚实拒绝（A2b2 起 busy 只发生在管理
+// 操作之间——prompt 已退出全局门禁，执行互斥下沉 per-runtime gate，在飞 prompt
+// 不再阻塞 new/load；plan A2「busy 语义改善」）。busy 是瞬态错误：另一管理
+// 操作的临界区只含注册表/repo 的状态突变（无 LLM 调用、无连接 I/O），稍后
+// 重试即可。
 func sessionBusyError() *protocol.RPCError {
 	return &protocol.RPCError{
 		Code:    -32000,
@@ -345,16 +357,41 @@ func (h *FrontendHandler) deviceToolSource(reporter aiacp.Reporter) func(ctx con
 	}
 }
 
-// Prompt 实现 aiacp.SessionHandler。流程：归档只读守卫 → 未知会话守卫
-// → 会话门禁（跨连接互斥 prompt 与 session/new|load-current；ctx 取消即失败，
-// 连接断开不悬挂）→ superseded 守卫（PR2 连接级:只认本连接自己的声明——其他
-// 连接的 session/new|load 不再顶掉本连接,§六语义变更;本连接重声明后的旧 id
-// 诚实报错。本连接从未声明时回落全局 ActiveSessionID,兼容不走 CreateSession
-// 的测试桩/简化壳）→ 连接级 Binding 随 ctx 注入执行链(prompt 路由到 binding
-// 指向的会话,总方案 §六;Binding 悬空 = 会话已被 /new 收口 → 插件侧诚实报错)
-// → 命令输出围栏 + token 映射 + HITL 授权 → evaluate → 闭合围栏。守卫、Binding
-// 读取与 evaluate 都在门禁内:检查与执行之间不再有 session/new|load 可钻的空档
-// (TOCTOU,评审 P1——它们同样要取门禁,与持门禁的 prompt 全序)。
+// Prompt 实现 aiacp.SessionHandler（A2b2 起 prompt 退出全局会话门禁——
+// plan A2「SessionGate 保留、职责收缩」）。流程：归档只读守卫 → 未知会话守卫
+// → superseded 守卫（连接级 h.active：只认本连接自己的声明，本连接重声明后的
+// 旧 id 诚实报错）→ 连接级 Binding 随 ctx 注入执行链 → 命令输出围栏 + token
+// 映射 + HITL 授权 → evaluate → 闭合围栏。
+//
+// 为什么不再需要全局门禁（plan A2「TOCTOU 封闭论证」的展开，取代旧版「守卫与
+// evaluate 都在门禁内」的论证）：
+//   - 旧病灶（coordinator.go 文件头，评审 P1）：单活动模型下 session/new 经
+//     SetSession 把新 cwd 应用到 current 正在执行的会话上——cwd/会话本体是
+//     daemon 全局共享状态，prompt 的守卫检查与 evaluate 之间存在 TOCTOU 空档，
+//     必须用 gate 把 prompt 与 session/new|load 全序化。
+//   - 病灶随单活动模型一并消失（A2b1）：session/new 真新建（CreateBoundSession
+//     只 Create 新 store + 注册新 runtime，**不动 current、不触碰任何在飞会话
+//     的状态**）；cwd 是会话属性（runtime 级声明，boundsession.go），声明只落
+//     新建/重开的目标会话。管理操作在全局临界区内只做状态突变（Create/注册/
+//     摘发起方 binding/引用减一），从不改写在飞 prompt 正在执行的实例。
+//   - 执行互斥下沉 per-runtime gate：prompt 经 binding → sessionRuntimeIn 解析
+//     出 runtime 实例快照，执行全程持有该 runtime 的 gate（withSession →
+//     AcquireRun，容量 1）——同一 session 的 prompt 串行、跨 session 并行。
+//     全局 gate 临界区从不等待 runtime gate（两域无嵌套，plan A2 锁序），管理
+//     操作与在飞 run 互不阻塞。
+//   - 守卫的自身一致性：membership/h.active 是连接私有状态（h.mu），其他连接
+//     的声明只写它们自己的连接私有状态，与本连接的检查无共享数据；本会话不会
+//     在守卫通过后凭空消失——收口（tryReleaseSession）以引用归零为前提，本
+//     连接仍绑着的目标会话引用非零、绝不收口。守卫通过到解析点之间的已知窗口：
+//     同一连接并发重声明（ai-acp 每请求独立 goroutine，协议允许）可在守卫后、
+//     解析前落地，让这轮在飞 prompt 的解析读到改绑后的 Binding——后果是该轮
+//     输入路由到客户端刚声明的新会话（跨连接无此窗口：Binding 连接私有），
+//     旧版以「new 永远 busy 拒绝」为代价封闭它，plan A2 明文放弃该代价（busy
+//     语义改善）；解析一经完成，执行全程持 runtime gate、闭包内读注入值，
+//     不再受后续改绑影响。
+//   - ctx 取消（连接断开）：不再经门禁排队面，而是随请求 ctx 传入 evaluate
+//     链——SDK 的 AgentRun 取消语义（ai-core 工具链对 ctx 的响应）承担「断连
+//     不悬挂」，与 xgw 后台 run 的 ctx 取消同源。
 func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt []protocol.ContentBlock, reporter aiacp.Reporter) (string, error) {
 	promptable, readOnly := h.membership(sessionID)
 	if readOnly {
@@ -371,40 +408,21 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 		}
 	}
 
-	// 会话门禁：与 session/new、load-current 互斥,封闭守卫到 evaluate 之间的
-	// TOCTOU 空档。ctx 取消（连接断开）时排队失败，绝不悬挂。
-	if err := h.gate.acquire(ctx); err != nil {
-		return "", &protocol.RPCError{
-			Code:    -32000,
-			Message: fmt.Sprintf("acp frontend: prompt canceled while waiting for the session gate: %v", err),
-		}
-	}
-	defer h.gate.release()
-
-	// superseded 守卫(PR2 连接级):本连接最近声明(h.active)优先——其他连接的
-	// session/new|load 不再顶掉本连接(§六语义变更,声明归属连接);本连接重声明
-	// 后的旧 id 仍诚实报错。空则回落全局 ActiveSessionID(评审 P1 原守卫,兜住
-	// 不走 CreateSession 的测试桩/简化壳)——**A2b2 将拆**:多 session 下
-	// ActiveSessionID 是跨连接单值,回落分支会被别的连接的声明误拒(plan A2
-	// 「superseded 守卫删除空则回落全局 ActiveSessionID 分支」),A2b2 收缩
-	// SessionGate 时一并清理;本步保持现状(任务边界:SessionGate 语义不动)。
-	// 门禁内检查:本连接的重声明同样要取门禁,与之全序,检查后不会再被顶掉。
+	// superseded 守卫(PR2 连接级,plan A2 起是唯一形态):本连接最近声明
+	// (h.active)——其他连接的 session/new|load 不再顶掉本连接(§六语义变更,
+	// 声明归属连接);本连接重声明后的旧 id 仍诚实报错。旧版的「空则回落全局
+	// ActiveSessionID」分支随全局门禁一并删除(A2b2):回落消费的是跨连接单值
+	// (plugin.activeTransportSession),多 session 下会被别的连接的声明误拒
+	// (plan A2「superseded 守卫删除空则回落全局 ActiveSessionID 分支」);
+	// h.active 为空 = 本连接从未声明(不走 CreateSession 的测试桩/简化壳),
+	// 直接放行——路由由 Binding(空 → current 回落)决定,守卫不参与。
 	h.mu.Lock()
 	local := h.active
 	h.mu.Unlock()
-	if local != "" {
-		if local != sessionID {
-			return "", &protocol.RPCError{
-				Code:    -32000,
-				Message: fmt.Sprintf("acp frontend: session %q is no longer active on this connection (last declared %q); create a new session or load the session again", sessionID, local),
-			}
-		}
-	} else if h.sessions != nil {
-		if active := h.sessions.ActiveSessionID(); active != "" && active != sessionID {
-			return "", &protocol.RPCError{
-				Code:    -32000,
-				Message: fmt.Sprintf("acp frontend: session %q is no longer active (current active session %q); single-session daemon — create a new session or load the current one", sessionID, active),
-			}
+	if local != "" && local != sessionID {
+		return "", &protocol.RPCError{
+			Code:    -32000,
+			Message: fmt.Sprintf("acp frontend: session %q is no longer active on this connection (last declared %q); create a new session or load the session again", sessionID, local),
 		}
 	}
 
@@ -424,7 +442,9 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 		// PR2:连接级 Binding 挂上执行链 ctx——Engine.Eval 把 model.Context 直通
 		// 命令 handler,插件的 binding 形态解析点(agentcontrol.BindingFromCtx)据此
 		// 把 prompt 路由到本连接选择的会话(总方案 §六;Binding 悬空时插件诚实
-		// 报错)。门禁内读取:声明也取门禁,读到的是与守卫一致的全序快照。
+		// 报错)。注入的是连接 binding 对象本身(非快照值):/new 收口经同一对象
+		// 的 b.Set("") 清空本连接选择、回落 current——快照注入会切断该收口
+		// (函数头 TOCTOU 论证的已知窗口由此而来)。
 		// Plan A2:连接句柄随同一执行链 ctx 注入(agentcontrol.WithClientID)——
 		// /new 收口(agentcontrol.ClientIDFromCtx)据此摘本连接的绑定登记;与
 		// ReleaseConnection 的 clientID 同源(h.connectionID)。
