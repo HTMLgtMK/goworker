@@ -602,3 +602,52 @@ func TestRepositoryCloseSessionEvictsAliasEntries(t *testing.T) {
 		t.Fatalf("Commit on fresh mount: %v", err)
 	}
 }
+
+// TestRepositoryPeekNeverResurrects 验证 Peek 的「只查不建」契约（Plan A4 加固，
+// storeFor 复活问题的 SDK 侧验收）：
+//   - 缓存命中返回同实例（指针相等，实例唯一不变量）；
+//   - 未命中返回 ok=false 且**不触碰文件系统**（对照：Open 未命中会走 Store.Open
+//     慢路径建实例并持 flock）；
+//   - repo.Close 清空缓存后 Peek 仍不复活——这正是 A3 审查抓到的泄漏根因：
+//     宿主 Stop 后 stale runtime 引用再取数，Open 会重建实例持 flock 到进程
+//     退出，Peek 把该路径收窄为诚实降级。
+func TestRepositoryPeekNeverResurrects(t *testing.T) {
+	root := t.TempDir()
+	repo, err := OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+	st, err := repo.Create(context.Background(), CreateOptions{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	id := st.SessionID()
+
+	got, ok := repo.Peek(id)
+	if !ok || got != st {
+		t.Fatalf("Peek(hit) = %v, %v, want the cached instance (指针相等)", got, ok)
+	}
+	missing := NewSessionID()
+	if s, ok := repo.Peek(missing); ok || s != nil {
+		t.Fatalf("Peek(miss) = %v, %v, want nil/false", s, ok)
+	}
+
+	// Close 清空缓存并关实例：Peek 不复活；对照 Open 的慢路径会重建（危险面）。
+	if err := repo.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if s, ok := repo.Peek(id); ok || s != nil {
+		t.Fatalf("Peek after Close = %v, %v, want nil/false（绝不重建）", s, ok)
+	}
+	revived, err := repo.Open(id)
+	if err != nil {
+		t.Fatalf("Open after Close (对照组,锁已释放应可重建): %v", err)
+	}
+	if revived == st {
+		t.Fatal("Open after Close returned the closed instance, want a fresh one")
+	}
+	// 收尾：对照组重建的实例落在了新 repo 状态里，Close 归还句柄。
+	if err := repo.Close(); err != nil {
+		t.Fatalf("final Close: %v", err)
+	}
+}

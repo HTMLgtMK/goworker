@@ -39,10 +39,11 @@ const (
 // 句柄、不加目录锁的只读解析面（digest.go 文件头论证：清单是高频操作，逐会话
 // Open 的缓存/flock 常驻不可接受；OpenArchiveView 同级只读纪律，坏行跳过）。
 // 旧版的「当前会话目录 archive/ 扫描」随之退役：Plan A1 起 archived 是原位
-// 终态标记（不再搬文件），显式归档与 A4 迁移的会话都在数据文件位置；
-// Store.Archive() 轮转时代的存量归档（root/archive/）由 A4 一次性迁移以
-// archived 态迁回 per-id 目录后自然回归清单，A3 阶段它们暂不可列（ArchivedSessionHistory
-// 的归档重放路径不受影响——已知 id 仍可 load）。
+// 终态标记（不再搬文件），显式归档与迁移的会话都在数据文件位置。
+// Store.Archive() 轮转时代的存量归档（root/archive/）已由 A4 一次性迁移
+// （session.MigrateLegacyLayout，启动链调用）以 archived 态迁回 per-id 目录后
+// 回归本清单；未迁移的旧快照（迁移前备份、异常中断的现场）上它们暂不可列，
+// ArchivedSessionHistory 的归档重放路径不受影响（已知 id 仍可 load）。
 //
 // 取值规则：
 //   - sessionId：metadata 的稳定 logical SessionID（与 session/load 判定同源，

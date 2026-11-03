@@ -48,8 +48,9 @@ type SessionDigest struct {
 //
 // 归档目录（<root>/archive/ 与 <root>/<id>/archive/）不扫描：Plan A1 起 archived
 // 是原位终态标记（MarkArchived 不搬文件），显式归档与 A4 迁移的会话都停在
-// 数据文件位置；存量轮转归档（Store.Archive() 的历史产物）不进 A3 清单——
-// A4 一次性迁移把它们以 archived 态迁回 per-id 目录后自然回归。
+// 数据文件位置；存量轮转归档（Store.Archive() 的历史产物）已由 A4 一次性迁移
+// （migrate.go，daemon 启动链调用）以 archived 态迁回 per-id 目录后回归清单，
+// 本扫描层对未迁移的旧快照维持「归档目录不扫描」的口径。
 //
 // 读错误（root 不可读）上抛；单个会话的解析失败（坏行/Stat 失败）按坏行策略
 // 跳过该会话（与 loadRecords 的容错一致，清单可用性优先于单条完整性）。

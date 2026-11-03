@@ -23,8 +23,9 @@
 //     数据不在 P1 范围内，原地挂载保证老用户升级后历史无损、行为不变。
 //     Plan A 定案 #2/#9 更新：/new 纯新建、不再在槽内轮转（Store.Archive() 已
 //     随「归档 = 只读保留终态」语义删除）；legacy 槽的淘汰（迁入 per-id 目录）
-//     由 A4 的一次性迁移（rename-only，幂等）负责，本层在其落地前维持原地挂载
-//     的只读兼容。
+//     已由 A4 的一次性迁移落地（migrate.go，daemon 启动链调用，rename-only 幂等）
+//     ——本层的原地挂载保留为迁移失败/未迁移根的兼容读路径，不删（防御性，
+//     正常启动链上迁移先行，挂载分支不再命中）。
 //
 //  3. 实例唯一：Repository 对同一 SessionID 恒返回同一 *Store（总方案第九节
 //     「Repository 对同一 SessionID 保证唯一的 Store 实例」），避免多次 Open 产生
@@ -213,6 +214,33 @@ func (r *Repository) Open(id string) (*Store, error) {
 	}
 	r.open[id] = s
 	return s, nil
+}
+
+// List 扫描 <root>/*/<数据文件> 的 metadata（复用 Store.Open 的
+// metadataFromRecords/legacySessionID 机制）+ legacy 根槽。数据文件按 v2 决议
+// 双探测（Plan A1）：先 <目录名>.jsonl 后 current.jsonl（非会话形态目录名恒为
+// current.jsonl，见 store.go resolveDataFilePath）。
+// Peek 返回缓存中 id 的实例（只查不建，Plan A4 加固）。ok=false 表示缓存未
+// 命中——与 Open 的本质差异是**绝不打开文件**：没有 Store.Open 的 flock 慢路径、
+// 没有实例重建。这是「只读探针」语义（Store 生命周期收口已 CloseSession 逐出，
+// 缓存命中即活实例，未命中即本仓库对该 id 无实例责任）。只做精确键匹配：
+// 同目录别名（存量「目录名 ≠ 内部 id」形态，Open 的复用路径）不在 Peek 视野——
+// 消费方（daemon storeFor）的取数键恒为注册键（rt.ID = 挂载/创建时的缓存键），
+// 别名形态在 A4 迁移对齐后不可达。
+//
+// 为什么 daemon 需要它（storeFor 复活加固，A3 审查发现）：storeFor 的取数链
+// 原为 repo.Open(rt.ID)——宿主 Stop（repo.Close 清空缓存并关实例）后，仍持
+// stale runtime 的调用方（current 指针、manager 残留条目）再走 Open 会**重建
+// 实例并持 flock**（慢路径锁空闲即成功），泄漏文件句柄与锁直至进程退出。
+// Peek 把 storeFor 收窄为纯缓存读：「注册表命中 ⇒ 缓存命中」由两条注册链的
+// 先缓存后注册次序保证（startSession 的 openSessionStore → Register、A2b1
+// mountRuntime 的 repo.Open → Register），未命中即宿主收尾后的 stale 引用，
+// 按无持久化降级（与 repo == nil 同型），绝不复活。
+func (r *Repository) Peek(id string) (*Store, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.open[id]
+	return s, ok
 }
 
 // List 扫描 <root>/*/<数据文件> 的 metadata（复用 Store.Open 的

@@ -888,14 +888,24 @@ func TestAgentPlugin_SetSessionValidatesSandboxBoundary(t *testing.T) {
 		t.Errorf("cwd error after redeclare = %v, want nil", err)
 	}
 
-	// /new（startSession 重建）：无效标记不跨会话保留，最后声明无效 → 新会话无 cwd
+	// /new（startSession 重建）：无效标记不跨会话保留，最后声明无效 → 新会话
+	// cwd 注入缺省执行域（Plan A4 定案 #5——「作废」丢弃无效标记，执行域由
+	// tmp 每会话目录兜底；沙箱校验靠第二 allowed root 放行，见下）
 	p.SetSession("sess_e", outside) // 置无效
 	p.startSession()
 	if err := p.sessionCWDError(); err != nil {
 		t.Errorf("cwdErr after startSession = %v, want nil (无效标记随旧会话作废)", err)
 	}
-	if got := p.currentSessionCwd(); got != "" {
-		t.Errorf("sessionCwd after startSession = %q, want empty", got)
+	injected := p.currentSessionCwd()
+	if !isTmpWorkspacePath(injected) {
+		t.Errorf("sessionCwd after startSession = %q, want injected default domain under %s", injected, tmpWorkspaceRoot())
+	}
+	// 注入域必须通过沙箱校验（第二 allowed root 的存在性由此断言）——否则
+	// AllowedWorkDir 部署上注入即无效标记、prompt 全被挡，A4 落空。
+	if rt := p.currentSession(); rt != nil {
+		if _, err := rt.DeclaredCWD(); err != nil {
+			t.Errorf("injected default domain rejected by sandbox: %v", err)
+		}
 	}
 
 	// 有效声明跨会话保留：重新声明界内 cwd 后重建，新会话继续生效

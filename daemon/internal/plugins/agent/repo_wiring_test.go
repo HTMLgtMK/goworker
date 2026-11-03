@@ -42,25 +42,28 @@ func seedLegacySession(t *testing.T, root, userText string) string {
 	return id
 }
 
-// TestNewCreatesIndependentStore：临时 Session.Dir 造 legacy 槽 → /new（经 handler）
-// → ① 新会话目录 <root>/<新id>/<新id>.jsonl 存在且 id ≠ 旧 id（Plan A1 v2 文件名）；
-// ② 旧会话不轮转、数据原样保留在 legacy 槽，且因引用归零被生命周期收口
-// （Plan A2：runtime 注销 + repo 缓存逐出，重开走 flock 慢路径拿活实例）；
-// ③ 新 store ActiveView 为空（旧历史不串入）。
+// TestNewCreatesIndependentStore：临时 Session.Dir 造 legacy 槽 → startSession
+// （Plan A4 首周期：一次性迁移把槽迁入 per-id，current 是 Create 的新会话）→
+// /new（经 handler）→ ① 新会话目录 <root>/<新id>/<新id>.jsonl 存在且 id ≠ 旧 id
+// （Plan A1 v2 文件名）；② 旧会话不轮转、迁移后的数据原样保留在 per-id 目录，
+// 且因引用归零被生命周期收口（Plan A2：runtime 注销 + repo 缓存逐出，重开走
+// flock 慢路径拿活实例）；③ 新 store ActiveView 为空（旧历史不串入）。
 func TestNewCreatesIndependentStore(t *testing.T) {
 	root := t.TempDir()
 	oldID := seedLegacySession(t, root, "旧会话的问题")
 
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: root}}
 	p := NewPlugin(cfg, runtimeconfig.Paths{})
-	p.startSession() // 首周期：root 下有 legacy 槽 → 原地挂载（维持旧版启动行为）
+	// 首周期（Plan A4）：legacy 槽迁移入 per-id（数据不丢、可 load），current 换成
+	// Create 的新会话——「迁移数据保留 + 新会话独立」两个意图同一夹具覆盖。
+	p.startSession()
 
-	legacy := p.currentStore()
-	if legacy == nil {
-		t.Fatal("no current store after startSession (legacy mount failed)")
+	migrated, err := os.Stat(filepath.Join(root, oldID, oldID+".jsonl"))
+	if err != nil || migrated.IsDir() {
+		t.Fatalf("legacy slot not migrated to per-id layout: %v", err)
 	}
-	if got := legacy.SessionID(); got != oldID {
-		t.Fatalf("current store id = %q, want mounted legacy id %q", got, oldID)
+	if _, err := os.Stat(filepath.Join(root, "current.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("legacy slot still at root after migration (err=%v), want moved", err)
 	}
 	t.Cleanup(func() { _ = p.Stop() })
 
@@ -78,39 +81,31 @@ func TestNewCreatesIndependentStore(t *testing.T) {
 	if fresh == nil {
 		t.Fatal("no current store after /new")
 	}
-	if fresh == legacy {
-		t.Fatal("current store still the pre-/new legacy instance")
-	}
 	newID := fresh.SessionID()
 	if newID == oldID {
-		t.Fatalf("new session id %q equals legacy id", newID)
+		t.Fatalf("new session id %q equals migrated legacy id", newID)
 	}
 	if _, err := os.Stat(filepath.Join(root, newID, newID+".jsonl")); err != nil {
 		t.Fatalf("new session dir %s missing: %v", filepath.Join(root, newID), err)
 	}
 
-	// ② 旧会话不轮转（定案需求 #2/#9：/new 纯新建，归档是显式命令）：数据原样
-	// 保留在 legacy 槽；同时单连接引用归零 → 生命周期收口（runtime 注销 + store
-	// 关闭并逐出 repo 缓存），重开经 flock 慢路径拿到活实例、历史可读（A2.1①）。
-	if _, err := os.Stat(filepath.Join(root, "current.jsonl")); err != nil {
-		t.Fatalf("legacy slot data must remain after /new (不轮转、不删除): %v", err)
-	}
+	// ② 旧会话不轮转（定案需求 #2/#9：/new 纯新建，归档是显式命令）：迁移后的
+	// 数据原样保留在 per-id 目录；同时单连接引用归零 → 生命周期收口（runtime
+	// 注销 + store 关闭并逐出 repo 缓存），重开经 flock 慢路径拿到活实例、历史
+	// 可读（A2.1①）。
 	if entries, err := os.ReadDir(filepath.Join(root, "archive")); err == nil && len(entries) > 0 {
-		t.Errorf("/new must not rotate the legacy slot (Plan A2): archive entries = %d", len(entries))
+		t.Errorf("/new must not rotate sessions (Plan A2): archive entries = %d", len(entries))
 	}
 	if p.manager.Get(oldID) != nil {
 		t.Error("old session runtime must be released after /new (引用归零即收口)")
 	}
 	reopened, err := p.repo.Open(oldID)
 	if err != nil {
-		t.Fatalf("repo.Open(oldID) after /new teardown: %v", err)
-	}
-	if reopened == legacy {
-		t.Fatal("repo.Open returned the closed pre-/new instance (CloseSession 未逐出缓存)")
+		t.Fatalf("repo.Open(migrated legacy id) after /new teardown: %v", err)
 	}
 	view := reopened.ActiveView()
 	if len(view) != 1 || view[0].Content != "旧会话的问题" {
-		t.Fatalf("reopened legacy view = %d msgs, want the seeded history (数据不丢)", len(view))
+		t.Fatalf("reopened legacy view = %d msgs, want the seeded history (迁移数据不丢)", len(view))
 	}
 
 	// ③ 新 store ActiveView 为空：旧历史不串入新会话
@@ -121,21 +116,28 @@ func TestNewCreatesIndependentStore(t *testing.T) {
 
 // TestCurrentStoreTracksSession：ReloadCurrentSession / CurrentSessionHistory 在
 // /new 前后返回各自会话的数据——取数随 current 换轨，新会话写入只落新 store。
+// Plan A4 起首周期不再挂载 legacy 槽（迁移退役该行为），首会话是 Create 的新
+// 会话：夹具改为对 current store 直接造数（迁移本身由 migrate_test 与
+// TestNewCreatesIndependentStore 覆盖）。
 func TestCurrentStoreTracksSession(t *testing.T) {
 	root := t.TempDir()
-	oldID := seedLegacySession(t, root, "旧会话的问题")
 
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: root}}
 	p := NewPlugin(cfg, runtimeconfig.Paths{})
 	p.startSession()
 	t.Cleanup(func() { _ = p.Stop() })
 
-	// /new 前：取数落在 legacy 会话上（构造即水合，ReloadCurrentSession 只做视图刷新）
+	// /new 前：current 是首周期 Create 的会话，对它造数（构造即水合，
+	// ReloadCurrentSession 只做视图刷新）
 	if err := p.ReloadCurrentSession(); err != nil {
 		t.Fatalf("ReloadCurrentSession before /new: %v", err)
 	}
-	if got := p.CurrentSessionID(); got != oldID {
-		t.Fatalf("CurrentSessionID before /new = %q, want %q", got, oldID)
+	firstID := p.CurrentSessionID()
+	if firstID == "" {
+		t.Fatal("CurrentSessionID before /new = empty, want the first Create session")
+	}
+	if _, err := p.currentStore().Commit([]core.Message{{Role: "user", Content: "旧会话的问题", MsgID: session.NewMsgID()}}); err != nil {
+		t.Fatalf("commit into first store: %v", err)
 	}
 	before := p.CurrentSessionHistory()
 	if len(before) != 1 || before[0].Content == nil || before[0].Content.Text != "旧会话的问题" {
@@ -148,7 +150,7 @@ func TestCurrentStoreTracksSession(t *testing.T) {
 	}
 
 	// /new 后：current 换轨到独立目录新会话，取数随之切换（旧数据不回流）
-	if got := p.CurrentSessionID(); got == "" || got == oldID {
+	if got := p.CurrentSessionID(); got == "" || got == firstID {
 		t.Fatalf("CurrentSessionID after /new = %q, want the fresh session id", got)
 	}
 	if after := p.CurrentSessionHistory(); len(after) != 0 {

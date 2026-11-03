@@ -230,8 +230,36 @@ func (p *AgentPlugin) mountRuntime(st *session.Store) (*runtimeagent.SessionRunt
 // declareSessionCWD 把一次 cwd 声明落到 runtime（及会话本体与会话 store）：
 // sandbox 校验 → 有效声明写三处（store workspace 记录 last-wins、runtime
 // DeclareCWD、Session.SetCWD）；无效声明落 cwdErr 标记（cwd 清空 + err 记账，
-// prompt 诚实报错——SetSession 同款，不让越界目录静默生效）；空串 = 未声明，
-// no-op（不重置：多连接共享下 load 不独占会话，见 LoadBoundSession 注释）。
+// prompt 诚实报错——SetSession 同款，不让越界目录静默生效）。
+//
+// Plan A4（定案 #5，plan A2 实施注意点 3 的语义反转）：空串 = 未声明 →
+// **注入缺省执行域**（tmpWorkspaceDir(rt.ID)，MkdirAll 0700），不再 no-op——
+// 旧语义（load 不动声明）在「从未声明过的会话 load/重开」时留下空执行域，工具
+// 回退 cfg.AllowedWorkDir 或进程 cwd；新语义给出确定答案：tmp 每会话目录
+// （重启即失是有意语义）。注入的是**执行域**而非声明：applySessionCWD 的
+// record=false——不写 workspace 记录，记录仍只落用户显式声明（清单 cwd 与
+// load 恢复的持久事实源不变，A7 设计点 5）；load 的恢复次序（实参非空优先、
+// 否则 workspace 记录、否则注入）见 LoadBoundSession。注入失败落 cwdErr 无效
+// 标记（prompt 诚实报错），不静默回退。
+func (p *AgentPlugin) declareSessionCWD(rt *runtimeagent.SessionRuntime, cwd string) {
+	if cwd == "" {
+		tmp, err := p.injectTmpWorkspace(rt.ID)
+		if err != nil {
+			rt.DeclareCWD("", err)
+			slog.Warn("agent: inject default workspace failed", "session", rt.ID, "err", err)
+			return
+		}
+		p.applySessionCWD(rt, tmp, false)
+		return
+	}
+	p.applySessionCWD(rt, cwd, true)
+}
+
+// applySessionCWD 落地一次已定值的 cwd（declareSessionCWD 与 SetSession 的共用
+// 执行面）：sandbox 校验 →（record=true 时）store workspace 记录 → runtime
+// DeclareCWD + Session.SetCWD。record=false 是注入域路径（执行域不是声明，
+// 不落记录）；校验失败统一落 cwdErr 标记（注入域受第二 allowed root 保护，
+// 失败即环境异常，诚实暴露）。
 //
 // store 记录同值去重：workspace 是 last-wins 的追加记录，声明值与既有事实一致
 // 时不再追加——CreateBoundSession 的「创建即声明」（repo.Create 已按 CWD 落记录）
@@ -243,18 +271,17 @@ func (p *AgentPlugin) mountRuntime(st *session.Store) (*runtimeagent.SessionRunt
 // store 记录写入失败只 warn 不回滚声明：执行面（工具 cwd）以 runtime/会话
 // 本体为准，持久化缺口可观测、下次 load 重申即补——与 journalRunState 的
 // warn 降级同款取舍（声明可用性高于记录完整性）。
-func (p *AgentPlugin) declareSessionCWD(rt *runtimeagent.SessionRuntime, cwd string) {
-	if cwd == "" {
-		return
-	}
+func (p *AgentPlugin) applySessionCWD(rt *runtimeagent.SessionRuntime, cwd string, record bool) {
 	if err := p.validateSessionCWD(cwd); err != nil {
 		rt.DeclareCWD("", err)
 		slog.Warn("agent: reject session cwd", "session", rt.ID, "cwd", cwd, "err", err)
 		return
 	}
-	if st := p.storeFor(rt); st != nil && st.Workspace() != cwd {
-		if err := st.DeclareWorkspace(cwd); err != nil {
-			slog.Warn("agent: declare workspace record failed", "session", rt.ID, "cwd", cwd, "err", err)
+	if record {
+		if st := p.storeFor(rt); st != nil && st.Workspace() != cwd {
+			if err := st.DeclareWorkspace(cwd); err != nil {
+				slog.Warn("agent: declare workspace record failed", "session", rt.ID, "cwd", cwd, "err", err)
+			}
 		}
 	}
 	rt.DeclareCWD(cwd, nil)

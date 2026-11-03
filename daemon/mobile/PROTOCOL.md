@@ -65,6 +65,22 @@ ZCode dispatcher 共享同一套协议语义（`ai-dispatch/protocol`），区�
 - 各会话的 prompt 在 daemon 侧按会话串行执行，连接断开时排队中的 prompt 以
   错误退出。
 
+**缺省执行域（tmp workspace，Plan A4 已知语义）**：从未声明 cwd 的会话
+（`session/new` 不带 cwd、`session/load` 无声明可恢复、CLI `/new`），daemon 自动
+注入 `<系统 tmp>/goworker-workspaces/<uid>/<sessionID>/`（MkdirAll 0700）作为
+工具执行域——**重启即失是有意语义**（系统 tmp，避免遗留垃圾；tmp 只是执行域，
+不存历史，会话数据仍在 sessions 目录）。要点：
+
+- **显式声明始终覆盖注入**：`session/new` 的 cwd、`session/load` 的重申落到
+  workspace 记录（持久事实）；注入域不写记录——清单 cwd 与重启恢复以用户
+  显式声明为唯一持久事实，从未声明的会话重启后回到注入域（新建的空目录）。
+- **沙箱第二边界**：配置了 `AllowedWorkDir` 的部署上，缺省执行域根自动成为
+  第二放行边界（否则注入即无效标记）；显式声明越界（两个边界之外）仍拒。
+- **启动迁移（一次性、幂等）**：旧布局（根槽 `current.jsonl`、根目录
+  `archive/*.jsonl` 存量归档、v1 文件名/目录名错位）在 daemon 启动时自动迁入
+  per-id 目录——存量归档以 `archived` 态回归 `session/list`；迁移失败条目直接
+  丢弃（逐条独立，不阻断启动）。
+
 ## x-goworker 扩展协议（后台 Run 与事件流）
 
 标准 ACP 方法面向同步交互（`session/prompt` 阻塞到回合结束）。`x-goworker/*`

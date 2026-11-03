@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -296,23 +298,30 @@ func TestStartRunCarriesGateReentryMarker(t *testing.T) {
 // ③ 新会话照常:current 换轨、新 runtime 在册、新 store 独立可写。
 func TestNewRemovesOldRuntimeAndClosesStore(t *testing.T) {
 	root := t.TempDir()
-	oldID := seedLegacySession(t, root, "旧会话的问题")
+	legacyID := seedLegacySession(t, root, "旧会话的问题")
 
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: root}}
 	p := NewPlugin(cfg, runtimeconfig.Paths{})
-	p.startSession() // 首周期:root 下有 legacy 槽 → 原地挂载(维持旧版启动行为)
+	// 首周期（Plan A4）：存量 legacy 槽先被一次性迁移（migrate.go，rename-only），
+	// 数据落 <legacyID>/<legacyID>.jsonl；current 是首周期 Create 的新会话——
+	// 迁移退役了「挂载 legacy 槽为 current」的启动行为（A2 模型：会话选择显式，
+	// 旧会话经 session/load 重开）。
+	p.startSession()
 	t.Cleanup(func() { _ = p.Stop() })
 
+	if _, err := os.Stat(filepath.Join(root, legacyID, legacyID+".jsonl")); err != nil {
+		t.Fatalf("legacy slot not migrated to per-id layout: %v", err)
+	}
 	oldRT := p.currentSession()
 	if oldRT == nil {
 		t.Fatal("no current runtime after startSession")
 	}
-	if oldRT.ID != oldID {
-		t.Fatalf("current runtime id = %q, want mounted legacy id %q", oldRT.ID, oldID)
+	if oldRT.ID == legacyID {
+		t.Fatalf("current runtime id = %q, want a fresh Create (legacy 槽已迁移,不再挂载为 current)", oldRT.ID)
 	}
 	oldStore := p.currentStore()
 	if oldStore == nil {
-		t.Fatal("no current store after startSession (legacy mount failed)")
+		t.Fatal("no current store after startSession")
 	}
 
 	ctx, buf := newContext()
@@ -325,8 +334,8 @@ func TestNewRemovesOldRuntimeAndClosesStore(t *testing.T) {
 
 	// ① 旧 runtime 注销出 manager:注册表不再累积(勘察 K:此前 daemon 对
 	// manager.Remove 零调用,旧 runtime 随 /new 无界累积)。
-	if got := p.manager.Get(oldID); got != nil {
-		t.Fatalf("manager.Get(%q) = %v, want nil after /new (P5-5 removed the old runtime)", oldID, got)
+	if got := p.manager.Get(oldRT.ID); got != nil {
+		t.Fatalf("manager.Get(%q) = %v, want nil after /new (P5-5 removed the old runtime)", oldRT.ID, got)
 	}
 
 	// ② 旧 store 已 Close:先验证「写入失败」(可靠判据),再验证 Close 幂等。
@@ -349,7 +358,7 @@ func TestNewRemovesOldRuntimeAndClosesStore(t *testing.T) {
 	if freshStore == nil || freshStore == oldStore {
 		t.Fatal("current store did not move to a new instance after /new")
 	}
-	if freshStore.SessionID() == oldID {
+	if freshStore.SessionID() == oldRT.ID {
 		t.Fatalf("fresh store id %q equals old id", freshStore.SessionID())
 	}
 	if _, err := freshStore.Commit([]core.Message{{Role: "user", Content: "新会话的问题", MsgID: session.NewMsgID()}}); err != nil {
