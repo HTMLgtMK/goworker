@@ -233,10 +233,12 @@ func TestLoadSessionCurrentReplaysHistory(t *testing.T) {
 	if stop != protocol.StopEndTurn {
 		t.Fatalf("stop reason = %q, want %q", stop, protocol.StopEndTurn)
 	}
+	// Plan A2b1:load-current 不再声明 cwd(SetSession 调用已从声明路径整体移除,
+	// cwd 声明归 BoundSessionSource;本 fake 无该能力走降级路径)。
 	sessions.mu.Lock()
 	defer sessions.mu.Unlock()
-	if len(sessions.setSessionCalls) != 1 || sessions.setSessionCalls[0] != "s1|/tmp" {
-		t.Fatalf("SetSession calls = %v, want [s1|/tmp]", sessions.setSessionCalls)
+	if len(sessions.setSessionCalls) != 0 {
+		t.Fatalf("SetSession calls = %v, want none (A2b1:声明面已切换到 BoundSessionSource)", sessions.setSessionCalls)
 	}
 }
 
@@ -605,13 +607,15 @@ func TestPromptSupersededSessionGuard(t *testing.T) {
 			t.Fatalf("CreateSession s2: %v", err)
 		}
 
-		// 两条连接的 Binding 各自指向声明落地的会话(共享同一 current → 同值),
-		// 实例独立(连接私有,§6.2 第 4 条:互不影响)。
-		if got := a.binding.Get(); got != "store-shared" {
-			t.Fatalf("a binding = %q, want store-shared (session/new 后 Set)", got)
+		// 两条连接的 Binding:A2b1 降级语义(fake 无 BoundSessionSource)下
+		// session/new 不产生稳定会话 id,Binding 保持空 = 回落 current 语义
+		// (superseded 守卫只依赖 h.active,不受影响);实例独立(连接私有,
+		// §6.2 第 4 条:互不影响)。
+		if got := a.binding.Get(); got != "" {
+			t.Fatalf("a binding = %q, want empty (降级形态:Binding 保持空)", got)
 		}
-		if got := b.binding.Get(); got != "store-shared" {
-			t.Fatalf("b binding = %q, want store-shared (session/new 后 Set)", got)
+		if got := b.binding.Get(); got != "" {
+			t.Fatalf("b binding = %q, want empty (降级形态:Binding 保持空)", got)
 		}
 		if a.active != "s1" || b.active != "s2" {
 			t.Fatalf("active declarations = %q/%q, want s1/s2 (声明归连接)", a.active, b.active)
@@ -665,11 +669,13 @@ func TestPromptSupersededSessionGuard(t *testing.T) {
 		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp/a"}, reporter); err != nil {
 			t.Fatalf("CreateSession s1: %v", err)
 		}
-		if got := handler.binding.Get(); got != "s2" {
-			t.Fatalf("binding after session/new = %q, want s2 (声明落地会话的 store id)", got)
+		// A2b1 降级语义:fake 无 BoundSessionSource,session/new 不产生稳定 id,
+		// Binding 保持空(回落 current 语义)。
+		if got := handler.binding.Get(); got != "" {
+			t.Fatalf("binding after session/new = %q, want empty (降级形态:Binding 保持空)", got)
 		}
-		// 对 s2 的 load-current 同样经 SetSession 声明，顶掉 s1 的活动身份,
-		// 并把 Binding 指向 s2
+		// 对 s2 的 load-current 顶掉 s1 的活动身份，并把 Binding 指向 s2
+		// （A2b1:SetSession 声明已移除,cwd 声明归 BoundSessionSource）。
 		if err := handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "s2", Cwd: "/tmp"}, reporter); err != nil {
 			t.Fatalf("LoadSession s2: %v", err)
 		}
@@ -687,7 +693,9 @@ func TestPromptSupersededSessionGuard(t *testing.T) {
 	})
 
 	t.Run("archived load does not rebind", func(t *testing.T) {
-		// 归档 load 是只读重放:Binding 不变(只读视图不是会话选择)。
+		// 归档 load 是只读重放:Binding 不变(只读视图不是会话选择)。A2b1 降级
+		// 语义:session/new 不设 Binding(fake 无多会话能力),归档 load 前后
+		// 都保持空——「不变」的断言形态从「保持 cur」改为「保持空」。
 		sessions := &fakeSessionSource{
 			currentID: "cur",
 			list:      []model.SessionSummary{{SessionID: "old"}},
@@ -699,11 +707,14 @@ func TestPromptSupersededSessionGuard(t *testing.T) {
 		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{Cwd: "/tmp"}, reporter); err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
+		if got := handler.binding.Get(); got != "" {
+			t.Fatalf("binding after session/new = %q, want empty (降级形态)", got)
+		}
 		if err := handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "old"}, reporter); err != nil {
 			t.Fatalf("LoadSession archived: %v", err)
 		}
-		if got := handler.binding.Get(); got != "cur" {
-			t.Fatalf("binding after archived load = %q, want cur (unchanged)", got)
+		if got := handler.binding.Get(); got != "" {
+			t.Fatalf("binding after archived load = %q, want empty (unchanged,只读视图不改绑)", got)
 		}
 	})
 
@@ -778,12 +789,14 @@ func TestPromptInFlightBlocksCreateSession(t *testing.T) {
 	if !errors.As(err, &rpcErr) || rpcErr.Code != -32000 || !strings.Contains(rpcErr.Message, "busy") {
 		t.Fatalf("CreateSession while prompt in flight = %v, want -32000 busy error", err)
 	}
-	// busy 拒绝不得留下副作用：s2 不得被声明，活动会话仍是 s1
+	// busy 拒绝不得留下副作用：A2b1 起声明面是 BoundSessionSource(本 fake 无
+	// 该能力,不存在 SetSession 侧的共享状态突变)——busy 路径必须零 source
+	// 调用、活动声明仍是 A 的 s1。
 	sessions.mu.Lock()
 	declared := append([]string(nil), sessions.setSessionCalls...)
 	sessions.mu.Unlock()
-	if len(declared) != 1 || declared[0] != "s1|/tmp/a" {
-		t.Fatalf("SetSession calls = %v, want only s1's declaration (busy CreateSession must have no side effects)", declared)
+	if len(declared) != 0 {
+		t.Fatalf("SetSession calls = %v, want none (A2b1:声明面已切换,busy CreateSession 必须零副作用)", declared)
 	}
 
 	// 放行 A：prompt 正常完成
@@ -792,14 +805,14 @@ func TestPromptInFlightBlocksCreateSession(t *testing.T) {
 		t.Fatalf("Prompt s1 = %v", err)
 	}
 
-	// A 结束后 B 重试成功
+	// A 结束后 B 重试成功(降级形态下同样零 source 侧声明调用)。
 	if err := b.CreateSession(context.Background(), "s2", protocol.NewSessionRequest{Cwd: "/tmp/b"}, reporter); err != nil {
 		t.Fatalf("CreateSession s2 after release = %v", err)
 	}
 	sessions.mu.Lock()
 	defer sessions.mu.Unlock()
-	if len(sessions.setSessionCalls) != 2 || sessions.setSessionCalls[1] != "s2|/tmp/b" {
-		t.Fatalf("SetSession calls = %v, want s2 declared after retry", sessions.setSessionCalls)
+	if len(sessions.setSessionCalls) != 0 {
+		t.Fatalf("SetSession calls = %v, want none after retry (A2b1 降级语义)", sessions.setSessionCalls)
 	}
 }
 

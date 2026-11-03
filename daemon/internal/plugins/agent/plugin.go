@@ -722,6 +722,14 @@ func (p *AgentPlugin) openSessionStore(firstCycle bool) *session.Store {
 // SetSession 记录 ACP 提交方声明的会话工作目录并应用到当前会话（单活动会话模型：
 // transport sessionID 与 store 的 head id 不同源，cwd 一律落当前活动会话）。
 //
+// **Plan A2b1 起本方法是 current 语义的兼容残留面，不在 ACP 声明路径上**：
+// handler 的 session/new|load 已切换到 BoundSessionSource（boundsession.go——
+// session/new 真新建、load 走 reload/重开，cwd 是会话属性而非 daemon 全局
+// 单值），本方法不再有任何生产调用方；保留它（a）兑现 SessionSource 接口
+// （CLI/stdio 面的既有契约），（b）承载 cwd 校验语义的既有测试面
+// （sessions_test/cwd_migration_test）。A4 反转空 cwd 语义（注入 tmp）时本
+// 方法与 declareSessionCWD 一并重审（plan A2 实施注意点 3）。
+//
 // sandbox 边界在插件侧校验：cfg.Sandbox.AllowedWorkDir 非空时，声明的 cwd 必须
 // 落在它之下（Abs + EvalSymlinks 解析后判断前缀，符号链接与相对路径钉到真实
 // 位置）；非法声明存为无效标记（P1-4 起落 current runtime 的 cwdErr，cwd 随之
@@ -770,6 +778,12 @@ func (p *AgentPlugin) SetSession(sessionID, cwd string) {
 // 一次经 session/new|load 有效声明的 transport 会话 id（锁内快照，空 = 未声明）。
 // 注意与 CurrentSessionID 的区别：那边是 store 的稳定逻辑 id，这边是连接方
 // 自造的会话句柄；FrontendHandler.Prompt 用它做 superseded 守卫。
+//
+// **A2b2 将拆**：A2b1 起 session/new|load 不再经过 SetSession（声明切换到
+// BoundSessionSource，boundsession.go），本字段的写入点只剩 SetSession 的
+// 兼容调用（测试/CLI 面）——多 session 下它是跨连接单值，Prompt 的回落分支
+// 消费它会被其他连接的声明误拒（plan A2「superseded 守卫删除空则回落」），
+// A2b2 收缩 SessionGate 时连同消费点一并清理；本步保持现状（任务边界）。
 func (p *AgentPlugin) ActiveSessionID() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()

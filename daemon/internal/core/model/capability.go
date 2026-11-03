@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
@@ -220,6 +221,68 @@ type DeviceCaller interface {
 //     收集（勘察结论 D），每次成功探测都幂等刷新绑定（重绑 = 刷新 TTL + 工具集）。
 type ClientToolBinder interface {
 	ClientToolSource(connectionID string, caller DeviceCaller) func(ctx context.Context) []core.Tool
+}
+
+// ErrSessionUnknown 是 BoundSessionSource 声明面的「会话不存在」sentinel
+// （Plan A2b1）：handler 的 session/load 据此把未知会话映射回既有的 -32000
+// 「unknown session」wire 契约。为什么放 model 而不直接判执行侧 sentinel：
+// ACP 生产面不得 import ai-runtime/agent（service/acp constraint_test 钉死，
+// EventHub 具体类型不回流协议层的同一道隔离），路由面的 ErrSessionNotFound
+// 对 handler 不可见——协议中立层（model）的 sentinel 是依赖方向允许的唯一
+// 判定点；实现侧用多 %w 同时包裹本 sentinel 与执行侧 sentinel，两个消费面
+// 各取所需。
+var ErrSessionUnknown = errors.New("session: unknown session")
+
+// BoundSessionSource 是 session/new|load 多会话语义的可选能力面（Plan A2b1，
+// handler 以 type-assert 获取——RunControlSource/ConnectionBinder 先例；无此
+// 能力的 SessionSource 实现（简化壳/测试桩）零感知，handler 落既有单活动
+// 降级路径）。
+//
+// 为什么是独立可选接口而不是扩 SessionSource 方法集：SessionSource 的既有
+// 方法集是「current 语义」的元数据面（ListSessions/CurrentSessionID/
+// ReloadCurrentSession/SetSession/...），A2b1 把标准 ACP 的 session/new|load
+// 从「落 current 的单活动语义」切换到「连接绑定语义」（plan A2「current 收缩
+// 为 CLI/stdin 便利指针」）——两组语义在过渡期并存于同一插件（A2b2 收缩 gate、
+// A4 反转空 cwd 语义、A3 重写清单，各自继续消费 current 面），可选接口把边界
+// 显式化，也让无多会话能力的实现保持可编译；方法集 opt-in 的纪律与
+// RunControlSource 的 R3 注释同源（受限面必须显式声明，不做隐式膨胀）。
+//
+// 与 ConnectionBinder 的分工：本接口是「声明动作」的执行面（创建/重开/reload
+// 的状态突变），ConnectionBinder 是「声明登记」的记账面（生命周期引用计数）；
+// handler 在声明成功点成对驱动两者（binding.Set + BindConnectionSession +
+// 本接口），登记零副作用、动作才碰共享状态。
+type BoundSessionSource interface {
+	// CreateBoundSession 真新建一个会话（ACP session/new，定案需求 #2 的 ACP
+	// 面）：持久化 Create（创建即声明 workspace，Plan A1）→ 新 runtime 注册进
+	// manager。cwd 是新会话声明的工作目录（空 = 不落 workspace 记录，执行域
+	// 维持既有回退语义）；cwd 落在 sandbox 边界外时拒绝创建（创建前失败优于
+	// 产出一个每个 prompt 都会被拒的带标记会话）。返回 store 稳定 SessionID
+	// （handler 据此设 Binding）。**不动 current**：新会话只是发起连接的路由
+	// 目标，发起方此前绑定的会话由登记面的改绑评估走引用计数（A2a 机制）。
+	// 不携带请求 ctx：实现内部（repo.Create）的 ctx 只做入口取消检查，管理
+	// 操作是短临界区、无长等待可取消点——断连中途的创建照常完成且无害（响应
+	// 随连接丢弃，孤儿会话由断连 ReleaseConnection 的引用计数收口），不为它
+	// 扩签名（LoadBoundSession/SessionHistory 同理）。
+	CreateBoundSession(cwd string) (string, error)
+	// LoadBoundSession 把 sessionID 载入为「可 prompt 的已注册会话」，二分支：
+	//   - 已注册 runtime（manager 注册表命中，含 current 与别连接绑着的）：
+	//     reload 内存视图（共享会话可能有别连接的追加），cwd 非空时重申声明；
+	//   - 持久化但不在册：重开（repo.Open，flock 空闲拿活实例——A2a 收口逐出
+	//     缓存后的重开走 flock 慢路径，这正是重开需要的语义）→ 新 runtime
+	//     注册 → cwd 恢复（实参非空优先，否则 workspace 记录）。
+	// 未知会话返回包裹 ErrSessionUnknown 的错误；cwd 无效（sandbox 边界外）
+	// 不拒绝 load——落无效标记（prompt 诚实报错），会话已存在、拒绝 load 会让
+	// 历史不可达，与 SetSession 的既有无效声明语义一致。
+	LoadBoundSession(sessionID, cwd string) error
+	// SessionHistory 导出已注册会话的完整对话历史（session/load 响应前的重放
+	// 面）。未知会话报错；纯内存（无持久化）返回空切片。
+	SessionHistory(sessionID string) ([]SessionUpdate, error)
+	// SessionArchived 只读探测：会话是否已落 archived 终态标记（Plan A1 记录
+	// 模型）。handler 据此把 session/load 分流到只读重放（不进门禁、不改绑、
+	// 不注册 runtime）；探测经 repo 层读持久化事实，重启后依然为真（A7 设计
+	// 点 4 的只读执法数据源统一）。未知会话/持久化禁用返回 false——交由
+	// LoadBoundSession 诚实报错，探测不吞掉「不存在」与「非终态」的差别。
+	SessionArchived(sessionID string) bool
 }
 
 // ConnectionBinder 是连接级会话绑定登记的可选能力面（Plan A2 生命周期半边，

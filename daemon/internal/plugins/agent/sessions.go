@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -157,16 +158,26 @@ func (p *AgentPlugin) CurrentSessionHistory() []model.SessionUpdate {
 }
 
 // ArchivedSessionHistory 只读解析归档会话并映射为 ACP 重放通知序列（方案 B
-// 「归档只读查看」的数据面）：按 archiveId 定位归档文件，OpenArchiveView 构建
-// ActiveView 与 checkpoint 锚点，经与 CurrentSessionHistory 相同的
-// segmentByCheckpoints + roundUpdates 管线输出。不持写句柄、不 rename、不触碰
-// current 与 store。
+// 「归档只读查看」的数据面）。两条解析路径：
+//   - archive/ 目录（方案 B 原路径）：按 archiveId 定位归档文件，OpenArchiveView
+//     构建 ActiveView 与 checkpoint 锚点，经与 CurrentSessionHistory 相同的
+//     segmentByCheckpoints + roundUpdates 管线输出。不持写句柄、不 rename、
+//     不触碰 current 与 store。归档路径先查当前会话目录的 archive/，legacy
+//     根槽（<Session.Dir>/archive/，兼容挂载的既有归档）次之。
+//   - repo 层 per-id 数据文件（Plan A2b1 扩展，判定源从「清单扫描」改为
+//     repo 探测）：Plan A1 起 archived 是原位终态标记（MarkArchived 不搬文件，
+//     Store.Archive() 已随定案 #9 删除），显式归档（A3）与迁移（A4）的产物
+//     停在 <root>/<id>/<数据文件>——这些会话不在任何 archive/ 目录里，经
+//     repo.Open（v2/v1 双探测 + legacy 槽，与 LoadBoundSession 的重开同链）
+//     解析后查 store.Archived()。命中 → 快照重放后释放（见下）；未命中
+//     archived 标记 → 诚实报错「not archived」（handler 只在 SessionArchived
+//     探测为真后到达这里，此分支是防御面）。
 //
-// 归档路径解析（P1-3）：先查当前会话目录的 archive/，legacy 根槽
-// （<Session.Dir>/archive/，兼容挂载的既有归档）次之；两处都只读 OpenArchiveView，
-// 其余 per-id 目录的并集留待 P5。Plan A2 起 /new 不再轮转归档（定案 #2/#9，
-// Store.Archive() 已删除）：归档目录的内容是存量数据 + 显式归档命令（A3）的
-// 产物，本方法只读消费，不产生新归档。
+// 释放守卫（repo 分支）：快照先于关闭——updates 是纯值切片，Close 后可安全
+// 流式下发。CloseSession 前置「非在册 runtime」判定（RouteSession 命中即
+// 跳过）：会话仍在 manager 注册表（如 A3 起的绑定态归档）时其 store 归
+// runtime 所有，绝不能随只读重放关闭；不在册的终态会话不常驻缓存（flock
+// 与句柄随快照释放，SessionArchived 探测留下的缓存条目一并逐出）。
 func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]model.SessionUpdate, error) {
 	if p.cfg == nil || p.cfg.Session.Dir == "" {
 		return nil, fmt.Errorf("agent: session persistence disabled")
@@ -181,6 +192,7 @@ func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]model.SessionU
 	}
 	dirs = append(dirs, p.cfg.Session.Dir)
 	path := ""
+	found := ""
 	for _, dir := range dirs {
 		candidate, ok := archivePathForSession(dir, sessionID)
 		if !ok {
@@ -190,18 +202,45 @@ func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]model.SessionU
 			path = candidate // 保留首个候选：全部未命中时按它给出 open archive 报错
 		}
 		if _, err := os.Stat(candidate); err == nil {
-			path = candidate
+			found = candidate
 			break
 		}
 	}
-	if path == "" {
-		return nil, fmt.Errorf("agent: invalid archive session id %q", sessionID)
+	if found != "" {
+		view, err := session.OpenArchiveView(found)
+		if err != nil {
+			return nil, fmt.Errorf("agent: open archive %q: %w", sessionID, err)
+		}
+		return replayUpdates(view.ActiveView(), anchorSet(view.Checkpoints(0))), nil
 	}
-	view, err := session.OpenArchiveView(path)
-	if err != nil {
-		return nil, fmt.Errorf("agent: open archive %q: %w", sessionID, err)
+	// repo 层 per-id 分支（Plan A2b1 扩展，见函数头）：archive/ 目录未命中时
+	// 会话可能以原位终态形态存在。
+	if p.repo != nil {
+		st, err := p.repo.Open(sessionID)
+		if err == nil {
+			if !st.Archived() {
+				return nil, fmt.Errorf("agent: session %q is not archived", sessionID)
+			}
+			updates := replayUpdates(st.ActiveView(), anchorSet(st.Checkpoints(0)))
+			if p.RouteSession(sessionID) == nil {
+				if err := p.repo.CloseSession(sessionID); err != nil {
+					slog.Warn("agent: archived store release failed", "session", sessionID, "err", err)
+				}
+			}
+			return updates, nil
+		}
 	}
-	return replayUpdates(view.ActiveView(), anchorSet(view.Checkpoints(0))), nil
+	if path != "" {
+		// 存量语义兜底：archive 候选在但文件缺失、且 repo 层也无此会话——按旧
+		// 报错形态给出 open archive 失败（TestAgentPlugin_ArchivedSessionHistoryErrors
+		// 钉死的文案路径）。
+		view, err := session.OpenArchiveView(path)
+		if err != nil {
+			return nil, fmt.Errorf("agent: open archive %q: %w", sessionID, err)
+		}
+		return replayUpdates(view.ActiveView(), anchorSet(view.Checkpoints(0))), nil
+	}
+	return nil, fmt.Errorf("agent: invalid archive session id %q", sessionID)
 }
 
 // currentSessionDir 返回当前会话的会话目录（P1-3 归档扫描基准）。目录两种形态：

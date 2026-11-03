@@ -140,14 +140,50 @@ func newXGWLiveControl(t *testing.T, id string, pv core.Provider, collect func(*
 	return &xgwLiveControl{fakeSessionSource: &fakeSessionSource{}, m: m, sid: id, leases: map[string]string{}}
 }
 
-// SetSession 覆写:handler 的 session/new 经 SetSession 声明会话(fake 只记
-// activeID),本 shim 同步推进 currentID —— requireCurrent 的 V1 路由校验锚点
-// 与生产的 CurrentSessionID 语义对齐(生产里 session/new 即当前会话易主)。
+// SetSession 覆写:Plan A2b1 起 handler 的 session/new 不再调用 SetSession
+// (声明切换到 BoundSessionSource,见下方 CreateBoundSession)——本覆写保留为
+// fake 的兼容记账面,由 liveNewSession 在声明成功后显式驱动(见其注释)。
 func (f *xgwLiveControl) SetSession(sessionID, cwd string) {
 	f.mu.Lock()
 	f.currentID = sessionID
 	f.mu.Unlock()
 	f.fakeSessionSource.SetSession(sessionID, cwd)
+}
+
+// CreateBoundSession 实现 model.BoundSessionSource(Plan A2b1 语义对齐):
+// session/new 真新建在本 shim 的形态 = 声明落地其唯一 runtime(单 runtime 世界
+// 里「新建」收敛为返回既有 runtime 的 id,与 pr2DualControl 的创建队列不同——
+// 本 shim 的用例都是单会话编排便签)。cwd 不落任何状态(shim 无持久化事实)。
+func (f *xgwLiveControl) CreateBoundSession(cwd string) (string, error) {
+	return f.sid, nil
+}
+
+// LoadBoundSession mirror 生产二分支(单 runtime 形态):已注册(runtime id 命中)
+// → reload no-op(store 无,ReloadFromStore 本身 no-op);不在册 → 诚实未知
+// (ErrSessionUnknown 契约,handler 映射 -32000)。cwd 不动声明。
+func (f *xgwLiveControl) LoadBoundSession(sessionID, cwd string) error {
+	if sessionID != f.sid {
+		return fmt.Errorf("xgwLiveControl: session %q: %w", sessionID, model.ErrSessionUnknown)
+	}
+	return nil
+}
+
+// SessionHistory mirror 生产(单 runtime 形态):已注册 → 空重放;未知 → 报错。
+func (f *xgwLiveControl) SessionHistory(sessionID string) ([]model.SessionUpdate, error) {
+	if sessionID != f.sid {
+		return nil, fmt.Errorf("xgwLiveControl: session %q: %w", sessionID, model.ErrSessionUnknown)
+	}
+	return []model.SessionUpdate{}, nil
+}
+
+// SessionArchived 按 fake 的归档脚本作答(TestXGWIntegrationStandardMethodShapes
+// 的归档 load 依赖:archived map 里的 id 报告终态,handler 据此走只读重放——
+// 基接口 ArchivedSessionHistory 的脚本化历史)。单 runtime 的活会话恒 false。
+func (f *xgwLiveControl) SessionArchived(sessionID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.archived[sessionID]
+	return ok
 }
 
 // requireCurrent mirror runcontrol.go 的 V1 路由校验(拍板⑤):非 current 会话
@@ -486,9 +522,14 @@ func (s *xgwLiveStack) liveInitializeWithDeviceCaps(t *testing.T) {
 	}
 }
 
-// liveNewSession 走 session/new,返回服务端签发的会话 id(handler.CreateSession
-// 经 SetSession 把它写成 fakeSessionSource 的 current —— shim 的 current 校验
-// 以此为锚)。
+// liveNewSession 走 session/new,返回服务端签发的 transport 会话 id。
+//
+// Plan A2b1 语义对齐:handler 的 session/new 现经 CreateBoundSession 声明(落地
+// 本 shim 的 runtime id,Binding 指向之),不再经 SetSession 写 current——本
+// fixture 在声明成功后把 transport 会话 id 显式写成 shim 的 current 校验锚点
+// (requireCurrent 的 V1 形态镜像)。与本 shim 的既有记账一致:xgw wire 调用与
+// 标准 ACP 共用同一 transport id(单 runtime 世界里 runtime id ≠ wire id 的
+// 分离只在事件 session_id 断言处可观测,hub 以 rt.ID 为会话键)。
 func (s *xgwLiveStack) liveNewSession(t *testing.T) string {
 	t.Helper()
 	sid, err := s.client.NewSession(context.Background(), "/repo")
@@ -498,6 +539,9 @@ func (s *xgwLiveStack) liveNewSession(t *testing.T) string {
 	if sid == "" {
 		t.Fatal("session/new returned empty sessionId")
 	}
+	s.src.mu.Lock()
+	s.src.currentID = sid
+	s.src.mu.Unlock()
 	return sid
 }
 
