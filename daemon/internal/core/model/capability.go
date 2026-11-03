@@ -221,3 +221,23 @@ type DeviceCaller interface {
 type ClientToolBinder interface {
 	ClientToolSource(connectionID string, caller DeviceCaller) func(ctx context.Context) []core.Tool
 }
+
+// ConnectionBinder 是连接级会话绑定登记的可选能力面（Plan A2 生命周期半边，
+// handler 以 type-assert 获取——RunControlSource/ClientToolBinder 先例；无此
+// 能力的插件/测试桩零感知，行为与 PR2 一致）。
+//
+// 语义：连接在其 SessionBinding.Set 点（CreateSession/LoadSession 声明成功后）
+// 同步登记 clientID → sessionID，供 agentcontrol.BindingRegistry 记账——它是
+// 多 session 运行时生命周期引用计数的唯一事实源（「任一连接绑定即活；最后解绑
+// → 关 store + 注销 manager」，Plan A2），也是 A3 state=active 判定的取数面。
+// 与 SessionBinding 的分工：连接内寻址仍走 ctx 携带的 SessionBinding（路由/
+// 解析不消费登记），跨连接计数走本登记（架构边界收窄论证见 agentcontrol
+// bindings.go / sessions.go 文件头）。实现侧在改绑（返回的旧会话失去引用）时
+// 自行评估生命周期收口，登记动作本身绝无副作用（不删会话、不取消 Run、不动
+// control lease，§6.2 纪律）。
+type ConnectionBinder interface {
+	// BindConnectionSession 登记 clientID 当前绑定的会话（改绑即替换；空
+	// sessionID = 解除绑定）。connectionID 与 RunControlSource 的连接句柄同源
+	// （handler 工厂生成的 connectionID），断连收口经 ReleaseConnection 清账。
+	BindConnectionSession(connectionID, sessionID string)
+}

@@ -417,7 +417,9 @@ func (h *FrontendHandler) xgwSessionDetach(_ context.Context, params json.RawMes
 // 在 <-server.Done() 返回路径 type-assert 调用(service.go connectionCloser)。
 // V1 语义:断开即释放 control lease——「审批不悬死在已死连接上」的宿主授权
 // 收口;I3 后 lease 按会话记账,ReleaseConnection 一次释放本连接持有的全部
-// 会话租约,重复/他人调用幂等空操作(P5-6 契约)。
+// 会话租约,重复/他人调用幂等空操作(P5-6 契约)。Plan A2 生命周期半边:同一
+// 调用一并清除该连接的会话绑定登记并评估被解除会话的引用归零收口
+// (runcontrol.go ReleaseConnection,与 lease 同构的断连清账)。
 //
 // P5-8:订阅泵统一回收——先清空 subs 表再逐个 stop,泵退出自清的判重落空;
 // done 关闭使各协议泵立即退出,cancel 唤醒各 SDK 泵 → 投递通道关闭。断连即

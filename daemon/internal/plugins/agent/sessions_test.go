@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,8 +18,38 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// sessionFixture 用真实 Store 生成 current + archive 数据：归档 archives 条
-// （每条一条 user 消息），current 留一条 user 消息且 head 停在其上。
+// seedPluginArchiveFile 直接构造 dir/archive/<name>.jsonl 归档夹具（Plan A2：
+// Store.Archive() 删除后不再有「轮转出归档文件」的写路径）：一次性 store 造数，
+// 关闭后把其数据文件字节搬进归档目录（归档文件与会话数据文件同一 record 模型，
+// 直接构造等价且诚实）。
+func seedPluginArchiveFile(t *testing.T, dir, name string, seed func(st *session.Store)) {
+	t.Helper()
+	scratch := filepath.Join(t.TempDir(), "seed-slot")
+	st, err := session.Open(scratch)
+	if err != nil {
+		t.Fatalf("open archive seed store: %v", err)
+	}
+	seed(st)
+	if err := st.Close(); err != nil {
+		t.Fatalf("close archive seed store: %v", err)
+	}
+	// 种子目录 basename 非会话形态 → 数据文件为 current.jsonl（store.go
+	// resolveDataFilePath 决议）。
+	data, err := os.ReadFile(filepath.Join(scratch, "current.jsonl"))
+	if err != nil {
+		t.Fatalf("read archive seed data: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "archive"), 0o700); err != nil {
+		t.Fatalf("mkdir archive dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "archive", name), data, 0o600); err != nil {
+		t.Fatalf("write archive fixture: %v", err)
+	}
+}
+
+// sessionFixture 用真实 Store 生成 current + archive 数据：current 留一条 user
+// 消息且 head 停在其上，archive/ 下直接构造 archives 条（每条一条 user 消息，
+// Store.Archive() 已随 Plan A 定案 #2/#9 删除，夹具改为直接落归档文件）。
 // 返回插件、挂载 store（= currentStore() 解析实例）与会话根目录。
 // P1-3 起按生产 repo 接线：先在种子句柄上造数（legacy 根槽布局），关闭释放
 // 文件锁后经 Repository 原地挂载，Session 绑定挂载实例（构造即水合）。
@@ -27,21 +58,21 @@ func sessionFixture(t *testing.T, archives int) (*AgentPlugin, *session.Store, s
 	dir := t.TempDir()
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
 	mountID := seedLegacySlot(t, dir, func(st *session.Store) {
-		for i := 0; i < archives; i++ {
-			msg := core.Message{Role: "user", Content: "历史会话标题\n第二行", MsgID: session.NewMsgID()}
-			if _, err := st.Commit([]core.Message{msg}); err != nil {
-				t.Fatalf("commit archive %d: %v", i, err)
-			}
-			// 拉开归档文件 mtime，让倒序排序可断言
-			time.Sleep(5 * time.Millisecond)
-			if err := st.Archive(); err != nil {
-				t.Fatalf("archive %d: %v", i, err)
-			}
-		}
 		if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
 			t.Fatalf("commit current: %v", err)
 		}
 	})
+	for i := 0; i < archives; i++ {
+		name := fmt.Sprintf("seed-%d.jsonl", i)
+		seedPluginArchiveFile(t, dir, name, func(st *session.Store) {
+			msg := core.Message{Role: "user", Content: "历史会话标题\n第二行", MsgID: session.NewMsgID()}
+			if _, err := st.Commit([]core.Message{msg}); err != nil {
+				t.Fatalf("commit archive %s: %v", name, err)
+			}
+		})
+		// 拉开归档文件 mtime，让倒序排序可断言
+		time.Sleep(5 * time.Millisecond)
+	}
 	p, st := wireLegacyStore(t, cfg, mountID)
 	return p, st, dir
 }
@@ -512,16 +543,23 @@ func TestAgentPlugin_CurrentSessionHistoryEmpty(t *testing.T) {
 	}
 }
 
-// archiveFixture 在 current 提交一整轮（user → assistant(2 tool_calls + thinking)
-// → tool → assistant 收尾）并打 checkpoint，随后 Archive 归档，再为 current 提交
-// 一条新消息。返回插件、挂载 store（= currentStore() 解析实例）、归档文件 id 与
-// 归档前视图。
+// archiveFixture 在 current 提交一条新消息，归档轮次（user → assistant(2
+// tool_calls + thinking) → tool → assistant 收尾 + checkpoint）直接构造进
+// archive/（Plan A2：Store.Archive() 已删除，夹具不再轮转）。返回插件、挂载
+// store（= currentStore() 解析实例）、归档文件 id（文件名去 .jsonl，经
+// archivePathForSession 的文件名兼容分支寻址）与归档前视图。
 func archiveFixture(t *testing.T) (*AgentPlugin, *session.Store, string, []core.Message) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
 	var want []core.Message
 	mountID := seedLegacySlot(t, dir, func(st *session.Store) {
+		// current 提交新消息，保证清单有「当前会话」条目可断言
+		if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
+			t.Fatalf("commit current: %v", err)
+		}
+	})
+	seedPluginArchiveFile(t, dir, "archived-round.jsonl", func(st *session.Store) {
 		if _, err := st.Commit([]core.Message{
 			core.Message{Role: "user", Content: "归档里的问题", MsgID: session.NewMsgID()},
 			core.Message{
@@ -541,16 +579,9 @@ func archiveFixture(t *testing.T) (*AgentPlugin, *session.Store, string, []core.
 			t.Fatalf("checkpoint: %v", err)
 		}
 		want = st.ActiveView()
-		if err := st.Archive(); err != nil {
-			t.Fatalf("archive: %v", err)
-		}
-		// 归档后 current 提交新消息，保证清单有「当前会话」条目可断言
-		if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
-			t.Fatalf("commit current: %v", err)
-		}
 	})
 	p, st := wireLegacyStore(t, cfg, mountID)
-	return p, st, archiveIDs(t, dir)[0], want
+	return p, st, "archived-round", want
 }
 
 // TestAgentPlugin_ArchivedSessionHistoryReplaysArchive 对真实归档文件做重放映射：
@@ -885,9 +916,9 @@ func TestAgentPlugin_ActiveSessionIDSemantics(t *testing.T) {
 }
 
 // seedLegacySlot 在 dir 播种 legacy 根槽（一次性 Open 生成 metadata），在种子句柄
-// 上跑 seedFn（提交/归档造数），随后关闭句柄释放文件锁，返回文件当前的 metadata
-// 会话 id（即 wireLegacyStore 的挂载键；归档轮转会更换 metadata id，以关闭时的
-// 最新值为准）。
+// 上跑 seedFn（提交造数；归档数据经 seedPluginArchiveFile 直接构造，Store.Archive()
+// 已随 Plan A 删除），随后关闭句柄释放文件锁，返回文件当前的 metadata 会话 id
+// （即 wireLegacyStore 的挂载键）。
 func seedLegacySlot(t *testing.T, dir string, seedFn func(st *session.Store)) string {
 	t.Helper()
 	seed, err := session.Open(dir)
@@ -911,7 +942,7 @@ func seedLegacySlot(t *testing.T, dir string, seedFn func(st *session.Store)) st
 //  2. deps.Store 注入 + runtime id = store SessionID（生产 ④ 的同款规则）；
 //  3. Session 绑定挂载实例（构造即水合，与重启恢复同路径）。
 //
-// 返回的挂载实例与插件视图是同一对象：测试对它的 Commit/Archive 与生产同轨。
+// 返回的挂载实例与插件视图是同一对象：测试对它的 Commit 与生产同轨。
 // 仓库经 t.Cleanup 关闭（连带释放目录文件锁）。
 func wireLegacyStore(t *testing.T, cfg *runtimeconfig.Config, mountID string) (*AgentPlugin, *session.Store) {
 	t.Helper()

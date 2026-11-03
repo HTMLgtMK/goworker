@@ -118,3 +118,72 @@ func TestAgentRunTransitions(t *testing.T) {
 
 	run.transition(RunFailed) // 重复终态不得重复关闭 done(panic 即失败)
 }
+
+// TestRunDoneHookFiresAfterTerminal(Plan A2 生命周期半边/A7 设计点 2):run 终态
+// 通知面——WithRunDoneHook 声明的回调经 Register 注入 runtime,finalizeRun 在
+// 清 active 后以 runtime id 触发恰好一次;触发点不变量:此刻 active 已清且
+// run.done 已关(等待面已放行),宿主的延迟收口据此安全重判。同步(RecordRun)
+// 与后台(StartRun)形态共享 finalizeRun,本测试覆盖同步形态的触发契约。
+func TestRunDoneHookFiresAfterTerminal(t *testing.T) {
+	hookCalls := make(chan string, 4)
+	m := NewSessionManager(WithRunDoneHook(func(sessionID string) {
+		hookCalls <- sessionID
+	}))
+	defer m.Close()
+
+	rt := NewSessionRuntime("s-hook", NewSession(SessionDeps{}))
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	var observedRun *AgentRun
+	relGate, err := rt.AcquireRun(context.Background()) // RecordRun 约定调用方已持 gate
+	if err != nil {
+		t.Fatalf("AcquireRun: %v", err)
+	}
+	res := rt.RecordRun(func(*Session) (RunResult, error) {
+		observedRun = rt.Active() // 执行中的 active 记账,供终态后对照
+		return RunResult{State: RunCompleted}, nil
+	})
+	relGate()
+	if res.State != RunCompleted {
+		t.Fatalf("RecordRun state = %q, want completed", res.State)
+	}
+
+	select {
+	case got := <-hookCalls:
+		if got != "s-hook" {
+			t.Fatalf("hook sessionID = %q, want s-hook", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run done hook did not fire")
+	}
+
+	// 触发点不变量:active 已清、done 已关——宿主在回调里看到的是「无在飞
+	// run」的干净终态,重判引用计数不会误判在飞。
+	if got := rt.Active(); got != nil {
+		t.Fatalf("Active() inside/after hook window = %v, want nil (cleared before hook)", got)
+	}
+	if observedRun == nil {
+		t.Fatal("setup: active was not set during RecordRun")
+	}
+	select {
+	case <-observedRun.done:
+	default:
+		t.Fatal("run.done not closed when hook fired (ordering invariant broken)")
+	}
+
+	// 无 hook 的 runtime(直接构造、不经 Register)零行为变化:finalizeRun 照常
+	// 完成、不 panic(hook 为 nil 的既有路径回归)。
+	bare := NewSessionRuntime("s-bare", NewSession(SessionDeps{}))
+	relBare, err := bare.AcquireRun(context.Background())
+	if err != nil {
+		t.Fatalf("bare AcquireRun: %v", err)
+	}
+	if res := bare.RecordRun(func(*Session) (RunResult, error) {
+		return RunResult{State: RunCompleted}, nil
+	}); res.State != RunCompleted {
+		t.Fatalf("bare RecordRun state = %q, want completed", res.State)
+	}
+	relBare()
+}

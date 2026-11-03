@@ -708,96 +708,6 @@ func TestOpenRestrictsExistingArchivePermissions(t *testing.T) {
 	assertPrivateMode(t, archivePath)
 }
 
-func TestArchive(t *testing.T) {
-	s := openStore(t)
-
-	all := commMsgs([]string{"m0", "m1"}, "user")
-	_, err := s.Commit(all)
-	if err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
-
-	// 确认 current.jsonl 有内容
-	currentPath := filepath.Join(s.dir, "current.jsonl")
-	lines := readJSONLFile(t, currentPath)
-	if len(lines) == 0 {
-		t.Fatal("current.jsonl should have content before archive")
-	}
-
-	err = s.Archive()
-	if err != nil {
-		t.Fatalf("Archive: %v", err)
-	}
-
-	// current.jsonl 保留新会话的 metadata 行，不能再把物理空文件当成空会话。
-	newLines := readJSONLFile(t, currentPath)
-	if len(newLines) != 1 {
-		t.Errorf("current.jsonl should contain one metadata line after archive, got %d", len(newLines))
-	}
-	var currentMetadata Record
-	if len(newLines) == 1 && json.Unmarshal([]byte(newLines[0]), &currentMetadata) == nil && currentMetadata.Kind != kindMetadata {
-		t.Errorf("current.jsonl first record kind = %q, want metadata", currentMetadata.Kind)
-	}
-
-	// archive 目录应该有刚才归档的文件
-	archiveDir := filepath.Join(s.dir, "archive")
-	entries, err := os.ReadDir(archiveDir)
-	if err != nil {
-		t.Fatalf("read archive dir: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 archive file, got %d", len(entries))
-	}
-	if !strings.HasSuffix(entries[0].Name(), ".jsonl") {
-		t.Errorf("archive file should be .jsonl, got %q", entries[0].Name())
-	}
-	assertPrivateMode(t, archiveDir)
-	assertPrivateMode(t, filepath.Join(archiveDir, entries[0].Name()))
-	assertPrivateMode(t, currentPath)
-
-	// ActiveView 应该是空
-	view := s.ActiveView()
-	if len(view) != 0 {
-		t.Errorf("ActiveView after archive should be empty, got %d", len(view))
-	}
-}
-
-// TestArchiveReopen 验证 Archive 后重新 Open 返回空会话。
-func TestArchiveReopen(t *testing.T) {
-	s := openStore(t)
-	dir := s.dir
-
-	all := commMsgs([]string{"m0", "m1"}, "user")
-	_, err := s.Commit(all)
-	if err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
-
-	err = s.Archive()
-	if err != nil {
-		t.Fatalf("Archive: %v", err)
-	}
-	s.Close()
-
-	// 重新 Open
-	s2, err := Open(dir)
-	if err != nil {
-		t.Fatalf("Open after archive: %v", err)
-	}
-	defer s2.Close()
-
-	view := s2.ActiveView()
-	if len(view) != 0 {
-		t.Errorf("reopen after archive: expected empty view, got %d", len(view))
-	}
-
-	// archive 文件还在
-	entries, _ := os.ReadDir(filepath.Join(dir, "archive"))
-	if len(entries) != 1 {
-		t.Errorf("archive should have 1 file, got %d", len(entries))
-	}
-}
-
 // TestCheckpoint 验证 checkpoint 功能。
 func TestCheckpoint(t *testing.T) {
 	s := openStore(t)
@@ -1716,36 +1626,6 @@ func TestStoreSessionIdentityIsStableAcrossReopenAndCompact(t *testing.T) {
 	defer reopened.Close()
 	if reopened.SessionID() != id {
 		t.Errorf("SessionID after reopen = %q, want %q", reopened.SessionID(), id)
-	}
-}
-
-func TestStoreArchiveKeepsArchivedIdentityAndCreatesNewCurrentIdentity(t *testing.T) {
-	dir := t.TempDir()
-	store, err := Open(dir)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	oldID := store.SessionID()
-	if _, err := store.Commit([]core.Message{commMsg("m0", "user", "archive me")}); err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
-	if err := store.Archive(); err != nil {
-		t.Fatalf("Archive: %v", err)
-	}
-	newID := store.SessionID()
-	if newID == "" || newID == oldID {
-		t.Fatalf("new current SessionID = %q, want a distinct non-empty ID", newID)
-	}
-	entries, err := os.ReadDir(filepath.Join(dir, "archive"))
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("archive entries = %v, err=%v", entries, err)
-	}
-	view, err := OpenArchiveView(filepath.Join(dir, "archive", entries[0].Name()))
-	if err != nil {
-		t.Fatalf("OpenArchiveView: %v", err)
-	}
-	if view.SessionID() != oldID {
-		t.Errorf("archived SessionID = %q, want %q", view.SessionID(), oldID)
 	}
 }
 

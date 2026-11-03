@@ -55,7 +55,18 @@ type FrontendHandler struct {
 	// 解析点据此路由——这是「标准 ACP 会话解析优先读 Binding」的唯一通道。它只是
 	// 选择器(§6.2):Set/清除不删除会话、不取消后台 Run、不动 control lease、
 	// 不影响其他连接。零值可用,连接私有,无需额外加锁(类型自带 RWMutex)。
+	//
+	// Plan A2 生命周期半边:每次 Set 处成对调用 binder.BindConnectionSession 把
+	// 本连接的绑定登记进 agentcontrol.BindingRegistry(生命周期引用计数的唯一
+	// 事实源;改绑即替换、/new 收口清除,断连 ReleaseConnection 清账)——登记
+	// 只服务引用计数,路由/解析仍只读本选择器(边界收窄论证见 agentcontrol
+	// bindings.go / sessions.go 文件头)。
 	binding agentcontrol.SessionBinding
+
+	// binder 是连接级会话绑定登记面(Plan A2,工厂内对 sessions type-assert
+	// model.ConnectionBinder 获得,RunControlSource 同款先例)。nil = 后端无
+	// 生命周期登记能力(简化壳/测试桩):Set 照常、登记跳过,行为与 PR2 一致。
+	binder model.ConnectionBinder
 
 	// connectionID 是本连接的稳定句柄(P5-7,工厂内 crypto/rand 生成):x-goworker
 	// control lease 的持有者寻址面,连接退出时经 Close 归还(P5-8/P5-9 的泵清理
@@ -153,6 +164,11 @@ func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Comma
 			if runs, ok := sessions.(model.RunControlSource); ok {
 				handler.runs = runs
 			}
+			// Plan A2 生命周期半边:连接级会话绑定登记面(可选能力,缺省 nil 时
+			// CreateSession/LoadSession 只做 PR2 的 Binding Set、不登记)。
+			if binder, ok := sessions.(model.ConnectionBinder); ok {
+				handler.binder = binder
+			}
 		}
 		return handler
 	}
@@ -228,6 +244,12 @@ func (h *FrontendHandler) CreateSession(_ context.Context, sessionID string, req
 	// Binding 是连接私有状态,门禁外 Set 即可(§6.2:不影响任何共享会话状态,
 	// 也不影响其他连接)。
 	h.binding.Set(boundTo)
+	// Plan A2 生命周期半边:Set 处成对登记(clientID → boundTo,改绑即替换——
+	// 本连接此前绑定的会话在此失去引用,由实现侧评估收口)。boundTo 为空(纯
+	// 内存降级,无稳定 id)不登记,与 Binding 保持空一致。
+	if h.binder != nil && boundTo != "" {
+		h.binder.BindConnectionSession(h.connectionID, boundTo)
+	}
 
 	if h.commands != nil {
 		if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
@@ -349,7 +371,10 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 		// 命令 handler,插件的 binding 形态解析点(agentcontrol.BindingFromCtx)据此
 		// 把 prompt 路由到本连接选择的会话(总方案 §六;Binding 悬空时插件诚实
 		// 报错)。门禁内读取:声明也取门禁,读到的是与守卫一致的全序快照。
-		Ctx: agentcontrol.WithBinding(ctx, &h.binding),
+		// Plan A2:连接句柄随同一执行链 ctx 注入(agentcontrol.WithClientID)——
+		// /new 收口(agentcontrol.ClientIDFromCtx)据此摘本连接的绑定登记;与
+		// ReleaseConnection 的 clientID 同源(h.connectionID)。
+		Ctx: agentcontrol.WithClientID(agentcontrol.WithBinding(ctx, &h.binding), h.connectionID),
 		FrontendContext: model.FrontendContext{
 			// 命令输出统一包成代码块（见 commandOutput）：命令侧仍按等宽终端排版，
 			// 由这里告诉渲染器「这段别重排」。
@@ -414,6 +439,11 @@ func (h *FrontendHandler) LoadSession(_ context.Context, req protocol.LoadSessio
 		// PR2:Binding 指向本连接刚加载的会话(连接私有状态,门禁外 Set;§6.2——
 		// 重选不删除原会话、不取消其后台 Run、不动 control lease、不影响其他连接)。
 		h.binding.Set(req.SessionID)
+		// Plan A2 生命周期半边:Set 处成对登记(与 CreateSession 同款;改绑即
+		// 替换,session/load 重开把引用落回重开的会话)。
+		if h.binder != nil {
+			h.binder.BindConnectionSession(h.connectionID, req.SessionID)
+		}
 		if h.commands != nil {
 			if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
 				reporter.Update(req.SessionID, body)

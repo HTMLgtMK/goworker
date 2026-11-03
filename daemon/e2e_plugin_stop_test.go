@@ -28,9 +28,10 @@ import (
 //	Plugin Stop   | 不遗留失控 goroutine、连接订阅或 Store 句柄
 //
 // 其余矩阵行由既有测试钉死（引用，不在本文件重复）：
-//   - 多客户端多会话（A/B 各自创建/启动/取消互不影响，PR2）：
+//   - 多客户端多会话（A/B 各自创建/启动/取消互不影响，PR2；Plan A2 起旧会话
+//     在其他连接仍绑定时保持存活）：
 //     daemon/internal/plugins/agent/binding_test.go（TestBindingRoutesPromptToBoundSession、
-//     TestHandleNewDetachesOnlyInitiatorBinding）、runcontrol_test.go
+//     TestHandleNewKeepsSessionWhileOtherConnectionBound）、runcontrol_test.go
 //     （TestCrossSessionRunControl、TestCrossSessionRequestIdempotency）；
 //   - Lease 接管（新持有者先提交后旧操作拒绝）：
 //     daemon/internal/agentcontrol/lease_test.go（TestLeaseRegistryTakeover、

@@ -19,10 +19,12 @@
 //     这比总方案第九节的 metadata.json 更保守，是有意为之。
 //
 //  2. 不移动 legacy 文件：<root>/current.jsonl 原地挂载为 legacy 会话（Open 命中
-//     legacy 分支时直接 session.Open(root)），/new 在其上仍走 Store.Archive() 在该槽
-//     内轮转（current.jsonl → root/archive/<ts>.jsonl），直到该槽被自然淘汰；新会话
-//     一律进 <root>/<id>/。迁移用户数据不在 P1 范围内，原地挂载保证老用户升级后
-//     历史无损、行为不变。
+//     legacy 分支时直接 session.Open(root)）；新会话一律进 <root>/<id>/。迁移用户
+//     数据不在 P1 范围内，原地挂载保证老用户升级后历史无损、行为不变。
+//     Plan A 定案 #2/#9 更新：/new 纯新建、不再在槽内轮转（Store.Archive() 已
+//     随「归档 = 只读保留终态」语义删除）；legacy 槽的淘汰（迁入 per-id 目录）
+//     由 A4 的一次性迁移（rename-only，幂等）负责，本层在其落地前维持原地挂载
+//     的只读兼容。
 //
 //  3. 实例唯一：Repository 对同一 SessionID 恒返回同一 *Store（总方案第九节
 //     「Repository 对同一 SessionID 保证唯一的 Store 实例」），避免多次 Open 产生
@@ -59,7 +61,8 @@ var (
 	// ErrSessionInUse：id 的 Store 仍在本 Repository 的 open 缓存中，拒绝删除。
 	ErrSessionInUse = errors.New("session: session in use")
 	// ErrLegacyImmutable：legacy 根槽（<root>/current.jsonl）不可删除——它是现有
-	// 用户数据的唯一活跃文件，删除等于毁历史；淘汰靠 Archive 轮转（决策 2）。
+	// 用户数据的唯一活跃文件，删除等于毁历史；淘汰由 A4 一次性迁移负责（决策 2，
+	// Plan A 定案 #2/#9：/new 已不轮转，Store.Archive() 删除）。
 	ErrLegacyImmutable = errors.New("session: legacy root session is immutable")
 	// ErrSessionNotOpen：custody 前置不满足——该会话的 Store 不在本 Repository
 	// 的 open 缓存中。RunJournal 依附 Store in-cache（journal.go 文件头论证，
@@ -156,7 +159,7 @@ func (r *Repository) Create(ctx context.Context, opts CreateOptions) (*Store, er
 //     决议双探测（Plan A1）：先 <id>.jsonl（v2 名）后 current.jsonl（存量兼容），
 //     见 store.go resolveDataFilePath；
 //  2. 否则 legacy 根槽：<root>/current.jsonl 存在且其 metadata.SessionID == id →
-//     Open(root) 原地挂载（决策 2，不移动文件，Archive 仍在槽内轮转）；
+//     Open(root) 原地挂载（决策 2，不移动文件；A4 一次性迁移前维持只读兼容）；
 //  3. 否则 ErrSessionNotFound。
 //
 // 命中缓存直接返回同一实例（决策 3）。P1-2 起 Store.Open 对会话目录加跨进程
@@ -164,9 +167,11 @@ func (r *Repository) Create(ctx context.Context, opts CreateOptions) (*Store, er
 // 路径全程在 r.mu 内串行——进程内恒返回同一实例、从不触碰本进程已持有的锁：
 //   - 双检：并发 Open 同 id 时只有第一个真正执行 Store.Open，其余在锁内命中
 //     缓存返回同一实例（决策 3；串行化后不再产生需要关闭的输家句柄）；
-//   - 别名先于 Store.Open：legacy 槽 Archive 换 id 后，Open(新 id) 必须复用
-//     已挂载实例，而不是对同一 <root>/current.jsonl 再开第二个句柄——目标目录
-//     已被本进程另一 id 条目持锁时，先开后查必然被 flock 拒绝；
+//   - 别名先于 Store.Open：同一目标目录已被本进程以其他 id 挂载时（存量形态：
+//     per-id 目录名 ≠ 文件内 metadata id，A4 迁移前可达；历史触发方 legacy 槽
+//     轮转已随 Store.Archive() 删除），Open 必须复用已挂载实例，而不是对同一
+//     目录再开第二个句柄——目标目录已被本进程另一 id 条目持锁时，先开后查必然
+//     被 flock 拒绝；
 //   - 跨进程第二写者不受影响：另一进程持锁时 Store.Open 的 LOCK_NB 立即返回
 //     ErrStoreLocked（宁拒勿双写，store.go ErrStoreLocked）。
 func (r *Repository) Open(id string) (*Store, error) {
@@ -193,8 +198,8 @@ func (r *Repository) Open(id string) (*Store, error) {
 		return nil, fmt.Errorf("session: open %s: %w", id, ErrSessionNotFound)
 	}
 
-	// 同目录别名：目标目录已被本进程以其他 id 挂载（legacy 槽 Archive 换 id
-	// 后的复用路径，决策 3）。必须先于 Store.Open——见函数头注释。
+	// 同目录别名：目标目录已被本进程以其他 id 挂载（决策 3；存量「目录名 ≠
+	// 内部 id」形态的复用路径，见函数头注释）。必须先于 Store.Open。
 	for _, existing := range r.open {
 		if existing.dir == target {
 			r.open[id] = existing
@@ -308,9 +313,9 @@ func (r *Repository) Close() error {
 // 重开语义 = 逐出后再次 Open 走 flock 慢路径，锁已释放即可重开。实例唯一
 // 不变量（决策 3）不变：缓存里同 id 至多一个实例，Open 的并发双检原样保留。
 //
-// 别名条目：legacy 槽 Archive 换 id 后同一 *Store 以多个 id 注册（Open 的同目录
-// 别名机制），逐出按实例指针把全部别名条目一并移除——留任一条目都会让该 id 的
-// Open 命中已关闭实例，死实例问题换个 id 复发。
+// 别名条目：同一 *Store 以多个 id 注册时（Open 的同目录别名机制，存量「目录名
+// ≠ 内部 id」形态可达），逐出按实例指针把全部别名条目一并移除——留任一条目
+// 都会让该 id 的 Open 命中已关闭实例，死实例问题换个 id 复发。
 //
 // 顺序论证：先逐出（r.mu 内）后 Close（r.mu 外，对齐 Repository.Close 的
 // 「先收集后关闭」锁序，不在持 r.mu 时等 s.mu）。逐出与锁释放之间有窗口：并发

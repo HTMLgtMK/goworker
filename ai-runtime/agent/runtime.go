@@ -39,6 +39,19 @@ type SessionRuntime struct {
 	// ——同步路径行为零变化(plan P3-4 边界,§6)。读写全部在 rt.mu 内,见
 	// bindEvents/eventHub 的并发论证。
 	events *EventHub
+	// onRunDone 是 run 终态通知回调(Plan A2 生命周期半边/A7 设计点 2):
+	// finalizeRun 清 active 后以 runtime id 触发,供宿主消费「有未完 run 时
+	// 延迟到 run 终态再关」所需的完成通知面——manager 的 active 记账此前只
+	// 记账、无回调(勘察结论),宿主侧引用计数收不到 run 收尾信号。
+	//
+	// 取舍(Plan A7②「选侵入最小的一种」):plugin 侧无可行的观察点——RunHandle.
+	// Wait 只有提交者在等,cb 回调面随提交方形态各異(xgw 全 nil),没有统一
+	// 收尾 choke point;而 finalizeRun 是 RecordRun(同步形态)与 StartRun/
+	// execute(后台形态)共享的唯一终态化路径,在此触发即覆盖全部 Run 形态。
+	// 写入点唯一(manager.Register 注入,先于任何 Run 提交的 happens-before
+	// 由 Register 的 m.mu 发布保证),读取在 rt.mu 内、触发在锁外(回调可能做
+	// 文件 I/O——宿主用它关 store,「锁内不做文件 I/O」纪律)。
+	onRunDone func(sessionID string)
 }
 
 // NewSessionRuntime 创建运行时。s 允许 nil,由 BindSession 后置绑定。
@@ -311,7 +324,18 @@ func finalizeRun(r *SessionRuntime, run *AgentRun, res RunResult) RunResult {
 	if r.active == run { // 防御:不覆盖后续记账(当前 gate 独占下不会发生)
 		r.active = nil
 	}
+	hook := r.onRunDone
 	r.mu.Unlock()
+	// 终态通知(A2/A7②):active 已清 ⇒ 该 run 不再占用会话执行权,宿主的
+	// 生命周期引用计数可在此刻重新评估「绑定集合空 && 无在飞 run」的延迟
+	// 收口。锁外触发:回调可能关 store(文件 I/O)且可能反查 manager(取注册
+	// 表状态),绝不在 rt.mu 内调用——此刻 r.active 已清、run.done 已关,manager
+	// Close 的等待者已放行,回调耗时不再阻塞任何等待面。回调自身必须不阻塞、
+	// 不重入本 runtime 的 gate(宿主侧约定;误重入会与 execute 的 defer 释放
+	// 竞争,由 AcquireRun 的容量 1 语义自然排队,不死锁)。
+	if hook != nil {
+		hook(r.ID)
+	}
 	return res
 }
 

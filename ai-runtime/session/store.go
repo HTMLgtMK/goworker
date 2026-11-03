@@ -576,69 +576,6 @@ func (s *Store) Archived() bool {
 	return archivedFromRecords(s.recs)
 }
 
-// Archive 将 current.jsonl 重命名为 archive/<timestamp>.jsonl，然后打开带有新 metadata 的 current 文件。
-// 跨进程文件锁（s.lock）不随轮转释放：Archive 只轮转数据文件，会话目录仍由本 Store 独占持有。
-//
-// Deprecated: Plan A 定案需求 #1/#9——归档语义改为「只读保留终态」（MarkArchived
-// 落 archived 标记、不搬文件、不可逆），轮转式归档废弃。daemon 侧 commands.go
-// 的 /new 自动归档仍有生产调用（A2 拆除该调用方后本方法删除）；legacy 槽轮转
-// 语义在其自然淘汰前由本方法维持，测试夹具仍可使用。
-func (s *Store) Archive() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// 关闭当前文件句柄
-	if s.file != nil {
-		if err := s.file.Sync(); err != nil {
-			slog.Warn("session: sync before archive failed", "err", err)
-		}
-		if err := s.file.Close(); err != nil {
-			return fmt.Errorf("session: close before archive: %w", err)
-		}
-		s.file = nil
-	}
-
-	// 创建 archive 目录
-	archiveDir := filepath.Join(s.dir, "archive")
-	if err := os.MkdirAll(archiveDir, 0o700); err != nil {
-		return fmt.Errorf("session: create archive dir: %w", err)
-	}
-	if err := os.Chmod(archiveDir, 0o700); err != nil {
-		return fmt.Errorf("session: restrict archive dir: %w", err)
-	}
-
-	// rename current.jsonl → archive/<unix_nano>.jsonl
-	ts := fmt.Sprintf("%d", time.Now().UnixNano())
-	dst := filepath.Join(archiveDir, ts+".jsonl")
-	if err := os.Rename(s.path, dst); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("session: rename to archive: %w", err)
-	}
-
-	// 重开空文件
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("session: reopen after archive: %w", err)
-	}
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return fmt.Errorf("session: restrict reopened file: %w", err)
-	}
-	s.file = f
-	s.recs = nil
-	s.head = ""
-	s.cursor = ""
-	s.metadata = Metadata{SessionID: NewSessionID(), CreatedAt: time.Now()}
-	metadataRec := newMetadataRecord(s.metadata.SessionID, s.metadata.CreatedAt)
-	if err := s.appendRecord(metadataRec); err != nil {
-		_ = f.Close()
-		s.file = nil
-		return fmt.Errorf("session: persist metadata after archive: %w", err)
-	}
-	s.recs = []Record{metadataRec}
-
-	return nil
-}
-
 // ── 内部辅助 ──────────────────────────────────────────────────────────
 
 // buildActiveView 从记录集与 head 构建活跃视图：沿 parent 链回溯到根（带 visited

@@ -83,6 +83,13 @@ type SessionManager struct {
 	// runCtx 时逐项 context.WithValue(supervisor.go ⑦)。构造期经 ManagerOption
 	// 一次写入,此后只读——无运行期写者,无锁(并发论证见 WithRunContext)。
 	runCtxValues []RunContextValue
+	// runDoneHook 是 WithRunDoneHook(Plan A2/A7②)声明的 run 终态通知回调:
+	// Register 把它注入每个新 runtime(SessionRuntime.onRunDone),finalizeRun
+	// 在清 active 后触发。构造期一次写入、此后只读;nil = 不通知(既有行为)。
+	// 宿主(daemon plugin)用它消费「有未完 run 时延迟到 run 终态再关」的完成
+	// 信号——回调语义约定:不阻塞、不重入本 runtime 的 gate、不反触 manager
+	// 的等待面(见 runtime.go finalizeRun 的触发点论证)。
+	runDoneHook func(sessionID string)
 }
 
 // ManagerOption 是 NewSessionManager 的配置选项。
@@ -129,6 +136,23 @@ func WithRunContext(values ...RunContextValue) ManagerOption {
 	}
 }
 
+// WithRunDoneHook 声明 run 终态通知回调(Plan A2 生命周期半边,A7 设计点 2 的
+// 完成通知面):每个 run 终态化(finalizeRun,同步与后台路径共享)清 active 后
+// 以 runtime id 触发一次。宿主消费点:plugin 侧「有未完 run 时延迟到 run 终态
+// 再关」的挂起收口——引用计数评估发现 run 在飞时挂起,由本回调唤醒重判。
+//
+// 注入路径:manager 构造期持有,Register 注入每个新 runtime(rt.onRunDone)——
+// 不放在 runtime 构造函数上的原因:回调属于「宿主对全部会话的统一观察面」,
+// 归 manager 一处声明,注册点统一接线,宿主(含测试 fixture)无需逐 runtime
+// 显式挂回调。并发论证:hook 只在构造期写入(Register 前的 happens-before 经
+// m.mu 发布),Register 注入先于该 runtime 的任何 Run 提交(StartRun 前置
+// manager.Get 命中,而命中必经 m.mu 读,与 Register 全序)。
+func WithRunDoneHook(hook func(sessionID string)) ManagerOption {
+	return func(m *SessionManager) {
+		m.runDoneHook = hook
+	}
+}
+
 // NewSessionManager 创建空注册表,并内建宿主生命周期 ctx 与默认全局配额。
 // 变参化(P2-5):不传选项时行为与旧无参签名完全一致,现有调用点(daemon
 // plugin 等)零改动;配额经 WithRunLimits 覆盖。
@@ -163,6 +187,12 @@ func (m *SessionManager) Register(rt *SessionRuntime) error {
 	}
 	if _, exists := m.runtimes[rt.ID]; exists {
 		return fmt.Errorf("session: runtime %q already registered", rt.ID)
+	}
+	// run 终态通知接线(A2/A7②,WithRunDoneHook):注册即注入,先于该 runtime
+	// 的任何 Run 提交——StartRun 必经 m.mu 读注册表,与本写点全序,hook 字段
+	// 的发布对后续 finalizeRun 的读取可见。
+	if m.runDoneHook != nil {
+		rt.onRunDone = m.runDoneHook
 	}
 	m.runtimes[rt.ID] = rt
 	return nil

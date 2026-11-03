@@ -109,6 +109,14 @@ type AgentPlugin struct {
 	// Eval 不登记，由 manager.Close 的 Run 等待面覆盖。
 	// 零值可用。
 	inFlight inFlightTracker
+
+	// suspendMu/suspendedReaps 是「引用归零但 run 在飞」的挂起收口台账(Plan A2
+	// 生命周期半边,lifecycle.go):归零判定发现 run 在飞时挂起,run 终态通知
+	// (manager.WithRunDoneHook → onSessionRunDone)重判。台账只记挂起中的会话,
+	// 是钩子的消费闸门——无它则每次 run 收尾都会误判零绑定的 current 会话。
+	// 零值可用(测试直构插件)。
+	suspendMu      sync.Mutex
+	suspendedReaps map[string]struct{}
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
@@ -134,6 +142,11 @@ func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *AgentPlugi
 	p.manager = runtimeagent.NewSessionManager(
 		runtimeagent.WithRunLimits(cfg.Session.MaxConcurrentRuns, cfg.Session.MaxPendingRuns),
 		runtimeagent.WithRunContext(runtimeagent.RunContextValue{Key: sessionGateKey{}, Value: p}),
+		// Plan A2 生命周期半边(A7 设计点 2):run 终态通知面——「有未完 run 时
+		// 延迟到 run 终态再关」的挂起收口由它唤醒(lifecycle.go onSessionRunDone
+		// 只对挂起台账中的会话重判,普通 run 收尾零开销)。闭包捕获 p:此刻 p 已
+		// 构造完成,回调只在 run 终态后才执行,无初始化次序问题。
+		runtimeagent.WithRunDoneHook(p.onSessionRunDone),
 	)
 	// PR1(总方案 §4.2):装配应用内唯一的 Application Control Plane——plugin 与
 	// ACP 共享同一实例(两套 Lease/Request Registry 是明确禁止的形态)。router/
@@ -258,8 +271,7 @@ func (p *AgentPlugin) sessionCWDErrorIn(ctx context.Context) error {
 // store 的 SessionID（startSession ④），repo.Open 按 id 命中实例唯一缓存，返回的
 // 正是 startSession 打开/创建的那个 *Store——取数与互斥同源于 current 解析，不再
 // 单独持有 store 指针（旧 atomic.Pointer[session.Store] 字段随 P1-3 退役，/new
-// 换轨只剩 current 一个切换点）。legacy 槽被 Archive 轮转后 store 的 metadata id
-// 会更换，但缓存键仍是挂载时的 id，解析不受影响。nil = 持久化禁用/无活动会话，
+// 换轨只剩 current 一个切换点）。nil = 持久化禁用/无活动会话，
 // 调用方按旧文案降级（/rewind 提示未启用、清单返回空、/new 兜底全量快照）。
 func (p *AgentPlugin) currentStore() *session.Store {
 	return p.storeFor(p.currentSession())
@@ -454,8 +466,11 @@ func (p *AgentPlugin) Stop() error {
 		}
 	}
 	// store 生命周期收尾（P1-3）：consolidate 后关闭当前会话 store 与仓库缓存的
-	// 全部实例——/new 换轨后旧 store 实例滞留在 repo.open 缓存（实例唯一不变量
-	// 要求其存活），统一在此回收。两级都幂等：currentStore 与 repo 缓存常为同一
+	// 全部实例。Plan A2 起 /new 的旧会话经引用归零判定即时收口（tryReleaseSession
+	// → repo.CloseSession 已逐出缓存），挂起收口的会话在 manager.Close 的取消
+	// 驱动下由 run 终态通知在此期间收敛（hook 内 CloseSession 与本步 repo.Close
+	// 并发安全：Store.Close 幂等、CloseSession 对已不在缓存的 id 为 no-op），
+	// 这里统一回收残余实例。两级都幂等：currentStore 与 repo 缓存常为同一
 	// 实例，Store.Close 对已关闭/未持锁 store 为 no-op（store.go Close 对 nil file
 	// 安全）；repo/current 为 nil（纯内存、Init 未完成或失败回滚）时整体跳过。
 	if st := p.currentStore(); st != nil {
@@ -560,8 +575,7 @@ func (p *AgentPlugin) startSession() {
 	// ② 解析本会话边界的 store：首个边界（Init，current 尚为 nil）对已有 legacy
 	// 槽原地挂载，维持旧版「打开 <dir>/current.jsonl」的启动行为（用户数据不动）；
 	// /new 驱动的边界一律 Create 独立目录新会话（新会话一律进 <root>/<id>/，
-	// repository 决策 2）——若仍挂载刚被 Archive 轮转出的空槽，repo.Open 会经同
-	// 目录别名规则复用旧实例，「新」会话拿不到独立目录。打开/创建失败降级纯内存。
+	// repository 决策 2）。打开/创建失败降级纯内存。
 	var st *session.Store
 	if p.repo != nil {
 		st = p.openSessionStore(p.currentSession() == nil)

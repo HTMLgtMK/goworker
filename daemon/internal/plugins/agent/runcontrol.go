@@ -63,6 +63,12 @@ var _ agentcontrol.InternalRunner = (*AgentPlugin)(nil)
 // 可见变化 #1 的生产者),断言失败回落原始 relay。
 var _ model.ClientToolBinder = (*AgentPlugin)(nil)
 
+// ConnectionBinder 编译期断言(Plan A2 生命周期半边):AgentPlugin 满足连接级
+// 会话绑定登记面,ACP handler 在 SessionBinding.Set 点 type-assert 它登记
+// BindingRegistry(生命周期引用计数的唯一事实源),断言失败则登记缺失、
+// 引用归零判定永远读不到 ACP 连接的绑定。
+var _ model.ConnectionBinder = (*AgentPlugin)(nil)
+
 // defaultCapabilityWaitTimeout 是 CapabilityWaitTimeout 的兜底值(拍板③ 45s;
 // 与 SDK 的 defaultCapabilityWaitTimeout 同值——那边未导出,daemon 侧按配置
 // 秒化后 <=0 回落此处,双保险不依赖 yaml 载入路径)。
@@ -250,11 +256,17 @@ func (p *AgentPlugin) HoldControl(sessionID, connectionID string) bool {
 	return p.control.HoldControl(sessionID, connectionID)
 }
 
-// ReleaseConnection 实现 RunControlSource(I3 新增断连收口,PR1 起薄委托):
-// 释放 connectionID 持有的全部会话的 control lease——handler.Close 一次调用
-// 替代逐会话归还。连接不持有任何租约时幂等空操作。
+// ReleaseConnection 实现 RunControlSource(I3 新增断连收口,PR1 起薄委托;
+// Plan A2 生命周期半边扩展):释放 connectionID 持有的全部会话的 control lease,
+// 并清除其会话绑定登记(Service.ReleaseConnection 一并清账,与 lease 同构)——
+// 返回的被解除会话若确有登记,立即评估引用归零收口(断连 = 最后解绑的触发点
+// 之一,lifecycle.go tryReleaseSession;有 run 在飞时由终态通知延迟收口)。
+// 连接不持有任何租约/绑定时幂等空操作。
 func (p *AgentPlugin) ReleaseConnection(connectionID string) {
-	p.control.ReleaseConnection(connectionID)
+	prev := p.control.ReleaseConnection(connectionID)
+	if prev != "" {
+		p.tryReleaseSession(prev)
+	}
 }
 
 // PendingApprovals 实现 RunControlSource(P5-6;C3 修正):多会话路由 → manager

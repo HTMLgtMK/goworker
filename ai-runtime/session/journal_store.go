@@ -41,10 +41,11 @@ import (
 
 // RunJournalStore 是一个会话的 Run 状态 journal 聚合：按 rec.RunID 把记录路由
 // 到 repo.OpenRunJournal 打开的 per-run 文件句柄。持有 repo 与 store 引用；
-// sessionID 在构造时从 store 快照——它是 repo 实例唯一缓存的挂载键：legacy 槽
-// 被 Archive 轮转后 store 的 metadata id 会更换而缓存键不变（plugin.go P1-3
-// 注释），逐次取 st.SessionID() 会在轮转后错指缓存外 id（ErrSessionNotOpen），
-// 构造期快照则始终落在本会话的 runs/ 目录。
+// sessionID 在构造时从 store 快照——它是 repo 实例唯一缓存的挂载键：存量形态
+// 下「文件内 metadata id ≠ 缓存挂载键」可能成立（目录名 ≠ 内部 id 的 legacy
+// 目录，A4 一次性迁移前可达；历史触发方 Store.Archive() 轮转已删除），逐次取
+// st.SessionID() 会错指缓存外 id（ErrSessionNotOpen），构造期快照则始终落在
+// 本会话的 runs/ 目录。
 type RunJournalStore struct {
 	repo      *Repository
 	st        *Store

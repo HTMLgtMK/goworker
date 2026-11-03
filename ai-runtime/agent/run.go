@@ -122,6 +122,22 @@ func (run *AgentRun) cancelFunc() context.CancelFunc {
 	return run.cancel
 }
 
+// Cancel 取消本次运行并报告取消是否已发出(Plan A2 生命周期半边的导出面):
+// 后台 StartRun 形态取消其 runCtx(execute 在 gate/执行入口按取消收敛,
+// finalizeRun 归一 cancelled);RecordRun 同步路径无 cancel,返回 false。与
+// manager.CancelRun 的差别:按 run 记账对象直接取消、不经 manager 注册表
+// 寻址——daemon 生命周期收口在 manager.Remove 之后防御性取消 queued run 时
+// (lifecycle.go tryReleaseSession),注册表已查无此 runtime,只能持 run 指针
+// 取消。幂等:重复取消只是关闭一个已取消的 ctx,无副作用。
+func (run *AgentRun) Cancel() bool {
+	cancel := run.cancelFunc()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
 // finish 记录最终结果并推进到终态。result 必须先于 done 关闭写入(与 transition
 // 的契约一致):done 关闭后等待者观察到的 snapshot 即为完整终态结果。
 func (run *AgentRun) finish(res RunResult) {

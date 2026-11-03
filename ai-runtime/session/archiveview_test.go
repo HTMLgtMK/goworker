@@ -9,62 +9,83 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 )
 
-// archivePathOf 返回会话目录下唯一的归档文件路径（测试夹具保证只有一个）。
-func archivePathOf(t *testing.T, dir string) string {
+// seedArchiveFile 在 dir/archive/ 下直接构造一个归档 jsonl 夹具：用一次性 store
+// 造出记录集，关闭后把数据文件字节原样搬进归档目录。Plan A 定案 #2/#9 删除
+// Store.Archive() 后不再有「轮转出归档文件」的写路径，归档文件的磁盘形态与
+// 会话数据文件完全一致（同一 record 模型），直接构造是等价且诚实的夹具方式。
+// 返回归档文件路径；造数期需要对照的快照由 seed 闭包内自行捕获。
+func seedArchiveFile(t *testing.T, dir, name string, seed func(s *Store)) string {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(dir, "archive"))
+	scratch := filepath.Join(t.TempDir(), "seed-slot")
+	s, err := Open(scratch)
 	if err != nil {
-		t.Fatalf("read archive dir: %v", err)
+		t.Fatalf("open seed store: %v", err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("archive entries = %d, want 1", len(entries))
+	seed(s)
+	if err := s.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
 	}
-	return filepath.Join(dir, "archive", entries[0].Name())
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		t.Fatalf("read seed data file: %v", err)
+	}
+	archiveDir := filepath.Join(dir, "archive")
+	if err := os.MkdirAll(archiveDir, 0o700); err != nil {
+		t.Fatalf("create archive dir: %v", err)
+	}
+	path := filepath.Join(archiveDir, name)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write archive fixture: %v", err)
+	}
+	return path
 }
 
 // TestOpenArchiveViewRoundTrip 归档只读视图往返：Commit 若干轮 + checkpoint →
-// Archive → OpenArchiveView 打开归档文件，断言 Head、ActiveView 内容/顺序与
-// Checkpoints 锚点与归档前一致，且查看不改动归档文件字节。
+// 数据文件字节直接落进 archive/（见 seedArchiveFile 的夹具论证）→ OpenArchiveView
+// 打开归档文件，断言 Head、ActiveView 内容/顺序与 Checkpoints 锚点与归档前一致，
+// 且查看不改动归档文件字节。
 func TestOpenArchiveViewRoundTrip(t *testing.T) {
-	s := openStore(t)
-	dir := s.dir
+	dir := t.TempDir()
 
-	// 轮 1：user → assistant(正文) → user；轮 2：assistant 带 tool_call → tool 结果
-	if _, err := s.Commit([]core.Message{
-		commMsg("m0", "user", "第一问"),
-		commMsg("m1", "assistant", "第一答"),
-		commMsg("m2", "user", "第二问"),
-	}); err != nil {
-		t.Fatalf("Commit round 1: %v", err)
-	}
-	if err := s.Checkpoint("round 1"); err != nil {
-		t.Fatalf("Checkpoint round 1: %v", err)
-	}
-	if _, err := s.Commit([]core.Message{
-		{
-			MsgID: "m3", Role: "assistant",
-			ToolCalls: []core.ToolCall{{
-				ID: "call_1", Type: "function",
-				Function: core.ToolCallFunction{Name: "read_file", Arguments: `{"path":"a.go"}`},
-			}},
-			Thinking: core.Thinking{Text: "想一下"},
-		},
-		{MsgID: "m4", Role: "tool", Content: "文件内容", ToolCallID: "call_1"},
-	}); err != nil {
-		t.Fatalf("Commit round 2: %v", err)
-	}
-	if err := s.Checkpoint("round 2"); err != nil {
-		t.Fatalf("Checkpoint round 2: %v", err)
-	}
+	var (
+		headBefore string
+		viewBefore []core.Message
+		cksBefore  []Checkpoint
+	)
+	path := seedArchiveFile(t, dir, "fixture.jsonl", func(s *Store) {
+		// 轮 1：user → assistant(正文) → user；轮 2：assistant 带 tool_call → tool 结果
+		if _, err := s.Commit([]core.Message{
+			commMsg("m0", "user", "第一问"),
+			commMsg("m1", "assistant", "第一答"),
+			commMsg("m2", "user", "第二问"),
+		}); err != nil {
+			t.Fatalf("Commit round 1: %v", err)
+		}
+		if err := s.Checkpoint("round 1"); err != nil {
+			t.Fatalf("Checkpoint round 1: %v", err)
+		}
+		if _, err := s.Commit([]core.Message{
+			{
+				MsgID: "m3", Role: "assistant",
+				ToolCalls: []core.ToolCall{{
+					ID: "call_1", Type: "function",
+					Function: core.ToolCallFunction{Name: "read_file", Arguments: `{"path":"a.go"}`},
+				}},
+				Thinking: core.Thinking{Text: "想一下"},
+			},
+			{MsgID: "m4", Role: "tool", Content: "文件内容", ToolCallID: "call_1"},
+		}); err != nil {
+			t.Fatalf("Commit round 2: %v", err)
+		}
+		if err := s.Checkpoint("round 2"); err != nil {
+			t.Fatalf("Checkpoint round 2: %v", err)
+		}
 
-	headBefore := s.Head()
-	viewBefore := s.ActiveView()
-	cksBefore := s.Checkpoints(0)
+		headBefore = s.Head()
+		viewBefore = s.ActiveView()
+		cksBefore = s.Checkpoints(0)
+	})
 
-	if err := s.Archive(); err != nil {
-		t.Fatalf("Archive: %v", err)
-	}
-	path := archivePathOf(t, dir)
 	rawBefore, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read archive bytes: %v", err)
@@ -123,27 +144,28 @@ func TestOpenArchiveViewRoundTrip(t *testing.T) {
 // TestOpenArchiveViewWithCompact 覆盖 compact 场景：归档视图里 compact 节点转为
 // system 摘要、保留段副本保真（与 Store.ActiveView 同语义）。
 func TestOpenArchiveViewWithCompact(t *testing.T) {
-	s := openStore(t)
-	dir := s.dir
+	dir := t.TempDir()
 
-	if _, err := s.Commit(commMsgs([]string{"m0", "m1", "m2", "m3", "m4"}, "user")); err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
-	// compact m1..m3，保留 m4 → 视图 [m0, s_m3(summary), m4']
-	if err := s.Compact("m1", "m3", "summary of m1-m3"); err != nil {
-		t.Fatalf("Compact: %v", err)
-	}
-	if err := s.Checkpoint("after compact"); err != nil {
-		t.Fatalf("Checkpoint: %v", err)
-	}
-	headBefore := s.Head()
-	viewBefore := s.ActiveView()
+	var (
+		headBefore string
+		viewBefore []core.Message
+	)
+	path := seedArchiveFile(t, dir, "compact-fixture.jsonl", func(s *Store) {
+		if _, err := s.Commit(commMsgs([]string{"m0", "m1", "m2", "m3", "m4"}, "user")); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		// compact m1..m3，保留 m4 → 视图 [m0, s_m3(summary), m4']
+		if err := s.Compact("m1", "m3", "summary of m1-m3"); err != nil {
+			t.Fatalf("Compact: %v", err)
+		}
+		if err := s.Checkpoint("after compact"); err != nil {
+			t.Fatalf("Checkpoint: %v", err)
+		}
+		headBefore = s.Head()
+		viewBefore = s.ActiveView()
+	})
 
-	if err := s.Archive(); err != nil {
-		t.Fatalf("Archive: %v", err)
-	}
-
-	v, err := OpenArchiveView(archivePathOf(t, dir))
+	v, err := OpenArchiveView(path)
 	if err != nil {
 		t.Fatalf("OpenArchiveView: %v", err)
 	}

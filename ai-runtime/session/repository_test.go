@@ -217,10 +217,11 @@ func TestConcurrentStoreOpen(t *testing.T) {
 	}
 }
 
-// TestLegacyRootMount 验证 legacy 布局的兼容挂载（决策 2）：用 session.Open +
-// Commit + Archive 在 root 自身造出 legacy 槽（root/current.jsonl + root/archive/），
-// 之后 Open(legacy id) 原地挂载、List 含它且不含归档、Delete 被拒绝，
-// 且 Archive 仍可在该槽内轮转（/new 语义保持）、同槽换 id 后仍复用同一实例。
+// TestLegacyRootMount 验证 legacy 布局的兼容挂载（决策 2）：在 root 自身造出
+// legacy 槽（root/current.jsonl + root/archive/ 夹具，归档文件直接构造——
+// Store.Archive() 已随 Plan A 定案 #2/#9 删除），之后 Open(legacy id) 原地
+// 挂载、List 含它且不含归档、Delete 被拒绝。轮转语义已不存在：/new 纯新建
+// （定案 #2），legacy 槽淘汰由 A4 一次性迁移负责。
 func TestLegacyRootMount(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -230,26 +231,30 @@ func TestLegacyRootMount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("legacy Open: %v", err)
 	}
-	preArchiveID := legacy.SessionID()
 	if _, err := legacy.Commit(msgs("user", "legacy hello")); err != nil {
 		t.Fatalf("legacy Commit: %v", err)
 	}
-	if err := legacy.Archive(); err != nil {
-		t.Fatalf("legacy Archive: %v", err)
-	}
-	legacyID := legacy.SessionID() // Archive 后 current 槽的新 metadata id
-	if legacyID == preArchiveID {
-		t.Fatal("Archive should rotate to a new session id")
-	}
+	legacyID := legacy.SessionID()
 	if err := legacy.Close(); err != nil {
 		t.Fatalf("legacy Close: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "current.jsonl")); err != nil {
 		t.Fatalf("legacy layout missing root/current.jsonl: %v", err)
 	}
-	archived, err := os.ReadDir(filepath.Join(root, "archive"))
-	if err != nil || len(archived) != 1 {
-		t.Fatalf("legacy layout: archive entries = %v (err %v), want 1 file", archived, err)
+	// root/archive/ 夹具：直接构造一个带独立 id 的归档文件（与被挂载槽不同 id），
+	// 断言 List 只认会话目录直下的数据文件、归档不入清单。
+	archivedPath := seedArchiveFile(t, root, "legacy-archived.jsonl", func(s *Store) {
+		if _, err := s.Commit(msgs("user", "archived history")); err != nil {
+			t.Fatalf("archive fixture commit: %v", err)
+		}
+	})
+	archivedView, err := OpenArchiveView(archivedPath)
+	if err != nil {
+		t.Fatalf("archive fixture view: %v", err)
+	}
+	archivedID := archivedView.SessionID()
+	if archivedID == "" || archivedID == legacyID {
+		t.Fatalf("archive fixture id = %q, want a distinct non-empty id", archivedID)
 	}
 
 	repo, err := OpenRepository(root)
@@ -258,7 +263,7 @@ func TestLegacyRootMount(t *testing.T) {
 	}
 	defer repo.Close()
 
-	// ── List：含 legacy 槽当前 id；归档里的旧 id 不计入 ──
+	// ── List：含 legacy 槽 id；归档里的 id 不计入 ──
 	list, err := repo.List(ctx)
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -266,8 +271,8 @@ func TestLegacyRootMount(t *testing.T) {
 	if !listContains(list, legacyID) {
 		t.Fatalf("List = %v, want legacy id %s", list, legacyID)
 	}
-	if listContains(list, preArchiveID) {
-		t.Fatalf("List = %v must not include archived id %s", list, preArchiveID)
+	if listContains(list, archivedID) {
+		t.Fatalf("List = %v must not include archived id %s", list, archivedID)
 	}
 
 	// ── Open：legacy id 原地挂载到 root，不产生 per-id 目录 ──
@@ -283,6 +288,13 @@ func TestLegacyRootMount(t *testing.T) {
 			t.Fatalf("legacy mount must not create per-id dir %s", legacyID)
 		}
 	}
+	// 挂载实例可用：历史可读、可继续写（legacy 槽在 A4 迁移前是活的会话）。
+	if view := mounted.ActiveView(); len(view) != 1 || view[0].Content != "legacy hello" {
+		t.Fatalf("mounted ActiveView = %v, want ['legacy hello']", viewContent(view))
+	}
+	if _, err := mounted.Commit([]core.Message{commMsg("m_legacy2", "user", "still writable")}); err != nil {
+		t.Fatalf("Commit on mounted legacy: %v", err)
+	}
 
 	// ── Delete：挂载中 → in-use 优先；未挂载的 repo → legacy 槽不可删 ──
 	if err := repo.Delete(ctx, legacyID); !errors.Is(err, ErrSessionInUse) {
@@ -297,32 +309,6 @@ func TestLegacyRootMount(t *testing.T) {
 	}
 	if err := repo2.Close(); err != nil {
 		t.Fatalf("repo2.Close: %v", err)
-	}
-
-	// ── Archive 仍在 legacy 槽内轮转；换 id 后同槽复用同一实例（同目录别名）──
-	if err := mounted.Archive(); err != nil {
-		t.Fatalf("Archive on mounted legacy: %v", err)
-	}
-	newID := mounted.SessionID()
-	if newID == legacyID {
-		t.Fatal("Archive on mounted legacy should rotate to a new session id")
-	}
-	list, err = repo.List(ctx)
-	if err != nil {
-		t.Fatalf("List after rotation: %v", err)
-	}
-	if !listContains(list, newID) || listContains(list, legacyID) {
-		t.Fatalf("List after rotation = %v, want [%s] without old %s", list, newID, legacyID)
-	}
-	again, err := repo.Open(newID)
-	if err != nil {
-		t.Fatalf("Open rotated id: %v", err)
-	}
-	if again != mounted {
-		t.Fatal("Open after legacy rotation returned a second instance for the same slot")
-	}
-	if _, err := mounted.Commit([]core.Message{commMsg("m_legacy2", "user", "post rotation")}); err != nil {
-		t.Fatalf("Commit on mounted legacy after rotation: %v", err)
 	}
 }
 
@@ -536,26 +522,31 @@ func TestRepositoryCloseSessionReopen(t *testing.T) {
 }
 
 // TestRepositoryCloseSessionEvictsAliasEntries 验证别名条目一并逐出：
-// legacy 槽轮转换 id 后同一 *Store 挂在多个 id 下（Open 的同目录别名机制），
-// CloseSession(任一 id) 必须把全部别名条目逐出并只关闭一次——留任一条目都会
-// 让该 id 的 Open 命中已关闭实例，死实例问题换个 id 复发。
+// 同一 *Store 挂在多个 id 下（Open 的同目录别名机制）时，CloseSession(任一 id)
+// 必须把全部别名条目逐出并只关闭一次——留任一条目都会让该 id 的 Open 命中已
+// 关闭实例，死实例问题换个 id 复发。
+//
+// 夹具说明（Plan A2：Store.Archive() 删除后的形态）：历史触发方「legacy 槽
+// 轮转换 id」已不存在，现可达的别名形态是存量「per-id 目录名 ≠ 文件内 metadata
+// id」（A4 一次性迁移前）。该形态经 Open 天然只会挂一个缓存键（另一 id 解析
+// 不到同一目录），因此别名条目由测试在包内直接播种——白盒构造与别名机制等价
+// 的缓存状态，逐出逻辑按实例指针清理的契约不依赖别名如何产生。
 func TestRepositoryCloseSessionEvictsAliasEntries(t *testing.T) {
 	root := t.TempDir()
 
-	// 造 legacy 槽夹具：root 自身即会话槽（同 TestLegacyRootMount）
-	legacy, err := Open(root)
-	if err != nil {
-		t.Fatalf("legacy Open: %v", err)
+	// 造「目录名 ≠ 内部 id」的存量形态夹具：目录 session_dirKey，文件内
+	// metadata id 为 session_metaKey。
+	dirKey, metaKey := NewSessionID(), NewSessionID()
+	if dirKey == metaKey {
+		t.Fatal("fixture: distinct ids required")
 	}
-	if _, err := legacy.Commit(msgs("user", "alias fixture")); err != nil {
-		t.Fatalf("legacy Commit: %v", err)
+	dir := filepath.Join(root, dirKey)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir legacy-layout dir: %v", err)
 	}
-	if err := legacy.Archive(); err != nil {
-		t.Fatalf("legacy Archive: %v", err)
-	}
-	legacyID := legacy.SessionID()
-	if err := legacy.Close(); err != nil {
-		t.Fatalf("legacy Close: %v", err)
+	seed := fmt.Sprintf(`{"kind":"metadata","session_id":%q,"created_at":"2024-01-01T00:00:00Z"}`+"\n", metaKey)
+	if err := os.WriteFile(filepath.Join(dir, "current.jsonl"), []byte(seed), 0o600); err != nil {
+		t.Fatalf("write seed metadata: %v", err)
 	}
 
 	repo, err := OpenRepository(root)
@@ -564,35 +555,45 @@ func TestRepositoryCloseSessionEvictsAliasEntries(t *testing.T) {
 	}
 	defer repo.Close()
 
-	mounted, err := repo.Open(legacyID)
+	// Open(目录名) → 实例的 SessionID 是文件内 id（metaKey），缓存键是 dirKey。
+	mounted, err := repo.Open(dirKey)
 	if err != nil {
-		t.Fatalf("Open legacy slot: %v", err)
+		t.Fatalf("Open by dir name: %v", err)
 	}
-	// 槽内再轮转一次换 id → Open(新 id) 走别名机制复用同一实例
-	if err := mounted.Archive(); err != nil {
-		t.Fatalf("Archive on mounted legacy: %v", err)
+	if mounted.SessionID() != metaKey {
+		t.Fatalf("mounted SessionID = %s, want internal id %s", mounted.SessionID(), metaKey)
 	}
-	newID := mounted.SessionID()
-	again, err := repo.Open(newID)
-	if err != nil {
-		t.Fatalf("Open rotated id: %v", err)
-	}
-	if again != mounted {
-		t.Fatal("fixture broken: rotated id did not reuse the mounted instance (alias)")
+	// 白盒播种别名条目：同一实例再挂 metaKey 键（与别名机制的缓存形态一致）。
+	repo.mu.Lock()
+	repo.open[metaKey] = mounted
+	repo.mu.Unlock()
+	if again, err := repo.Open(metaKey); err != nil || again != mounted {
+		t.Fatalf("Open(alias key) = (%p, %v), want same instance %p", again, err, mounted)
 	}
 
-	// CloseSession(旧 id) → 实例关闭、{旧 id, 新 id} 两个条目全部逐出
-	if err := repo.CloseSession(legacyID); err != nil {
-		t.Fatalf("CloseSession(alias id): %v", err)
+	// CloseSession(目录名) → 实例关闭、{目录名, 内部 id} 两个条目全部逐出
+	if err := repo.CloseSession(dirKey); err != nil {
+		t.Fatalf("CloseSession(dirKey): %v", err)
+	}
+	repo.mu.Lock()
+	_, dirKeyLeft := repo.open[dirKey]
+	_, metaKeyLeft := repo.open[metaKey]
+	repo.mu.Unlock()
+	if dirKeyLeft || metaKeyLeft {
+		t.Fatalf("alias entries not fully evicted: dirKey=%v metaKey=%v", dirKeyLeft, metaKeyLeft)
 	}
 	if _, err := mounted.Commit(msgs("user", "dead alias")); err == nil {
 		t.Error("Commit on closed alias instance = nil error, want error")
 	}
+	// CloseSession(别名键) 同样幂等收敛（实例已不在缓存）
+	if err := repo.CloseSession(metaKey); err != nil {
+		t.Fatalf("CloseSession(metaKey) after eviction = %v, want nil", err)
+	}
 
-	// 重开：新实例、活实例（legacy 根槽 current.jsonl 重新挂载）
-	fresh, err := repo.Open(newID)
+	// 重开：慢路径新实例、活实例（flock 已释放；Open 按目录名重新解析）。
+	fresh, err := repo.Open(dirKey)
 	if err != nil {
-		t.Fatalf("Open newID after CloseSession: %v", err)
+		t.Fatalf("Open after CloseSession: %v", err)
 	}
 	if fresh == mounted {
 		t.Fatal("Open after CloseSession returned the closed alias instance")

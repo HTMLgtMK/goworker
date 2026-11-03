@@ -162,9 +162,11 @@ func (p *AgentPlugin) CurrentSessionHistory() []model.SessionUpdate {
 // segmentByCheckpoints + roundUpdates 管线输出。不持写句柄、不 rename、不触碰
 // current 与 store。
 //
-// 归档路径解析（P1-3）：归档随会话目录轮转（Archive 以 store 自身 dir 为基准），
-// 先查当前会话目录的 archive/，legacy 根槽（<Session.Dir>/archive/，兼容挂载的
-// 既有归档）次之；两处都只读 OpenArchiveView，其余 per-id 目录的并集留待 P5。
+// 归档路径解析（P1-3）：先查当前会话目录的 archive/，legacy 根槽
+// （<Session.Dir>/archive/，兼容挂载的既有归档）次之；两处都只读 OpenArchiveView，
+// 其余 per-id 目录的并集留待 P5。Plan A2 起 /new 不再轮转归档（定案 #2/#9，
+// Store.Archive() 已删除）：归档目录的内容是存量数据 + 显式归档命令（A3）的
+// 产物，本方法只读消费，不产生新归档。
 func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]model.SessionUpdate, error) {
 	if p.cfg == nil || p.cfg.Session.Dir == "" {
 		return nil, fmt.Errorf("agent: session persistence disabled")
@@ -202,17 +204,13 @@ func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]model.SessionU
 	return replayUpdates(view.ActiveView(), anchorSet(view.Checkpoints(0))), nil
 }
 
-// currentSessionDir 返回当前会话的会话目录（P1-3 归档扫描基准）。归档随会话目录
-// 轮转，目录两种形态：
+// currentSessionDir 返回当前会话的会话目录（P1-3 归档扫描基准）。目录两种形态：
 //   - 新布局 <Session.Dir>/<store SessionID>/（Repository.Create 创建，目录名即
 //     文件内 SessionID）；
 //   - legacy 根槽 = Session.Dir 本身（兼容挂载，current.jsonl 直在根下）。
 //
 // 判定：会话 id 命中新布局目录（其下有 current.jsonl）取该目录；否则根下有
-// legacy 槽取根；都没有返回空串。store 被 Archive 轮转的瞬间 metadata id 会换成
-// 新随机 id 而 store 目录不变，新 id 不命中任何目录 → 短暂返回空串；/new 在同一
-// gate 临界区内随即换轨新会话，窗口只暴露给无锁的只读清单方，与旧版在归档瞬间
-// 读清单的抖动同级。
+// legacy 槽取根；都没有返回空串。
 func (p *AgentPlugin) currentSessionDir() string {
 	root := p.cfg.Session.Dir
 	store := p.currentStore()
