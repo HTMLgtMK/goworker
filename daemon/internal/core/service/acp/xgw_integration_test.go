@@ -257,7 +257,10 @@ func (f *xgwLiveControl) StartRun(sessionID, connectionID, input, requestID stri
 		}
 		f.runByReq[requestID] = h
 	}
-	return h.RunID, string(h.State()), nil
+	// fresh 提交返回接受时刻快照(SubmitState,恒 queued),镜像生产的
+	// runcontrol.StartRun;活快照 State() 在 fast provider 下可能是 completed,
+	// 会让 wire 契约断言变成调度竞争。
+	return h.RunID, string(h.SubmitState()), nil
 }
 
 // CancelRun mirror runcontrol.go(fencing 同 StartRun):直转 manager(未知 run

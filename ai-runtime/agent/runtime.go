@@ -399,10 +399,12 @@ func journalRunState(s *Session, rec session.RunStateRecord) {
 }
 
 // finalizeRun 是 RecordRun(同步路径)与 StartRun/execute(P2-5 后台路径)共享
-// 的终态化路径:终态归一防御 → journal 终态记录(durable-first)→ run.finish
-// (关闭 done 唤醒等待者)→ 清 active(仅当仍为本 run,防御不覆盖后续记账)。
+// 的终态化路径:终态归一防御 → journal 终态记录(durable-first)→ 清 active
+// (仅当仍为本 run,防御不覆盖后续记账)→ run.finish(关闭 done 唤醒等待者)。
 // 返回归一后的结果供调用方继续使用(RecordRun 的返回值即它)。次序即不变量:
 // journal 落盘先于 done 关闭——等待者被唤醒时终态已持久(总方案第九节);
+// active 清空先于 done 关闭——等待者被唤醒后立刻提交的下一笔 Run 不会撞
+// ErrRunActive(同步 prompt 返回即下一次 prompt 的调用形态直接依赖此序);
 // journalRunState 在 rt.mu 外调用(P2-3:锁内不做文件 I/O)。
 //
 // 终态归一(P2-1 防御分支原样移自 RecordRun,主映射在 Session.Run,与 execute
@@ -441,13 +443,16 @@ func finalizeRun(r *SessionRuntime, run *AgentRun, res RunResult) RunResult {
 		At:        time.Now(),
 	})
 
-	run.finish(res)
 	r.mu.Lock()
 	if r.active == run { // 防御:不覆盖后续记账(当前 gate 独占下不会发生)
 		r.active = nil
 	}
 	hook := r.onRunDone
 	r.mu.Unlock()
+	// 先清 active 再关 done:等待者被唤醒的瞬间,本会话已可提交下一笔 Run。
+	// 反序会给「prompt 返回 → 立即下一次 prompt」的同步调用形态留一个
+	// ErrRunActive 窗口(fast provider + race detector 下已实测命中)。
+	run.finish(res)
 	// 终态通知(A2/A7②):active 已清 ⇒ 该 run 不再占用会话执行权,宿主的
 	// 生命周期引用计数可在此刻重新评估「绑定集合空 && 无在飞 run」的延迟
 	// 收口。锁外触发:回调可能关 store(文件 I/O)且可能反查 manager(取注册

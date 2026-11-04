@@ -343,8 +343,14 @@ var _ model.ConnectionBinder = (*AgentPlugin)(nil)
 // 曾把这个失败窗口放大成「run 写在已关 store 上」)。
 func TestStartRunConcurrentWithRelease(t *testing.T) {
 	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
-	p := newPersistedPlugin(t, gated)
-	sidA := p.CurrentSessionID()
+	p := newPersistedPlugin(t, fixedProvider{content: "x"})
+	// A 必须是 newPersistedSession 建出来的会话:newPersistedPlugin 的
+	// refreshSession 同 id 重注册会撞 Init 留下的旧条目,manager 里仍是真实
+	// provider 的 runtime——A 变成非 current 后路由走 manager.Get,会拿到它。
+	sidA := newPersistedSession(t, p, gated)
+	if rt := p.manager.Get(sidA); rt == nil || rt != p.currentSession() {
+		t.Fatal("setup: gated runtime must be registered for session A")
+	}
 	// current 换到 B:被释放的 A 不在 current 隐式引用保护下,收口可真实执行。
 	if sidB := newPersistedSession(t, p, fixedProvider{content: "x"}); sidB == sidA {
 		t.Fatal("setup: distinct sessions required")

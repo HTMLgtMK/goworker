@@ -206,6 +206,30 @@ func assertHostCtxAlive(t *testing.T, m *SessionManager, when string) {
 	}
 }
 
+// TestRunWaitImpliesActiveCleared 钉死 finalizeRun 的次序不变量:Wait 返回时
+// 本会话的 active 必须已清,同步调用形态(Wait 返回 → 立刻下一次提交)才不会
+// 撞上 ErrRunActive。反序(先关 done 再清 active)会留下这个真实竞态窗口。
+func TestRunWaitImpliesActiveCleared(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+	pv := &gatedProvider{} // 无 gate:每次调用立即完成
+	rt := NewSessionRuntime("seq", newFakeStoreSession(&fakeConversationStore{}, nil, pv))
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	for i := 0; i < 20; i++ {
+		h, err := m.StartRun("seq", RunRequest{Input: "q"}, RunCallbacks{})
+		if err != nil {
+			t.Fatalf("run #%d rejected right after Wait: %v", i, err)
+		}
+		waitHandle(t, h)
+		if run := rt.Active(); run != nil {
+			t.Fatalf("run #%d: Wait returned while active still set to %s", i, run.ID)
+		}
+	}
+}
+
 // TestRunSurvivesDisconnect(总方案第十一节 → 本步):提交方 goroutine 在
 // StartRun 返回后直接退出、不 Wait(模拟连接断开——StartRun 无 ctx 参数,API
 // 形状即保证调用方 ctx 不成 run 父);provider 挂起期间宿主 ctx 未取消;release
