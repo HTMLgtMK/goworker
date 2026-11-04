@@ -104,6 +104,7 @@ func registerXGWMethods(server *aiacp.Server, handler aiacp.SessionHandler) {
 	server.Handle(XMethodSessionAttach, fh.xgwSessionAttach)
 	server.Handle(XMethodSessionDetach, fh.xgwSessionDetach)
 	server.Handle(XMethodSessionArchive, fh.xgwSessionArchive)
+	server.Handle(XMethodSessionModes, fh.xgwSessionModes)
 }
 
 // xgwRunStart 处理 x-goworker/run/start:runs.StartRun(req.SessionID,
@@ -207,6 +208,24 @@ func (h *FrontendHandler) xgwSessionArchive(_ context.Context, params json.RawMe
 		return nil, xgwError("%s: %v", XMethodSessionArchive, err)
 	}
 	return XSessionArchiveResult{Archived: true}, nil
+}
+
+// xgwSessionModes 处理 x-goworker/session/modes（Plan B 任务3）：无 session 即取
+// daemon 的 modes 声明（数据源 cfg.LLM providers，与 session/new 响应同源同形）。
+// 只读、无门禁——纯展示数据，草稿面板在 session/new 之前渲染模型下拉用。
+func (h *FrontendHandler) xgwSessionModes(_ context.Context, _ json.RawMessage) (any, error) {
+	if h.sessions == nil {
+		return nil, xgwError("%s: session capabilities unavailable", XMethodSessionModes)
+	}
+	state := h.sessions.SessionModes()
+	if state == nil {
+		return XSessionModesResult{AvailableModes: []SessionModeChoice{}}, nil
+	}
+	choices := make([]SessionModeChoice, 0, len(state.AvailableModes))
+	for _, mode := range state.AvailableModes {
+		choices = append(choices, SessionModeChoice{ID: mode.ID, Name: mode.Name, Description: mode.Description})
+	}
+	return XSessionModesResult{CurrentModeID: state.CurrentModeID, AvailableModes: choices}, nil
 }
 
 // xgwApprovalRespond 处理 x-goworker/approval/respond(C1 修复 + 第三轮评审 I4

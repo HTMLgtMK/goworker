@@ -23,6 +23,7 @@ const (
 	XMethodSessionDetach   = "x-goworker/session/detach"   // P5-8
 	XMethodSessionEvents   = "x-goworker/session/events"   // 服务端通知(P5-8,Send only)
 	XMethodSessionArchive  = "x-goworker/session/archive"  // Plan A3:{sessionId} → {archived}
+	XMethodSessionModes    = "x-goworker/session/modes"    // Plan B 任务3:无 session 取 modes（草稿面板模型下拉）
 )
 
 // xgwErrorCode 是 x-goworker 方法面的统一 JSON-RPC 错误码:沿用既有 -32000
@@ -185,6 +186,21 @@ type XSessionDetachResult struct {
 // 会话 control lease（与 run/cancel 同款，实现侧 WithControl 同临界区）。
 type XSessionArchiveParams struct {
 	SessionID string `json:"sessionId"`
+}
+
+// XSessionModesResult 是 x-goworker/session/modes 的响应：与 session/new|load
+// 响应里的 modes 同形（model.SessionModeState）。无配置 LLM → 空对象。供前端
+// 草稿面板在 session/new 之前渲染模型下拉（Plan B 任务3）。
+type XSessionModesResult struct {
+	CurrentModeID  string              `json:"currentModeId"`
+	AvailableModes []SessionModeChoice `json:"availableModes"`
+}
+
+// SessionModeChoice 是 availableModes 的条目形状（对齐 model.SessionModeState）。
+type SessionModeChoice struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
 }
 
 // XSessionArchiveResult 是 x-goworker/session/archive 的响应：archived=true
