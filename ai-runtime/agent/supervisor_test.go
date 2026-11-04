@@ -78,6 +78,79 @@ func TestMarkArchivedRejectsActiveRun(t *testing.T) {
 	}
 }
 
+func TestRetireRejectsActiveRun(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	_, started, release := newSupRuntime(t, m, "retire-active", "reply", true)
+	h, err := m.StartRun("retire-active", RunRequest{Input: "q"}, RunCallbacks{})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	waitStarted(t, started)
+
+	if err := m.Get("retire-active").Retire(); !errors.Is(err, ErrRunActive) {
+		t.Fatalf("Retire while run active = %v, want ErrRunActive", err)
+	}
+
+	close(release)
+	if _, err := h.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if err := m.Get("retire-active").Retire(); err != nil {
+		t.Fatalf("Retire after run: %v", err)
+	}
+}
+
+// TestStartRunRejectsRetiredRuntime covers the lifecycle window from the review:
+// StartRun already holds the runtime pointer from the registry, then the reaper
+// retires it before reservation. Retire() runs while the runtime is still
+// registered (Remove has not executed yet), which is exactly the interleaving
+// that manager.Get alone cannot protect.
+func TestStartRunRejectsRetiredRuntime(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	_, _, _ = newSupRuntime(t, m, "retired", "reply", false)
+	rt := m.Get("retired")
+	if rt == nil {
+		t.Fatal("setup: runtime not registered")
+	}
+	if err := rt.Retire(); err != nil {
+		t.Fatalf("Retire: %v", err)
+	}
+	if _, err := m.StartRun("retired", RunRequest{Input: "q"}, RunCallbacks{}); !errors.Is(err, ErrSessionRetired) {
+		t.Fatalf("StartRun after retire = %v, want ErrSessionRetired", err)
+	}
+	if run := rt.Active(); run != nil {
+		t.Fatalf("retired runtime admitted run %s, want none", run.ID)
+	}
+	if err := m.Register(rt); !errors.Is(err, ErrSessionRetired) {
+		t.Fatalf("Register(retired runtime) = %v, want ErrSessionRetired", err)
+	}
+}
+
+func TestArchiveFailureRestoresAdmission(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	_, _, _ = newSupRuntime(t, m, "rollback", "reply", false)
+	rt := m.Get("rollback")
+	commitErr := errors.New("archive commit failed")
+	if err := rt.Archive(func() error { return commitErr }); !errors.Is(err, commitErr) {
+		t.Fatalf("Archive with failing commit = %v, want commitErr", err)
+	}
+
+	// 回滚后必须恢复可提交状态:不得残留 archived=true 的只读半状态。
+	h, err := m.StartRun("rollback", RunRequest{Input: "q"}, testRunCallbacks(&strings.Builder{}))
+	if err != nil {
+		t.Fatalf("StartRun after failed archive commit: %v", err)
+	}
+	if _, err := h.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+}
+
 // startOutcome 承载提交方 goroutine 的 StartRun 结果(提交方不 Wait 的形态)。
 type startOutcome struct {
 	h   RunHandle

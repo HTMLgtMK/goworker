@@ -176,6 +176,10 @@ func NewSessionManager(opts ...ManagerOption) *SessionManager {
 // Register 注册 runtime;同 ID 冲突报错(一个会话至多一个 runtime)。manager
 // 已 Close 时拒绝注册(ErrManagerClosed)——宿主级统一停机后不再有新成员
 // (P0 注释里的「宿主级统一停机属 P2」在此兑现)。
+//
+// 已注销(Retire)的实例拒绝重注册(ErrSessionRetired):生命周期收口与
+// ensureRegistered 的修复重建并发时,陈旧指针不得被重新挂回注册表——它指向
+// 已关闭的 hub/store。持久化会话的重开走 mountRuntime 构造的新实例,不受影响。
 func (m *SessionManager) Register(rt *SessionRuntime) error {
 	if rt == nil {
 		return errors.New("session: register nil runtime")
@@ -184,6 +188,9 @@ func (m *SessionManager) Register(rt *SessionRuntime) error {
 	defer m.mu.Unlock()
 	if m.closed {
 		return ErrManagerClosed
+	}
+	if rt.Retired() {
+		return fmt.Errorf("session: register retired runtime %q: %w", rt.ID, ErrSessionRetired)
 	}
 	if _, exists := m.runtimes[rt.ID]; exists {
 		return fmt.Errorf("session: runtime %q already registered", rt.ID)

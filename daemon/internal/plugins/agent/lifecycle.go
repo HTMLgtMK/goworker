@@ -19,12 +19,14 @@ import (
 //
 // 锁序:本文件不引入新锁面——suspendedReaps 台账自带小锁且是叶锁(只护 map,
 // 不回调);tryReleaseSession 依次取 agentcontrol registry.mu(已释放)、manager.mu
-// (Get/Remove,短临界区)、repo.mu/store.mu(CloseSession),全为单向短临界区,
-// 与 withSession 的 gate、SessionLease.mu 无嵌套。run 终态回调
-// (onSessionRunDone)跑在 manager execute goroutine 上(finalizeRun 触发点,
-// ai-runtime/agent/runtime.go),此刻该 run 已终态、rt.active 已清、run.done 已
-// 关——manager.Close 的等待面已放行,回调内做 store 关闭的文件 I/O 不阻塞任何
-// 等待者。
+// (Get/Remove,短临界区)、SessionRuntime.admissionMu(Retire 的 Run 提交线性化
+// 点,短暂)、rt.mu、repo.mu/store.mu(CloseSession),全为单向短临界区,与
+// withSession 的 gate、SessionLease.mu 无嵌套。admissionMu 与 manager.mu 不嵌套
+// (Retire 返回后 admissionMu 已释放才 Remove),与 reserveRun 的「m.mu 释放后
+// 再取 admissionMu」同向,无锁环。run 终态回调(onSessionRunDone)跑在 manager
+// execute goroutine 上(finalizeRun 触发点,ai-runtime/agent/runtime.go),此刻
+// 该 run 已终态、rt.active 已清、run.done 已关——manager.Close 的等待面已放行,
+// 回调内做 store 关闭的文件 I/O 不阻塞任何等待者。
 
 // markSuspendedRelease 登记一个「引用已归零但 run 在飞」的挂起收口。幂等。
 func (p *AgentPlugin) markSuspendedRelease(sessionID string) {
@@ -121,15 +123,13 @@ func (p *AgentPlugin) bindConnectionSessionLocked(clientID, sessionID string) {
 // 恢复;宁取诚实失败,不为它把 manager/repo 锁与 agentcontrol 注册表锁互取
 // (锁序单向是硬边界,见文件头)。
 //
-// 收口次序:Remove 先于 CloseSession——Remove 后对旧 id 的 StartRun/路由立即
-// 得 ErrSessionNotFound(诚实拒绝),不存在「store 已关但 runtime 仍可路由、
-// run 往死 store 里写」的窗口;反序则两者之间到达的 run 会在 CloseSession 之后
-// 才被 manager 拒绝,执行面撞已关句柄。Remove 后对捕获的 runtime 防御复查
-// Active():StartRun 的同步段(manager.Get 命中 → rt.mu 占位)可能恰在「判定
-// 无 run」与「Remove」之间插入——此刻 run 尚未获得 gate(/new 闭包持有旧
-// runtime 的 gate;断连路径无人在跑),取消其 runCtx 让 execute 在 gate/执行
-// 入口按取消收敛(finalizeRun 归一 cancelled),绝不留孤儿 run 对已收口会话
-// 继续执行。cancel 为 nil(同步 RecordRun 形态,daemon 无生产调用方)只留痕。
+// 收口次序:Retire 先于 Remove 先于 CloseSession——Retire 与 manager 的 Run
+// admission 共用 SessionRuntime.admissionMu,是「引用归零判定」与「Run 提交」
+// 的线性化点:Retire 成功后,已拿到 rt 指针但尚未占位的 StartRun 在 reserveRun
+// 处被拒(ErrSessionRetired),不存在「Manager 已注销、store 已关、run 却刚占位
+// 成功」的窗口;Remove 后对旧 id 的 StartRun/路由立即得 ErrSessionNotFound
+// (诚实拒绝)。Remove 与 Retire 是同一临界区内的顺序动作(Retire 返回 nil 时
+// active 已为空且不再可变),故不再需要旧的 Active() 二次复查与 cancel 补救。
 //
 // current 隐式引用守卫:p.current 指向的 runtime 恒有一个「无绑定调用方的
 // 便利引用」(CLI/stdio/测试回落 current 语义,plugin.go current 注释)——它
@@ -169,8 +169,12 @@ func (p *AgentPlugin) tryReleaseSessionLocked(sessionID string) {
 		p.clearSuspendedRelease(sessionID)
 		return
 	}
-	if run := rt.Active(); run != nil {
-		// 有未完 run:挂起,等 run 终态通知再判(定案需求 #8 的收口时点半边)。
+	if err := rt.Retire(); err != nil {
+		// 有未完 run:Retire 返回 ErrRunActive,挂起等 run 终态通知再判(定案
+		// 需求 #8 的收口时点半边)。admissionMu 与 reserveRun 同一线性化点:
+		// Retire 成功后,任何已从 manager 拿到 rt 指针但尚未占位的 StartRun 都会
+		// 在 reserveRun 处被 ErrSessionRetired 拒绝,绝不会触碰随后关闭的
+		// hub/store。
 		p.markSuspendedRelease(sessionID)
 		return
 	}
@@ -185,17 +189,9 @@ func (p *AgentPlugin) tryReleaseSessionLocked(sessionID string) {
 	// journal.SeqRange 磁盘播种续接既有事件历史——Seq 不从零，重连按 afterSeq
 	// 续放。次序：先关 hub 再关 store——hub 桥接（RunJournalStore）不实现
 	// io.Closer，两步无交互，但 hub 若晚于 store 关闭，残余 Publish 会撞已关
-	// 句柄（warn 噪音）；此刻不可能有在飞 Publish（挂起判定已排除在飞 run，
-	// 本路径只在终态后到达）。
+	// 句柄（warn 噪音）；此刻不可能有在飞 Publish（Retire 已排除在飞 run，本
+	// 路径只在终态后到达）。
 	rt.CloseEvents()
-	if run := rt.Active(); run != nil {
-		// 防御复查(Remove 前后的 queued-run 竞态窗口,论证见函数头)。
-		if run.Cancel() {
-			slog.Warn("agent: released session had a queued run, cancelled", "session", sessionID, "run", run.ID)
-		} else {
-			slog.Warn("agent: released session had an uncancellable queued run", "session", sessionID, "run", run.ID)
-		}
-	}
 	// store 收口:同 id 重建窗口(纯内存 /new 的 Register 冲突、会话边界的同 id
 	// 重建——manager 里同 id 的旧条目是误路由隐患,上面已移除)下,该 id 可能仍
 	// 是 current 会话的 store id——store 归 current 持有,不能随旧条目一起关。

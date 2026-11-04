@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -333,3 +334,74 @@ func TestConcurrentLoadAndRelease(t *testing.T) {
 }
 
 var _ model.ConnectionBinder = (*AgentPlugin)(nil)
+
+// TestStartRunConcurrentWithRelease 覆盖「Run 提交」与「最后解绑收口」的竞态:
+// StartRunSync 可能已经路由到 rt,随后 ReleaseConnection 完成 Retire+Remove。
+// 合法结果只有两种——Run 先占位(收口挂起,终态后注销),或收口先 Retire
+// (提交在 reserveRun 处被拒,绝不落到已关闭的 hub/store)。核心断言:被拒的
+// 提交不能把已注销的 runtime 复活回注册表(ensureRegistered 的陈旧指针修复
+// 曾把这个失败窗口放大成「run 写在已关 store 上」)。
+func TestStartRunConcurrentWithRelease(t *testing.T) {
+	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
+	p := newPersistedPlugin(t, gated)
+	sidA := p.CurrentSessionID()
+	// current 换到 B:被释放的 A 不在 current 隐式引用保护下,收口可真实执行。
+	if sidB := newPersistedSession(t, p, fixedProvider{content: "x"}); sidB == sidA {
+		t.Fatal("setup: distinct sessions required")
+	}
+	p.BindConnectionSession("conn-1", sidA)
+
+	start := make(chan struct{})
+	type outcome struct {
+		h   runtimeagent.RunHandle
+		err error
+	}
+	runCh := make(chan outcome, 1)
+	go func() {
+		<-start
+		h, err := p.StartRunSync(sidA, runtimeagent.RunRequest{Input: "q"}, runtimeagent.RunCallbacks{})
+		runCh <- outcome{h: h, err: err}
+	}()
+	releaseDone := make(chan struct{})
+	go func() {
+		<-start
+		p.ReleaseConnection("conn-1")
+		close(releaseDone)
+	}()
+	close(start)
+
+	run := <-runCh
+	<-releaseDone
+
+	if run.err != nil {
+		// 收口先 Retire:提交必须在 admission 处被拒(still-registered → retired,
+		// 已 Remove → not found),且不得复活 runtime。
+		if !errors.Is(run.err, runtimeagent.ErrSessionRetired) && !errors.Is(run.err, runtimeagent.ErrSessionNotFound) {
+			t.Fatalf("StartRun concurrent with release = %v, want ErrSessionRetired/ErrSessionNotFound", run.err)
+		}
+		if p.manager.Get(sidA) != nil {
+			t.Fatal("retired runtime was resurrected into the registry by a rejected StartRun")
+		}
+		return
+	}
+
+	// Run 先占位:收口被挂起,run 终态后由 run-done 通知重判注销。
+	select {
+	case <-gated.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not start in time")
+	}
+	close(gated.release)
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := run.h.Wait(waitCtx); err != nil {
+		t.Fatalf("run Wait: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for p.manager.Get(sidA) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("session not reaped after run terminal state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}

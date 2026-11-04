@@ -18,6 +18,12 @@ import (
 // ErrSessionArchived prevents new runs after a session reaches its terminal state.
 var ErrSessionArchived = errors.New("session: runtime is archived")
 
+// ErrSessionRetired rejects runs on a runtime instance that has been removed from
+// the SessionManager. Archived is a persisted terminal state; retired only ends
+// this in-memory instance, so a later session/load may open a fresh runtime from
+// the same store.
+var ErrSessionRetired = errors.New("session: runtime retired")
+
 // SessionRuntime 持有一个会话的独占执行权,是 SessionManager 注册的最小单元。
 // session 允许后置绑定(P0-2 的 daemon 在 startSession 前就要有 gate),
 // 也可为 nil(纯 gate 场景)。
@@ -31,6 +37,10 @@ type SessionRuntime struct {
 	// admissionMu serializes run reservation with the archived transition.
 	admissionMu sync.Mutex
 	archived    bool
+	// retired marks this runtime instance as removed from the manager registry.
+	// It shares admissionMu with archived so a StartRun that already holds the
+	// pointer (but has not reserved yet) cannot execute against a closed hub/store.
+	retired bool
 	// cwd/cwdErr 是本 runtime 的会话工作目录声明(P1-4 状态绑定收口):cwd 为
 	// 最近一次有效声明的绝对路径(空 = 未声明,工具回退 cfg.AllowedWorkDir),
 	// cwdErr 为最近一次声明的校验错误(非 nil 即无效标记,且 cwd 恒空——宿主
@@ -79,6 +89,9 @@ func (r *SessionRuntime) reserveRun(run *AgentRun) (*Session, error) {
 	if r.archived {
 		return nil, ErrSessionArchived
 	}
+	if r.retired {
+		return nil, ErrSessionRetired
+	}
 	if r.active != nil {
 		return nil, ErrRunActive
 	}
@@ -99,6 +112,37 @@ func (r *SessionRuntime) releaseRunReservation(run *AgentRun) {
 		r.active = nil
 	}
 	r.mu.Unlock()
+}
+
+// Retire closes this runtime instance to new runs. It shares admissionMu with
+// reserveRun, closing the window between the manager lookup and reservation: a
+// StartRun that already holds the pointer either reserves first (Retire sees it
+// as active and reports ErrRunActive) or observes ErrSessionRetired here.
+//
+// Retirement is irreversible and only flips admission state; the caller closes
+// the event hub and the persisted store afterwards. Return ErrRunActive means a
+// run is still in flight; callers using delayed reaping should keep their marker
+// and retry after the run-done notification.
+func (r *SessionRuntime) Retire() error {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.active != nil {
+		return ErrRunActive
+	}
+	r.retired = true
+	return nil
+}
+
+// Retired reports whether this instance has been removed from admission. A
+// retired runtime must never be registered again; a persisted session reopens
+// as a fresh instance instead.
+func (r *SessionRuntime) Retired() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.retired
 }
 
 // Archive transitions the runtime to read-only and rolls it back if commit fails.

@@ -67,6 +67,27 @@ func newTestService(t *testing.T, pv core.Provider) (*Service, *runtimeagent.Ses
 	return NewService(mgr, &fakeRouter{rt: rt}, nil), rt
 }
 
+// TestStartRunSyncDoesNotResurrectRetiredRuntime:路由已拿到 rt,随后生命周期
+// 收口 Remove+Retire 完成——ensureRegistered 的修复逻辑不得把陈旧指针重新挂回
+// 注册表(否则提交可能落到已关闭的 hub/store),提交面按未注册诚实失败。
+func TestStartRunSyncDoesNotResurrectRetiredRuntime(t *testing.T) {
+	s, rt := newTestService(t, fixedProvider{content: "x"})
+	s.sessions.Remove(rt.ID)
+	if err := rt.Retire(); err != nil {
+		t.Fatalf("Retire: %v", err)
+	}
+
+	if _, err := s.StartRunSync("current", runtimeagent.RunRequest{Input: "q"}, runtimeagent.RunCallbacks{}); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
+		t.Fatalf("StartRunSync after retire = %v, want ErrSessionNotFound", err)
+	}
+	if s.sessions.Get(rt.ID) != nil {
+		t.Fatal("ensureRegistered resurrected a retired runtime")
+	}
+	if err := s.sessions.Register(rt); !errors.Is(err, runtimeagent.ErrSessionRetired) {
+		t.Fatalf("Register(retired) = %v, want ErrSessionRetired", err)
+	}
+}
+
 // waitForRunStatus 轮询 RunStatus 直至 want 状态或超时。
 func waitForRunStatus(t *testing.T, s *Service, sid, runID, want string) (string, uint64) {
 	t.Helper()
