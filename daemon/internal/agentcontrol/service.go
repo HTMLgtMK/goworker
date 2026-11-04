@@ -11,7 +11,9 @@
 // (hitl.Decision、runtimeagent.*、session.*)直接使用。Service 自身不持有
 // 「当前会话」状态与会话级资源(它们随会话边界重建、属于调用入口的会话选择,
 // 总方案 §六),经 SessionRouter/JournalSource 窄接口由宿主注入,接口定义按方案
-// 要求放在本包(sessions.go)。
+// 要求放在本包(sessions.go)。Plan A2 起的唯一新增是生命周期绑定登记
+// (BindingRegistry,bindings.go):它是跨连接的引用计数事实源,不是会话选择
+// 状态,路由/解析不消费它(架构边界收窄论证见 sessions.go/bindings.go 文件头)。
 package agentcontrol
 
 import (
@@ -68,6 +70,10 @@ func ClientPrincipal(clientID string) Principal {
 //     表的锁互相阻塞);锁序 lease.mu→registry.mu→manager 内部锁单向(registry.mu
 //     各临界区与 manager 各路径绝不取 lease.mu,无环);ReleaseConnection 先在
 //     registry.mu 下快照再逐个锁 lease.mu,两锁不同时持有(反向无嵌套);
+//   - BindingRegistry 的 registry.mu(bindings.go,Plan A2)同为叶锁:只护映射
+//     读写、无 I/O 无回调,与 lease.mu 永不嵌套;绑定登记的调用方(handler 断言
+//     面/插件)在拿到「受影响的会话 id」后于锁外执行生命周期评估(manager/repo
+//     的锁不进入本包),锁序仍单向无环;
 //   - 跨层嵌套唯一一处:ACP handler 的 h.mu 临界区内调用 Acquire/ReleaseControl
 //     ——锁序 h.mu→session lease 单向(lease 是叶锁,绝不回调 handler、不取
 //     h.mu),Close 侧同向,无环(guard 换名 lease,DE2-I1 论证随方法整体迁入);
@@ -81,6 +87,10 @@ type Service struct {
 	leases *LeaseRegistry
 	// requests 是 (sessionID, requestID) 幂等注册表(§4.3):per-key single-flight。
 	requests *RequestRegistry
+	// bindings 是 per-connection 会话绑定登记(Plan A2 生命周期半边,bindings.go):
+	// 生命周期引用计数的唯一事实源,只服务计数与 A3 的 active 判定,路由/解析
+	// 不消费(架构边界收窄论证见 sessions.go SessionBinding 与 bindings.go 文件头)。
+	bindings *BindingRegistry
 	// router 是会话寻址窄接口(宿主注入):「当前会话优先 + 注册表权威」的统一
 	// 解析点由 plugin 提供(RouteSession),Service 不持有会话选择状态。
 	router SessionRouter
@@ -97,6 +107,7 @@ func NewService(sessions *runtimeagent.SessionManager, router SessionRouter, jou
 		sessions: sessions,
 		leases:   NewLeaseRegistry(),
 		requests: NewRequestRegistry(),
+		bindings: NewBindingRegistry(),
 		router:   router,
 		journals: journals,
 	}
@@ -122,10 +133,49 @@ func (s *Service) HoldControl(sessionID, clientID string) bool {
 }
 
 // ReleaseConnection 释放 clientID 持有的全部会话的 control lease(断连收口:
-// handler.Close 一次调用替代逐会话归还,「审批不悬死在已死连接上」)。连接不
-// 持有任何租约时幂等空操作。
-func (s *Service) ReleaseConnection(clientID string) {
+// handler.Close 一次调用替代逐会话归还,「审批不悬死在已死连接上」),并清除该
+// 连接的会话绑定登记(Plan A2:与 lease 同构的断连清账——连接退出即失去对绑定
+// 会话的引用)。返回被清除登记指向的会话 id(未登记返回空串),供调用方在锁外
+// 评估该会话的引用归零收口;连接不持有任何租约/绑定时幂等空操作。
+func (s *Service) ReleaseConnection(clientID string) string {
 	s.leases.ReleaseConnection(clientID)
+	return s.bindings.Unbind(clientID)
+}
+
+// BindSession 把 clientID 的会话绑定登记到 sessionID,返回改绑前的会话 id
+// (bindings.go Bind 语义:空 sessionID = 解除绑定;空 clientID 无操作)。登记
+// 只是记账——改绑/解绑导致的引用变化由调用方拿返回值评估收口(Plan A2 的
+// 「切换」触发点),本方法不执行任何生命周期动作。
+func (s *Service) BindSession(clientID, sessionID string) string {
+	return s.bindings.Bind(clientID, sessionID)
+}
+
+// UnbindSession 解除 clientID 的绑定登记(bindings.go Unbind),返回被解除的
+// 会话 id。/new 收口「摘发起方绑定」的登记侧调用点;生命周期评估由调用方以
+// 返回值驱动,本方法不执行任何收口动作。
+func (s *Service) UnbindSession(clientID string) string {
+	return s.bindings.Unbind(clientID)
+}
+
+// SessionBindings 返回当前绑定在 sessionID 上的全部连接 id(bindings.go
+// Bindings;升序拷贝)。生命周期归零判定「绑定集合空 && 无在飞 run」与 A3 的
+// state=active 判定都从这里取数——它是跨连接绑定的事实源。
+func (s *Service) SessionBindings(sessionID string) []string {
+	return s.bindings.Bindings(sessionID)
+}
+
+// WithControl 是受 lease 保护的操作提交入口的宿主面(LeaseRegistry.WithControl
+// 的 Service 透传;Plan A3 的归档 fencing 消费——run/cancel/审批的 fencing 编排
+// 都封装在 Service 的对应方法内,归档的动作面(MarkArchived)持在宿主(plugin),
+// 编排经本方法回到同一 lease 临界区):本会话 lease.mu 临界区内先校验 holder
+// 再执行 fn——校验通过后到 fn 返回之间不可能被接管,旧持有者绝不能在失权后
+// 落地归档。fn 必须是短提交操作(一次校验 + 一次文件突变,如 MarkArchived 的
+// append+fsync——与 manager.StartRun 同步段的 journal fsync 同款先例),绝不是
+// 整个 AgentRun;后台执行仍在锁外完成。仅宿主消费——协议层经
+// BoundSessionSource.ArchiveSession 的方法面触达,静态类型拿不到本方法,
+// 「不向协议层暴露任意长 callback 注入口」的边界(R3 纪律)不变。
+func (s *Service) WithControl(sessionID, clientID string, fn func() error) error {
+	return s.leases.WithControl(sessionID, clientID, fn)
 }
 
 // TrackedRequest 返回 (sessionID, requestID) 的已记账 RunHandle(幂等表按键直查

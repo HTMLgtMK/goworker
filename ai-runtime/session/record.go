@@ -18,6 +18,8 @@ const (
 	kindCheckpoint = "checkpoint"
 	kindCursor     = "cursor"
 	kindMetadata   = "metadata"
+	kindWorkspace  = "workspace" // Plan A1：cwd 兼任 workspace，last-wins 声明
+	kindArchived   = "archived"  // Plan A1：归档终态标记（只读保留、不可逆）
 )
 
 // msgFields 真实消息（含 compact 时的保留段副本）。
@@ -71,6 +73,19 @@ type metadataFields struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// workspaceFields 工作目录声明（Plan A1，cwd 兼任 workspace，定案需求 #4）。
+// last-wins：同 kind 重复追加时取最后一条，旧记录保留不改写（纯追加原则）。
+type workspaceFields struct {
+	Path      string    `json:"path,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// archivedFields 归档终态标记（Plan A1）。只记归档时间，不搬文件——
+// 归档 = 只读保留终态（定案需求 #1），可 load 重放、不可逆。
+type archivedFields struct {
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // Record 是 jsonl 记录的统一视图：kind 判别 + 对应类型的字段组。
 // 磁盘格式保持扁平单行，序列化/反序列化见 MarshalJSON/UnmarshalJSON。
 type Record struct {
@@ -82,6 +97,8 @@ type Record struct {
 	CK   *checkpointFields // kind == kindCheckpoint
 	Cur  *cursorFields     // kind == kindCursor
 	Meta *metadataFields   // kind == kindMetadata
+	Ws   *workspaceFields  // kind == kindWorkspace
+	Arc  *archivedFields   // kind == kindArchived
 }
 
 // NodeID 返回节点 id（msg/compact/checkpoint 有，head/cursor 无则空串）。
@@ -145,6 +162,14 @@ func (r Record) Created() time.Time {
 		if r.Meta != nil {
 			return r.Meta.CreatedAt
 		}
+	case kindWorkspace:
+		if r.Ws != nil {
+			return r.Ws.CreatedAt
+		}
+	case kindArchived:
+		if r.Arc != nil {
+			return r.Arc.CreatedAt
+		}
 	}
 	return time.Time{}
 }
@@ -153,8 +178,10 @@ func (r Record) Created() time.Time {
 // 跟旧聚合格式一致（追加文件兼容读旧数据，也便于人工比对）。
 //
 // 注意：新增字段需同步改 3 处——类型化 struct（msgFields 等）、下方 flat struct、
-// MarshalJSON 的 switch 填充。漏改任一处 = 字段静默丢失或输出漂移，
-// record_format_test.go 的字节级断言会兜底抓漏。
+// MarshalJSON 的 switch 填充；新增 record kind 则需同步 5 处——字段组 struct、
+// flat struct（如引入新字段名）、MarshalJSON 的 switch 填充、UnmarshalJSON 的
+// switch 分发、Created() 的 switch。漏改任一处 = 字段静默丢失、kind 读不回来
+// 或时间戳丢失，record_format_test.go 的字节级断言会兜底抓漏。
 func (r Record) MarshalJSON() ([]byte, error) {
 	type flat struct {
 		Kind        string                     `json:"kind"`
@@ -175,6 +202,7 @@ func (r Record) MarshalJSON() ([]byte, error) {
 		Preview     string                     `json:"preview,omitempty"`
 		MsgID       string                     `json:"msg_id,omitempty"`
 		SessionID   string                     `json:"session_id,omitempty"`
+		Path        string                     `json:"path,omitempty"`
 		CreatedAt   time.Time                  `json:"created_at"`
 	}
 
@@ -208,6 +236,13 @@ func (r Record) MarshalJSON() ([]byte, error) {
 		if r.Meta != nil {
 			f.SessionID = r.Meta.SessionID
 		}
+	case kindWorkspace:
+		if r.Ws != nil {
+			f.Path = r.Ws.Path
+		}
+	case kindArchived:
+		// archived 无附加字段：created_at 已在 flat 初始化时由 r.Created() 填充。
+		// case 保留为文档锚点，与本函数上方的同步纪律注释呼应。
 	}
 	return json.Marshal(f)
 }
@@ -260,6 +295,18 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		r.Meta = &f
+	case kindWorkspace:
+		var f workspaceFields
+		if err := json.Unmarshal(data, &f); err != nil {
+			return err
+		}
+		r.Ws = &f
+	case kindArchived:
+		var f archivedFields
+		if err := json.Unmarshal(data, &f); err != nil {
+			return err
+		}
+		r.Arc = &f
 	}
 	return nil
 }
@@ -303,6 +350,18 @@ func newCursorRecord(msgID string, created time.Time) Record {
 // newMetadataRecord constructs the immutable logical session identity record.
 func newMetadataRecord(sessionID string, created time.Time) Record {
 	return Record{Kind: kindMetadata, Meta: &metadataFields{SessionID: sessionID, CreatedAt: created}}
+}
+
+// newWorkspaceRecord 构造 workspace 声明记录（Plan A1：创建即声明 + 换绑
+// last-wins 追加，旧记录保留不改写）。
+func newWorkspaceRecord(path string, created time.Time) Record {
+	return Record{Kind: kindWorkspace, Ws: &workspaceFields{Path: path, CreatedAt: created}}
+}
+
+// newArchivedRecord 构造 archived 终态标记记录（Plan A1：归档 = 只读保留终态，
+// 只落时间戳，不搬文件）。
+func newArchivedRecord(created time.Time) Record {
+	return Record{Kind: kindArchived, Arc: &archivedFields{CreatedAt: created}}
 }
 
 // ── 记录与消息互转 ──────────────────────────────────────────────────────

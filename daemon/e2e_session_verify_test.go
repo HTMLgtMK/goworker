@@ -20,8 +20,9 @@ import (
 )
 
 // TestE2E_SessionPersistFullChain 端到端验证会话持久化完整链路：
-// /agent 两轮 → jsonl 落盘 + 自动 checkpoint → 重启恢复 → rewind → /new 归档。
-// mock LLM 返回固定回复，Memory 关闭以专注会话链路。
+// /agent 两轮 → jsonl 落盘 + 自动 checkpoint → 重启恢复 → rewind。
+// mock LLM 返回固定回复，Memory 关闭以专注会话链路。（/new 自动归档已随
+// Plan A 定案 #2/#9 移除：/new 纯新建，归档为显式命令、A3 提供。）
 func TestE2E_SessionPersistFullChain(t *testing.T) {
 	// mock LLM：返回固定 assistant 回复
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -113,18 +114,6 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 	}
 	if rewound := st2.ActiveView(); len(rewound) == 0 {
 		t.Fatal("rewind restored empty view")
-	}
-
-	// 6. /new 归档：archive/ 应有旧文件
-	if err := st2.Archive(); err != nil {
-		t.Fatalf("Archive: %v", err)
-	}
-	entries, err := os.ReadDir(filepath.Join(cfg.Session.Dir, "archive"))
-	if err != nil {
-		t.Fatalf("archive dir: %v", err)
-	}
-	if len(entries) == 0 {
-		t.Fatal("archive/ should have old session file")
 	}
 }
 

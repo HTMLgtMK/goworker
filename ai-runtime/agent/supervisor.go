@@ -101,7 +101,10 @@ func (h RunHandle) Wait(ctx context.Context) (RunResult, error) {
 // 拒绝语义:manager 已 Close → ErrManagerClosed;未知会话 → ErrSessionNotFound;
 // 全局排队满 → ErrTooManyPending(③ 预留先于 ② 的占用检查:排队面满即拒,不
 // 为注定拒绝的提交探测会话状态);同会话已有 Run(在跑或排队)→ ErrRunActive;
-// 会话未绑定 → ErrSessionNotBound;queued 接受记录持久化失败 → ErrRunJournalWrite
+// 会话未绑定 → ErrSessionNotBound;Runtime 实例已注销(manager.Get 命中后、
+// reserveRun 之前被生命周期收口 Retire)→ ErrSessionRetired(不同于
+// ErrSessionArchived:注销只终结内存实例,持久化会话可由 session/load 重开);
+// queued 接受记录持久化失败 → ErrRunJournalWrite
 // (I1 修复,包裹底层 journal 错误——「接受并持久化登记」是 run/start 返回的
 // 前提,写失败即拒绝启动,pending/active 记账无痕清退,绝不返回句柄);
 // 事件 hub 接线失败(EventJournal.SeqRange 播种 I/O 错误,I3 修复,包裹底层
@@ -135,31 +138,20 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	// ② 同会话互斥检查 + ④ 记账占位,合并为同一 rt.mu 临界区(C1 修复:原形态
 	// ② 读 active 后放锁、③ 预留后 ④ 再单独占位,是检查/占位 TOCTOU——并发
 	// StartRun 可双双通过检查,后占位者覆盖先占位者的 rt.active,CancelRun 经
-	// Active() 定位失败、「同会话至多一个 Run(含排队)」不变量被破坏)。锁内
-	// 只做判定与指针写:active 非 nil → 置冲突标志(ErrRunActive);会话未绑定
-	// → 同置标志(ErrSessionNotBound);否则占位 rt.active=run 并快照 sess——
-	// 检查通过与占位同临界区完成,无窗口。rt.mu 内禁止 channel 操作:冲突/未
-	// 绑定先置标志,解锁后归还 ③ 预留的令牌再返回;归还接收无阻塞(令牌计数
-	// 守恒:每笔预留恰一次归还——execute 各出口或本冲突路径,任一归还者执行
-	// 接收时其余接收者至多完成「预留总数-1」次,缓冲恒非空)。
+	// Active() 定位失败、「同会话至多一个 Run(含排队)」不变量被破坏)。reserveRun
+	// 同时持 admissionMu:与 Retire/Archive 共用线性化点——生命周期收口在
+	// manager.Get 与占位之间发生时,提交被 ErrSessionRetired 拒绝,不可能把 run
+	// 落到已关闭的 hub/store 上。锁内只做判定与指针写:active 非 nil → 置冲突
+	// 标志(ErrRunActive);会话未绑定 → 同置标志(ErrSessionNotBound);否则占位
+	// rt.active=run 并快照 sess——检查通过与占位同临界区完成,无窗口。rt.mu 内
+	// 禁止 channel 操作:冲突/未绑定先置标志,解锁后归还 ③ 预留的令牌再返回;
+	// 归还接收无阻塞(令牌计数守恒:每笔预留恰一次归还——execute 各出口或本
+	// 冲突路径,任一归还者执行接收时其余接收者至多完成「预留总数-1」次,缓冲
+	// 恒非空)。
 	run := newAgentRun(newRunID(), sessionID) // state 保持 RunQueued(不 transition,queued 状态由此启用),execute 内再推进 running
-	var (
-		sess   *Session
-		reject error // 冲突标志:锁内置非 nil,锁外归还令牌后以此返回
-	)
-	rt.mu.Lock()
-	switch {
-	case rt.active != nil: // 同会话第二 Run 不排队(总方案第四节「Session 在排队期间已经被占用,不能继续提交第二个 Run」)
-		reject = ErrRunActive
-	case rt.session == nil:
-		reject = ErrSessionNotBound
-	default:
-		rt.active = run
-		sess = rt.session
-	}
-	rt.mu.Unlock()
+	sess, reject := rt.reserveRun(run)
 	if reject != nil {
-		<-m.pending // ③ 预留的令牌原路归还(锁外——rt.mu 内不做 channel 操作)
+		<-m.pending // ③ 预留的令牌原路归还(锁外——runtime admission 已完成)
 		return RunHandle{}, reject
 	}
 
@@ -189,11 +181,7 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	// execute 未启动——零事件产出,无需回收。
 	hub, err := rt.bindEvents(sessionID, sess.deps.RunEvents)
 	if err != nil {
-		rt.mu.Lock()
-		if rt.active == run {
-			rt.active = nil
-		}
-		rt.mu.Unlock()
+		rt.releaseRunReservation(run)
 		<-m.pending // ③ 预留的令牌原路归还(锁外,同 ② 的拒绝路径)
 		return RunHandle{}, fmt.Errorf("agent: start run %s in session %s: %w", run.ID, sessionID, err)
 	}
@@ -223,11 +211,7 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 		State:     string(RunQueued),
 		At:        time.Now(),
 	}); err != nil {
-		rt.mu.Lock()
-		if rt.active == run {
-			rt.active = nil
-		}
-		rt.mu.Unlock()
+		rt.releaseRunReservation(run)
 		<-m.pending // ③ 预留的令牌原路归还(锁外,同 ②/⑥ 的拒绝路径)
 		return RunHandle{}, fmt.Errorf("agent: start run %s in session %s: %w: %w",
 			run.ID, sessionID, ErrRunJournalWrite, err)

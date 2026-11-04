@@ -15,6 +15,15 @@ import (
 // daemon/internal/core/service/acp/coordinator.go 的 SessionGate——
 // 容量 1 channel + select ctx.Done(),锁不可被卡死客户端攥住。
 
+// ErrSessionArchived prevents new runs after a session reaches its terminal state.
+var ErrSessionArchived = errors.New("session: runtime is archived")
+
+// ErrSessionRetired rejects runs on a runtime instance that has been removed from
+// the SessionManager. Archived is a persisted terminal state; retired only ends
+// this in-memory instance, so a later session/load may open a fresh runtime from
+// the same store.
+var ErrSessionRetired = errors.New("session: runtime retired")
+
 // SessionRuntime 持有一个会话的独占执行权,是 SessionManager 注册的最小单元。
 // session 允许后置绑定(P0-2 的 daemon 在 startSession 前就要有 gate),
 // 也可为 nil(纯 gate 场景)。
@@ -25,6 +34,13 @@ type SessionRuntime struct {
 	session *Session
 	gate    chan struct{}
 	active  *AgentRun
+	// admissionMu serializes run reservation with the archived transition.
+	admissionMu sync.Mutex
+	archived    bool
+	// retired marks this runtime instance as removed from the manager registry.
+	// It shares admissionMu with archived so a StartRun that already holds the
+	// pointer (but has not reserved yet) cannot execute against a closed hub/store.
+	retired bool
 	// cwd/cwdErr 是本 runtime 的会话工作目录声明(P1-4 状态绑定收口):cwd 为
 	// 最近一次有效声明的绝对路径(空 = 未声明,工具回退 cfg.AllowedWorkDir),
 	// cwdErr 为最近一次声明的校验错误(非 nil 即无效标记,且 cwd 恒空——宿主
@@ -39,6 +55,19 @@ type SessionRuntime struct {
 	// ——同步路径行为零变化(plan P3-4 边界,§6)。读写全部在 rt.mu 内,见
 	// bindEvents/eventHub 的并发论证。
 	events *EventHub
+	// onRunDone 是 run 终态通知回调(Plan A2 生命周期半边/A7 设计点 2):
+	// finalizeRun 清 active 后以 runtime id 触发,供宿主消费「有未完 run 时
+	// 延迟到 run 终态再关」所需的完成通知面——manager 的 active 记账此前只
+	// 记账、无回调(勘察结论),宿主侧引用计数收不到 run 收尾信号。
+	//
+	// 取舍(Plan A7②「选侵入最小的一种」):plugin 侧无可行的观察点——RunHandle.
+	// Wait 只有提交者在等,cb 回调面随提交方形态各異(xgw 全 nil),没有统一
+	// 收尾 choke point;而 finalizeRun 是 RecordRun(同步形态)与 StartRun/
+	// execute(后台形态)共享的唯一终态化路径,在此触发即覆盖全部 Run 形态。
+	// 写入点唯一(manager.Register 注入,先于任何 Run 提交的 happens-before
+	// 由 Register 的 m.mu 发布保证),读取在 rt.mu 内、触发在锁外(回调可能做
+	// 文件 I/O——宿主用它关 store,「锁内不做文件 I/O」纪律)。
+	onRunDone func(sessionID string)
 }
 
 // NewSessionRuntime 创建运行时。s 允许 nil,由 BindSession 后置绑定。
@@ -48,6 +77,95 @@ func NewSessionRuntime(id string, s *Session) *SessionRuntime {
 		session: s,
 		gate:    make(chan struct{}, 1),
 	}
+}
+
+// reserveRun atomically checks the admission state and records a queued run.
+func (r *SessionRuntime) reserveRun(run *AgentRun) (*Session, error) {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.archived {
+		return nil, ErrSessionArchived
+	}
+	if r.retired {
+		return nil, ErrSessionRetired
+	}
+	if r.active != nil {
+		return nil, ErrRunActive
+	}
+	if r.session == nil {
+		return nil, ErrSessionNotBound
+	}
+	r.active = run
+	return r.session, nil
+}
+
+// releaseRunReservation removes a run that failed before execution started.
+func (r *SessionRuntime) releaseRunReservation(run *AgentRun) {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+
+	r.mu.Lock()
+	if r.active == run {
+		r.active = nil
+	}
+	r.mu.Unlock()
+}
+
+// Retire closes this runtime instance to new runs. It shares admissionMu with
+// reserveRun, closing the window between the manager lookup and reservation: a
+// StartRun that already holds the pointer either reserves first (Retire sees it
+// as active and reports ErrRunActive) or observes ErrSessionRetired here.
+//
+// Retirement is irreversible and only flips admission state; the caller closes
+// the event hub and the persisted store afterwards. Return ErrRunActive means a
+// run is still in flight; callers using delayed reaping should keep their marker
+// and retry after the run-done notification.
+func (r *SessionRuntime) Retire() error {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.active != nil {
+		return ErrRunActive
+	}
+	r.retired = true
+	return nil
+}
+
+// Retired reports whether this instance has been removed from admission. A
+// retired runtime must never be registered again; a persisted session reopens
+// as a fresh instance instead.
+func (r *SessionRuntime) Retired() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.retired
+}
+
+// Archive transitions the runtime to read-only and rolls it back if commit fails.
+func (r *SessionRuntime) Archive(commit func() error) error {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+
+	r.mu.Lock()
+	if r.active != nil {
+		r.mu.Unlock()
+		return ErrRunActive
+	}
+	r.archived = true
+	r.mu.Unlock()
+
+	if commit == nil {
+		return nil
+	}
+	if err := commit(); err != nil {
+		r.archived = false
+		return err
+	}
+	return nil
 }
 
 // AcquireRun 获取本会话的独占执行权;ctx 取消(如连接断开)时立即失败返回,
@@ -173,6 +291,23 @@ func (r *SessionRuntime) Hub() *EventHub {
 	return r.eventHub()
 }
 
+// CloseEvents 收口本 runtime 的事件枢纽(closeEvents 的导出形,A7 设计点 3):
+// 宿主侧会话生命周期收口(引用归零注销,lifecycle.go tryReleaseSession)时调用
+// ——EndRun+Close 幂等,订阅通道全部关闭,daemon 侧的通知泵(pumpSessionEvents)
+// 经「通道关闭 → range 结束 → 自清」诚实退出,订阅不泄漏;hub 关闭后
+// Subscribe/Publish 一律 ErrHubClosed(可观测),重开路径(session/load →
+// mountRuntime)构造新 runtime 与新 hub,EnsureHub 经 journal.SeqRange 磁盘播种
+// 续接既有事件历史——Seq 不从零,重连客户端按 afterSeq 续放即可(事件 journal
+// 是持久事实,收口不删数据)。
+//
+// 调用时序约束:必须在「该 runtime 不可能有在飞 Publish」之后调用——宿主收口
+// 路径已保证(run 在飞时收口被挂起,终态通知触发时 finalizeRun 已过、execute
+// 的事件面已收口);manager.Close 内部的 closeEvents(P3-5)语义不变。events 为
+// nil(纯内存/未启用 RunEvents/从未 StartRun)时幂等空操作。
+func (r *SessionRuntime) CloseEvents() {
+	r.closeEvents()
+}
+
 // EnsureHub 惰性创建并返回本 runtime 的 EventHub(P5-6,遗留③「重启后 attach
 // 时 hub 未建」的解法):bindEvents 只在 StartRun 同步段触发(supervisor.go ⑥),
 // 重启后的 runtime 若从未 StartRun,events 恒 nil——attach 即建补上该缺口,
@@ -264,10 +399,12 @@ func journalRunState(s *Session, rec session.RunStateRecord) {
 }
 
 // finalizeRun 是 RecordRun(同步路径)与 StartRun/execute(P2-5 后台路径)共享
-// 的终态化路径:终态归一防御 → journal 终态记录(durable-first)→ run.finish
-// (关闭 done 唤醒等待者)→ 清 active(仅当仍为本 run,防御不覆盖后续记账)。
+// 的终态化路径:终态归一防御 → journal 终态记录(durable-first)→ 清 active
+// (仅当仍为本 run,防御不覆盖后续记账)→ run.finish(关闭 done 唤醒等待者)。
 // 返回归一后的结果供调用方继续使用(RecordRun 的返回值即它)。次序即不变量:
 // journal 落盘先于 done 关闭——等待者被唤醒时终态已持久(总方案第九节);
+// active 清空先于 done 关闭——等待者被唤醒后立刻提交的下一笔 Run 不会撞
+// ErrRunActive(同步 prompt 返回即下一次 prompt 的调用形态直接依赖此序);
 // journalRunState 在 rt.mu 外调用(P2-3:锁内不做文件 I/O)。
 //
 // 终态归一(P2-1 防御分支原样移自 RecordRun,主映射在 Session.Run,与 execute
@@ -306,12 +443,26 @@ func finalizeRun(r *SessionRuntime, run *AgentRun, res RunResult) RunResult {
 		At:        time.Now(),
 	})
 
-	run.finish(res)
 	r.mu.Lock()
 	if r.active == run { // 防御:不覆盖后续记账(当前 gate 独占下不会发生)
 		r.active = nil
 	}
+	hook := r.onRunDone
 	r.mu.Unlock()
+	// 先清 active 再关 done:等待者被唤醒的瞬间,本会话已可提交下一笔 Run。
+	// 反序会给「prompt 返回 → 立即下一次 prompt」的同步调用形态留一个
+	// ErrRunActive 窗口(fast provider + race detector 下已实测命中)。
+	run.finish(res)
+	// 终态通知(A2/A7②):active 已清 ⇒ 该 run 不再占用会话执行权,宿主的
+	// 生命周期引用计数可在此刻重新评估「绑定集合空 && 无在飞 run」的延迟
+	// 收口。锁外触发:回调可能关 store(文件 I/O)且可能反查 manager(取注册
+	// 表状态),绝不在 rt.mu 内调用——此刻 r.active 已清、run.done 已关,manager
+	// Close 的等待者已放行,回调耗时不再阻塞任何等待面。回调自身必须不阻塞、
+	// 不重入本 runtime 的 gate(宿主侧约定;误重入会与 execute 的 defer 释放
+	// 竞争,由 AcquireRun 的容量 1 语义自然排队,不死锁)。
+	if hook != nil {
+		hook(r.ID)
+	}
 	return res
 }
 

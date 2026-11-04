@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,9 +88,9 @@ type AgentPlugin struct {
 	mu          sync.Mutex
 	allowRuleMu sync.Mutex
 	// activeTransportSession 是最近一次有效声明的 transport 会话 id(连接方自造
-	// 的 UUID,与 store 的稳定 id 不同源)。空 = 尚无 ACP 会话声明。单活动会话
-	// 模式下它是「谁拥有 daemon 当前活动状态」的记号:FrontendHandler.Prompt 据此
-	// 拒绝已被其他连接顶掉的旧会话,而不是让 prompt 静默串到新声明的工作区里跑。
+	// 的 UUID,与 store 的稳定 id 不同源)。空 = 尚无 ACP 会话声明。A2b2 起它是
+	// 零生产调用方的兼容残留(ActiveSessionID 注释):原消费方 Prompt 的全局
+	// 回落守卫已删除,写入点只剩 SetSession(接口兑现面),字段随接口保留。
 	activeTransportSession string
 
 	// control 是应用内唯一的 Application Control Plane(总方案 §4.2,PR1 建立):
@@ -109,6 +110,23 @@ type AgentPlugin struct {
 	// Eval 不登记，由 manager.Close 的 Run 等待面覆盖。
 	// 零值可用。
 	inFlight inFlightTracker
+
+	// suspendMu/suspendedReaps 是「引用归零但 run 在飞」的挂起收口台账(Plan A2
+	// 生命周期半边,lifecycle.go):归零判定发现 run 在飞时挂起,run 终态通知
+	// (manager.WithRunDoneHook → onSessionRunDone)重判。台账只记挂起中的会话,
+	// 是钩子的消费闸门——无它则每次 run 收尾都会误判零绑定的 current 会话。
+	// 零值可用(测试直构插件)。
+	// lifecycleMu serializes binding changes, delayed reaping, and run completion handling.
+	lifecycleMu    sync.Mutex
+	suspendMu      sync.Mutex
+	suspendedReaps map[string]struct{}
+
+	// bgFinalizers 是插件派生的后台收尾计数(A2b2:/new 的 CheckpointSync 挪出
+	// 全局临界区,commands.go):固化 goroutine spawn 前登记、退出时摘除,Stop 在
+	// memory 收尾前 Wait——固化是 memory.Client 的使用方,必须先于其 Close 完成,
+	// 绝不因停机丢固化。不放进 inFlightTracker 的论证见 commands.go 的异步化
+	// 注释(closeAdmission 拒绝语义 vs 后台收尾的语义差异)。零值可用。
+	bgFinalizers sync.WaitGroup
 }
 
 // NewPlugin 构造 agent 插件。cfg 为 ai-runtime 运行配置，paths 为宿主注入的目录路径。
@@ -134,6 +152,11 @@ func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *AgentPlugi
 	p.manager = runtimeagent.NewSessionManager(
 		runtimeagent.WithRunLimits(cfg.Session.MaxConcurrentRuns, cfg.Session.MaxPendingRuns),
 		runtimeagent.WithRunContext(runtimeagent.RunContextValue{Key: sessionGateKey{}, Value: p}),
+		// Plan A2 生命周期半边(A7 设计点 2):run 终态通知面——「有未完 run 时
+		// 延迟到 run 终态再关」的挂起收口由它唤醒(lifecycle.go onSessionRunDone
+		// 只对挂起台账中的会话重判,普通 run 收尾零开销)。闭包捕获 p:此刻 p 已
+		// 构造完成,回调只在 run 终态后才执行,无初始化次序问题。
+		runtimeagent.WithRunDoneHook(p.onSessionRunDone),
 	)
 	// PR1(总方案 §4.2):装配应用内唯一的 Application Control Plane——plugin 与
 	// ACP 共享同一实例(两套 Lease/Request Registry 是明确禁止的形态)。router/
@@ -258,8 +281,7 @@ func (p *AgentPlugin) sessionCWDErrorIn(ctx context.Context) error {
 // store 的 SessionID（startSession ④），repo.Open 按 id 命中实例唯一缓存，返回的
 // 正是 startSession 打开/创建的那个 *Store——取数与互斥同源于 current 解析，不再
 // 单独持有 store 指针（旧 atomic.Pointer[session.Store] 字段随 P1-3 退役，/new
-// 换轨只剩 current 一个切换点）。legacy 槽被 Archive 轮转后 store 的 metadata id
-// 会更换，但缓存键仍是挂载时的 id，解析不受影响。nil = 持久化禁用/无活动会话，
+// 换轨只剩 current 一个切换点）。nil = 持久化禁用/无活动会话，
 // 调用方按旧文案降级（/rewind 提示未启用、清单返回空、/new 兜底全量快照）。
 func (p *AgentPlugin) currentStore() *session.Store {
 	return p.storeFor(p.currentSession())
@@ -267,17 +289,28 @@ func (p *AgentPlugin) currentStore() *session.Store {
 
 // storeFor 是按 runtime 解析其会话 store 的统一底座(currentStore/currentStoreIn
 // 共用,PR2 从 currentStore 提取):解析链与 currentStore 注释同源——rt.ID 即
-// 会话边界绑定的 store id,repo.Open 命中实例唯一缓存;未命中即纯内存降级或仓库
+// 会话边界绑定的 store id,取数走 repo.Peek 纯缓存读;未命中即纯内存降级或仓库
 // 已收尾,按无持久化处理。rt 为 nil 直接返回 nil。
+//
+// Plan A4 加固（storeFor 复活问题,A3 审查发现）：取数原为 repo.Open(rt.ID)——
+// Open 在缓存未命中时会**重建实例并持 flock**（慢路径锁空闲即成功）。宿主 Stop
+// （repo.Close 清空缓存并关实例）后,stale runtime 引用（current 指针、manager
+// 残留条目——A3 的 StartRun 执法经 manager.Get 命中过一次）再取数就复活了实例:
+// 文件句柄与 flock 泄漏到进程退出（e2e 句柄释放断言抓到,双向二分确认）。
+// 改 Peek 后取数是纯缓存读:「注册表命中 ⇒ 缓存命中」由两条注册链的先缓存后
+// 注册次序保证（openSessionStore → Register、mountRuntime 的 repo.Open →
+// Register）,未命中即 stale 引用,绝不复活。其余 repo.Open 直呼面（SessionArchived
+// 探测、ArchivedSessionHistory 的 repo 分支、ArchiveSession 的不在册分支）都在
+// ACP 管理路径上,Stop 后不可达,不在本次加固范围。
 func (p *AgentPlugin) storeFor(rt *runtimeagent.SessionRuntime) *session.Store {
 	if rt == nil || p.repo == nil {
 		return nil
 	}
-	st, err := p.repo.Open(rt.ID)
-	if err != nil {
-		// 正常路径是缓存命中（runtime id 即 store id）；未命中即纯内存降级
-		// （runtime id 非 store id）或仓库已收尾，按无持久化处理，与旧版
-		// store=nil 一致。
+	st, ok := p.repo.Peek(rt.ID)
+	if !ok {
+		// 缓存未命中：纯内存降级（runtime id 非 store id，A2b1 前的旧形态）、
+		// 仓库已收尾（Stop 后的 stale 引用）。按无持久化处理，与旧版 store=nil
+		// 一致——绝不走 Open 慢路径复活实例。
 		return nil
 	}
 	return st
@@ -408,6 +441,11 @@ func (p *AgentPlugin) Start() error { return nil }
 //	    收口事件枢纽；
 //	  ③ 等待已登记的维护请求：inFlight.wait，覆盖仍在 Session Gate 前排队的
 //	    /new /compact 等非 AgentRun 执行面；
+//	  ③.5 等待后台固化收尾（A2b2）：bgFinalizers.wait——/new 的 CheckpointSync
+//	    已挪出命令回合异步执行（commands.go），spawn 即登记、完成即摘除；
+//	    固化是 memory.Client 的使用方，必须先于 memory.Close 完成（绝不因停机
+//	    丢固化）。等待放在 manager.Close 之后：固化不依赖执行平面；不与 inFlight
+//	    合并的语义差异见 commands.go 异步化注释；
 //	  ④ 收口：MCP 进程、memory、当前 store 与 repo 缓存逐层关闭。
 //
 //	Forced（P6 设计声明，未实现）：
@@ -435,6 +473,10 @@ func (p *AgentPlugin) Stop() error {
 	p.inFlight.wait()
 	// MCP server 是外部进程，退出时统一回收，避免残留孤儿进程
 	p.closeMCP()
+	// A2b2：等待 /new 派生的后台固化完成（③.5）——固化 goroutine 是
+	// memory.Client 的最后使用方之一，先于下方 memory.Close 收敛；固化不触
+	// store/MCP，放在 closeMCP 之后仅是次序习惯（MCP 先收、固化后等，互不依赖）。
+	p.bgFinalizers.Wait()
 	if p.memory != nil {
 		// 进程退出 = 会话结束，把当前 conversation 固化进任务档案，供下次会话恢复。
 		// 同步等一次 LLM（带超时），否则后台 goroutine 会被进程退出杀掉，固化直接丢。
@@ -454,8 +496,11 @@ func (p *AgentPlugin) Stop() error {
 		}
 	}
 	// store 生命周期收尾（P1-3）：consolidate 后关闭当前会话 store 与仓库缓存的
-	// 全部实例——/new 换轨后旧 store 实例滞留在 repo.open 缓存（实例唯一不变量
-	// 要求其存活），统一在此回收。两级都幂等：currentStore 与 repo 缓存常为同一
+	// 全部实例。Plan A2 起 /new 的旧会话经引用归零判定即时收口（tryReleaseSession
+	// → repo.CloseSession 已逐出缓存），挂起收口的会话在 manager.Close 的取消
+	// 驱动下由 run 终态通知在此期间收敛（hook 内 CloseSession 与本步 repo.Close
+	// 并发安全：Store.Close 幂等、CloseSession 对已不在缓存的 id 为 no-op），
+	// 这里统一回收残余实例。两级都幂等：currentStore 与 repo 缓存常为同一
 	// 实例，Store.Close 对已关闭/未持锁 store 为 no-op（store.go Close 对 nil file
 	// 安全）；repo/current 为 nil（纯内存、Init 未完成或失败回滚）时整体跳过。
 	if st := p.currentStore(); st != nil {
@@ -554,14 +599,29 @@ func (p *AgentPlugin) startSession() {
 			slog.Warn("session: repository open failed, persistence disabled", "err", err)
 		} else {
 			p.repo = repo
+			// Plan A4 一次性布局迁移（定案 #6/#9）：OpenRepository 之后、② 的
+			// 首个 store 打开之前——无写者前提在此成立（本进程缓存为空、无
+			// flock 持有、无在途追加；跨进程面见 migrate.go 文件头论证），且
+			// 「仅首周期执行」给出进程内单飞（startSession 的后续边界是 /new，
+			// 那时 repo 已非 nil，本块不再进入）。失败逐条 warn 不阻断启动
+			// （定案 #9）；摘要日志输出迁移/丢弃条数。
+			if stats, merr := session.MigrateLegacyLayout(p.cfg.Session.Dir); merr != nil {
+				slog.Warn("session: legacy layout migration failed", "dir", p.cfg.Session.Dir, "err", merr)
+			} else if stats != (session.LayoutMigration{}) {
+				slog.Info("session: legacy layout migration done",
+					"legacy_slots", stats.Legacy,
+					"archived_files", stats.Archived,
+					"aligned", stats.Aligned,
+					"shells_removed", stats.Shells,
+					"dropped", stats.Dropped)
+			}
 		}
 	}
 
 	// ② 解析本会话边界的 store：首个边界（Init，current 尚为 nil）对已有 legacy
 	// 槽原地挂载，维持旧版「打开 <dir>/current.jsonl」的启动行为（用户数据不动）；
 	// /new 驱动的边界一律 Create 独立目录新会话（新会话一律进 <root>/<id>/，
-	// repository 决策 2）——若仍挂载刚被 Archive 轮转出的空槽，repo.Open 会经同
-	// 目录别名规则复用旧实例，「新」会话拿不到独立目录。打开/创建失败降级纯内存。
+	// repository 决策 2）。打开/创建失败降级纯内存。
 	var st *session.Store
 	if p.repo != nil {
 		st = p.openSessionStore(p.currentSession() == nil)
@@ -654,12 +714,31 @@ func (p *AgentPlugin) startSession() {
 	// 会话与 store 会话的对应关系」，单活动会话模型下一律落当前会话。
 	// activeTransportSession 有意不清：/new 只是 REPL 内换掉运行时会话对象，
 	// transport 会话的声明（连同其活动身份）依旧成立，prompt 它不算 superseded。
+	//
+	// Plan A4（定案 #5）的空 cwd 分支注入在这里同样成立：无有效声明可迁（Init
+	// 首边界 / 旧会话未声明）→ 注入本会话自己的缺省执行域——「无声明会话的
+	// 执行域 = tmp 每会话目录」与入口无关，CLI 面不注入则定案 #5 对 CLI 落空。
+	// 携带值本身是注入域的（旧会话未显式声明、上一边界注入过）**不跨边界携带**：
+	// 注入域路径含旧会话 id（tmpWorkspaceDir 的 <sessionID>/ 层），携带会让新
+	// 会话执行在旧会话的域里，破坏每会话隔离——按 tmpWorkspaceRoot 前缀识别后
+	// 对新会话重新注入（用户显式声明 tmp 域内路径的病态场景按同样处理，语义
+	// 等价）。注入失败保持未声明（回退链与 A4 前一致），warn 留痕。
 	var carriedCwd string
 	if old := p.currentSession(); old != nil { // Init 首边界无旧 runtime,即无声明可迁
 		if cwd, err := old.DeclaredCWD(); err == nil {
 			carriedCwd = cwd
-			rt.DeclareCWD(cwd, nil)
 		}
+	}
+	switch {
+	case carriedCwd == "" || isTmpWorkspacePath(carriedCwd):
+		if tmp, err := p.injectTmpWorkspace(id); err == nil {
+			carriedCwd = tmp
+			rt.DeclareCWD(tmp, nil)
+		} else {
+			slog.Warn("agent: inject default workspace failed", "session", id, "err", err)
+		}
+	default:
+		rt.DeclareCWD(carriedCwd, nil)
 	}
 	if err := p.manager.Register(rt); err != nil {
 		slog.Debug("session: keep previous runtime registered", "id", rt.ID, "err", err)
@@ -671,13 +750,15 @@ func (p *AgentPlugin) startSession() {
 
 // openSessionStore 在仓库里解析本会话边界的 store（P1-3 startSession ②）。
 // firstCycle 标记进程首个会话边界（Init，此刻 currentSession() 仍为 nil）：
-//   - firstCycle 且 root 下已有 legacy 槽（current.jsonl）→ 原地挂载：id 经只读
-//     OpenArchiveView 读出（解析链与 repo.Open 的 legacy 分支同源——metadata 记录
-//     优先、缺失时按首节点/内容摘要合成 legacy id），不触碰写句柄；repo.Open
-//     命中后进实例唯一缓存。旧版启动行为（打开 <dir>/current.jsonl 并恢复对话）
-//     由此保持，现有用户数据不移动（总方案 P1 硬性要求）。
-//   - 其余（无 legacy 槽的首次启动、全部 /new 边界）→ Create 独立目录新会话
-//     （<root>/<id>/，目录名 == 文件内 SessionID）。
+//   - firstCycle 且 root 下已有 legacy 槽（current.jsonl）→ 原地挂载（Plan A4 起
+//     是**迁移失败/未迁移根的兜底分支**：正常启动链上 ① 的一次性迁移已把槽迁入
+//     per-id 目录，本分支不再命中；保留它让迁移被外部打断（root 不可写等）的
+//     部署仍能按旧形态启动，数据不丢）。id 经只读 OpenArchiveView 读出（解析链
+//     与 repo.Open 的 legacy 分支同源——metadata 记录优先、缺失时按首节点/内容
+//     摘要合成 legacy id），不触碰写句柄；repo.Open 命中后进实例唯一缓存。
+//   - 其余（迁移后的首次启动、无 legacy 槽的首次启动、全部 /new 边界）→ Create
+//     独立目录新会话（<root>/<id>/，目录名 == 文件内 SessionID）——迁移后的
+//     旧会话经 session/list + session/load 显式回到（A2 模型：会话选择显式）。
 //
 // 失败返回 nil（调用方降级纯内存，不阻塞会话创建）。
 func (p *AgentPlugin) openSessionStore(firstCycle bool) *session.Store {
@@ -708,11 +789,29 @@ func (p *AgentPlugin) openSessionStore(firstCycle bool) *session.Store {
 // SetSession 记录 ACP 提交方声明的会话工作目录并应用到当前会话（单活动会话模型：
 // transport sessionID 与 store 的 head id 不同源，cwd 一律落当前活动会话）。
 //
+// **Plan A2b2 起本方法是零生产调用方的接口兑现残留面**（A2b1 把 ACP 声明切换到
+// BoundSessionSource、A2b2 删除 Prompt 守卫的全局回落分支——原「唯一消费面」
+// 已清零）：全仓库生产代码对 AgentPlugin.SetSession 的调用为零（grep 钉死；
+// handler 的 session/new|load 走 boundsession.go，CLI/stdin 从不调用）。保留它
+// 的理由：(a) model.SessionSource 是接口方法——dispatcher 链路的 acpIngress/
+// acpWorker 各有同名实现消费于 orchestrator 派发（与本插件无关），删本实现即
+// 破坏接口；(b) 承载 cwd 校验语义的既有测试面（sessions_test/cwd_migration_test
+// 的 P1-4 边界用例）。A4 反转空 cwd 语义（注入 tmp）时本方法与 declareSessionCWD
+// 一并重审（plan A2 实施注意点 3）；届时若测试面也迁移完毕，本方法按接口演进
+// 评估删除。
+//
 // sandbox 边界在插件侧校验：cfg.Sandbox.AllowedWorkDir 非空时，声明的 cwd 必须
 // 落在它之下（Abs + EvalSymlinks 解析后判断前缀，符号链接与相对路径钉到真实
 // 位置）；非法声明存为无效标记（P1-4 起落 current runtime 的 cwdErr，cwd 随之
 // 清空），session/prompt 时返回明确错误，不让越界目录静默生效。AllowedWorkDir
-// 为空 = 不限制，接受任意 cwd；cwd 为空 = 未声明，清空会话目录回退现行为。
+// 为空 = 不限制，接受任意 cwd。
+//
+// Plan A4（定案 #5，plan A2 实施注意点 3 的语义反转）：cwd 为空 = 未声明 →
+// **注入缺省执行域**（tmpWorkspaceDir，MkdirAll 0700，重启即失是有意语义），
+// 不再「清空回退现行为」——无声明会话的工具执行域从此有确定答案（tmp 每会话
+// 目录），而不是回退 cfg.AllowedWorkDir 或进程 cwd。注入的是执行域不是声明：
+// 不写 workspace 记录（记录仍只落用户显式声明，A7 设计点 5）。空 cwd 仍是
+// 「有效声明」：active 标记照常转移（ActiveSessionID 语义不变）。
 func (p *AgentPlugin) SetSession(sessionID, cwd string) {
 	cwd = strings.TrimSpace(cwd)
 	if cwd != "" {
@@ -724,6 +823,23 @@ func (p *AgentPlugin) SetSession(sessionID, cwd string) {
 	// cwdErr），会话本体绑定其上——分开解析可能在 /new 换轨瞬间把声明与应用
 	// 劈到两个 runtime。
 	rt := p.currentSession()
+	if cwd == "" {
+		// A4 空 cwd 分支：注入缺省执行域（与 declareSessionCWD 同源，见其注释）。
+		p.mu.Lock()
+		p.activeTransportSession = sessionID
+		p.mu.Unlock()
+		if rt == nil {
+			return
+		}
+		tmp, err := p.injectTmpWorkspace(rt.ID)
+		if err != nil {
+			rt.DeclareCWD("", err)
+			slog.Warn("agent: inject default workspace failed", "session", rt.ID, "err", err)
+			return
+		}
+		p.applySessionCWD(rt, tmp, false)
+		return
+	}
 	if err := p.validateSessionCWD(cwd); err != nil {
 		// 无效标记落 current runtime（cwd 清空 + err 记账）。无 runtime（Init 未
 		// 跑完/失败回滚）时无处落声明，直接丢弃——该窗口内 prompt 本就被
@@ -735,10 +851,10 @@ func (p *AgentPlugin) SetSession(sessionID, cwd string) {
 		return
 	}
 	p.mu.Lock()
-	// 有效声明（含空 cwd 的「未声明」重置）才转移活动会话标记。取舍：无效声明
-	// 不能顶掉别连接的好会话——B 连接的坏 session/new 若同时转移 active，A 的
-	// 好会话会被顶成 superseded 而无法 prompt；保持不动则与 prompt 侧的 cwdErr
-	// 防线一致（B 的 prompt 本来就会被拒）。
+	// 有效声明才转移活动会话标记。取舍：无效声明不能顶掉别连接的好会话——B
+	// 连接的坏 session/new 若同时转移 active，A 的好会话会被顶成 superseded 而
+	// 无法 prompt；保持不动则与 prompt 侧的 cwdErr 防线一致（B 的 prompt 本来
+	// 就会被拒）。
 	p.activeTransportSession = sessionID
 	p.mu.Unlock()
 	// 无活动 runtime（Init 未跑完/失败回滚）时声明无处落、会话不存在，无事可做：
@@ -746,16 +862,20 @@ func (p *AgentPlugin) SetSession(sessionID, cwd string) {
 	if rt == nil {
 		return
 	}
-	rt.DeclareCWD(cwd, nil)
-	if s := rt.Session(); s != nil {
-		s.SetCWD(cwd)
-	}
+	p.applySessionCWD(rt, cwd, true)
 }
 
 // ActiveSessionID 实现 model.SessionSource 的 transport 活动会话语义：返回最近
 // 一次经 session/new|load 有效声明的 transport 会话 id（锁内快照，空 = 未声明）。
 // 注意与 CurrentSessionID 的区别：那边是 store 的稳定逻辑 id，这边是连接方
-// 自造的会话句柄；FrontendHandler.Prompt 用它做 superseded 守卫。
+// 自造的会话句柄。
+//
+// **A2b2 起零生产调用方的接口兑现残留面**：唯一消费方是 Prompt superseded 守卫
+// 的「空则回落全局 ActiveSessionID」分支，该分支已随全局门禁一并删除（plan A2
+// 「superseded 守卫删除空则回落全局 ActiveSessionID 分支」——多 session 下它是
+// 跨连接单值，回落会被别的连接的声明误拒；连接级 h.active 是唯一守卫事实源）。
+// 写入点只剩 SetSession 的兼容调用（测试面）。保留：接口方法（dispatcher 同款
+// 兑现）；A3 清单重写/接口演进时一并评估删除。
 func (p *AgentPlugin) ActiveSessionID() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -764,6 +884,12 @@ func (p *AgentPlugin) ActiveSessionID() string {
 
 // validateSessionCWD 校验声明的 cwd 是否落在 sandbox 边界内。
 // allowed 为空 = 不限制；cwd 为空 = 未声明，均直接放行。
+//
+// Plan A4（定案 #5）：缺省执行域根（tmpWorkspaceRoot）是**第二 allowed root**
+// ——空 cwd 注入的 tmp 目录必须能通过本校验，否则「缺省执行域」在配置了
+// AllowedWorkDir 的部署上恒为无效标记、prompt 全被挡，A4 的语义落空。前缀
+// 比较与主边界同款（Abs + EvalSymlinks 钉到真实位置再比，符号链接与 macOS
+// 的 /var → /private/var 一致解析）。
 func (p *AgentPlugin) validateSessionCWD(cwd string) error {
 	allowed := ""
 	if p.cfg != nil {
@@ -776,18 +902,81 @@ func (p *AgentPlugin) validateSessionCWD(cwd string) error {
 	if err != nil {
 		return fmt.Errorf("invalid session cwd %q: %w", cwd, err)
 	}
-	absAllowed, err := filepath.Abs(allowed)
+	// 主边界：解析失败按既有契约报错（boundary 不可读是配置面故障，诚实上抛）。
+	ok, err := cwdUnderRoot(resolvedCwd, allowed)
 	if err != nil {
 		return fmt.Errorf("invalid session cwd %q: sandbox boundary %q: %w", cwd, allowed, err)
 	}
-	resolvedAllowed, err := filepath.EvalSymlinks(absAllowed)
+	if ok {
+		return nil
+	}
+	// 第二边界（tmp 执行域根，Plan A4）：best-effort——根目录尚未创建（进程内
+	// 还没有任何注入）视为不命中、继续走主边界的拒绝路径，绝不让它改变既有
+	// 的「outside sandbox boundary」错误形态（它不是用户配置的边界，缺席是
+	// 正常态而非故障）。
+	if under, err := cwdUnderRoot(resolvedCwd, tmpWorkspaceRoot()); err == nil && under {
+		return nil
+	}
+	return fmt.Errorf("invalid session cwd %q: outside sandbox boundary %q", cwd, allowed)
+}
+
+// cwdUnderRoot 报告已解析的 cwd 是否落在 root（解析后）之下——EvalSymlinks 前缀
+// 比较的公共实现（validateSessionCWD 的两个边界共用，防两份实现漂移）。
+func cwdUnderRoot(resolvedCwd, root string) (bool, error) {
+	absRoot, err := filepath.Abs(root)
 	if err != nil {
-		return fmt.Errorf("invalid session cwd %q: sandbox boundary %q: %w", cwd, allowed, err)
+		return false, err
 	}
-	if resolvedCwd != resolvedAllowed && !strings.HasPrefix(resolvedCwd, resolvedAllowed+string(os.PathSeparator)) {
-		return fmt.Errorf("invalid session cwd %q: outside sandbox boundary %q", cwd, allowed)
+	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return false, err
 	}
-	return nil
+	return resolvedCwd == resolvedRoot || strings.HasPrefix(resolvedCwd, resolvedRoot+string(os.PathSeparator)), nil
+}
+
+// tmpWorkspaceRoot 返回缺省执行域根（Plan A4/定案 #5）：<系统 tmp>/goworker-workspaces/<uid>。
+// uid 层沿用 defaultLogPath（app/config.go）的多用户隔离先例——系统 tmp 对全体
+// 用户可写，0700 每层收紧；会话目录是其下 <sessionID>/ 一层（tmpWorkspaceDir）。
+//
+// 派生点取舍（任务书「勘察 config.go 后定」）：根是**环境派生**（os.TempDir +
+// uid）而非用户配置——没有可配置的自由度，落 config 字段只会增加装配链穿透
+// （app/config → runtimeconfig → plugin）而无表达力；且唯一消费方是本插件
+// （declareSessionCWD/SetSession/startSession 的注入点 + validateSessionCWD 的
+// 第二边界），私有 helper 同源消费避免多份派生漂移。isTmpWorkspacePath 用同源
+// 前缀判定「该 cwd 是注入域」，/new 边界的携带决策（tmp 域随会话走，不跨
+// 会话携带——路径含旧会话 id）据此判。
+func tmpWorkspaceRoot() string {
+	root := filepath.Join(os.TempDir(), "goworker-workspaces")
+	if uid := os.Getuid(); uid >= 0 {
+		root = filepath.Join(root, strconv.Itoa(uid))
+	}
+	return root
+}
+
+// isTmpWorkspacePath 报告 cwd 是否为缺省执行域命名空间内的路径（同源前缀比较，
+// 不做 symlink 解析——两侧都出自 tmpWorkspaceDir 的同一原始派生，比较口径
+// 一致；沙箱校验那侧的 symlink 解析见 validateSessionCWD）。
+func isTmpWorkspacePath(cwd string) bool {
+	root := tmpWorkspaceRoot()
+	return cwd == root || strings.HasPrefix(cwd, root+string(os.PathSeparator))
+}
+
+// tmpWorkspaceDir 返回会话的缺省执行域目录：<根>/<sessionID>/。
+func tmpWorkspaceDir(sessionID string) string {
+	return filepath.Join(tmpWorkspaceRoot(), sessionID)
+}
+
+// injectTmpWorkspace 为会话创建缺省执行域（MkdirAll 0700）并返回其绝对路径。
+// 注入的是**执行域**而非声明：不写 workspace 记录（记录仍只落用户显式声明，
+// A7 设计点 5 的「清单 cwd / load 恢复以用户声明为唯一持久事实」语义不变），
+// 重启即失是有意语义（系统 tmp，避免遗留垃圾——定案 #5 已拍板）。失败上抛，
+// 调用方落 cwdErr 无效标记（prompt 诚实报错，不让静默回退到进程 cwd）。
+func (p *AgentPlugin) injectTmpWorkspace(sessionID string) (string, error) {
+	dir := tmpWorkspaceDir(sessionID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("agent: create default workspace %s: %w", dir, err)
+	}
+	return dir, nil
 }
 
 // sessionCWDError 返回当前会话 runtime 最近一次 cwd 声明的校验错误（无活动

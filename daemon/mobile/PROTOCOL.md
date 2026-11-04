@@ -30,21 +30,56 @@ ZCode dispatcher 共享同一套协议语义（`ai-dispatch/protocol`），区�
 | 方法 | 说明 |
 |---|---|
 | `initialize` | 能力协商，首条必发；params 带 `clientCapabilities`（见下节），响应含 `agentCapabilities`（loadSession 等） |
-| `session/new` | 建会话，params `{cwd, mcpServers}`；响应 `{sessionId, modes?}` |
-| `session/load` | 回放历史会话（checkpoint 锚定，update 先于响应到达）；仅当 agentCapabilities 声明 `loadSession` 时可用 |
-| `session/list` | 会话清单（当前 + 归档，`isCurrent` 显式区分） |
+| `session/new` | **真新建**会话，params `{cwd, mcpServers}`；响应 `{sessionId, modes?}`。新会话只是发起连接的路由目标，不影响其他连接 |
+| `session/load` | 回放历史会话（checkpoint 锚定，update 先于响应到达）；对已归档（archived）会话是**只读重放**，不产生可 prompt 的会话；仅当 agentCapabilities 声明 `loadSession` 时可用 |
+| `session/list` | 会话清单（全仓并集扫描，`updatedAt` 降序，条目含三态 `state`，见下） |
 | `session/prompt` | 提交一轮对话，阻塞到回合结束返回 stop reason |
 | `session/cancel` | **通知**（无响应）：取消进行中的 prompt —— Android 停止按钮发这个 |
 | `session/set_mode` | 未注册（method-not-found 诚实失败） |
 
-**单活动会话**：daemon 同一时刻只有一个活动会话。连接 B 发 `session/new`（或对
-当前会话 `session/load`）会把连接 A 的会话顶成 superseded，此后 A 再发
-`session/prompt` 返回 -32000 错误（消息含 "no longer active"）——prompt 不会静默
-串到 B 的工作区里执行。客户端收到该错误后应重新 `session/new` 或 `session/load`
-当前会话。反方向同理：prompt 在飞期间，B 的 `session/new` 与对当前会话的
-`session/load` 返回 -32000 "session busy"（归档 load 只读不受限），等 prompt 结束
-或取消后重试即可；各连接的 prompt 在 daemon 侧串行执行，连接断开时排队中的
-prompt 以错误退出。
+**会话三态（session/list 条目的 `state` 字段，Plan A3）**：
+
+- `active` = 事实活跃：有连接绑定（attach control / session/new|load 声明）或
+  run 在飞（后台 Run 未到终态）。字段 omitempty 兼容旧客户端（不识别的实现按
+  无字段组收下）。
+- `idle` = 无引用无在飞（收口前后过渡态）。
+- `archived` = 显式归档终态（见 x-goworker/session/archive），只读保留。
+- `cwd`：会话最近一次声明的执行目录——active 会话以运行时声明为最新事实；
+  idle/archived 会话从持久化 workspace 记录读（重启后仍有值）。
+
+**多会话并行语义（取代旧版「单活动会话」）**：daemon 支持多会话并行，每个
+会话独立的执行权（同一会话 prompt 串行，跨会话 prompt 并行互不阻塞）。
+
+- **superseded 守卫只看本连接**：连接 B 的 `session/new` / `session/load` 不再
+  影响连接 A；A 的 prompt 路由由 A 自己最近一次声明决定。A 对「本连接曾声明
+  后又改绑」的旧 id 发 prompt → -32000（消息含 "no longer active"），prompt
+  绝不静默串到别的会话工作区。
+- **管理门禁**：`session/new` / `session/load`（可 prompt 分支）/
+  `x-goworker/session/archive` 是管理操作，全局互斥——并发管理操作返回
+  -32000 "session busy"（瞬态，稍后重试）。管理操作**不再被在飞 prompt 阻塞**
+  （prompt 已退出全局门禁）。
+- **`/new` 旧会话收口**：`session/new` 纯新建，旧会话在引用归零后由 daemon
+  自动收口（注销 + 关闭存储句柄），**数据不删、不自动归档**——切回旧会话走
+  `session/load` 重开。连接断开即解除该连接的绑定，最后一条绑定解除（且无
+  在飞 run）时同样收口。
+- 各会话的 prompt 在 daemon 侧按会话串行执行，连接断开时排队中的 prompt 以
+  错误退出。
+
+**缺省执行域（tmp workspace，Plan A4 已知语义）**：从未声明 cwd 的会话
+（`session/new` 不带 cwd、`session/load` 无声明可恢复、CLI `/new`），daemon 自动
+注入 `<系统 tmp>/goworker-workspaces/<uid>/<sessionID>/`（MkdirAll 0700）作为
+工具执行域——**重启即失是有意语义**（系统 tmp，避免遗留垃圾；tmp 只是执行域，
+不存历史，会话数据仍在 sessions 目录）。要点：
+
+- **显式声明始终覆盖注入**：`session/new` 的 cwd、`session/load` 的重申落到
+  workspace 记录（持久事实）；注入域不写记录——清单 cwd 与重启恢复以用户
+  显式声明为唯一持久事实，从未声明的会话重启后回到注入域（新建的空目录）。
+- **沙箱第二边界**：配置了 `AllowedWorkDir` 的部署上，缺省执行域根自动成为
+  第二放行边界（否则注入即无效标记）；显式声明越界（两个边界之外）仍拒。
+- **启动迁移（一次性、幂等）**：旧布局（根槽 `current.jsonl`、根目录
+  `archive/*.jsonl` 存量归档、v1 文件名/目录名错位）在 daemon 启动时自动迁入
+  per-id 目录——存量归档以 `archived` 态回归 `session/list`；迁移失败条目直接
+  丢弃（逐条独立，不阻断启动）。
 
 ## x-goworker 扩展协议（后台 Run 与事件流）
 
@@ -67,6 +102,7 @@ run 生命周期）以持久化游标暴露给任意连接——断线重连不�
 | `x-goworker/run/cancel` | 请求 | `{sessionId, runId}` | `{accepted}` | **必须持有** |
 | `x-goworker/session/attach` | 请求 | `{sessionId, afterSeq, mode?}` | `{currentRun, latestSeq, replayIntegrity, tookOver?}` | `mode:"control"` 获取/接管；observe 不动 lease |
 | `x-goworker/session/detach` | 请求 | `{sessionId, mode?}` | `{detached}` | `mode:"control"` 归还（仅持有者本人有效） |
+| `x-goworker/session/archive` | 请求 | `{sessionId}` | `{archived}` | **必须持有**（声明的 `sessionId` 的 lease） |
 | `x-goworker/approval/respond` | 请求 | `{sessionId, requestId, decision}` | `{accepted}` | **必须持有**（声明的 `sessionId` 的 lease） |
 | `x-goworker/session/events` | **服务端通知** | `SessionEvent`（原样 JSON，蛇形键；逐事件投递） | — | attach 建立订阅后下行；observe/control 均可收 |
 
@@ -82,6 +118,19 @@ run 生命周期）以持久化游标暴露给任意连接——断线重连不�
 - **run/start 立即返回**：Run 被接受并持久化登记后即响应（提交时 state 恒
   `queued`），不等 LLM 完成；后续进展经 `x-goworker/session/events` 或
   run/get 观察。
+- **`x-goworker/session/archive`（Plan A3）= 显式归档终态**：
+  - 语义：把会话落为 `archived` 终态（session/list 立即反映）——**只读保留、
+    不可逆、无 unarchive**。归档后 `session/load` 仍可只读重放历史；prompt 与
+    run/start 一律拒绝（写提交面同源执法，-32000，文案含 `archived`/
+    `read-only`），无论该连接此前是否 load 过它；run/cancel、run/get、attach
+    等只读/终态管理面照常可用（只读保留 ≠ 下线不可触达）。
+  - fencing 双保险：调用方必须持有该会话的 control lease（run/cancel 同款——
+    lease 校验与落盘同一受保护临界区，接管后旧持有者一律拒绝）；且归档是管理
+    操作，受全局管理门禁（满即 -32000 "session busy"）。
+  - run 在飞 → -32000 busy（文案含 `busy`）：在飞 run 即事实活跃，等 run 终态
+    后重试；终态与在飞 run 并存会让只读执法与事件流失真。
+  - 绑定中的会话**允许**归档：绑定保留、prompt 转只读拒绝、引用归零后由
+    daemon 正常收口（数据保留）。
 - **错误约定**：沿用 -32000 + 明确文案（不新增标准错误码）。无 control
   lease → 文案含 `control lease`（lease 校验与操作提交在 daemon 侧同一
   受保护临界区内原子完成——接管后旧持有者的 run/start|cancel、
@@ -147,11 +196,11 @@ control lease **按会话记账**（拍板②原文「每会话至多一个 cont
   提交。
 - **run/start|status|cancel 与 attach 按 sessionId 寻址**（C3 修正，不再限当
   前会话）——**多 Session 路由**：x-goworker 方法寻址**任意已注册会话**
-  （daemon 侧会话注册表权威，不限当前会话；与标准方法「单活动会话」的约束
-  是两回事，标准面行为不变）。`session/new` 建新会话时旧会话被归档并从注册
-  表**收口**——此后对已收口旧 sessionId 或任意未注册 id 的 x-goworker 寻址
-  **诚实失败**：-32000（文案含 `session not found`），归档历史走
-  `session/load` 只读重放。分工：`session/load` = 历史对话重放，
+  （daemon 侧会话注册表权威，不限当前会话；标准面行为不变）。会话在引用归零
+  （绑定解除且无在飞 run）后从注册表**收口**——此后对已收口旧 sessionId 或
+  任意未注册 id 的 x-goworker 寻址
+  **诚实失败**：-32000（文案含 `session not found`），历史走
+  `session/load` 重开或只读重放。分工：`session/load` = 历史对话重放/重开，
   `x-goworker/session/attach` = 事件游标（Replay+Live）。`requestId` 幂等键
   按 (sessionId, requestId) 组合寻址，幂等作用域是**会话**：同会话同键同
   input 重试返回原 run、同键不同 input 返回 -32000 显式冲突；不同会话各自

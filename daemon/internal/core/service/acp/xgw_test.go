@@ -867,6 +867,13 @@ func TestXGWNotAvailableWithoutRunControlSource(t *testing.T) {
 			_, err := bare.xgwApprovalRespond(context.Background(), json.RawMessage(`{}`))
 			return err
 		}},
+		// Plan A3:session/archive 同属 x-goworker 管理面,无 BoundSessionSource
+		// 的后端诚实报 not-available(fakeSessionSource 不实现该能力,工厂
+		// type-assert 不命中 ⇒ multi 为 nil)。
+		{"session/archive", func() error {
+			_, err := bare.xgwSessionArchive(context.Background(), json.RawMessage(`{}`))
+			return err
+		}},
 	} {
 		err := tc.call()
 		rpcErr := wantXGWError(t, tc.what+" without run control source", err)

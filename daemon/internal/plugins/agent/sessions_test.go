@@ -1,7 +1,9 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,8 +19,38 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// sessionFixture 用真实 Store 生成 current + archive 数据：归档 archives 条
-// （每条一条 user 消息），current 留一条 user 消息且 head 停在其上。
+// seedPluginArchiveFile 直接构造 dir/archive/<name>.jsonl 归档夹具（Plan A2：
+// Store.Archive() 删除后不再有「轮转出归档文件」的写路径）：一次性 store 造数，
+// 关闭后把其数据文件字节搬进归档目录（归档文件与会话数据文件同一 record 模型，
+// 直接构造等价且诚实）。
+func seedPluginArchiveFile(t *testing.T, dir, name string, seed func(st *session.Store)) {
+	t.Helper()
+	scratch := filepath.Join(t.TempDir(), "seed-slot")
+	st, err := session.Open(scratch)
+	if err != nil {
+		t.Fatalf("open archive seed store: %v", err)
+	}
+	seed(st)
+	if err := st.Close(); err != nil {
+		t.Fatalf("close archive seed store: %v", err)
+	}
+	// 种子目录 basename 非会话形态 → 数据文件为 current.jsonl（store.go
+	// resolveDataFilePath 决议）。
+	data, err := os.ReadFile(filepath.Join(scratch, "current.jsonl"))
+	if err != nil {
+		t.Fatalf("read archive seed data: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "archive"), 0o700); err != nil {
+		t.Fatalf("mkdir archive dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "archive", name), data, 0o600); err != nil {
+		t.Fatalf("write archive fixture: %v", err)
+	}
+}
+
+// sessionFixture 用真实 Store 生成 current + archive 数据：current 留一条 user
+// 消息且 head 停在其上，archive/ 下直接构造 archives 条（每条一条 user 消息，
+// Store.Archive() 已随 Plan A 定案 #2/#9 删除，夹具改为直接落归档文件）。
 // 返回插件、挂载 store（= currentStore() 解析实例）与会话根目录。
 // P1-3 起按生产 repo 接线：先在种子句柄上造数（legacy 根槽布局），关闭释放
 // 文件锁后经 Repository 原地挂载，Session 绑定挂载实例（构造即水合）。
@@ -27,134 +59,222 @@ func sessionFixture(t *testing.T, archives int) (*AgentPlugin, *session.Store, s
 	dir := t.TempDir()
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
 	mountID := seedLegacySlot(t, dir, func(st *session.Store) {
-		for i := 0; i < archives; i++ {
-			msg := core.Message{Role: "user", Content: "历史会话标题\n第二行", MsgID: session.NewMsgID()}
-			if _, err := st.Commit([]core.Message{msg}); err != nil {
-				t.Fatalf("commit archive %d: %v", i, err)
-			}
-			// 拉开归档文件 mtime，让倒序排序可断言
-			time.Sleep(5 * time.Millisecond)
-			if err := st.Archive(); err != nil {
-				t.Fatalf("archive %d: %v", i, err)
-			}
-		}
 		if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
 			t.Fatalf("commit current: %v", err)
 		}
 	})
+	for i := 0; i < archives; i++ {
+		name := fmt.Sprintf("seed-%d.jsonl", i)
+		seedPluginArchiveFile(t, dir, name, func(st *session.Store) {
+			msg := core.Message{Role: "user", Content: "历史会话标题\n第二行", MsgID: session.NewMsgID()}
+			if _, err := st.Commit([]core.Message{msg}); err != nil {
+				t.Fatalf("commit archive %s: %v", name, err)
+			}
+		})
+		// 拉开归档文件 mtime，让倒序排序可断言
+		time.Sleep(5 * time.Millisecond)
+	}
 	p, st := wireLegacyStore(t, cfg, mountID)
 	return p, st, dir
 }
 
-// archiveIDs 返回归档目录下的 sessionId（文件名去 .jsonl），按文件名排序。
-func archiveIDs(t *testing.T, dir string) []string {
+// makeSideSession 在插件 repo 下新建一个 per-id 持久化会话（不挂 runtime、不进
+// 注册表——清单扫描的「非活跃」数据源）：repo.Create 落 v2 数据文件 + workspace
+// 记录（A1「创建即声明」），Commit 落首条 user 消息作 title 原料，随后
+// CloseSession 释放句柄与 flock（实例缓存逐出，清单的 digest 扫描直接读文件）。
+// 返回稳定 SessionID。
+func makeSideSession(t *testing.T, p *AgentPlugin, cwd, text string) string {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(dir, "archive"))
+	st, err := p.repo.Create(context.Background(), session.CreateOptions{CWD: cwd})
 	if err != nil {
-		t.Fatalf("read archive dir: %v", err)
+		t.Fatalf("repo.Create: %v", err)
 	}
-	ids := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		ids = append(ids, strings.TrimSuffix(entry.Name(), ".jsonl"))
+	if _, err := st.Commit([]core.Message{{Role: "user", Content: text, MsgID: session.NewMsgID()}}); err != nil {
+		t.Fatalf("commit side session: %v", err)
 	}
-	return ids
+	id := st.SessionID()
+	if err := p.repo.CloseSession(id); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+	return id
 }
 
-// archiveSessionIDs 返回归档文件 metadata 中的 logical sessionId，按文件名排序。
-func archiveSessionIDs(t *testing.T, dir string) []string {
+// touchSessionData 把会话数据文件的 mtime 拨到 at，让 updatedAt 排序可断言
+// （同秒创建的文件 mtime 粒度不稳定）。路径按 resolveDataFilePath 的决议取：
+// per-id 会话形态目录是 v2 名 <id>/<id>.jsonl；legacy 根槽（目录 id 形态但根
+// 目录名非会话形态）回落 root 自身的 current.jsonl。
+func touchSessionData(t *testing.T, dir, id string, at time.Time) {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(dir, "archive"))
-	if err != nil {
-		t.Fatalf("read archive dir: %v", err)
+	path := filepath.Join(dir, id, id+".jsonl")
+	if _, err := os.Stat(path); err != nil {
+		path = filepath.Join(dir, "current.jsonl")
 	}
-	ids := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-			continue
-		}
-		view, err := session.OpenArchiveView(filepath.Join(dir, "archive", entry.Name()))
-		if err != nil {
-			t.Fatalf("open archive view: %v", err)
-		}
-		ids = append(ids, view.SessionID())
+	if err := os.Chtimes(path, at, at); err != nil {
+		t.Fatalf("chtimes %s: %v", path, err)
 	}
-	return ids
 }
 
-func TestAgentPlugin_ListSessionsPinsCurrentAndOrdersArchivesByUpdatedAt(t *testing.T) {
-	p, st, dir := sessionFixture(t, 2)
-	logicalID := st.SessionID()
-	headBefore := st.Head()
+// TestAgentPlugin_ListSessionsUnionScanSortsByUpdatedAt 验证 Plan A3 的清单并集
+// 重写：per-id 目录（v2 数据文件）与 legacy 根槽全部入列；updatedAt 降序统一
+// 排序，旧版「当前会话置顶且不参与排序」的特殊逻辑取消（plan A3——多会话下
+// current 只是普通条目）；title 取首条 user 消息；cwd 取 workspace 记录（A7
+// 设计点 5：非 current 会话从记录读，current 未声明为空）；三态 idle/active
+// 判定（定案 #3：current 便利指针持有即 active）。
+func TestAgentPlugin_ListSessionsUnionScanSortsByUpdatedAt(t *testing.T) {
+	p, st, dir := sessionFixture(t, 0)
+	currentID := st.SessionID()
+
+	older := makeSideSession(t, p, "/tmp/wk-older", "较早的会话")
+	newer := makeSideSession(t, p, "/tmp/wk-newer", "较新的会话")
+
+	base := time.Now().Add(-time.Hour)
+	touchSessionData(t, dir, currentID, base) // current 最老 → 排最后（不置顶）
+	touchSessionData(t, dir, older, base.Add(time.Minute))
+	touchSessionData(t, dir, newer, base.Add(2*time.Minute))
 
 	got := p.ListSessions()
 	if len(got) != 3 {
-		t.Fatalf("ListSessions = %+v, want current + 2 archived", got)
+		t.Fatalf("ListSessions = %+v, want 3 entries (per-id ×2 + legacy root)", got)
 	}
-	if got[0].SessionID != logicalID {
-		t.Errorf("sessions[0].sessionId = %q, want current logical id %q", got[0].SessionID, logicalID)
-	}
-	if got[0].Title != "当前会话" {
-		t.Errorf("sessions[0].title = %q, want 当前会话", got[0].Title)
-	}
-	if got[1].Title != "历史会话标题 第二行" {
-		t.Errorf("sessions[1].title = %q, want newline-collapsed 历史会话标题 第二行", got[1].Title)
-	}
-	// 归档按 mtime 倒序：后归档的文件名（UnixNano）更大，应排在前面
-	ids := archiveSessionIDs(t, dir)
-	if len(ids) != 2 {
-		t.Fatalf("archive ids = %v, want 2", ids)
-	}
-	if got[1].SessionID != ids[1] || got[2].SessionID != ids[0] {
-		t.Errorf("archived sessionIds = [%q %q], want newest-first [%q %q]", got[1].SessionID, got[2].SessionID, ids[1], ids[0])
-	}
-	for i, info := range got {
-		if info.Cwd != "" {
-			t.Errorf("sessions[%d].cwd = %q, want empty (jsonl 不落 cwd)", i, info.Cwd)
+	wantOrder := []string{newer, older, currentID}
+	for i, want := range wantOrder {
+		if got[i].SessionID != want {
+			t.Errorf("sessions[%d].sessionId = %q, want %q (updatedAt 降序，current 不置顶)", i, got[i].SessionID, want)
 		}
-		if _, err := time.Parse(time.RFC3339, info.UpdatedAt); err != nil {
-			t.Errorf("sessions[%d].updatedAt = %q, want RFC3339: %v", i, info.UpdatedAt, err)
+		if _, err := time.Parse(time.RFC3339, got[i].UpdatedAt); err != nil {
+			t.Errorf("sessions[%d].updatedAt = %q, want RFC3339: %v", i, got[i].UpdatedAt, err)
 		}
+	}
+	// cwd（A7⑤）：非 current 会话从 workspace 记录读；current 未声明为空。
+	if got[0].Cwd != "/tmp/wk-newer" || got[1].Cwd != "/tmp/wk-older" {
+		t.Errorf("cwds = [%q %q], want workspace records [/tmp/wk-newer /tmp/wk-older]", got[0].Cwd, got[1].Cwd)
+	}
+	if got[2].Cwd != "" {
+		t.Errorf("current cwd = %q, want empty (未声明)", got[2].Cwd)
+	}
+	// title：文件内首条 user 消息（短文本原样）。
+	if got[0].Title != "较新的会话" || got[1].Title != "较早的会话" {
+		t.Errorf("titles = [%q %q], want [较新的会话 较早的会话]", got[0].Title, got[1].Title)
+	}
+	// 三态：current=active（便利指针持有，plan A2「current 收缩为 CLI/stdin
+	// 便利指针」但持有即活跃），其余 idle。
+	if got[0].State != model.SessionStateIdle || got[1].State != model.SessionStateIdle || got[2].State != model.SessionStateActive {
+		t.Errorf("states = [%q %q %q], want [idle idle active]", got[0].State, got[1].State, got[2].State)
 	}
 
 	// 清单是只读扫描：不得改动 store 状态
-	if after := st.Head(); after != headBefore {
-		t.Errorf("store head changed by ListSessions: %q → %q", headBefore, after)
+	if after := st.Head(); after == "" {
+		t.Error("store head lost after ListSessions")
 	}
 	if view := st.ActiveView(); len(view) != 1 {
 		t.Errorf("active view = %d messages after ListSessions, want 1", len(view))
 	}
 }
 
-func TestAgentPlugin_ListSessionsKeepsCurrentFirstEvenWhenArchiveIsNewer(t *testing.T) {
-	p, st, dir := sessionFixture(t, 1)
+// TestAgentPlugin_ListSessionsTruncatesAtMax 验证 maxListSessions 截断：清单按
+// updatedAt 降序输出最新的 50 条（超出的最老条目不出现——与排序语义一致）。
+func TestAgentPlugin_ListSessionsTruncatesAtMax(t *testing.T) {
+	p, _, dir := sessionFixture(t, 0)
+	currentID := p.CurrentSessionID()
 
-	// 把归档文件 mtime 拨到未来：当前会话仍须置顶（不参与 updatedAt 排序）
-	archived := filepath.Join(dir, "archive", archiveIDs(t, dir)[0]+".jsonl")
-	future := time.Now().Add(time.Hour)
-	if err := os.Chtimes(archived, future, future); err != nil {
-		t.Fatalf("chtimes archive: %v", err)
+	// 52 个 per-id 会话，mtime 依次 +1 分钟（可断言的确定序）；current 拨在
+	// 中段（第 31/32 名之间），截断丢的是最老的两条。
+	ids := make([]string, 0, 52)
+	base := time.Now().Add(-2 * time.Hour)
+	for i := 0; i < 52; i++ {
+		id := makeSideSession(t, p, "", fmt.Sprintf("会话 %d", i))
+		ids = append(ids, id)
+		touchSessionData(t, dir, id, base.Add(time.Duration(i)*time.Minute))
 	}
+	touchSessionData(t, dir, currentID, base.Add(30*time.Minute+30*time.Second))
 
 	got := p.ListSessions()
-	if len(got) != 2 {
-		t.Fatalf("ListSessions = %+v, want current + 1 archived", got)
+	if len(got) != maxListSessions {
+		t.Fatalf("ListSessions = %d entries, want truncated to %d", len(got), maxListSessions)
 	}
-	if got[0].SessionID != st.SessionID() {
-		t.Errorf("sessions[0].sessionId = %q, want current logical id %q pinned first", got[0].SessionID, st.SessionID())
+	// 最新在前：第 1 条是 mtime 最大的 side 会话（ids[51]）；52 - 50 = 2 条最老
+	// 的（ids[0..1]）被截掉。
+	if got[0].SessionID != ids[51] {
+		t.Errorf("sessions[0] = %q, want newest %q", got[0].SessionID, ids[51])
+	}
+	dropped := make(map[string]bool)
+	for _, id := range ids[:2] {
+		dropped[id] = true
+	}
+	for _, info := range got {
+		if dropped[info.SessionID] {
+			t.Errorf("oldest session %s survived truncation, want dropped", info.SessionID)
+		}
+	}
+	// current（mtime 第 53 新）应在列。
+	found := false
+	for _, info := range got {
+		if info.SessionID == currentID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("current session %s missing, want listed (mtime newer than the dropped tail)", currentID)
+	}
+}
+
+// TestAgentPlugin_ListSessionsBindingActive 验证连接绑定即活跃（定案 #8 的绑定
+// 半边）：非 current、无 run 在飞的会话仅因 BindingRegistry 里有连接绑定即报
+// active；解绑触发收口（A2a 生命周期）后，会话文件仍在、清单转 idle——「收口
+// 不删数据」与 idle 为收口前后过渡态的语义一致。
+func TestAgentPlugin_ListSessionsBindingActive(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "echo-A"})
+	sidA := p.CurrentSessionID()
+	_ = newPersistedSession(t, p, fixedProvider{content: "echo-B"}) // current 切到 B，A 仍在册
+
+	stateOf := func(t *testing.T, id string) model.SessionSummary {
+		t.Helper()
+		for _, info := range p.ListSessions() {
+			if info.SessionID == id {
+				return info
+			}
+		}
+		t.Fatalf("session %s missing from list", id)
+		return model.SessionSummary{}
+	}
+
+	// A 无绑定、非 current：idle。
+	if got := stateOf(t, sidA); got.State != model.SessionStateIdle {
+		t.Fatalf("unbound A state = %q, want idle", got.State)
+	}
+	// 绑定到达（连接登记，无 run、非 current）：A 转 active。
+	p.BindConnectionSession("conn-1", sidA)
+	if got := stateOf(t, sidA); got.State != model.SessionStateActive {
+		t.Fatalf("bound A state = %q, want active", got.State)
+	}
+	// 解绑（空 sessionID = 解除绑定）：引用归零触发收口，A 转回 idle。
+	p.BindConnectionSession("conn-1", "")
+	if got := stateOf(t, sidA); got.State != model.SessionStateIdle {
+		t.Fatalf("released A state = %q, want idle", got.State)
 	}
 }
 
 func TestAgentPlugin_ListSessionsWithoutCurrentOrPersistence(t *testing.T) {
-	// 空会话（无 head）：current 不出现，返回非 nil 空清单
+	// 空会话（无 head）：metadata 已落盘 ⇒ 可寻址（可 load），清单如实收录一条
+	// （A3 并集语义取代旧版「Head 非空才出现」——旧判据防的是把 current.jsonl
+	// 文件名当 id，清单 id 已换轨 metadata）；current 指针持有 ⇒ state=active，
+	// title 空（无 user 消息）。
 	dir := t.TempDir()
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
 	mountID := seedLegacySlot(t, dir, nil)
 	p, st := wireLegacyStore(t, cfg, mountID)
-	if got := p.ListSessions(); got == nil || len(got) != 0 {
-		t.Errorf("ListSessions = %#v, want non-nil empty", got)
+	got := p.ListSessions()
+	if got == nil || len(got) != 1 {
+		t.Fatalf("ListSessions = %#v, want exactly the headless legacy slot", got)
 	}
-	if got := p.CurrentSessionID(); got != st.SessionID() {
-		t.Errorf("CurrentSessionID = %q, want logical session id %q for headless session", got, st.SessionID())
+	if got[0].SessionID != st.SessionID() {
+		t.Errorf("sessions[0].sessionId = %q, want logical session id %q for headless session", got[0].SessionID, st.SessionID())
+	}
+	if got[0].Title != "" || got[0].State != model.SessionStateActive {
+		t.Errorf("sessions[0] = {title:%q state:%q}, want empty title + active (current 持有)", got[0].Title, got[0].State)
+	}
+	if id := p.CurrentSessionID(); id != st.SessionID() {
+		t.Errorf("CurrentSessionID = %q, want logical session id %q for headless session", id, st.SessionID())
 	}
 
 	// store 未启用（nil）：清单为空、当前会话 id 为空
@@ -512,16 +632,23 @@ func TestAgentPlugin_CurrentSessionHistoryEmpty(t *testing.T) {
 	}
 }
 
-// archiveFixture 在 current 提交一整轮（user → assistant(2 tool_calls + thinking)
-// → tool → assistant 收尾）并打 checkpoint，随后 Archive 归档，再为 current 提交
-// 一条新消息。返回插件、挂载 store（= currentStore() 解析实例）、归档文件 id 与
-// 归档前视图。
+// archiveFixture 在 current 提交一条新消息，归档轮次（user → assistant(2
+// tool_calls + thinking) → tool → assistant 收尾 + checkpoint）直接构造进
+// archive/（Plan A2：Store.Archive() 已删除，夹具不再轮转）。返回插件、挂载
+// store（= currentStore() 解析实例）、归档文件 id（文件名去 .jsonl，经
+// archivePathForSession 的文件名兼容分支寻址）与归档前视图。
 func archiveFixture(t *testing.T) (*AgentPlugin, *session.Store, string, []core.Message) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: dir}}
 	var want []core.Message
 	mountID := seedLegacySlot(t, dir, func(st *session.Store) {
+		// current 提交新消息，保证清单有「当前会话」条目可断言
+		if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
+			t.Fatalf("commit current: %v", err)
+		}
+	})
+	seedPluginArchiveFile(t, dir, "archived-round.jsonl", func(st *session.Store) {
 		if _, err := st.Commit([]core.Message{
 			core.Message{Role: "user", Content: "归档里的问题", MsgID: session.NewMsgID()},
 			core.Message{
@@ -541,16 +668,9 @@ func archiveFixture(t *testing.T) (*AgentPlugin, *session.Store, string, []core.
 			t.Fatalf("checkpoint: %v", err)
 		}
 		want = st.ActiveView()
-		if err := st.Archive(); err != nil {
-			t.Fatalf("archive: %v", err)
-		}
-		// 归档后 current 提交新消息，保证清单有「当前会话」条目可断言
-		if _, err := st.Commit([]core.Message{{Role: "user", Content: "当前会话", MsgID: session.NewMsgID()}}); err != nil {
-			t.Fatalf("commit current: %v", err)
-		}
 	})
 	p, st := wireLegacyStore(t, cfg, mountID)
-	return p, st, archiveIDs(t, dir)[0], want
+	return p, st, "archived-round", want
 }
 
 // TestAgentPlugin_ArchivedSessionHistoryReplaysArchive 对真实归档文件做重放映射：
@@ -653,38 +773,43 @@ func TestAgentPlugin_ArchivedSessionHistoryErrors(t *testing.T) {
 	}
 }
 
-// TestAgentPlugin_ListSessionsMarksCurrentAndCwd 验证 domain Active 标记与当前会话
-// cwd 回显：当前条目 Active=true，归档条目 Active=false。
+// TestAgentPlugin_ListSessionsMarksCurrentAndCwd 验证 cwd 取值的双事实源（A7
+// 设计点 5）：current 会话以 runtime 声明为最新事实（声明迁移不落记录——/new
+// 后新会话无记录，声明是唯一事实源），其余会话从 workspace 记录读；domain
+// Active 标记只落在 current 条目。
 func TestAgentPlugin_ListSessionsMarksCurrentAndCwd(t *testing.T) {
-	p, st, dir := sessionFixture(t, 2)
+	p, st, dir := sessionFixture(t, 0)
 	logicalID := st.SessionID()
+	sideID := makeSideSession(t, p, "/tmp/wk-record", "有记录的会话")
+	touchSessionData(t, dir, sideID, time.Now().Add(time.Minute)) // side 最新 → 排第一
 
 	got := p.ListSessions()
-	if len(got) != 3 {
-		t.Fatalf("ListSessions = %+v, want 3 entries", got)
+	if len(got) != 2 {
+		t.Fatalf("ListSessions = %+v, want 2 entries", got)
 	}
-	if !got[0].Active || got[1].Active || got[2].Active {
-		t.Errorf("active flags = [%v %v %v], want [true false false]", got[0].Active, got[1].Active, got[2].Active)
+	if got[0].SessionID != sideID || got[1].SessionID != logicalID {
+		t.Fatalf("sessionIds = [%q %q], want [side current]", got[0].SessionID, got[1].SessionID)
 	}
-	if got[0].SessionID != logicalID {
-		t.Errorf("sessions[0].sessionId = %q, want logical id %q", got[0].SessionID, logicalID)
+	if got[0].Cwd != "/tmp/wk-record" {
+		t.Errorf("side cwd = %q, want workspace record /tmp/wk-record", got[0].Cwd)
 	}
-	if got[0].Cwd != "" {
-		t.Errorf("sessions[0].cwd = %q before SetSession, want empty", got[0].Cwd)
+	if got[1].Cwd != "" {
+		t.Errorf("current cwd = %q before SetSession, want empty", got[1].Cwd)
 	}
 
-	// AllowedWorkDir 为空 = 不限制：任意 cwd 接受并回显（绝对路径）
+	// AllowedWorkDir 为空 = 不限制：任意 cwd 接受并回显（绝对路径）——current
+	// 条目的 cwd 跟随声明，side 条目保持记录值。
 	p.SetSession("sess_transport", filepath.Join(dir, "workspace"))
 	got = p.ListSessions()
 	wantCwd, err := filepath.Abs(filepath.Join(dir, "workspace"))
 	if err != nil {
 		t.Fatalf("abs: %v", err)
 	}
-	if got[0].Cwd != wantCwd {
-		t.Errorf("sessions[0].cwd = %q, want declared %q", got[0].Cwd, wantCwd)
+	if got[1].Cwd != wantCwd {
+		t.Errorf("current cwd = %q, want declared %q", got[1].Cwd, wantCwd)
 	}
-	if got[1].Cwd != "" || got[2].Cwd != "" {
-		t.Errorf("archived cwds = [%q %q], want empty", got[1].Cwd, got[2].Cwd)
+	if got[0].Cwd != "/tmp/wk-record" {
+		t.Errorf("side cwd = %q after SetSession, want unchanged record /tmp/wk-record", got[0].Cwd)
 	}
 }
 
@@ -757,14 +882,24 @@ func TestAgentPlugin_SetSessionValidatesSandboxBoundary(t *testing.T) {
 		t.Errorf("cwd error after redeclare = %v, want nil", err)
 	}
 
-	// /new（startSession 重建）：无效标记不跨会话保留，最后声明无效 → 新会话无 cwd
+	// /new（startSession 重建）：无效标记不跨会话保留，最后声明无效 → 新会话
+	// cwd 注入缺省执行域（Plan A4 定案 #5——「作废」丢弃无效标记，执行域由
+	// tmp 每会话目录兜底；沙箱校验靠第二 allowed root 放行，见下）
 	p.SetSession("sess_e", outside) // 置无效
 	p.startSession()
 	if err := p.sessionCWDError(); err != nil {
 		t.Errorf("cwdErr after startSession = %v, want nil (无效标记随旧会话作废)", err)
 	}
-	if got := p.currentSessionCwd(); got != "" {
-		t.Errorf("sessionCwd after startSession = %q, want empty", got)
+	injected := p.currentSessionCwd()
+	if !isTmpWorkspacePath(injected) {
+		t.Errorf("sessionCwd after startSession = %q, want injected default domain under %s", injected, tmpWorkspaceRoot())
+	}
+	// 注入域必须通过沙箱校验（第二 allowed root 的存在性由此断言）——否则
+	// AllowedWorkDir 部署上注入即无效标记、prompt 全被挡，A4 落空。
+	if rt := p.currentSession(); rt != nil {
+		if _, err := rt.DeclaredCWD(); err != nil {
+			t.Errorf("injected default domain rejected by sandbox: %v", err)
+		}
 	}
 
 	// 有效声明跨会话保留：重新声明界内 cwd 后重建，新会话继续生效
@@ -885,9 +1020,9 @@ func TestAgentPlugin_ActiveSessionIDSemantics(t *testing.T) {
 }
 
 // seedLegacySlot 在 dir 播种 legacy 根槽（一次性 Open 生成 metadata），在种子句柄
-// 上跑 seedFn（提交/归档造数），随后关闭句柄释放文件锁，返回文件当前的 metadata
-// 会话 id（即 wireLegacyStore 的挂载键；归档轮转会更换 metadata id，以关闭时的
-// 最新值为准）。
+// 上跑 seedFn（提交造数；归档数据经 seedPluginArchiveFile 直接构造，Store.Archive()
+// 已随 Plan A 删除），随后关闭句柄释放文件锁，返回文件当前的 metadata 会话 id
+// （即 wireLegacyStore 的挂载键）。
 func seedLegacySlot(t *testing.T, dir string, seedFn func(st *session.Store)) string {
 	t.Helper()
 	seed, err := session.Open(dir)
@@ -911,7 +1046,7 @@ func seedLegacySlot(t *testing.T, dir string, seedFn func(st *session.Store)) st
 //  2. deps.Store 注入 + runtime id = store SessionID（生产 ④ 的同款规则）；
 //  3. Session 绑定挂载实例（构造即水合，与重启恢复同路径）。
 //
-// 返回的挂载实例与插件视图是同一对象：测试对它的 Commit/Archive 与生产同轨。
+// 返回的挂载实例与插件视图是同一对象：测试对它的 Commit 与生产同轨。
 // 仓库经 t.Cleanup 关闭（连带释放目录文件锁）。
 func wireLegacyStore(t *testing.T, cfg *runtimeconfig.Config, mountID string) (*AgentPlugin, *session.Store) {
 	t.Helper()

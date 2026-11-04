@@ -6,15 +6,18 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
+	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 )
 
 // binding_test.go 是 PR2(统一 Session 路由,总方案 §六/§十)的插件侧测试:
 // AgentPlugin 的 binding 形态解析点(sessionRuntimeIn/boundSessionIn/currentStoreIn)
 // 的路由语义——Binding 优先(命中非 current 的已注册 runtime,CR4)、空 Binding
-// 回落 current(无绑定调用方默认)、悬空 Binding(/new 收口摘除的旧会话)诚实
-// 失败;以及 /new 收口「只摘发起方的 binding」。
+// 回落 current(无绑定调用方默认)、悬空 Binding(被生命周期收口的旧会话)诚实
+// 失败;以及 /new 收口「只摘发起方的 binding」+ Plan A2 的引用计数存活语义
+// (其他连接仍绑旧会话 → 不收口)。
 
 // TestBindingRoutesPromptToBoundSession:current 已是 B 时,Binding→A 的连接
 // prompt(handleAgent)路由到 A 的 runtime/store,B 的会话不受影响。
@@ -108,12 +111,20 @@ func TestBindingDanglingSessionFailsHonest(t *testing.T) {
 	}
 }
 
-// TestHandleNewDetachesOnlyInitiatorBinding:两条连接的 Binding 同指 A,连接 1
-// 发起 /new → TEARDOWN 语义不变(归档/换轨/收口),但只摘发起方 b1;连接 2 的
-// b2 原样保留,此后指向被收口会话、解析诚实失败;b1 回落 current 落到新会话。
-func TestHandleNewDetachesOnlyInitiatorBinding(t *testing.T) {
+// TestHandleNewKeepsSessionWhileOtherConnectionBound(Plan A2 生命周期半边):
+// 两条连接的 Binding 同指 A 且都经 BindingRegistry 登记(生产由 handler 的
+// CreateSession 经 model.ConnectionBinder 完成,这里按登记点同款直调),连接 1
+// 发起 /new → 只摘发起方(b1 清空 + 登记解除),但连接 2 仍绑 A → 引用未归零,
+// A 不收口、可继续 prompt——多 session 并行的存活语义。随后连接 2 断连
+// (ReleaseConnection)→ A 引用归零 → 收口,残留指向 A 的 Binding 解析诚实失败
+// (PR2 悬空语义),store 数据保留、经 repo.Open 重开拿活实例(A2.1①)。
+func TestHandleNewKeepsSessionWhileOtherConnectionBound(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "x"})
 	sidA := p.CurrentSessionID()
+
+	// 两连接登记绑定(与 handler CreateSession 的登记侧同款)。
+	p.BindConnectionSession("conn-1", sidA)
+	p.BindConnectionSession("conn-2", sidA)
 
 	b1 := &agentcontrol.SessionBinding{}
 	b1.Set(sidA) // 连接 1(发起方)
@@ -121,18 +132,19 @@ func TestHandleNewDetachesOnlyInitiatorBinding(t *testing.T) {
 	b2.Set(sidA) // 连接 2(旁观者,Binding 连接私有,§6.2 第 4 条)
 
 	mctx, _ := newContext()
-	mctx.Ctx = agentcontrol.WithBinding(context.Background(), b1)
+	mctx.Ctx = agentcontrol.WithClientID(agentcontrol.WithBinding(context.Background(), b1), "conn-1")
 	if err := p.handleNew(mctx); err != nil {
 		t.Fatalf("handleNew: %v", err)
 	}
 
-	// TEARDOWN 语义不变:current 换到新会话,A 的 runtime 已收口注销(P5-5)。
+	// TEARDOWN 语义不变:current 换到新会话;发起方 Binding 清空(回落 current
+	// 语义,落到新会话)。
 	sidNew := p.CurrentSessionID()
 	if sidNew == sidA || sidNew == "" {
 		t.Fatalf("CurrentSessionID after /new = %q, want a fresh session id", sidNew)
 	}
-	if p.manager.Get(sidA) != nil {
-		t.Fatal("session A runtime still registered after /new teardown")
+	if p.manager.Get(sidA) == nil {
+		t.Fatal("session A must stay registered while conn-2 is still bound (Plan A2 引用计数:引用未归零不收口)")
 	}
 
 	// 只摘发起方:发起方 Binding 清空(回落 current 语义,落到新会话);连接 2
@@ -150,10 +162,40 @@ func TestHandleNewDetachesOnlyInitiatorBinding(t *testing.T) {
 		t.Fatalf("initiator re-resolve = %v, %v; want current runtime", rt1, err)
 	}
 
-	// 旁观者指向被收口的会话 → 诚实失败(不静默串到新会话)。
+	// 旁观连接仍可 prompt 旧会话:解析命中 A 的 runtime,prompt 落到 A 的会话本体
+	// (多 session 并行:A 不因发起方换轨而失活)。
 	rt2, err := p.sessionRuntimeIn(agentcontrol.WithBinding(context.Background(), b2))
+	if err != nil || rt2 == nil || rt2.ID != sidA {
+		t.Fatalf("observer re-resolve = %v, %v; want session A runtime", rt2, err)
+	}
+	pmctx, _ := newContext("still-alive")
+	pmctx.Ctx = agentcontrol.WithBinding(context.Background(), b2)
+	if err := p.handleAgent(pmctx); err != nil {
+		t.Fatalf("prompt on surviving session A: %v", err)
+	}
+	convA := p.manager.Get(sidA).Session().Conversation()
+	if len(convA) == 0 || convA[0].Role != "user" || convA[0].Content != "still-alive" {
+		t.Fatalf("session A conversation = %v, want the surviving prompt", convA)
+	}
+
+	// 旁观连接断连(ReleaseConnection,handler.Close 的收口路径):A 引用归零 →
+	// 收口(runtime 注销);store 数据保留,经 repo.Open 重开拿活实例(A2.1①)。
+	p.ReleaseConnection("conn-2")
+	if p.manager.Get(sidA) != nil {
+		t.Fatal("session A must be released after the last binding dropped (断连收口)")
+	}
+	st, err := p.repo.Open(sidA)
+	if err != nil {
+		t.Fatalf("repo.Open(released session): %v", err)
+	}
+	if _, err := st.Commit([]core.Message{{Role: "user", Content: "reopened", MsgID: session.NewMsgID()}}); err != nil {
+		t.Fatalf("commit on reopened store: %v", err)
+	}
+
+	// 旁观者残留的 Binding 指向已收口的会话 → 诚实失败(不静默串到新会话)。
+	rt2, err = p.sessionRuntimeIn(agentcontrol.WithBinding(context.Background(), b2))
 	if rt2 != nil || !errors.Is(err, runtimeagent.ErrSessionNotFound) {
-		t.Fatalf("observer re-resolve = %v, %v; want honest session-not-found", rt2, err)
+		t.Fatalf("observer re-resolve after release = %v, %v; want honest session-not-found", rt2, err)
 	}
 
 	// 无 Binding(CLI)的 /new 不受牵连:照常作用于 current。

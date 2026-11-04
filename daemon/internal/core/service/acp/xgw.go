@@ -103,6 +103,8 @@ func registerXGWMethods(server *aiacp.Server, handler aiacp.SessionHandler) {
 	server.Handle(XMethodApprovalRespond, fh.xgwApprovalRespond)
 	server.Handle(XMethodSessionAttach, fh.xgwSessionAttach)
 	server.Handle(XMethodSessionDetach, fh.xgwSessionDetach)
+	server.Handle(XMethodSessionArchive, fh.xgwSessionArchive)
+	server.Handle(XMethodSessionModes, fh.xgwSessionModes)
 }
 
 // xgwRunStart 处理 x-goworker/run/start:runs.StartRun(req.SessionID,
@@ -166,6 +168,64 @@ func (h *FrontendHandler) xgwRunCancel(_ context.Context, params json.RawMessage
 		return nil, xgwError("%s: %v", XMethodRunCancel, err)
 	}
 	return XRunCancelResult{Accepted: true}, nil
+}
+
+// xgwSessionArchive 处理 x-goworker/session/archive（Plan A3，定案需求 #1 的
+// 显式归档命令）：目标会话 store 落 archived 终态标记（幂等、不可逆），响应前
+// session/list 即反映 state=archived（清单数据源是持久化事实的只读快照）。
+//
+// fencing 双保险（执行序）：
+//  1. 全局管理门禁（本 handler 持有）：归档是管理操作（A2b2 收窄后的 gate 只守
+//     session/new|load|archive），满即 busy——与在飞 prompt 无关（prompt 已退出
+//     门禁），只与其他管理操作互斥。临界区含 MarkArchived 的一次 append+fsync：
+//     与 CreateBoundSession 的 repo.Create（MkdirAll+metadata 落盘）同款先例，
+//     管理临界区禁的是长 I/O（LLM/连接写），毫秒级文件突变放行。
+//  2. control lease（实现侧 WithControl 同临界区，run/cancel 同款）：未持有 →
+//     ErrControlLeaseLost 归一 -32000；lease 校验与 MarkArchived 之间不可被接管。
+//
+// run 在飞 → -32000 busy（定案需求 #8：在飞即活跃，终态与在飞 run 并存会让
+// 只读执法与事件面失真——等终态后重试，瞬态语义与 new/load 的 busy 同款）。
+// 绑定中的会话允许归档（绑定保留、prompt 转只读拒绝、收口等引用归零——A2a
+// 生命周期自然处理）。终态不可逆：无 unarchive 方法，重复归档幂等 no-op。
+func (h *FrontendHandler) xgwSessionArchive(_ context.Context, params json.RawMessage) (any, error) {
+	if h.multi == nil {
+		return nil, xgwNotAvailableError(XMethodSessionArchive)
+	}
+	var req XSessionArchiveParams
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, xgwError("%s: invalid params: %v", XMethodSessionArchive, err)
+	}
+	if req.SessionID == "" {
+		return nil, xgwError("%s: sessionId is required", XMethodSessionArchive)
+	}
+	// 管理门禁：满即 busy（瞬态），绝不排队攥住门禁（tryAcquire 语义）。
+	if !h.gate.tryAcquire() {
+		return nil, sessionBusyError()
+	}
+	err := h.multi.ArchiveSession(req.SessionID, h.connectionID)
+	h.gate.release()
+	if err != nil {
+		return nil, xgwError("%s: %v", XMethodSessionArchive, err)
+	}
+	return XSessionArchiveResult{Archived: true}, nil
+}
+
+// xgwSessionModes 处理 x-goworker/session/modes（Plan B 任务3）：无 session 即取
+// daemon 的 modes 声明（数据源 cfg.LLM providers，与 session/new 响应同源同形）。
+// 只读、无门禁——纯展示数据，草稿面板在 session/new 之前渲染模型下拉用。
+func (h *FrontendHandler) xgwSessionModes(_ context.Context, _ json.RawMessage) (any, error) {
+	if h.sessions == nil {
+		return nil, xgwError("%s: session capabilities unavailable", XMethodSessionModes)
+	}
+	state := h.sessions.SessionModes()
+	if state == nil {
+		return XSessionModesResult{AvailableModes: []SessionModeChoice{}}, nil
+	}
+	choices := make([]SessionModeChoice, 0, len(state.AvailableModes))
+	for _, mode := range state.AvailableModes {
+		choices = append(choices, SessionModeChoice{ID: mode.ID, Name: mode.Name, Description: mode.Description})
+	}
+	return XSessionModesResult{CurrentModeID: state.CurrentModeID, AvailableModes: choices}, nil
 }
 
 // xgwApprovalRespond 处理 x-goworker/approval/respond(C1 修复 + 第三轮评审 I4
@@ -417,7 +477,9 @@ func (h *FrontendHandler) xgwSessionDetach(_ context.Context, params json.RawMes
 // 在 <-server.Done() 返回路径 type-assert 调用(service.go connectionCloser)。
 // V1 语义:断开即释放 control lease——「审批不悬死在已死连接上」的宿主授权
 // 收口;I3 后 lease 按会话记账,ReleaseConnection 一次释放本连接持有的全部
-// 会话租约,重复/他人调用幂等空操作(P5-6 契约)。
+// 会话租约,重复/他人调用幂等空操作(P5-6 契约)。Plan A2 生命周期半边:同一
+// 调用一并清除该连接的会话绑定登记并评估被解除会话的引用归零收口
+// (runcontrol.go ReleaseConnection,与 lease 同构的断连清账)。
 //
 // P5-8:订阅泵统一回收——先清空 subs 表再逐个 stop,泵退出自清的判重落空;
 // done 关闭使各协议泵立即退出,cancel 唤醒各 SDK 泵 → 投递通道关闭。断连即

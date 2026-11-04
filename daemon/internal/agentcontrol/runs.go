@@ -46,13 +46,21 @@ var _ InternalRunner = (*Service)(nil)
 // Register 撞旧条目保留旧值,handleNew 尾部 Remove 移除的正是旧条目——新
 // runtime 此刻不在册(Get == nil);经同 id 重建的路径(如测试 fixture 的
 // refreshSession)则可能有同 id 旧条目占位(Get != rt)。两者都违反不变量,
-// Remove+Register 幂等重建。Register 的错误不在此放大:唯一可达失败是
-// ErrManagerClosed,后续 manager.StartRun/CancelRun 会给出同一权威错误。
+// Remove+Register 幂等重建。
+//
+// 已 Retire 的陈旧指针不参与重建:路由拿到的 rt 可能在本次修复前被生命周期
+// 收口注销(Remove 之后),复活它等于把已关闭的 hub/store 挂回注册表。此处
+// 直接放弃,提交面由 manager 按未注册诚实失败;Register 自身也会拒绝已注销
+// 实例,这里是防 Remove 误删同 id 新条目的前置判定。
 func (s *Service) ensureRegistered(rt *runtimeagent.SessionRuntime) {
-	if got := s.sessions.Get(rt.ID); got != rt {
-		s.sessions.Remove(rt.ID)
-		_ = s.sessions.Register(rt)
+	if got := s.sessions.Get(rt.ID); got == rt {
+		return
 	}
+	if rt.Retired() {
+		return
+	}
+	s.sessions.Remove(rt.ID)
+	_ = s.sessions.Register(rt)
 }
 
 // StartRun 提交一次后台 Run 并立即返回 (runID, 提交时状态):

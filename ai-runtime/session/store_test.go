@@ -708,96 +708,6 @@ func TestOpenRestrictsExistingArchivePermissions(t *testing.T) {
 	assertPrivateMode(t, archivePath)
 }
 
-func TestArchive(t *testing.T) {
-	s := openStore(t)
-
-	all := commMsgs([]string{"m0", "m1"}, "user")
-	_, err := s.Commit(all)
-	if err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
-
-	// 确认 current.jsonl 有内容
-	currentPath := filepath.Join(s.dir, "current.jsonl")
-	lines := readJSONLFile(t, currentPath)
-	if len(lines) == 0 {
-		t.Fatal("current.jsonl should have content before archive")
-	}
-
-	err = s.Archive()
-	if err != nil {
-		t.Fatalf("Archive: %v", err)
-	}
-
-	// current.jsonl 保留新会话的 metadata 行，不能再把物理空文件当成空会话。
-	newLines := readJSONLFile(t, currentPath)
-	if len(newLines) != 1 {
-		t.Errorf("current.jsonl should contain one metadata line after archive, got %d", len(newLines))
-	}
-	var currentMetadata Record
-	if len(newLines) == 1 && json.Unmarshal([]byte(newLines[0]), &currentMetadata) == nil && currentMetadata.Kind != kindMetadata {
-		t.Errorf("current.jsonl first record kind = %q, want metadata", currentMetadata.Kind)
-	}
-
-	// archive 目录应该有刚才归档的文件
-	archiveDir := filepath.Join(s.dir, "archive")
-	entries, err := os.ReadDir(archiveDir)
-	if err != nil {
-		t.Fatalf("read archive dir: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 archive file, got %d", len(entries))
-	}
-	if !strings.HasSuffix(entries[0].Name(), ".jsonl") {
-		t.Errorf("archive file should be .jsonl, got %q", entries[0].Name())
-	}
-	assertPrivateMode(t, archiveDir)
-	assertPrivateMode(t, filepath.Join(archiveDir, entries[0].Name()))
-	assertPrivateMode(t, currentPath)
-
-	// ActiveView 应该是空
-	view := s.ActiveView()
-	if len(view) != 0 {
-		t.Errorf("ActiveView after archive should be empty, got %d", len(view))
-	}
-}
-
-// TestArchiveReopen 验证 Archive 后重新 Open 返回空会话。
-func TestArchiveReopen(t *testing.T) {
-	s := openStore(t)
-	dir := s.dir
-
-	all := commMsgs([]string{"m0", "m1"}, "user")
-	_, err := s.Commit(all)
-	if err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
-
-	err = s.Archive()
-	if err != nil {
-		t.Fatalf("Archive: %v", err)
-	}
-	s.Close()
-
-	// 重新 Open
-	s2, err := Open(dir)
-	if err != nil {
-		t.Fatalf("Open after archive: %v", err)
-	}
-	defer s2.Close()
-
-	view := s2.ActiveView()
-	if len(view) != 0 {
-		t.Errorf("reopen after archive: expected empty view, got %d", len(view))
-	}
-
-	// archive 文件还在
-	entries, _ := os.ReadDir(filepath.Join(dir, "archive"))
-	if len(entries) != 1 {
-		t.Errorf("archive should have 1 file, got %d", len(entries))
-	}
-}
-
 // TestCheckpoint 验证 checkpoint 功能。
 func TestCheckpoint(t *testing.T) {
 	s := openStore(t)
@@ -1719,36 +1629,6 @@ func TestStoreSessionIdentityIsStableAcrossReopenAndCompact(t *testing.T) {
 	}
 }
 
-func TestStoreArchiveKeepsArchivedIdentityAndCreatesNewCurrentIdentity(t *testing.T) {
-	dir := t.TempDir()
-	store, err := Open(dir)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	oldID := store.SessionID()
-	if _, err := store.Commit([]core.Message{commMsg("m0", "user", "archive me")}); err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
-	if err := store.Archive(); err != nil {
-		t.Fatalf("Archive: %v", err)
-	}
-	newID := store.SessionID()
-	if newID == "" || newID == oldID {
-		t.Fatalf("new current SessionID = %q, want a distinct non-empty ID", newID)
-	}
-	entries, err := os.ReadDir(filepath.Join(dir, "archive"))
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("archive entries = %v, err=%v", entries, err)
-	}
-	view, err := OpenArchiveView(filepath.Join(dir, "archive", entries[0].Name()))
-	if err != nil {
-		t.Fatalf("OpenArchiveView: %v", err)
-	}
-	if view.SessionID() != oldID {
-		t.Errorf("archived SessionID = %q, want %q", view.SessionID(), oldID)
-	}
-}
-
 func TestStoreMigratesLegacyJSONLWithStableIdentity(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "current.jsonl")
@@ -1792,5 +1672,183 @@ func TestStoreMigratesLegacyJSONLWithStableIdentity(t *testing.T) {
 	}
 	if !foundMetadata {
 		t.Fatal("legacy migration did not persist metadata record")
+	}
+}
+
+// ── Plan A1：v2 文件名决议 + workspace / archived 声明 ───────────────────
+
+// countRecordsOfKind 统计 jsonl 文件中指定 kind 的记录条数（幂等/追加数断言用）。
+func countRecordsOfKind(t *testing.T, path, kind string) int {
+	t.Helper()
+	n := 0
+	for _, line := range readJSONLFile(t, path) {
+		var r Record
+		if err := json.Unmarshal([]byte(line), &r); err == nil && r.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// TestOpenDataFileNameV2 验证 v2 文件名决议（Plan A1）三分支：
+// ① 会话形态目录（basename = session_<hex>）新建 → 写 <id>.jsonl、不产生 current.jsonl，重开仍走 v2 文件；
+// ② 会话形态目录存量 current.jsonl → 兼容读、追加仍落 current.jsonl，且读路径不做重命名迁移（改名归 A4 一次性迁移）；
+// ③ 非会话形态 basename（测试目录等）→ 恒用 current.jsonl，行为同 v1。
+func TestOpenDataFileNameV2(t *testing.T) {
+	// ① 新建 → v2 名
+	shaped := filepath.Join(t.TempDir(), NewSessionID())
+	s, err := Open(shaped)
+	if err != nil {
+		t.Fatalf("Open shaped dir: %v", err)
+	}
+	v2 := filepath.Join(shaped, filepath.Base(shaped)+".jsonl")
+	if _, err := os.Stat(v2); err != nil {
+		t.Fatalf("new session in shaped dir must use v2 name %s: %v", v2, err)
+	}
+	if _, err := os.Stat(filepath.Join(shaped, "current.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("v2 store must not create current.jsonl: stat err = %v", err)
+	}
+	if _, err := s.Commit(msgs("user", "v2 hello")); err != nil {
+		t.Fatalf("Commit on v2 store: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close v2 store: %v", err)
+	}
+
+	// 重开仍决议到 v2 文件且历史完整
+	reopened, err := Open(shaped)
+	if err != nil {
+		t.Fatalf("reopen v2 store: %v", err)
+	}
+	defer reopened.Close()
+	if view := reopened.ActiveView(); len(view) != 1 || view[0].Content != "v2 hello" {
+		t.Fatalf("ActiveView after v2 reopen = %v, want ['v2 hello']", viewContent(view))
+	}
+
+	// ② 会话形态目录存量 current.jsonl → 兼容读，追加仍落 current.jsonl
+	legacyID := NewSessionID()
+	legacyDir := filepath.Join(t.TempDir(), legacyID)
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatalf("mkdir legacy dir: %v", err)
+	}
+	// 种一行 metadata（id 与目录名一致，模拟 A4 迁移前的存量 per-id 形态）
+	seed := fmt.Sprintf(`{"kind":"metadata","session_id":%q,"created_at":"2024-01-01T00:00:00Z"}`+"\n", legacyID)
+	legacyPath := filepath.Join(legacyDir, "current.jsonl")
+	if err := os.WriteFile(legacyPath, []byte(seed), 0o600); err != nil {
+		t.Fatalf("write legacy current.jsonl: %v", err)
+	}
+	s2, err := Open(legacyDir)
+	if err != nil {
+		t.Fatalf("Open legacy-shaped dir: %v", err)
+	}
+	defer s2.Close()
+	if s2.SessionID() != legacyID {
+		t.Fatalf("legacy store SessionID = %q, want %q (metadata 兼容读)", s2.SessionID(), legacyID)
+	}
+	if _, err := s2.Commit(msgs("user", "appended to legacy")); err != nil {
+		t.Fatalf("Commit on legacy store: %v", err)
+	}
+	if n := countRecordsOfKind(t, legacyPath, "msg"); n != 1 {
+		t.Errorf("appended records must land in current.jsonl, msg lines = %d, want 1", n)
+	}
+	if _, err := os.Stat(filepath.Join(legacyDir, legacyID+".jsonl")); !os.IsNotExist(err) {
+		t.Errorf("compat read must not create the v2 file (rename 归 A4): stat err = %v", err)
+	}
+
+	// ③ 非会话形态 basename → 维持 current.jsonl
+	plain := filepath.Join(t.TempDir(), "plain-test-dir")
+	s3, err := Open(plain)
+	if err != nil {
+		t.Fatalf("Open plain dir: %v", err)
+	}
+	defer s3.Close()
+	if _, err := os.Stat(filepath.Join(plain, "current.jsonl")); err != nil {
+		t.Errorf("non-session-shaped dir must keep current.jsonl: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(plain, "plain-test-dir.jsonl")); !os.IsNotExist(err) {
+		t.Errorf("non-session-shaped dir must not use v2 name: stat err = %v", err)
+	}
+}
+
+// TestDeclareWorkspaceLastWins 验证 workspace 记录 last-wins（Plan A1）：
+// 多次声明取最后一条；落盘跨重开保持；空串声明被拒绝。
+func TestDeclareWorkspaceLastWins(t *testing.T) {
+	s := openStore(t)
+	if got := s.Workspace(); got != "" {
+		t.Fatalf("fresh store Workspace = %q, want empty", got)
+	}
+	if err := s.DeclareWorkspace("/tmp/wk/a"); err != nil {
+		t.Fatalf("DeclareWorkspace a: %v", err)
+	}
+	if err := s.DeclareWorkspace("/tmp/wk/b"); err != nil {
+		t.Fatalf("DeclareWorkspace b: %v", err)
+	}
+	if got := s.Workspace(); got != "/tmp/wk/b" {
+		t.Fatalf("Workspace after two declarations = %q, want /tmp/wk/b (last-wins)", got)
+	}
+
+	// 落盘：重开后仍是最后一条（记录在文件里，不依赖内存态）
+	dir := s.dir
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	if got := s2.Workspace(); got != "/tmp/wk/b" {
+		t.Fatalf("Workspace after reopen = %q, want /tmp/wk/b (last-wins 落盘)", got)
+	}
+
+	// 空串拒绝：「未声明」的表达是不写记录（DeclareWorkspace 注释论证）
+	if err := s2.DeclareWorkspace(""); err == nil {
+		t.Error("DeclareWorkspace(\"\") = nil error, want error")
+	}
+	if got := s2.Workspace(); got != "/tmp/wk/b" {
+		t.Errorf("Workspace after rejected empty declaration = %q, want unchanged /tmp/wk/b", got)
+	}
+}
+
+// TestMarkArchivedIdempotent 验证 archived 终态标记（Plan A1）：
+// 首次标记落盘、重复标记 no-op（文件里只有一条 archived 记录）、跨重开保留。
+func TestMarkArchivedIdempotent(t *testing.T) {
+	s := openStore(t)
+	if s.Archived() {
+		t.Fatal("fresh store must not be archived")
+	}
+	if err := s.MarkArchived(); err != nil {
+		t.Fatalf("MarkArchived: %v", err)
+	}
+	if _, err := s.Commit(msgs("user", "post archive mark")); err != nil {
+		t.Fatalf("Commit after mark: %v", err)
+	}
+	if !s.Archived() {
+		t.Fatal("Archived = false after MarkArchived, want true")
+	}
+
+	// 幂等 no-op：重复标记不追加记录（MarkArchived 注释的取舍论证）
+	if err := s.MarkArchived(); err != nil {
+		t.Fatalf("repeated MarkArchived: %v", err)
+	}
+	if n := countRecordsOfKind(t, filepath.Join(s.dir, "current.jsonl"), kindArchived); n != 1 {
+		t.Errorf("archived records in file = %d, want 1 (repeat must be no-op)", n)
+	}
+
+	// 终态跨重开保留（A3 只读执法依赖重启后依然拒）
+	dir := s.dir
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+	if !s2.Archived() {
+		t.Error("Archived after reopen = false, want true (终态持久)")
+	}
+	if got := s2.Workspace(); got != "" {
+		t.Errorf("Workspace on unmarked store = %q, want empty", got)
 	}
 }

@@ -95,7 +95,12 @@ func (p *AgentPlugin) doRewind(ctx *model.Context, arg string) error {
 		return nil
 	}
 
-	// 执行回溯：移动 head → 刷新 session
+	// 执行回溯：移动 head → 刷新 session。写面前同源拒 archived（定案需求 #1，
+	// 与 handleCompact/handleAgent 的 store 执法同一数据源）——/rewind 无参的
+	// 检查点列表是只读观察面，保留对 archived 会话可用。
+	if st := p.currentStoreIn(ctx.Ctx); st.Archived() {
+		return fmt.Errorf("agent: session %q is archived and read-only", st.SessionID())
+	}
 	if err := p.currentStoreIn(ctx.Ctx).SetHead(ck.At); err != nil {
 		ctx.Writer(fmt.Sprintf("✘ 回溯失败: %v\n", err))
 		return nil

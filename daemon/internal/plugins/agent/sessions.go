@@ -1,19 +1,16 @@
-// sessions.go 提供 agent 插件的会话清单与元数据能力：扫描当前会话目录（current.jsonl +
-// archive/*.jsonl）产出 ACP session/list 的会话摘要、session/new|load 响应的 modes
-// 状态与归档只读重放，供主会话 ACP service 做会话列表、load 判定与模型显示。
-// P1-3 起持久化换轨 Repository（每会话独立目录 + legacy 根槽兼容挂载），归档随
-// 会话目录轮转：清单取数经 currentStore() 解析，扫描「当前会话目录」下的
-// current.jsonl 与 archive/（legacy 挂载期即 Session.Dir，与旧布局逐字段一致；
-// 其余 per-id 目录的并集留待 P5 并入）。
-// 只读扫描：不取 store.mu、不触发 Archive、归档文件只读打开
-// ——清单绝不干扰运行中的 store（追加中的半行按坏行跳过，与 store.loadRecords 同策略）。
+// sessions.go 提供 agent 插件的会话清单与元数据能力：清单（ListSessions）在
+// Plan A3 起改为全仓并集扫描——session.ScanSessionDigests 一次只读解析 Session.Dir
+// 下全部会话（per-id 目录 v2/v1 双探测 + legacy 根槽），三态判定后按 updatedAt
+// 降序输出；本文件另承载 session/new|load 响应的 modes 状态、当前/归档会话的
+// 历史重放与 cwd 取数，供主会话 ACP service 做会话列表、load 判定与模型显示。
+// 只读纪律不变：不取 store.mu、不触发归档、坏行跳过——清单绝不干扰运行中的
+// store（追加中的半行按坏行跳过，与 store.loadRecords 同策略）。
 package service
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -32,45 +29,116 @@ const (
 	titleMaxRunes = 60
 )
 
-// ListSessions 汇总会话清单：当前会话（store 有 head 时）置顶且不参与排序，
-// 归档会话按 updatedAt 倒序随后，最多 maxListSessions 条。
+// ListSessions 汇总会话清单（Plan A3 并集重写）：扫描 Session.Dir 下全部会话
+// （per-id 目录 v2/v1 双探测 + legacy 根槽，session.ScanSessionDigests 一次性
+// 只读解析），三态判定（定案需求 #3）后按 updatedAt 降序输出、
+// maxListSessions 截断。旧版「当前会话置顶且不参与排序」的特殊逻辑取消——
+// 多会话下统一排序（plan A3），当前会话只是普通条目（cwd 取值有特例，见下）。
 //
-// 数据源（P1-3 换轨）：当前会话 = currentStore()（经 current runtime → repo 实例
-// 唯一缓存解析，与命令互斥同源）；归档 = 当前会话目录（currentSessionDir）的
-// archive/ 扫描——legacy 挂载期即 Session.Dir（与旧布局输出一致），独立目录会话
-// 扫 <root>/<id>/archive/；其余 per-id 目录的并集留待 P5 并入，本步输出逐字段
-// 规则与旧版一致。
+// 数据源（Plan A3）：session.ScanSessionDigests——不进实例唯一缓存、不取写
+// 句柄、不加目录锁的只读解析面（digest.go 文件头论证：清单是高频操作，逐会话
+// Open 的缓存/flock 常驻不可接受；OpenArchiveView 同级只读纪律，坏行跳过）。
+// 旧版的「当前会话目录 archive/ 扫描」随之退役：Plan A1 起 archived 是原位
+// 终态标记（不再搬文件），显式归档与迁移的会话都在数据文件位置。
+// Store.Archive() 轮转时代的存量归档（root/archive/）已由 A4 一次性迁移
+// （session.MigrateLegacyLayout，启动链调用）以 archived 态迁回 per-id 目录后
+// 回归本清单；未迁移的旧快照（迁移前备份、异常中断的现场）上它们暂不可列，
+// ArchivedSessionHistory 的归档重放路径不受影响（已知 id 仍可 load）。
 //
-// 取值规则（store 的记录模型不落 cwd）：
-//   - sessionId：当前会话 = store 的稳定 logical SessionID（与 session/load 的「当前会话」
-//     判定同源，保证列表给出的 id 可直接 load）；Store.Head 只用于判断当前文件是否有
-//     消息，绝不作为 ACP sessionId；归档会话 = 归档 metadata 中的 logical SessionID。
-//   - cwd：当前会话填最近一次有效声明的会话 cwd（未声明为空）；归档会话为空。
-//   - active：daemon domain summary 标记当前会话；ACP SessionInfo 映射时不会写入该字段。
+// 取值规则：
+//   - sessionId：metadata 的稳定 logical SessionID（与 session/load 判定同源，
+//     可直接 load）；legacy 槽为合成 id（metadata 缺失时）。
+//   - state（定案需求 #3/#8，archived 优先）：archived 终态标记 → archived；
+//     连接绑定（BindingRegistry）或 run 在飞（rt.Active 非 nil；挂起收口中的
+//     会话同样在飞——isSuspendedRelease 取数面覆盖「终态已清、台账未摘」的
+//     瞬间窗口）或 current 便利指针持有 → active；否则 idle。current 是
+//     CLI/stdin 的便利绑定（plan A2「current 收缩为 CLI/stdin 便利指针」），
+//     持有即活跃——否则 CLI 用户看自己的会话是 idle。
+//   - cwd（A7 设计点 5）：active 的 current 会话以 runtime 声明为最新事实
+//     （startSession 的声明迁移只落 runtime 不落 workspace 记录——/new 后
+//     新会话无记录，声明是唯一事实源）；其余会话从 workspace 记录读（declareSessionCWD
+//     声明即双写，记录与声明同步；idle/archived 的记录是唯一事实源）。
 //   - title：文件内首条 user 消息内容，空白折叠为单行后截断到 titleMaxRunes。
-//   - updatedAt：文件 mtime（RFC3339）。
+//   - updatedAt：数据文件 mtime（RFC3339 展示；排序用 time.Time 避免字符串
+//     比较的时区陷阱）。
 func (p *AgentPlugin) ListSessions() []model.SessionSummary {
-	out := make([]model.SessionSummary, 0, 4)
-	store := p.currentStore()
-	dir := p.currentSessionDir()
-	if store == nil || dir == "" {
+	out := make([]model.SessionSummary, 0, 8)
+	if p.cfg == nil || p.cfg.Session.Dir == "" {
 		return out
 	}
-
-	if head := store.Head(); head != "" {
-		if m := describeSessionFile(filepath.Join(dir, "current.jsonl"), store.SessionID()); m != nil {
-			m.info.Active = true
-			m.info.Cwd = p.currentSessionCwd()
-			out = append(out, m.info)
-		}
+	digests, err := session.ScanSessionDigests(p.cfg.Session.Dir)
+	if err != nil {
+		// root 不可读（目录被移走/权限收紧）：空清单诚实降级，warn 留痕。
+		slog.Warn("agent: session list scan failed", "dir", p.cfg.Session.Dir, "err", err)
+		return out
 	}
-	for _, m := range listArchivedSessions(filepath.Join(dir, "archive")) {
-		out = append(out, m.info)
+	currentID := p.CurrentSessionID()
+	type entry struct {
+		info model.SessionSummary
+		at   time.Time
+	}
+	entries := make([]entry, 0, len(digests))
+	for _, d := range digests {
+		id := d.Metadata.SessionID
+		info := model.SessionSummary{
+			SessionID: id,
+			Title:     truncateTitle(d.FirstUserText),
+			Cwd:       d.Workspace,
+			UpdatedAt: d.ModTime.Format(time.RFC3339),
+			Archived:  d.Archived,
+		}
+		switch {
+		case d.Archived:
+			info.State = model.SessionStateArchived
+		case p.sessionIsLive(id):
+			info.State = model.SessionStateActive
+			if id == currentID {
+				// A7⑤：current 会话的 cwd 以 runtime 声明为最新事实（声明迁移
+				// 不落记录）；无效声明下 currentSessionCwd 返回空（cwdErr 标记）。
+				info.Cwd = p.currentSessionCwd()
+			}
+		default:
+			info.State = model.SessionStateIdle
+		}
+		entries = append(entries, entry{info: info, at: d.ModTime})
+	}
+	// updatedAt 降序（time.Time 比较，无时区字符串陷阱）；稳定排序保持同刻
+	// 文件的扫描序（os.ReadDir 语义）。
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].at.After(entries[j].at) })
+	for _, e := range entries {
+		out = append(out, e.info)
 	}
 	if len(out) > maxListSessions {
 		out = out[:maxListSessions]
 	}
 	return out
+}
+
+// sessionIsLive 报告会话处于 active 态（Plan A3/定案需求 #8 的判定底座）：
+// 连接绑定（BindingRegistry，生命周期引用的事实源）、run 在飞（rt.Active 非
+// nil——后台 run 与挂起收口中的会话同样在飞）、current 便利指针持有（CLI/stdin
+// 形态）。三个判据任一命中即活；全零即 idle（引用归零的会话由 A2a 生命周期
+// 收口注销，idle 是收口前后的过渡态）。
+//
+// 绑定集合的跨层取数通路（A3 任务书勘察项）：取 p.control（agentcontrol.Service，
+// 插件装配时已持有的实例）的 SessionBindings 透传，而非新建 ConnectionBinder
+// 同款可选接口——插件与 Service 是组合关系（control 字段），零新增接口面；
+// 新接口反而要在 model 层再造一个 type-assert 面，侵入更大。control 为 nil
+// （测试直构插件）按无绑定处理，与 lifecycle.go 的 nil 容忍同款。
+func (p *AgentPlugin) sessionIsLive(id string) bool {
+	if p.control != nil && len(p.control.SessionBindings(id)) > 0 {
+		return true
+	}
+	if rt := p.manager.Get(id); rt != nil && rt.Active() != nil {
+		return true
+	}
+	if p.isSuspendedRelease(id) {
+		return true
+	}
+	if cur := p.currentSession(); cur != nil && cur.ID == id {
+		return true
+	}
+	return false
 }
 
 // SessionModes 实现 modes 探测（经 ACP service 委托给 dispatch.Server）：
@@ -157,14 +225,26 @@ func (p *AgentPlugin) CurrentSessionHistory() []model.SessionUpdate {
 }
 
 // ArchivedSessionHistory 只读解析归档会话并映射为 ACP 重放通知序列（方案 B
-// 「归档只读查看」的数据面）：按 archiveId 定位归档文件，OpenArchiveView 构建
-// ActiveView 与 checkpoint 锚点，经与 CurrentSessionHistory 相同的
-// segmentByCheckpoints + roundUpdates 管线输出。不持写句柄、不 rename、不触碰
-// current 与 store。
+// 「归档只读查看」的数据面）。两条解析路径：
+//   - archive/ 目录（方案 B 原路径）：按 archiveId 定位归档文件，OpenArchiveView
+//     构建 ActiveView 与 checkpoint 锚点，经与 CurrentSessionHistory 相同的
+//     segmentByCheckpoints + roundUpdates 管线输出。不持写句柄、不 rename、
+//     不触碰 current 与 store。归档路径先查当前会话目录的 archive/，legacy
+//     根槽（<Session.Dir>/archive/，兼容挂载的既有归档）次之。
+//   - repo 层 per-id 数据文件（Plan A2b1 扩展，判定源从「清单扫描」改为
+//     repo 探测）：Plan A1 起 archived 是原位终态标记（MarkArchived 不搬文件，
+//     Store.Archive() 已随定案 #9 删除），显式归档（A3）与迁移（A4）的产物
+//     停在 <root>/<id>/<数据文件>——这些会话不在任何 archive/ 目录里，经
+//     repo.Open（v2/v1 双探测 + legacy 槽，与 LoadBoundSession 的重开同链）
+//     解析后查 store.Archived()。命中 → 快照重放后释放（见下）；未命中
+//     archived 标记 → 诚实报错「not archived」（handler 只在 SessionArchived
+//     探测为真后到达这里，此分支是防御面）。
 //
-// 归档路径解析（P1-3）：归档随会话目录轮转（Archive 以 store 自身 dir 为基准），
-// 先查当前会话目录的 archive/，legacy 根槽（<Session.Dir>/archive/，兼容挂载的
-// 既有归档）次之；两处都只读 OpenArchiveView，其余 per-id 目录的并集留待 P5。
+// 释放守卫（repo 分支）：快照先于关闭——updates 是纯值切片，Close 后可安全
+// 流式下发。CloseSession 前置「非在册 runtime」判定（RouteSession 命中即
+// 跳过）：会话仍在 manager 注册表（如 A3 起的绑定态归档）时其 store 归
+// runtime 所有，绝不能随只读重放关闭；不在册的终态会话不常驻缓存（flock
+// 与句柄随快照释放，SessionArchived 探测留下的缓存条目一并逐出）。
 func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]model.SessionUpdate, error) {
 	if p.cfg == nil || p.cfg.Session.Dir == "" {
 		return nil, fmt.Errorf("agent: session persistence disabled")
@@ -179,6 +259,7 @@ func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]model.SessionU
 	}
 	dirs = append(dirs, p.cfg.Session.Dir)
 	path := ""
+	found := ""
 	for _, dir := range dirs {
 		candidate, ok := archivePathForSession(dir, sessionID)
 		if !ok {
@@ -188,31 +269,54 @@ func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]model.SessionU
 			path = candidate // 保留首个候选：全部未命中时按它给出 open archive 报错
 		}
 		if _, err := os.Stat(candidate); err == nil {
-			path = candidate
+			found = candidate
 			break
 		}
 	}
-	if path == "" {
-		return nil, fmt.Errorf("agent: invalid archive session id %q", sessionID)
+	if found != "" {
+		view, err := session.OpenArchiveView(found)
+		if err != nil {
+			return nil, fmt.Errorf("agent: open archive %q: %w", sessionID, err)
+		}
+		return replayUpdates(view.ActiveView(), anchorSet(view.Checkpoints(0))), nil
 	}
-	view, err := session.OpenArchiveView(path)
-	if err != nil {
-		return nil, fmt.Errorf("agent: open archive %q: %w", sessionID, err)
+	// repo 层 per-id 分支（Plan A2b1 扩展，见函数头）：archive/ 目录未命中时
+	// 会话可能以原位终态形态存在。
+	if p.repo != nil {
+		st, err := p.repo.Open(sessionID)
+		if err == nil {
+			if !st.Archived() {
+				return nil, fmt.Errorf("agent: session %q is not archived", sessionID)
+			}
+			updates := replayUpdates(st.ActiveView(), anchorSet(st.Checkpoints(0)))
+			if p.RouteSession(sessionID) == nil {
+				if err := p.repo.CloseSession(sessionID); err != nil {
+					slog.Warn("agent: archived store release failed", "session", sessionID, "err", err)
+				}
+			}
+			return updates, nil
+		}
 	}
-	return replayUpdates(view.ActiveView(), anchorSet(view.Checkpoints(0))), nil
+	if path != "" {
+		// 存量语义兜底：archive 候选在但文件缺失、且 repo 层也无此会话——按旧
+		// 报错形态给出 open archive 失败（TestAgentPlugin_ArchivedSessionHistoryErrors
+		// 钉死的文案路径）。
+		view, err := session.OpenArchiveView(path)
+		if err != nil {
+			return nil, fmt.Errorf("agent: open archive %q: %w", sessionID, err)
+		}
+		return replayUpdates(view.ActiveView(), anchorSet(view.Checkpoints(0))), nil
+	}
+	return nil, fmt.Errorf("agent: invalid archive session id %q", sessionID)
 }
 
-// currentSessionDir 返回当前会话的会话目录（P1-3 归档扫描基准）。归档随会话目录
-// 轮转，目录两种形态：
+// currentSessionDir 返回当前会话的会话目录（P1-3 归档扫描基准）。目录两种形态：
 //   - 新布局 <Session.Dir>/<store SessionID>/（Repository.Create 创建，目录名即
 //     文件内 SessionID）；
 //   - legacy 根槽 = Session.Dir 本身（兼容挂载，current.jsonl 直在根下）。
 //
 // 判定：会话 id 命中新布局目录（其下有 current.jsonl）取该目录；否则根下有
-// legacy 槽取根；都没有返回空串。store 被 Archive 轮转的瞬间 metadata id 会换成
-// 新随机 id 而 store 目录不变，新 id 不命中任何目录 → 短暂返回空串；/new 在同一
-// gate 临界区内随即换轨新会话，窗口只暴露给无锁的只读清单方，与旧版在归档瞬间
-// 读清单的抖动同级。
+// legacy 槽取根；都没有返回空串。
 func (p *AgentPlugin) currentSessionDir() string {
 	root := p.cfg.Session.Dir
 	store := p.currentStore()
@@ -456,86 +560,6 @@ func rawInputValue(args string) any {
 		return json.RawMessage(args)
 	}
 	return args
-}
-
-// sessionMeta 是扫描单个 jsonl 的内部摘要；at 保留 time.Time 供排序。
-type sessionMeta struct {
-	info model.SessionSummary
-	at   time.Time
-}
-
-// listArchivedSessions 读取归档目录，按文件 mtime 倒序返回归档会话摘要。
-// 目录不存在（从未归档）返回空。
-func listArchivedSessions(archiveDir string) []sessionMeta {
-	entries, err := os.ReadDir(archiveDir)
-	if err != nil {
-		return nil
-	}
-	out := make([]sessionMeta, 0, len(entries))
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".jsonl") {
-			continue
-		}
-		path := filepath.Join(archiveDir, name)
-		sessionID := strings.TrimSuffix(name, ".jsonl")
-		if view, viewErr := session.OpenArchiveView(path); viewErr == nil && view.SessionID() != "" {
-			sessionID = view.SessionID()
-		}
-		m := describeSessionFile(path, sessionID)
-		if m == nil {
-			continue
-		}
-		out = append(out, *m)
-	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].at.After(out[j].at) })
-	return out
-}
-
-// describeSessionFile 取文件 mtime 与标题，组装一条会话摘要（sessionId 由调用方
-// 给定）。文件不存在或不可读返回 nil。
-func describeSessionFile(path, sessionID string) *sessionMeta {
-	fi, err := os.Stat(path)
-	if err != nil || fi.IsDir() {
-		return nil
-	}
-	return &sessionMeta{
-		info: model.SessionSummary{
-			SessionID: sessionID,
-			Title:     firstUserTitle(path),
-			UpdatedAt: fi.ModTime().Format(time.RFC3339),
-		},
-		at: fi.ModTime(),
-	}
-}
-
-// firstUserTitle 只读扫描 jsonl，返回首条 user 消息的单行化截断标题。
-// 无 user 消息（或全是坏行/空文件）返回空串（omitempty 下标题缺省）。
-func firstUserTitle(path string) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 1<<20) // 与 store.loadRecords 同限：单行最大 1MB
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		var r session.Record
-		if err := json.Unmarshal(line, &r); err != nil {
-			continue // 坏行跳过
-		}
-		// kind/role 字面量对齐 session 包的磁盘格式契约（record_format_test 兜底）：
-		// kind == "msg" 且 role == "user" 即用户消息。
-		if r.Kind == "msg" && r.Msg != nil && r.Msg.Role == "user" {
-			return truncateTitle(r.Msg.Content)
-		}
-	}
-	return ""
 }
 
 // truncateTitle 把内容折叠为单行并按 rune 截断，超长补 …（规则对齐 session 包

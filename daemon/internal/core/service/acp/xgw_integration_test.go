@@ -140,14 +140,82 @@ func newXGWLiveControl(t *testing.T, id string, pv core.Provider, collect func(*
 	return &xgwLiveControl{fakeSessionSource: &fakeSessionSource{}, m: m, sid: id, leases: map[string]string{}}
 }
 
-// SetSession 覆写:handler 的 session/new 经 SetSession 声明会话(fake 只记
-// activeID),本 shim 同步推进 currentID —— requireCurrent 的 V1 路由校验锚点
-// 与生产的 CurrentSessionID 语义对齐(生产里 session/new 即当前会话易主)。
+// SetSession 覆写:Plan A2b1 起 handler 的 session/new 不再调用 SetSession
+// (声明切换到 BoundSessionSource,见下方 CreateBoundSession)——本覆写保留为
+// fake 的兼容记账面,由 liveNewSession 在声明成功后显式驱动(见其注释)。
 func (f *xgwLiveControl) SetSession(sessionID, cwd string) {
 	f.mu.Lock()
 	f.currentID = sessionID
 	f.mu.Unlock()
 	f.fakeSessionSource.SetSession(sessionID, cwd)
+}
+
+// CreateBoundSession 实现 model.BoundSessionSource(Plan A2b1 语义对齐):
+// session/new 真新建在本 shim 的形态 = 声明落地其唯一 runtime(单 runtime 世界
+// 里「新建」收敛为返回既有 runtime 的 id,与 pr2DualControl 的创建队列不同——
+// 本 shim 的用例都是单会话编排便签)。cwd 不落任何状态(shim 无持久化事实)。
+func (f *xgwLiveControl) CreateBoundSession(cwd string) (string, error) {
+	return f.sid, nil
+}
+
+// LoadBoundSession mirror 生产二分支(单 runtime 形态):已注册(runtime id 命中)
+// → reload no-op(store 无,ReloadFromStore 本身 no-op);不在册 → 诚实未知
+// (ErrSessionUnknown 契约,handler 映射 -32000)。cwd 不动声明。
+func (f *xgwLiveControl) LoadBoundSession(sessionID, cwd string) error {
+	if sessionID != f.sid {
+		return fmt.Errorf("xgwLiveControl: session %q: %w", sessionID, model.ErrSessionUnknown)
+	}
+	return nil
+}
+
+// SessionHistory mirror 生产(单 runtime 形态):已注册 → 空重放;未知 → 报错。
+func (f *xgwLiveControl) SessionHistory(sessionID string) ([]model.SessionUpdate, error) {
+	if sessionID != f.sid {
+		return nil, fmt.Errorf("xgwLiveControl: session %q: %w", sessionID, model.ErrSessionUnknown)
+	}
+	return []model.SessionUpdate{}, nil
+}
+
+// SessionArchived 按 fake 的归档脚本作答(TestXGWIntegrationStandardMethodShapes
+// 的归档 load 依赖:archived map 里的 id 报告终态,handler 据此走只读重放——
+// 基接口 ArchivedSessionHistory 的脚本化历史)。单 runtime 的活会话恒 false。
+func (f *xgwLiveControl) SessionArchived(sessionID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.archived[sessionID]
+	return ok
+}
+
+// ArchiveSession shim(A3):归档动作落 f.archived 终态标记(值为 nil 的脚本
+// 项——SessionArchived 据此为真,ArchivedSessionHistory 无脚本按其既有报错
+// 形态走);run 在飞拒绝镜像生产语义——判据直接查注册表 rt.Active() 非 nil
+// (与生产 boundsession.go ArchiveSession 同一谓词;不走 f.ActiveRun,它前置
+// requireCurrent 的 V1 校验,而生产的归档寻址没有该限制);lease fencing 不
+// 模拟(见 pr2DualControl 同名注释,真插件链路的 fencing 验收在 plugins/agent
+// 的 ArchiveSession 测试)。未知会话诚实未知。
+//
+// 锁序注意:在飞检查只触 manager 内部锁,与本 shim 的 f.mu 无嵌套;终态落回
+// 持 f.mu(short critical section)。在飞检查与落标记之间的窗口对本 shim 的
+// 单线程用例无影响(生产侧的同类窗口由生产实现的 WithControl 临界区封闭)。
+func (f *xgwLiveControl) ArchiveSession(sessionID, clientID string) error {
+	if rt := f.m.Get(f.sid); rt != nil {
+		if run := rt.Active(); run != nil {
+			return fmt.Errorf("xgwLiveControl: session %q is busy: run in flight (state %s)", sessionID, run.State())
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.archived == nil {
+		f.archived = make(map[string][]model.SessionUpdate) // 惰性建表:仅归档用例消费
+	}
+	if _, ok := f.archived[sessionID]; ok {
+		return nil // 幂等:已终态
+	}
+	if sessionID != f.sid {
+		return fmt.Errorf("xgwLiveControl: session %q: %w", sessionID, model.ErrSessionUnknown)
+	}
+	f.archived[sessionID] = nil
+	return nil
 }
 
 // requireCurrent mirror runcontrol.go 的 V1 路由校验(拍板⑤):非 current 会话
@@ -189,7 +257,10 @@ func (f *xgwLiveControl) StartRun(sessionID, connectionID, input, requestID stri
 		}
 		f.runByReq[requestID] = h
 	}
-	return h.RunID, string(h.State()), nil
+	// fresh 提交返回接受时刻快照(SubmitState,恒 queued),镜像生产的
+	// runcontrol.StartRun;活快照 State() 在 fast provider 下可能是 completed,
+	// 会让 wire 契约断言变成调度竞争。
+	return h.RunID, string(h.SubmitState()), nil
 }
 
 // CancelRun mirror runcontrol.go(fencing 同 StartRun):直转 manager(未知 run
@@ -486,9 +557,14 @@ func (s *xgwLiveStack) liveInitializeWithDeviceCaps(t *testing.T) {
 	}
 }
 
-// liveNewSession 走 session/new,返回服务端签发的会话 id(handler.CreateSession
-// 经 SetSession 把它写成 fakeSessionSource 的 current —— shim 的 current 校验
-// 以此为锚)。
+// liveNewSession 走 session/new,返回服务端签发的 transport 会话 id。
+//
+// Plan A2b1 语义对齐:handler 的 session/new 现经 CreateBoundSession 声明(落地
+// 本 shim 的 runtime id,Binding 指向之),不再经 SetSession 写 current——本
+// fixture 在声明成功后把 transport 会话 id 显式写成 shim 的 current 校验锚点
+// (requireCurrent 的 V1 形态镜像)。与本 shim 的既有记账一致:xgw wire 调用与
+// 标准 ACP 共用同一 transport id(单 runtime 世界里 runtime id ≠ wire id 的
+// 分离只在事件 session_id 断言处可观测,hub 以 rt.ID 为会话键)。
 func (s *xgwLiveStack) liveNewSession(t *testing.T) string {
 	t.Helper()
 	sid, err := s.client.NewSession(context.Background(), "/repo")
@@ -498,6 +574,9 @@ func (s *xgwLiveStack) liveNewSession(t *testing.T) string {
 	if sid == "" {
 		t.Fatal("session/new returned empty sessionId")
 	}
+	s.src.mu.Lock()
+	s.src.currentID = sid
+	s.src.mu.Unlock()
 	return sid
 }
 
@@ -1186,6 +1265,66 @@ func TestXGWIntegrationStandardMethodShapes(t *testing.T) {
 	}
 	if string(raw) != `{"stopReason":"end_turn"}` {
 		t.Fatalf("session/prompt response = %s, want exactly end_turn shape", raw)
+	}
+}
+
+// TestXGWIntegrationSessionArchive(Plan A3):x-goworker/session/archive 的协议
+// 级契约——响应形状逐字 {"archived":true}(重复归档幂等同形)、缺参与未知会话
+// 归一 -32000、管理门禁满即 busy(与 session/new|load 互斥的 wire 面);归档后
+// SessionArchived 探测为真,session/load 随即走只读重放分支(既有归档 load 用例
+// 的脚本面由本命令真实驱动)。run 在飞 busy 与 lease fencing 的语义验收在
+// plugins/agent 的 ArchiveSession 测试(真插件链路),shim 不模拟。
+func TestXGWIntegrationSessionArchive(t *testing.T) {
+	src := newXGWLiveControl(t, "xgw-proto-archive", &xgwScriptedProvider{}, nil)
+	l := newXGWLiveStack(t, nil, src)
+	l.liveInitialize(t)
+	l.liveNewSession(t)
+
+	// 缺 sessionId:参数校验先于 source,协议面诚实拒绝。
+	_, err := l.liveCallRaw(t, XMethodSessionArchive, map[string]any{})
+	rpcErr := wantXGWError(t, "archive without sessionId", err)
+	if !strings.Contains(rpcErr.Message, "sessionId") {
+		t.Fatalf("missing sessionId message = %q, want sessionId mention", rpcErr.Message)
+	}
+
+	// 未知会话:source 的 ErrSessionUnknown 归一 -32000。
+	_, err = l.liveCallRaw(t, XMethodSessionArchive, map[string]any{"sessionId": "session_ffffffffffffffffffffffffffffffff"})
+	rpcErr = wantXGWError(t, "archive unknown session", err)
+	if !strings.Contains(rpcErr.Message, "unknown session") {
+		t.Fatalf("unknown session message = %q, want unknown session mention", rpcErr.Message)
+	}
+
+	// 管理门禁:满即 busy(tryAcquire 语义,绝不排队攥住门禁)。
+	if !l.handler.gate.tryAcquire() {
+		t.Fatal("setup: gate acquire failed")
+	}
+	_, err = l.liveCallRaw(t, XMethodSessionArchive, map[string]any{"sessionId": src.sid})
+	rpcErr = wantXGWError(t, "archive while gate held", err)
+	if !strings.Contains(rpcErr.Message, "busy") {
+		t.Fatalf("gate-busy message = %q, want busy mention", rpcErr.Message)
+	}
+	l.handler.gate.release()
+
+	// 归档成功:响应逐字 {"archived":true};重复归档幂等同形。
+	raw, err := l.liveCallRaw(t, XMethodSessionArchive, map[string]any{"sessionId": src.sid})
+	if err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if string(raw) != `{"archived":true}` {
+		t.Fatalf("archive response = %s, want exactly {\"archived\":true}", raw)
+	}
+	raw, err = l.liveCallRaw(t, XMethodSessionArchive, map[string]any{"sessionId": src.sid})
+	if err != nil || string(raw) != `{"archived":true}` {
+		t.Fatalf("re-archive = %s, %v, want idempotent {\"archived\":true}", raw, err)
+	}
+
+	// 终态可观测:SessionArchived 探测为真(session/load 只读分流的前提),
+	// session/load 随即走归档只读重放(不注册 runtime、Binding 不动)。
+	if !src.SessionArchived(src.sid) {
+		t.Fatal("SessionArchived after archive = false, want true")
+	}
+	if _, err := l.client.SessionLoad(context.Background(), src.sid, ""); err != nil {
+		t.Fatalf("session/load of archived session: %v", err)
 	}
 }
 

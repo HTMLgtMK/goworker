@@ -411,7 +411,8 @@ func TestStopWaitsForInFlightMaintenance(t *testing.T) {
 		t.Fatalf("store write inside maintenance closure failed while Stop was winding down: %v", storeOpErr)
 	}
 	// ③ 写入已落盘:Close 的 Sync 之后从磁盘重读,消息在活跃视图中。
-	view, err := session.OpenArchiveView(filepath.Join(p.cfg.Session.Dir, sid, "current.jsonl"))
+	// 数据文件为 Plan A1 v2 名 <sid>.jsonl（Create 产出的 session 形态目录）。
+	view, err := session.OpenArchiveView(filepath.Join(p.cfg.Session.Dir, sid, sid+".jsonl"))
 	if err != nil {
 		t.Fatalf("reopen persisted store file after Stop: %v", err)
 	}
@@ -428,5 +429,38 @@ func TestStopWaitsForInFlightMaintenance(t *testing.T) {
 	// withSession 在 AcquireRun 成功后被 inFlightTracker 拒绝,不触碰任何持久化面。
 	if err := p.withSession(context.Background(), func(context.Context) error { return nil }); !errors.Is(err, errAgentStopping) {
 		t.Fatalf("withSession after Stop = %v, want errAgentStopping", err)
+	}
+}
+
+// TestStopWaitsForBackgroundFinalizers（A2b2 的 Stop 等待面验收，对齐
+// TestStopWaitsForInFlightMaintenance 的白盒形态）：/new 的 CheckpointSync 已
+// 挪出命令回合异步执行（commands.go，spawn 即登记 bgFinalizers）——Stop 必须
+// 在 memory 收尾（memory.Client.Close）之前等待全部后台固化完成，否则停机会
+// 打断固化、丢记忆（固化 goroutine 持有的 deps.Memory 在 Close 后调用）。
+// 直接断言「Stop 返回前 bgFinalizers 已排空」：以一个慢收尾 goroutine 模拟
+// 固化时长，Stop 返回时它必须已完成。
+func TestStopWaitsForBackgroundFinalizers(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "x"})
+
+	finalizerDone := make(chan struct{})
+	p.bgFinalizers.Add(1)
+	go func() {
+		defer p.bgFinalizers.Done()
+		time.Sleep(50 * time.Millisecond) // 模拟 LLM 固化耗时
+		close(finalizerDone)
+	}()
+
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case <-finalizerDone:
+	default:
+		t.Fatal("Stop returned while a background finalizer was still running (bgFinalizers wait missing)")
+	}
+
+	// 幂等：再次 Stop 不悬挂、不 panic（WaitGroup 空计数重入安全）。
+	if err := p.Stop(); err != nil {
+		t.Fatalf("second Stop: %v", err)
 	}
 }

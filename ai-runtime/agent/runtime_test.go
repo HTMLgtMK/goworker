@@ -3,8 +3,11 @@ package agent
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/tinguo/goworker/ai-runtime/session"
 )
 
 // TestSessionRuntimeExclusiveRun:同一 runtime 的独占执行权——A 持 gate 时
@@ -117,4 +120,153 @@ func TestAgentRunTransitions(t *testing.T) {
 	}
 
 	run.transition(RunFailed) // 重复终态不得重复关闭 done(panic 即失败)
+}
+
+// TestRunDoneHookFiresAfterTerminal(Plan A2 生命周期半边/A7 设计点 2):run 终态
+// 通知面——WithRunDoneHook 声明的回调经 Register 注入 runtime,finalizeRun 在
+// 清 active 后以 runtime id 触发恰好一次;触发点不变量:此刻 active 已清且
+// run.done 已关(等待面已放行),宿主的延迟收口据此安全重判。同步(RecordRun)
+// 与后台(StartRun)形态共享 finalizeRun,本测试覆盖同步形态的触发契约。
+func TestRunDoneHookFiresAfterTerminal(t *testing.T) {
+	hookCalls := make(chan string, 4)
+	m := NewSessionManager(WithRunDoneHook(func(sessionID string) {
+		hookCalls <- sessionID
+	}))
+	defer m.Close()
+
+	rt := NewSessionRuntime("s-hook", NewSession(SessionDeps{}))
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	var observedRun *AgentRun
+	relGate, err := rt.AcquireRun(context.Background()) // RecordRun 约定调用方已持 gate
+	if err != nil {
+		t.Fatalf("AcquireRun: %v", err)
+	}
+	res := rt.RecordRun(func(*Session) (RunResult, error) {
+		observedRun = rt.Active() // 执行中的 active 记账,供终态后对照
+		return RunResult{State: RunCompleted}, nil
+	})
+	relGate()
+	if res.State != RunCompleted {
+		t.Fatalf("RecordRun state = %q, want completed", res.State)
+	}
+
+	select {
+	case got := <-hookCalls:
+		if got != "s-hook" {
+			t.Fatalf("hook sessionID = %q, want s-hook", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("run done hook did not fire")
+	}
+
+	// 触发点不变量:active 已清、done 已关——宿主在回调里看到的是「无在飞
+	// run」的干净终态,重判引用计数不会误判在飞。
+	if got := rt.Active(); got != nil {
+		t.Fatalf("Active() inside/after hook window = %v, want nil (cleared before hook)", got)
+	}
+	if observedRun == nil {
+		t.Fatal("setup: active was not set during RecordRun")
+	}
+	select {
+	case <-observedRun.done:
+	default:
+		t.Fatal("run.done not closed when hook fired (ordering invariant broken)")
+	}
+
+	// 无 hook 的 runtime(直接构造、不经 Register)零行为变化:finalizeRun 照常
+	// 完成、不 panic(hook 为 nil 的既有路径回归)。
+	bare := NewSessionRuntime("s-bare", NewSession(SessionDeps{}))
+	relBare, err := bare.AcquireRun(context.Background())
+	if err != nil {
+		t.Fatalf("bare AcquireRun: %v", err)
+	}
+	if res := bare.RecordRun(func(*Session) (RunResult, error) {
+		return RunResult{State: RunCompleted}, nil
+	}); res.State != RunCompleted {
+		t.Fatalf("bare RecordRun state = %q, want completed", res.State)
+	}
+	relBare()
+}
+
+// memEventJournal 是 CloseEvents 测试用的最小内存事件 journal(EventJournal 的
+// 三方法直译;daemon 侧 xgw_integration_test 的同名先例,此处独立最小实现)。
+type memEventJournal struct {
+	mu     sync.Mutex
+	events []session.EventRecord
+	closed bool
+}
+
+func (j *memEventJournal) AppendEvent(rec session.EventRecord) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.closed {
+		return errors.New("journal closed")
+	}
+	j.events = append(j.events, rec)
+	return nil
+}
+
+func (j *memEventJournal) ReadEvents(afterSeq uint64) ([]session.EventRecord, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var out []session.EventRecord
+	for _, ev := range j.events {
+		if ev.Seq > afterSeq {
+			out = append(out, ev)
+		}
+	}
+	return out, nil
+}
+
+func (j *memEventJournal) SeqRange() (uint64, uint64, bool, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.events) == 0 {
+		return 0, 0, false, nil
+	}
+	return j.events[0].Seq, j.events[len(j.events)-1].Seq, true, nil
+}
+
+// TestSessionRuntimeCloseEvents 验证 CloseEvents 的收口语义(Plan A3,A7 设计点
+// 3——宿主侧生命周期收口 tryReleaseSession 的导出消费面):订阅通道随收口关闭
+// (daemon 通知泵经「通道关闭 → 泵退出自清」收敛,订阅不泄漏)、hub 关闭后
+// Publish/Subscribe 一律 ErrHubClosed(可观测)、幂等重入安全,events 未接线
+// (RunEvents nil,纯内存/未启用事件流)时幂等空操作。
+func TestSessionRuntimeCloseEvents(t *testing.T) {
+	j := &memEventJournal{}
+	rt := NewSessionRuntime("s-events", NewSession(SessionDeps{RunEvents: j}))
+	hub, err := rt.EnsureHub()
+	if err != nil || hub == nil {
+		t.Fatalf("EnsureHub = %v, %v, want hub", hub, err)
+	}
+
+	// 订阅建立后收口:通道关闭 → 消费方 range 到关闭即知订阅终结。
+	ch, err := hub.Subscribe(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	rt.CloseEvents()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("subscription channel delivered an event after close, want closed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscription channel not closed by CloseEvents")
+	}
+	if _, err := hub.Subscribe(context.Background(), 0); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("Subscribe after close = %v, want ErrHubClosed", err)
+	}
+	if err := hub.Publish(IngressEvent{Type: "run.started"}); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("Publish after close = %v, want ErrHubClosed", err)
+	}
+	// 幂等重入:二次收口无 panic(hub.Close 的 closed 幂等)。
+	rt.CloseEvents()
+
+	// RunEvents 未接线(纯内存形态):CloseEvents 幂等空操作。
+	bare := NewSessionRuntime("s-bare-events", NewSession(SessionDeps{}))
+	bare.CloseEvents()
 }

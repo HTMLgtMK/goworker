@@ -48,6 +48,11 @@ var errAgentStopping = errors.New("agent: plugin is stopping")
 // 全序，WaitGroup 的 Add 永不与 Wait 的零计数边界竞争。零值可用（测试直接构造
 // AgentPlugin 的字面量无需感知）；嵌套 Eval（owner == p 重入）不计数——那些闭包
 // 跑在 Run goroutine 内，已由 manager.Close 的 run.done 等待面覆盖。
+//
+// 措辞消歧（A2b2）：本文件与 plugin.go 提到的「Session Gate」一律指插件内
+// withSession 的 per-runtime 执行 gate（AcquireRun，容量 1，解析即互斥）——与
+// acp 包的全局管理门禁 SessionGate（coordinator.go，只守会话管理操作）是同名
+// 异物；后者自 A2b2 起 prompt 已退出，与插件的维护请求排队面无关。
 type inFlightTracker struct {
 	mu     sync.Mutex
 	wg     sync.WaitGroup
@@ -206,6 +211,19 @@ func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
 	if rt == nil {
 		return fmt.Errorf("agent: no active session")
 	}
+	// Plan A3 只读执法（A7 设计点 4，定案需求 #1）：archived 终态会话拒绝 prompt
+	// ——执法数据源统一为 store 查询（持久事实，重启后依然拒），不依赖 handler
+	// 的连接级 readOnly 集合（只覆盖「load 过归档的连接」——归档一个仍有绑定的
+	// 会话后，未 load 过它的连接 prompt 也会到达这里，集合面漏拦）。错误文案与
+	// handler 的归档拒写同形（read-only），客户端按同一契约分流。范围：写提交
+	// 面全查——prompt（/agent 与 fallback 同路，本处）与后台 run（runcontrol.go
+	// StartRun 的同源执法，堵 xgw run/start 写 archived store 的旁路）；维护命令
+	// 不查——/history /usage 是只读观察面，/new 是新建（不写 archived store）；
+	// 写型维护命令（/compact /rewind 回溯）由评审收尾补齐同源执法
+	// （handleCompact / rewind.go doRewind）。
+	if st := p.storeFor(rt); st != nil && st.Archived() {
+		return fmt.Errorf("agent: session %q is archived and read-only", rt.ID)
+	}
 	handle, err := p.StartRunSync(rt.ID, runtimeagent.RunRequest{
 		Input:      strings.Join(ctx.Args, " "),
 		ToolSource: ctx.ToolSource,
@@ -294,11 +312,13 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 		if oldRT != nil {
 			old = oldRT.Session()
 		}
-		// 会话 store 经同一 runtime 解析(P1-3 链,storeFor):快照与归档都落在
-		// startSession 换轨前的同一实例上。
+		// 会话 store 经同一 runtime 解析(P1-3 链,storeFor):快照落在 startSession
+		// 换轨前的同一实例上。
 		oldStore := p.storeFor(oldRT)
 
-		// pending 快照（store 生效时用游标后的增量，否则全量）
+		// pending 快照（store 生效时用游标后的增量，否则全量）。Plan A2 起 /new
+		// 不再轮转旧 store（下方 P5-5 块），快照的「归档前取出」次序约束消失，
+		// 仍在此处先取——CheckpointSync 消费的是换轨前捕获的同一份增量。
 		var pending []core.Message
 		if oldStore != nil {
 			pending = oldStore.PendingAfterCursor()
@@ -316,15 +336,14 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 			runContext.Writer("✔ New session started\n")
 		}
 
-		// 先归档旧 store，再开新会话（新 store 写新文件）
-		// pending 快照已在 Archive 前取出，不受归档影响。legacy 槽内轮转
-		// （current.jsonl → root/archive/）；独立目录会话同样在其目录内轮转
-		// （Archive 以 store 自身 dir 为基准）。
-		if oldStore != nil {
-			if err := oldStore.Archive(); err != nil {
-				slog.Warn("session: archive failed", "err", err)
-			}
-		}
+		// 定案需求 #2（Plan A2）：/new 纯新建，旧会话不轮转。旧 store 的数据文件
+		// 原样保留在原位（legacy 槽或 per-id 目录），后续去向：本连接独占引用时
+		// 由 P5-5 的引用归零判定关 store（数据不删，session/load 重开经 repo.Open
+		// 走 flock 慢路径拿活实例）；有其他连接引用/挂起收口时按生命周期保留。
+		// 归档是显式命令（x-goworker/session/archive，A3 提供 MarkArchived 只读
+		// 保留终态）；旧论证里「先归档旧 store」「legacy 槽内轮转（current.jsonl
+		// → root/archive/）」「Archive 以 store 自身 dir 为基准」的段落随
+		// Store.Archive() 删除（定案需求 #9）而作废。
 
 		// 创建新会话（新对象 = 新会话，旧状态随对象回收）。P1-3 起 startSession
 		// 经 Repository.Create 产出独立目录新会话（<Session.Dir>/<id>/）。
@@ -332,46 +351,87 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 
 		runContext.Writer("✔ STM cleared, memory will be retrieved on every query\n")
 
-		// 同步固化旧会话：阻塞至完成（内部 120s 超时），进度经 ctx.Publish 进状态栏，
-		// 结果/警告经 ctx.Writer 回显。主 goroutine 执行，可直接读共享配置。
+		// 后台固化旧会话（A2b2：CheckpointSync 挪出全局临界区——plan A2 锁序
+		// 论证「/new 的 CheckpointSync（阻塞至 120s）与关 store 挪出临界区，走
+		// 引用计数归零路径异步收尾」）：/new 的命令回合到此只做过状态突变
+		// （ACP 面在全局管理临界区内被 evaluate 调起；CLI 面无门禁同型执行），
+		// LLM 固化最长阻塞 120s，若同步执行会把全局管理门禁攥住 120s、阻塞全
+		// daemon 的会话管理操作。异步化的四个面：
+		//   - ctx 用 Background：不传播请求 ctx——/new 返回即请求生命周期结束，
+		//     连接断开/请求取消不得中断固化；CheckpointSync 内部自包 120s 上限
+		//     （checkpoint.go）。同步旧路径的「用户 Esc 中断固化」语义随异步化
+		//     退役：固化只有成功/失败两种收场，失败经回调回显并留痕（其内部
+		//     ⚠ 前缀警告）。
+		//   - 回调保留（callbacksFromPlugin）：CLI 面照常回显进度/结果；ACP 面的
+		//     Writer（commandOutput）自 evaluate 返回起由本 goroutine 独占——
+		//     handler 在 evaluate 返回后只调 output.Close()（写闭合围栏，与本
+		//     goroutine 的写入经 reporter 串行下发，无共享可变状态的并发写——
+		//     commandOutput 字段只被 evaluate 链触碰，此后封闭）；连接已断开时
+		//     ai-acp 的 Notify 对写失败静默忽略（server.go Update 的 _ = 丢弃），
+		//     安全降级。ACP 面的固化输出在命令代码围栏闭合之后到达（裸流）——
+		//     排版降级不丢内容，是有意接受的形态。
+		//   - 与 P5-5 收口并发安全：CheckpointSync 只消费 pending 快照（值切片）
+		//     与 old Session 对象（cwd/usage 锁内快照读、deps.Config/Memory 构造
+		//     后只读），固化不写会话 store（AdvanceCursor 仅 Consolidate 路径）——
+		//     下方收口的 CloseSession 关闭 store 句柄与固化无共享写面；old Session
+		//     对象在收口后无人再写（runtime 已注销，无新 run 可达）。
+		//   - Stop 覆盖：goroutine 登记 p.bgFinalizers（plugin.go Stop 在 memory
+		//     收尾前 Wait，固化是 memory.Client 的使用方，先于其 Close 完成——
+		//     绝不因停机丢固化）。不放进 inFlightTracker：其 closeAdmission 后
+		//     enter 一律拒绝，停机窗口内 spawn 的固化将登记失败而丢失；且语义
+		//     不同——inFlight 是外部请求屏障，bgFinalizers 是插件派生的后台收尾。
 		if consolidate {
-			old.CheckpointSync(runCtx, pending, callbacksFromPlugin(runContext))
+			p.bgFinalizers.Add(1)
+			go func() {
+				defer p.bgFinalizers.Done()
+				old.CheckpointSync(context.Background(), pending, callbacksFromPlugin(runContext))
+			}()
 		}
 
-		// P5-5 收口（遗留①）：旧 runtime 注销出 manager、旧 store 关闭。
+		// P5-5 收口（遗留①；Plan A2 生命周期半边改写为引用计数判定）。
 		//
-		// Remove（首用 manager.Remove，勘察 K——此前 daemon 对 Remove 零调用，
-		// manager 随 /new 无界累积）：拍板⑤「V1 仅 current 可路由」成立后，旧
-		// runtime 留册只剩误路由面（经 manager.Get(旧id) 触达的是已换轨的死会话），
-		// 注销后对旧 id 的 run/start|attach（P5-6/8）得 ErrSessionNotFound → 诚实
-		// 报错，客户端语义随 P5-10 写入 PROTOCOL.md。纯内存降级（无 store）下新旧
-		// runtime 同 id "current"、Register 冲突时旧条目保留（plugin.go startSession）：
-		// Remove 移除的正是旧条目（新 runtime 本就不在册），注册表随之归零。
+		// ① 摘发起方的绑定登记（引用减一）：clientID 是连接句柄（FrontendHandler
+		// 经 agentcontrol.WithClientID 随 prompt 链注入；CLI 无连接身份时为空串，
+		// 零动作）。BindingRegistry 是跨连接的生命周期事实源（agentcontrol
+		// bindings.go），b.Set("") 只清本连接的选择器、登记侧必须在此同步摘除，
+		// 否则旧会话的引用永不归零。
 		//
-		// Close：旧 store 归档/快照后已无写者——在途 run 与本闭包被 gate 串行
-		// （handleNew 持 gate 期间旧 runtime 不可能有活动 run），Remove 后经 manager
-		// 也再触达不了旧 runtime。Close 幂等（store.go:177-199，对已关闭/未持锁
-		// store 为 no-op）。只 Close、不从 repo 缓存逐出：P1-3 的实例唯一不变量要求
-		// 缓存条目存活到 Stop 的 repo.Close 统一回收；repo.Open 命中缓存直接返回
-		// 实例、不触碰文件锁（repository.go:161-163），已关闭实例留缓存不会引发
-		// 二次 Open 的 ErrStoreLocked。
-		if oldRT != nil {
-			p.manager.Remove(oldRT.ID)
+		// ② 引用归零判定（tryReleaseSession，lifecycle.go）：
+		//    绑定集合空 && 无在飞 run → manager.Remove(旧id) + repo.CloseSession。
+		//    Remove 的论证与旧版一致：旧 runtime 留册只剩误路由面（经 manager.Get
+		//    触达已换轨的死会话），注销后对旧 id 的 run/start|attach 诚实报
+		//    ErrSessionNotFound；纯内存降级（无 store）下新旧 runtime 同 id
+		//    "current"、Register 冲突时旧条目保留，tryReleaseSession 按 runtime
+		//    指针判 current 守卫（非 id），Remove 移除的正是旧条目。CloseSession
+		//    取代旧版的「只 Close 不逐出缓存」（A2.1①：死实例留缓存会让
+		//    session/load 重开命中死对象；逐出后重开走 flock 慢路径拿活实例，
+		//    这正是重开需要的语义）。
+		//    有其他连接绑定 → 旧会话保留（多 session 并行：旁观连接的旧会话可
+		//    继续 prompt）；有 run 在飞 → 挂起，run 终态通知（WithRunDoneHook →
+		//    onSessionRunDone）再判（定案需求 #8 的收口时点半边）。
+		//
+		// 判定的可靠性边界：本闭包持有旧 runtime 的 gate（withSession 解析即
+		// 互斥），Active() 非 nil 只可能是被 gate 挡在 execute ① 的 queued run
+		// ——挂起后它照常获得 gate 执行至终态、由终态通知驱动收口；「判定后、
+		// 执行前」的改绑窗口与 Remove 前后的 queued-run 窗口的封闭论证见
+		// tryReleaseSession 函数头（原子复查 + 防御取消）。
+		if clientID := agentcontrol.ClientIDFromCtx(runCtx); clientID != "" && p.control != nil {
+			p.control.UnbindSession(clientID)
 		}
-		if oldStore != nil {
-			if err := oldStore.Close(); err != nil {
-				slog.Warn("session: old store close failed", "err", err)
-			}
+		if oldRT != nil {
+			p.tryReleaseSession(oldRT.ID)
 		}
 
 		// PR2 /new 收口的 Binding 面(总方案 §六「只摘发起方的 binding」):仅清除
 		// 发起本命令的连接 Binding(agentcontrol.BindingFromCtx,FrontendHandler 经
 		// prompt 链注入;CLI 无 Binding 时为 nil,零动作)——此后该连接回落 current
 		// 语义,自然落到 startSession 刚换轨的新会话,单连接行为与旧版一致。TEARDOWN
-		// 语义不变:重选/清除 Binding 不删除会话(删除只发生在上面的既有收口)、不
-		// 取消后台 Run、不触碰 control lease(§6.2 四条纪律);其他连接的 Binding
-		// 连接私有、这里不可见也不可触及——指向被收口会话的它们在下次解析时诚实
-		// 失败(sessionRuntimeIn 的悬空分支),不会静默串到新会话。
+		// 语义不变:重选/清除 Binding 不删除会话(删除只发生在上面引用归零后的
+		// 生命周期收口)、不取消后台 Run、不触碰 control lease(§6.2 四条纪律);
+		// 其他连接的 Binding 连接私有、这里不可见也不可触及——仍指向旧会话的
+		// 它们是旧会话的存活引用(引用归零判定已计入 BindingRegistry);旧会话
+		// 真被收口而某连接的 SessionBinding 未同步登记的残留形态(测试桩/旧客户端)
+		// 在下次解析时诚实失败(sessionRuntimeIn 的悬空分支),不会静默串到新会话。
 		if b := agentcontrol.BindingFromCtx(runCtx); b != nil {
 			b.Set("")
 		}
@@ -639,6 +699,13 @@ func (p *AgentPlugin) handleCompact(ctx *model.Context) error {
 		if s == nil {
 			runContext.Writer("(no active session)\n")
 			return nil
+		}
+		// Plan A3 只读执法收尾（定案需求 #1「只读保留终态」）：写型维护命令与
+		// prompt/run 提交同源拒 archived（store 持久事实，重启后依然拒）——
+		// ACP 客户端归档一个 CLI 正在用的会话后，/compact 不再能写穿终态。
+		// 取数用本命令既有的 currentStoreIn 解析链（同一 gate 临界区、同一会话）。
+		if st := p.currentStoreIn(runCtx); st != nil && st.Archived() {
+			return fmt.Errorf("agent: session %q is archived and read-only", st.SessionID())
 		}
 		return s.Compact(runCtx, callbacksFromPlugin(runContext))
 	})

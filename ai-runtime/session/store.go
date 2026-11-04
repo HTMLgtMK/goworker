@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,7 +44,7 @@ var ErrStoreLocked = errors.New("session: store is locked by another holder")
 type Store struct {
 	mu sync.Mutex
 
-	path string // current.jsonl 绝对路径
+	path string // 会话数据 jsonl 绝对路径（v2 名 <dir>/<basename>.jsonl 或兼容存量 current.jsonl，见 resolveDataFilePath）
 	dir  string // 会话目录
 
 	file *os.File // 追加写入句柄，Open 后保持打开
@@ -56,6 +57,10 @@ type Store struct {
 }
 
 // Open 打开或创建 dir 下的会话存储。目录不存在则创建，jsonl 文件不存在则新建。
+// 数据文件名按 v2 决议（Plan A1，见 resolveDataFilePath）：会话形态目录
+// （basename 匹配 session_<hex>/legacy_<hex>）优先 <dir>/<basename>.jsonl，
+// 存量 current.jsonl 兼容读；非会话形态目录（测试目录、legacy 根槽等）恒用
+// current.jsonl，行为与 v1 完全一致。
 // 目录就绪后对 dir 加跨进程排它文件锁（flock，LOCK_EX|LOCK_NB，见 lock_unix.go）：
 // 已被占用（另一进程或本进程的另一实例正持有）→ ErrStoreLocked，第二写者被拒绝
 // （宁拒勿双写）。锁随 Store 生命周期持有，Close 释放；锁文件常驻不删除
@@ -77,7 +82,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 
-	path := filepath.Join(dir, "current.jsonl")
+	path := resolveDataFilePath(dir)
 
 	// 加载已有记录（lastGoodEnd = 最后一条合法记录行末偏移，见 loadRecords）
 	recs, lastGoodEnd, err := loadRecords(path)
@@ -507,62 +512,68 @@ func (s *Store) AdvanceCursor(id string) error {
 	return nil
 }
 
-// Archive 将 current.jsonl 重命名为 archive/<timestamp>.jsonl，然后打开带有新 metadata 的 current 文件。
-// 跨进程文件锁（s.lock）不随轮转释放：Archive 只轮转数据文件，会话目录仍由本 Store 独占持有。
-func (s *Store) Archive() error {
+// ── workspace / archived 声明（Plan A1）─────────────────────────────────
+
+// DeclareWorkspace 追加一条 workspace 记录，声明会话的工作目录。
+//
+// Plan A1：cwd 兼任 workspace（定案需求 #4），session/new 自带的 CWD 在创建时
+// 声明（repository.Create「创建即声明」），此后换绑工作目录同样再追加一条、
+// last-wins 生效。纯追加：旧记录不删除不改写（文件头原则），Workspace() 取
+// 最后一条。空串拒绝——「未声明」的表达方式是不写记录（repository.Create 对
+// 空 CWD 直接跳过），而非落一条空声明把最后一条有效声明冲掉。
+func (s *Store) DeclareWorkspace(path string) error {
+	if path == "" {
+		return fmt.Errorf("session: declare workspace: empty path")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 关闭当前文件句柄
-	if s.file != nil {
-		if err := s.file.Sync(); err != nil {
-			slog.Warn("session: sync before archive failed", "err", err)
-		}
-		if err := s.file.Close(); err != nil {
-			return fmt.Errorf("session: close before archive: %w", err)
-		}
-		s.file = nil
+	rec := newWorkspaceRecord(path, time.Now())
+	if err := s.appendRecord(rec); err != nil {
+		return fmt.Errorf("session: declare workspace %s: %w", path, err)
 	}
-
-	// 创建 archive 目录
-	archiveDir := filepath.Join(s.dir, "archive")
-	if err := os.MkdirAll(archiveDir, 0o700); err != nil {
-		return fmt.Errorf("session: create archive dir: %w", err)
-	}
-	if err := os.Chmod(archiveDir, 0o700); err != nil {
-		return fmt.Errorf("session: restrict archive dir: %w", err)
-	}
-
-	// rename current.jsonl → archive/<unix_nano>.jsonl
-	ts := fmt.Sprintf("%d", time.Now().UnixNano())
-	dst := filepath.Join(archiveDir, ts+".jsonl")
-	if err := os.Rename(s.path, dst); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("session: rename to archive: %w", err)
-	}
-
-	// 重开空文件
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("session: reopen after archive: %w", err)
-	}
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return fmt.Errorf("session: restrict reopened file: %w", err)
-	}
-	s.file = f
-	s.recs = nil
-	s.head = ""
-	s.cursor = ""
-	s.metadata = Metadata{SessionID: NewSessionID(), CreatedAt: time.Now()}
-	metadataRec := newMetadataRecord(s.metadata.SessionID, s.metadata.CreatedAt)
-	if err := s.appendRecord(metadataRec); err != nil {
-		_ = f.Close()
-		s.file = nil
-		return fmt.Errorf("session: persist metadata after archive: %w", err)
-	}
-	s.recs = []Record{metadataRec}
-
+	s.recs = append(s.recs, rec)
 	return nil
+}
+
+// Workspace 返回最后一条 workspace 记录声明的路径（last-wins）；从未声明返回
+// 空串。锁内 O(n) 扫描——调用方是会话清单等低频路径，不值得为它维护一份
+// 常驻缓存字段（Plan A1 的取舍：追加面零成本、读面 O(n)）。
+func (s *Store) Workspace() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return workspaceFromRecords(s.recs)
+}
+
+// MarkArchived 追加 archived 终态标记。
+//
+// 幂等语义：已存在 archived 记录时 no-op 返回 nil。取舍论证——archived 是
+// 终态（定案需求 #1「只读保留、不可逆」），重复标记不是新事实而是调用方缺陷：
+// no-op 让归档时间定格在首次声明（终态时间戳不应随重复调用漂移），也让 A4 的
+// 一次性迁移天然幂等（中断重跑不会追加重复行）。选 no-op 而非无条件追加的
+// 代价是「读后判断」，但该判断在 s.mu 内完成、同目录的跨进程写者又被 flock
+// 排他（ErrStoreLocked 宁拒勿双写），check-then-append 的 TOCTOU 已封闭。
+func (s *Store) MarkArchived() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if archivedFromRecords(s.recs) {
+		return nil
+	}
+	rec := newArchivedRecord(time.Now())
+	if err := s.appendRecord(rec); err != nil {
+		return fmt.Errorf("session: mark archived: %w", err)
+	}
+	s.recs = append(s.recs, rec)
+	return nil
+}
+
+// Archived 报告会话是否已有 archived 记录。Plan A3 的只读执法数据源：
+// prompt 命中终态标记走既有只读拒写路径（重启后依然拒，A7 设计点 4）。
+func (s *Store) Archived() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return archivedFromRecords(s.recs)
 }
 
 // ── 内部辅助 ──────────────────────────────────────────────────────────
@@ -633,6 +644,29 @@ func metadataFromRecords(recs []Record) (Metadata, bool) {
 		}
 	}
 	return Metadata{}, false
+}
+
+// workspaceFromRecords 返回最后一条 workspace 记录声明的路径（last-wins，
+// Plan A1；无声明返回空串）。Store.Workspace 与 ArchiveView.Workspace 共用，
+// 语义天然一致。
+func workspaceFromRecords(recs []Record) string {
+	for i := len(recs) - 1; i >= 0; i-- {
+		if r := recs[i]; r.Kind == kindWorkspace && r.Ws != nil {
+			return r.Ws.Path
+		}
+	}
+	return ""
+}
+
+// archivedFromRecords 报告记录集中是否存在 archived 记录。Store.Archived 与
+// ArchiveView.Archived 共用。
+func archivedFromRecords(recs []Record) bool {
+	for _, r := range recs {
+		if r.Kind == kindArchived && r.Arc != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func firstNodeID(recs []Record) string {
@@ -765,6 +799,78 @@ func (s *Store) remapCursor(retainIDs []string, cloneMap map[string]string, last
 }
 
 // ── 文件操作 ──────────────────────────────────────────────────────────
+
+// legacyDataFileName 是 v1 数据文件名。Plan A1 起会话形态目录改用 v2 名
+// <basename>.jsonl，本名保留两处身份：存量数据的兼容读路径（A4 一次性迁移前
+// 不重命名）与非会话形态目录（测试目录、legacy 根槽）的恒定文件名。
+const legacyDataFileName = "current.jsonl"
+
+// sessionShapedBasename 严格判定目录名是否为真实会话 id 形态：session_<hex> 或
+// legacy_<hex>（id.go 仅有的两种真实前缀），后缀为非空小写 hex（两种 id 的
+// 后缀都由 hex.EncodeToString 产出，恒小写）。
+//
+// 为什么要严格模式（Plan A1）：v2 文件名只对真实会话 id 生效。放宽判定（任意
+// basename 拼同名 jsonl）会让测试目录、legacy 根槽（<root> 本身，basename 是
+// 配置目录名）等被卷进 v2 决议，破坏既有测试与 legacy 挂载语义；严格形态也让
+// v2 名不可能与用户自建目录意外撞名。
+func sessionShapedBasename(name string) bool {
+	for _, prefix := range []string{"session_", "legacy_"} {
+		if strings.HasPrefix(name, prefix) && isLowerHex(name[len(prefix):]) {
+			return true
+		}
+	}
+	return false
+}
+
+// isLowerHex 报告 s 是否为非空的全小写十六进制串（sessionShapedBasename 的
+// 后缀校验）。
+func isLowerHex(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// newDataFileName 返回「新建」场景的数据文件名（无存量探测）：会话形态目录用
+// v2 名 <basename>.jsonl（Plan A1），否则维持 current.jsonl。
+// resolveDataFilePath 在两个候选都不存在时回落到同一结果（新建路径一致）。
+func newDataFileName(dir string) string {
+	if sessionShapedBasename(filepath.Base(dir)) {
+		return filepath.Base(dir) + ".jsonl"
+	}
+	return legacyDataFileName
+}
+
+// resolveDataFilePath 决议 dir 下的会话数据文件路径（Plan A1 v2 文件名）。
+// 会话形态目录的探测顺序：
+//
+//  1. <dir>/<basename>.jsonl 存在 → 用它（v2 名，Create/迁移后的正式形态）；
+//  2. 否则 <dir>/current.jsonl 存在 → 用它（兼容读存量；A4 一次性迁移负责
+//     改名，读路径不 rename——保持纯追加原则，不在读路径改写文件布局）；
+//  3. 两者都不存在（新建）→ v2 名。
+//
+// 非会话形态目录（sessionShapedBasename 不匹配）恒返回 current.jsonl。
+// Store.Open、Repository.Open/List 的探测都经本函数，保证读写两侧决议不漂移。
+func resolveDataFilePath(dir string) string {
+	current := filepath.Join(dir, legacyDataFileName)
+	if !sessionShapedBasename(filepath.Base(dir)) {
+		return current
+	}
+	v2 := filepath.Join(dir, filepath.Base(dir)+".jsonl")
+	if _, err := os.Stat(v2); err == nil {
+		return v2
+	}
+	if _, err := os.Stat(current); err == nil {
+		return current
+	}
+	return v2
+}
 
 // loadRecords 从 jsonl 文件加载全部记录，坏行跳过并 warn。
 // 除记录外返回 lastGoodEnd：最后一条合法记录行末的字节偏移（含行尾 '\n'，即

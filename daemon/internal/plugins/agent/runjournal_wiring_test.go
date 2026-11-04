@@ -71,16 +71,20 @@ func initHub(cfg *runtimeconfig.Config) *model.Hub {
 	}
 }
 
-// TestStartSessionMarksInterruptedRuns 验证 P2-7 的启动恢复接线（总方案第九节
-// 「Daemon 重启后」的 daemon 落地）：临时 Session.Dir 造 legacy 槽 + 上一进程
-// 遗留的 runs/（run-<nano>-1 末记录 running、run-<nano>-0 已终态 completed）→
-// NewPlugin+Init（真实 startSession 路径）→ 未收尾的 run 被追加恰好一条
-// interrupted 标记且原内容为字节前缀（不动）；已终态的 run 逐字节不动。
+// TestStartSessionMarksInterruptedRuns 验证 P2-7 的启动恢复接线在 Plan A4 之后
+// 的完整链（总方案第九节「Daemon 重启后」的 daemon 落地）：临时 Session.Dir 造
+// legacy 槽 + 上一进程遗留的 <root>/runs/（run-<nano>-1 末记录 running、
+// run-<nano>-0 已终态 completed）→ NewPlugin+Init（startSession 首周期先执行
+// 一次性迁移：legacy 槽迁入 per-id、runs/ 随迁 <root>/<sid>/runs/）→
+// LoadBoundSession 重开迁移后的会话（A2b1 重开路径承担恢复扫描——迁移退役了
+// 「挂载 legacy 槽为 current」的启动行为，current 是 Create 的新会话、无 journal
+// 可扫）→ 未收尾的 run 被追加恰好一条 interrupted 标记且原内容为字节前缀
+// （不动）；已终态的 run 逐字节不动。runs/ 的随迁由此一并验收。
 func TestStartSessionMarksInterruptedRuns(t *testing.T) {
 	root := t.TempDir()
 
 	// legacy 槽（<root>/current.jsonl，既有用户数据的挂载形态）：session.Open
-	// 在空根目录种 metadata 行并持 flock，先关闭释放锁，daemon Init 才能挂载。
+	// 在空根目录种 metadata 行并持 flock，先关闭释放锁，迁移与 daemon 才能触碰。
 	legacy, err := session.Open(root)
 	if err != nil {
 		t.Fatalf("open legacy slot: %v", err)
@@ -107,8 +111,8 @@ func TestStartSessionMarksInterruptedRuns(t *testing.T) {
 		session.RunStateRecord{Kind: "state", SessionID: sid, RunID: doneID, State: "completed", Persisted: true, At: at.Add(time.Second)},
 	)
 
-	// daemon 启动：NewPlugin + Init → startSession 挂载 legacy 槽并执行恢复扫描
-	//（MarkInterruptedRuns）。Memory 关闭以隔离本测试关注面。
+	// daemon 启动：NewPlugin + Init → startSession 首周期迁移（槽 + runs/ 入
+	// per-id）→ Create 新会话为 current。
 	cfg := runtimeconfig.Default()
 	cfg.Session.Dir = root
 	cfg.Session.Enabled = true
@@ -118,17 +122,34 @@ func TestStartSessionMarksInterruptedRuns(t *testing.T) {
 	if err := p.Init(hub); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	t.Cleanup(func() { _ = p.Stop() }) // 释放 repo 持有的 legacy 槽 flock
+	t.Cleanup(func() { _ = p.Stop() })
+
+	// 迁移落位断言：槽与 runs/ 都在 per-id 目录下，根下旧形态消失。
+	if _, err := os.Stat(filepath.Join(root, sid, sid+".jsonl")); err != nil {
+		t.Fatalf("legacy slot not migrated to per-id: %v", err)
+	}
+	migratedRunsDir := filepath.Join(root, sid, "runs")
+	if _, err := os.Stat(migratedRunsDir); err != nil {
+		t.Fatalf("legacy runs dir not carried over to per-id: %v", err)
+	}
+	if _, err := os.Stat(runsDir); !os.IsNotExist(err) {
+		t.Fatalf("root runs dir still present after migration (err=%v), want moved", err)
+	}
+
+	// 重开迁移后的会话（session/load 链）：A2b1 的重开路径执行 P2-7 恢复扫描。
+	if err := p.LoadBoundSession(sid, ""); err != nil {
+		t.Fatalf("LoadBoundSession(migrated session): %v", err)
+	}
 
 	// 未收尾的 run：原内容字节前缀不动 + 追加恰好一条 interrupted 标记。
-	interruptedAfter, err := os.ReadFile(filepath.Join(runsDir, runID+".jsonl"))
+	interruptedAfter, err := os.ReadFile(filepath.Join(migratedRunsDir, runID+".jsonl"))
 	if err != nil {
-		t.Fatalf("read %s after Init: %v", runID, err)
+		t.Fatalf("read %s after reopen: %v", runID, err)
 	}
 	if !bytes.HasPrefix(interruptedAfter, interruptedBefore) {
-		t.Fatalf("%s original content not preserved as prefix by startup scan", runID)
+		t.Fatalf("%s original content not preserved as prefix by reopen scan", runID)
 	}
-	recs := readRunJournalFile(t, filepath.Join(runsDir, runID+".jsonl"))
+	recs := readRunJournalFile(t, filepath.Join(migratedRunsDir, runID+".jsonl"))
 	if len(recs) != 2 {
 		t.Fatalf("%s records = %d, want 2 (原 running + 恰一条标记)", runID, len(recs))
 	}
@@ -141,12 +162,12 @@ func TestStartSessionMarksInterruptedRuns(t *testing.T) {
 	}
 
 	// 已终态的 run：逐字节不动。
-	completedAfter, err := os.ReadFile(filepath.Join(runsDir, doneID+".jsonl"))
+	completedAfter, err := os.ReadFile(filepath.Join(migratedRunsDir, doneID+".jsonl"))
 	if err != nil {
-		t.Fatalf("read %s after Init: %v", doneID, err)
+		t.Fatalf("read %s after reopen: %v", doneID, err)
 	}
 	if !bytes.Equal(completedBefore, completedAfter) {
-		t.Fatalf("%s modified by startup scan: %d bytes before, %d after", doneID, len(completedBefore), len(completedAfter))
+		t.Fatalf("%s modified by reopen scan: %d bytes before, %d after", doneID, len(completedBefore), len(completedAfter))
 	}
 }
 

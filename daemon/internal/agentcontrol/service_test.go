@@ -67,6 +67,27 @@ func newTestService(t *testing.T, pv core.Provider) (*Service, *runtimeagent.Ses
 	return NewService(mgr, &fakeRouter{rt: rt}, nil), rt
 }
 
+// TestStartRunSyncDoesNotResurrectRetiredRuntime:路由已拿到 rt,随后生命周期
+// 收口 Remove+Retire 完成——ensureRegistered 的修复逻辑不得把陈旧指针重新挂回
+// 注册表(否则提交可能落到已关闭的 hub/store),提交面按未注册诚实失败。
+func TestStartRunSyncDoesNotResurrectRetiredRuntime(t *testing.T) {
+	s, rt := newTestService(t, fixedProvider{content: "x"})
+	s.sessions.Remove(rt.ID)
+	if err := rt.Retire(); err != nil {
+		t.Fatalf("Retire: %v", err)
+	}
+
+	if _, err := s.StartRunSync("current", runtimeagent.RunRequest{Input: "q"}, runtimeagent.RunCallbacks{}); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
+		t.Fatalf("StartRunSync after retire = %v, want ErrSessionNotFound", err)
+	}
+	if s.sessions.Get(rt.ID) != nil {
+		t.Fatal("ensureRegistered resurrected a retired runtime")
+	}
+	if err := s.sessions.Register(rt); !errors.Is(err, runtimeagent.ErrSessionRetired) {
+		t.Fatalf("Register(retired) = %v, want ErrSessionRetired", err)
+	}
+}
+
 // waitForRunStatus 轮询 RunStatus 直至 want 状态或超时。
 func waitForRunStatus(t *testing.T, s *Service, sid, runID, want string) (string, uint64) {
 	t.Helper()
@@ -276,5 +297,32 @@ func TestServiceLeaseControls(t *testing.T) {
 	s.ReleaseConnection("conn-B")
 	if s.HoldControl("sess", "conn-B") || s.HoldControl("sess2", "conn-B") {
 		t.Fatal("ReleaseConnection must clear every lease held by the connection")
+	}
+}
+
+// TestServiceWithControlFencing:Service.WithControl 是 LeaseRegistry.WithControl
+// 的宿主透传面(Plan A3 的归档执行面消费——MarkArchived 动作面持在宿主 plugin,
+// 编排经本方法回到同一 lease 临界区):未持照拒绝且不执行、持照临界区内执行且
+// 返回值原样透传、接管后旧持有者一律失权。
+func TestServiceWithControlFencing(t *testing.T) {
+	s, _ := newTestService(t, fixedProvider{content: "svc-withctl"})
+
+	ran := false
+	if err := s.WithControl("sess", "conn-A", func() error { ran = true; return nil }); !errors.Is(err, ErrControlLeaseLost) || ran {
+		t.Fatalf("WithControl without lease = %v ran=%v, want ErrControlLeaseLost and no execution", err, ran)
+	}
+
+	s.AcquireControl("sess", "conn-A")
+	sentinel := errors.New("submit failed")
+	err := s.WithControl("sess", "conn-A", func() error { ran = true; return sentinel })
+	if !ran || !errors.Is(err, sentinel) {
+		t.Fatalf("WithControl with lease = %v ran=%v, want execution and sentinel passthrough", err, ran)
+	}
+
+	// 接管后旧持有者失权:同锁串行,被接管的 WithControl 一律拒绝。
+	s.AcquireControl("sess", "conn-B")
+	ran = false
+	if err := s.WithControl("sess", "conn-A", func() error { ran = true; return nil }); !errors.Is(err, ErrControlLeaseLost) || ran {
+		t.Fatalf("WithControl after takeover = %v ran=%v, want ErrControlLeaseLost and no execution", err, ran)
 	}
 }

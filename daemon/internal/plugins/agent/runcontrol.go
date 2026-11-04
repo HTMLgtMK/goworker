@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -62,6 +63,12 @@ var _ agentcontrol.InternalRunner = (*AgentPlugin)(nil)
 // 面,ACP handler 优先 type-assert 它走 CapabilityRegistry + proxy(P5 显式
 // 可见变化 #1 的生产者),断言失败回落原始 relay。
 var _ model.ClientToolBinder = (*AgentPlugin)(nil)
+
+// ConnectionBinder 编译期断言(Plan A2 生命周期半边):AgentPlugin 满足连接级
+// 会话绑定登记面,ACP handler 在 SessionBinding.Set 点 type-assert 它登记
+// BindingRegistry(生命周期引用计数的唯一事实源),断言失败则登记缺失、
+// 引用归零判定永远读不到 ACP 连接的绑定。
+var _ model.ConnectionBinder = (*AgentPlugin)(nil)
 
 // defaultCapabilityWaitTimeout 是 CapabilityWaitTimeout 的兜底值(拍板③ 45s;
 // 与 SDK 的 defaultCapabilityWaitTimeout 同值——那边未导出,daemon 侧按配置
@@ -182,8 +189,24 @@ func (p *AgentPlugin) runJournalStore() *session.RunJournalStore {
 // ErrControlLeaseLost;幂等键 (sessionID, requestID) 组合寻址,同键同 Input
 // 返回原 runID 与其当前状态,不同 Input 显式冲突)。requestID 的记账完全在
 // Service 层;协议面强制 requestId 非空的前提不变(xgwRunStart 守卫)。
+//
+// A3 只读执法(archived 终态,定案需求 #1):写提交面在委托前拒绝已归档会话
+// ——与 handleAgent 的 A7④ 同一事实源(store 持久事实,重启后依然拒),堵后台
+// 提交(xgw run/start)向 archived store 追加 run 记录的写半边。寻址用 manager
+// 注册表权威而非 RouteSession:RouteSession 的「current 优先」回落在 Stop 后
+// (注册表已清)仍可能返回 stale runtime,其 storeFor → repo.Open 会在 repo.Close
+// 清缓存之后走慢路径重建实例并持有 flock(e2e_plugin_stop_test ③ 的句柄释放
+// 断言抓到的泄漏);注册表命中 ⇒ store 必在实例缓存(mount/Create 先缓存后注册、
+// CloseSession 先 Remove 后逐出),命中路径绝不新建实例。注册表未命中不在此拒
+// ——停机态由 manager 的 closed 检查诚实报 ErrManagerClosed,运行态的未知会话
+// 由 control 路由报 session not found(不改既有错误契约);cancel/run/get/attach
+// 等只读与终态管理面不查——归档是「只读保留」而非「下线不可触达」。
 func (p *AgentPlugin) StartRun(sessionID, connectionID, input, requestID string) (string, string, error) {
-	return p.control.StartRun(sessionID, connectionID, input, requestID, runtimeagent.RunCallbacks{})
+	runID, state, err := p.control.StartRun(sessionID, connectionID, input, requestID, runtimeagent.RunCallbacks{})
+	if errors.Is(err, runtimeagent.ErrSessionArchived) {
+		return "", "", fmt.Errorf("agent: session %q is archived and read-only", sessionID)
+	}
+	return runID, state, err
 }
 
 // StartRunSync 是同步宿主入口(/agent、session/prompt、CLI prompt)的 Run 提交
@@ -194,7 +217,11 @@ func (p *AgentPlugin) StartRun(sessionID, connectionID, input, requestID string)
 // (ClientKindInternal 预留的启用点)。会话寻址由调用方先经 binding 形态解析点
 // (sessionRuntimeIn)解析出 rt 再传 rt.ID,与互斥/记账同源。
 func (p *AgentPlugin) StartRunSync(sessionID string, req runtimeagent.RunRequest, cb runtimeagent.RunCallbacks) (runtimeagent.RunHandle, error) {
-	return p.control.StartRunSync(sessionID, req, cb)
+	h, err := p.control.StartRunSync(sessionID, req, cb)
+	if errors.Is(err, runtimeagent.ErrSessionArchived) {
+		return runtimeagent.RunHandle{}, fmt.Errorf("agent: session %q is archived and read-only", sessionID)
+	}
+	return h, err
 }
 
 // CancelRunSync 是同步入口的 Run 取消委托(PR4,总方案 §九 Legacy 取消语义):
@@ -250,11 +277,17 @@ func (p *AgentPlugin) HoldControl(sessionID, connectionID string) bool {
 	return p.control.HoldControl(sessionID, connectionID)
 }
 
-// ReleaseConnection 实现 RunControlSource(I3 新增断连收口,PR1 起薄委托):
-// 释放 connectionID 持有的全部会话的 control lease——handler.Close 一次调用
-// 替代逐会话归还。连接不持有任何租约时幂等空操作。
+// ReleaseConnection 实现 RunControlSource(I3 新增断连收口,PR1 起薄委托;
+// Plan A2 生命周期半边扩展):释放 connectionID 持有的全部会话的 control lease,
+// 并清除其会话绑定登记(Service.ReleaseConnection 一并清账,与 lease 同构)——
+// 返回的被解除会话若确有登记,立即评估引用归零收口(断连 = 最后解绑的触发点
+// 之一,lifecycle.go tryReleaseSession;有 run 在飞时由终态通知延迟收口)。
+// 连接不持有任何租约/绑定时幂等空操作。
 func (p *AgentPlugin) ReleaseConnection(connectionID string) {
-	p.control.ReleaseConnection(connectionID)
+	prev := p.control.ReleaseConnection(connectionID)
+	if prev != "" {
+		p.tryReleaseSession(prev)
+	}
 }
 
 // PendingApprovals 实现 RunControlSource(P5-6;C3 修正):多会话路由 → manager

@@ -72,3 +72,12 @@ func (v *ArchiveView) ActiveView() []core.Message {
 func (v *ArchiveView) Checkpoints(limit int) []Checkpoint {
 	return checkpointsFromRecords(v.recs, limit)
 }
+
+// Workspace 返回归档会话最后一条 workspace 记录声明的路径（last-wins，与
+// Store.Workspace 共用 workspaceFromRecords 同语义；Plan A7 设计点 5——
+// idle/archived 会话的清单 cwd 从记录读）。
+func (v *ArchiveView) Workspace() string { return workspaceFromRecords(v.recs) }
+
+// Archived 报告归档文件中是否存在 archived 记录（与 Store.Archived 共用
+// archivedFromRecords 同语义；归档重放路径的只读执法数据源）。
+func (v *ArchiveView) Archived() bool { return archivedFromRecords(v.recs) }

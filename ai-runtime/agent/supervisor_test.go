@@ -39,6 +39,118 @@ import (
 // 并行性断言沿用 run_lifecycle_test.go 的「屏障代替计时」风格:唯一挂钟等待是
 // waitStarted(开工宣告)与终态 Wait 的超时上界,其余为确定性断言。
 
+func TestStartRunRejectsArchivedRuntime(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	_, _, _ = newSupRuntime(t, m, "archived", "reply", false)
+	rt := m.Get("archived")
+	if err := rt.Archive(nil); err != nil {
+		t.Fatalf("MarkArchived: %v", err)
+	}
+
+	if _, err := m.StartRun("archived", RunRequest{Input: "q"}, RunCallbacks{}); !errors.Is(err, ErrSessionArchived) {
+		t.Fatalf("StartRun after archive = %v, want ErrSessionArchived", err)
+	}
+}
+
+func TestMarkArchivedRejectsActiveRun(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	_, started, release := newSupRuntime(t, m, "active", "reply", true)
+	h, err := m.StartRun("active", RunRequest{Input: "q"}, RunCallbacks{})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	waitStarted(t, started)
+
+	if err := m.Get("active").Archive(nil); !errors.Is(err, ErrRunActive) {
+		t.Fatalf("MarkArchived while run active = %v, want ErrRunActive", err)
+	}
+
+	close(release)
+	if _, err := h.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if err := m.Get("active").Archive(nil); err != nil {
+		t.Fatalf("MarkArchived after run: %v", err)
+	}
+}
+
+func TestRetireRejectsActiveRun(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	_, started, release := newSupRuntime(t, m, "retire-active", "reply", true)
+	h, err := m.StartRun("retire-active", RunRequest{Input: "q"}, RunCallbacks{})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	waitStarted(t, started)
+
+	if err := m.Get("retire-active").Retire(); !errors.Is(err, ErrRunActive) {
+		t.Fatalf("Retire while run active = %v, want ErrRunActive", err)
+	}
+
+	close(release)
+	if _, err := h.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if err := m.Get("retire-active").Retire(); err != nil {
+		t.Fatalf("Retire after run: %v", err)
+	}
+}
+
+// TestStartRunRejectsRetiredRuntime covers the lifecycle window from the review:
+// StartRun already holds the runtime pointer from the registry, then the reaper
+// retires it before reservation. Retire() runs while the runtime is still
+// registered (Remove has not executed yet), which is exactly the interleaving
+// that manager.Get alone cannot protect.
+func TestStartRunRejectsRetiredRuntime(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	_, _, _ = newSupRuntime(t, m, "retired", "reply", false)
+	rt := m.Get("retired")
+	if rt == nil {
+		t.Fatal("setup: runtime not registered")
+	}
+	if err := rt.Retire(); err != nil {
+		t.Fatalf("Retire: %v", err)
+	}
+	if _, err := m.StartRun("retired", RunRequest{Input: "q"}, RunCallbacks{}); !errors.Is(err, ErrSessionRetired) {
+		t.Fatalf("StartRun after retire = %v, want ErrSessionRetired", err)
+	}
+	if run := rt.Active(); run != nil {
+		t.Fatalf("retired runtime admitted run %s, want none", run.ID)
+	}
+	if err := m.Register(rt); !errors.Is(err, ErrSessionRetired) {
+		t.Fatalf("Register(retired runtime) = %v, want ErrSessionRetired", err)
+	}
+}
+
+func TestArchiveFailureRestoresAdmission(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	_, _, _ = newSupRuntime(t, m, "rollback", "reply", false)
+	rt := m.Get("rollback")
+	commitErr := errors.New("archive commit failed")
+	if err := rt.Archive(func() error { return commitErr }); !errors.Is(err, commitErr) {
+		t.Fatalf("Archive with failing commit = %v, want commitErr", err)
+	}
+
+	// 回滚后必须恢复可提交状态:不得残留 archived=true 的只读半状态。
+	h, err := m.StartRun("rollback", RunRequest{Input: "q"}, testRunCallbacks(&strings.Builder{}))
+	if err != nil {
+		t.Fatalf("StartRun after failed archive commit: %v", err)
+	}
+	if _, err := h.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+}
+
 // startOutcome 承载提交方 goroutine 的 StartRun 结果(提交方不 Wait 的形态)。
 type startOutcome struct {
 	h   RunHandle
@@ -91,6 +203,30 @@ func assertHostCtxAlive(t *testing.T, m *SessionManager, when string) {
 	case <-m.contextOf().Done():
 		t.Fatalf("manager host context canceled %s", when)
 	default:
+	}
+}
+
+// TestRunWaitImpliesActiveCleared 钉死 finalizeRun 的次序不变量:Wait 返回时
+// 本会话的 active 必须已清,同步调用形态(Wait 返回 → 立刻下一次提交)才不会
+// 撞上 ErrRunActive。反序(先关 done 再清 active)会留下这个真实竞态窗口。
+func TestRunWaitImpliesActiveCleared(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+	pv := &gatedProvider{} // 无 gate:每次调用立即完成
+	rt := NewSessionRuntime("seq", newFakeStoreSession(&fakeConversationStore{}, nil, pv))
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	for i := 0; i < 20; i++ {
+		h, err := m.StartRun("seq", RunRequest{Input: "q"}, RunCallbacks{})
+		if err != nil {
+			t.Fatalf("run #%d rejected right after Wait: %v", i, err)
+		}
+		waitHandle(t, h)
+		if run := rt.Active(); run != nil {
+			t.Fatalf("run #%d: Wait returned while active still set to %s", i, run.ID)
+		}
 	}
 }
 

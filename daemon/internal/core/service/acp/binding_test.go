@@ -80,16 +80,32 @@ func (p bindingFixedProvider) ChatStream(context.Context, *core.ChatRequest) (<-
 // pr2DualControl 是双 runtime 的 SessionSource + RunControlSource + SessionRouter
 // 测试 shim:控制操作全部委托真实 agentcontrol.Service(per-session lease、幂等
 // single-flight 与生产同源);SubscribeEvents 走真实 Service(路由/EnsureHub/
-// hub.Subscribe/完整性快照与生产同源)。current 由测试
-// 经 switchCurrent 驱动(模拟 /new 换轨),SetSession 只记 transport 活动声明
-// (与生产 SetSession 的 activeTransportSession 语义一致,不推 current)。
+// hub.Subscribe/完整性快照与生产同源)。
+//
+// Plan A2b1 语义对齐:本 shim 实现 model.BoundSessionSource——CreateBoundSession
+// 按创建队列真新建 runtime 并注册(handler 的 session/new 据此绑定,现「真新建」
+// 语义),current 由测试经 switchCurrent 显式驱动且创建不动它(A2b1:current 是
+// CLI/stdin 便利指针,ACP 声明不再落 current;无 Binding 调用方回落才消费)。
 type pr2DualControl struct {
 	mu      sync.Mutex
-	current string // 当前 runtime id("A"/"B");CurrentSessionID 的返回值
-	active  string // 最近一次 transport 会话声明(session/new|load-current 经 SetSession)
+	current string // 当前 runtime id(测试显式驱动;创建不动,A2b1 语义)
+	active  string // 最近一次 transport 会话声明(降级面记账,声明路径不再消费)
+
+	// createQueue 是 CreateBoundSession 的创建队列:第 n 次真新建产出第 n 项
+	// (id 与 provider 预配置,确定性会话身份)。队列耗尽后回落 generated-N +
+	// 默认 provider(防御分支)。
+	createQueue []pr2CreateSpec
+	created     int
 
 	m       *runtimeagent.SessionManager
 	control *agentcontrol.Service
+	cfg     *runtimeconfig.Config
+}
+
+// pr2CreateSpec 是创建队列的单项:预配置的会话 id 与 provider。
+type pr2CreateSpec struct {
+	id string
+	pv core.Provider
 }
 
 func (f *pr2DualControl) switchCurrent(id string) {
@@ -116,6 +132,70 @@ func (f *pr2DualControl) routeOrErr(sessionID string) (*runtimeagent.SessionRunt
 		return rt, nil
 	}
 	return nil, fmt.Errorf("acp: session %q: %w", sessionID, runtimeagent.ErrSessionNotFound)
+}
+
+// ---- BoundSessionSource 面(Plan A2b1 语义:真新建/重开/reload/归档只读) ----
+
+// CreateBoundSession 按创建队列真新建 runtime 并注册(生产 = AgentPlugin 经
+// repo.Create + mountRuntime;本 shim 是纯内存形态:NewSessionRuntime + Register)。
+// cwd 不落任何状态(shim 的会话无持久化事实)。返回预配置 id——handler 据此
+// Set Binding,测试用同一 id 断言/run 寻址(RouteSession 注册表权威)。
+func (f *pr2DualControl) CreateBoundSession(cwd string) (string, error) {
+	f.mu.Lock()
+	spec := pr2CreateSpec{id: fmt.Sprintf("generated-%d", f.created), pv: nil}
+	if f.created < len(f.createQueue) {
+		spec = f.createQueue[f.created]
+	}
+	f.created++
+	f.mu.Unlock()
+
+	pv := spec.pv
+	if pv == nil {
+		pv = bindingFixedProvider{content: "fixed-" + spec.id}
+	}
+	deps := runtimeagent.SessionDeps{
+		Config:       f.cfg,
+		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		NewProvider:  func(*runtimeconfig.Config) (core.Provider, error) { return pv, nil },
+		RunEvents:    &memEventJournal{},
+	}
+	rt := runtimeagent.NewSessionRuntime(spec.id, runtimeagent.NewSession(deps))
+	if err := f.m.Register(rt); err != nil {
+		return "", err
+	}
+	return spec.id, nil
+}
+
+// LoadBoundSession mirror 生产二分支(纯内存形态):已注册 → reload no-op
+// (store 无,ReloadFromStore 本身 no-op);不在册 → 诚实未知(ErrSessionUnknown
+// 契约,handler 映射 -32000)。cwd 不动声明(shim 无 cwd 面可声明)。
+func (f *pr2DualControl) LoadBoundSession(sessionID, cwd string) error {
+	if f.m.Get(sessionID) == nil {
+		return fmt.Errorf("acp shim: session %q: %w", sessionID, model.ErrSessionUnknown)
+	}
+	return nil
+}
+
+// SessionHistory mirror 生产(纯内存形态):已注册 → 空重放;未知 → 报错。
+func (f *pr2DualControl) SessionHistory(sessionID string) ([]model.SessionUpdate, error) {
+	if f.m.Get(sessionID) == nil {
+		return nil, fmt.Errorf("acp shim: session %q: %w", sessionID, model.ErrSessionUnknown)
+	}
+	return []model.SessionUpdate{}, nil
+}
+
+// SessionArchived 纯内存 shim:无持久化事实源,恒 false(未知/非终态都交由
+// LoadBoundSession 分流,与生产 SessionArchived 的降级语义一致)。
+func (f *pr2DualControl) SessionArchived(sessionID string) bool { return false }
+
+// ArchiveSession 纯内存 shim:镜像生产「已注册可归档(纯内存无标记可落,no-op)、
+// 未注册诚实未知」的分支;lease fencing(run/cancel 同款)在 plugin 实现侧,
+// shim 不模拟(真插件链路的 fencing 验收在 plugins/agent 的 archive 集成测试)。
+func (f *pr2DualControl) ArchiveSession(sessionID, clientID string) error {
+	if f.m.Get(sessionID) == nil {
+		return fmt.Errorf("acp shim: session %q: %w", sessionID, model.ErrSessionUnknown)
+	}
+	return nil
 }
 
 // ---- SessionSource 面(最小空实现;PR2 binding 面只消费 CurrentSessionID) ----
@@ -227,35 +307,26 @@ func (f *pr2DualControl) UnbindCapabilities(connectionID string) {
 
 func (f *pr2DualControl) CapabilityWaitTimeout() time.Duration { return 45 * time.Second }
 
-// newPR2DualControl 构造 shim 并按 ids 逐个注册真实 runtime(纯内存,每个
-// runtime 自带 RunEvents=memEventJournal → attach 可建真 hub);ids[0] 为初始
-// current。providers 缺省时回落 bindingFixedProvider。
+// newPR2DualControl 构造 shim。Plan A2b1 语义:ids 是 **CreateBoundSession 的
+// 创建队列**(第 n 次 session/new 真新建第 n 个 id 的 runtime 并注册——生产
+// 的 repo.Create + 新 runtime 注册形态;providers 按 id 配置队列项的 provider,
+// 缺省回落 bindingFixedProvider),不预注册任何 runtime,current 置空(创建
+// 不动 current,A2b1 语义;需要时测试经 switchCurrent 显式驱动)。每个 runtime
+// 自带 RunEvents=memEventJournal → attach 可建真 hub。
 func newPR2DualControl(t *testing.T, providers map[string]core.Provider, ids ...string) *pr2DualControl {
 	t.Helper()
 	if len(ids) < 2 {
-		t.Fatal("pr2DualControl needs at least two runtime ids")
+		t.Fatal("pr2DualControl needs at least two create-queue ids")
 	}
 	m := runtimeagent.NewSessionManager()
 	t.Cleanup(func() { m.Close() })
 	cfg := runtimeconfig.Default()
 	cfg.Sandbox.AllowedWorkDir = t.TempDir()
+	queue := make([]pr2CreateSpec, 0, len(ids))
 	for _, id := range ids {
-		pv, ok := providers[id]
-		if !ok {
-			pv = bindingFixedProvider{content: "fixed-" + id}
-		}
-		deps := runtimeagent.SessionDeps{
-			Config:       cfg,
-			CollectTools: func(*sandbox.Config) []core.Tool { return nil },
-			NewProvider:  func(*runtimeconfig.Config) (core.Provider, error) { return pv, nil },
-			RunEvents:    &memEventJournal{},
-		}
-		rt := runtimeagent.NewSessionRuntime(id, runtimeagent.NewSession(deps))
-		if err := m.Register(rt); err != nil {
-			t.Fatalf("register runtime %s: %v", id, err)
-		}
+		queue = append(queue, pr2CreateSpec{id: id, pv: providers[id]})
 	}
-	f := &pr2DualControl{m: m, current: ids[0]}
+	f := &pr2DualControl{m: m, createQueue: queue, cfg: cfg}
 	// 真实 Application Control Plane(per-session lease + 幂等 single-flight);
 	// journals=nil → RunStatus 走纯内存分支(与 xgwLiveControl 同形)。
 	f.control = agentcontrol.NewService(m, f, nil)
@@ -394,13 +465,16 @@ func pr2Attach(t *testing.T, client *aiacp.Client, sessionID string) XSessionAtt
 	return res
 }
 
-// TestPR2TwoConnectionsEachOperateOwnSession(总方案 §十 PR2 完成标准,场景 1):
-// 两条连接各自 session/new(Session A/B)→ 各自 prompt/attach/cancel 互不影响。
-// prompt 按连接级 Binding 路由(标准 ACP);run/attach 按显式 sessionId(CR4);
-// 两会话的 lease、run、事件流互不可见、互不阻塞。
+// TestPR2TwoConnectionsEachOperateOwnSession(总方案 §十 PR2 完成标准,场景 1;
+// Plan A2b1 语义对齐:session/new 真新建):两条连接各自 session/new(各创建
+// Session A/B)→ 各自 prompt/attach/cancel 互不影响。prompt 按连接级 Binding
+// 路由(标准 ACP);run/attach 按显式 sessionId(CR4);两会话的 lease、run、
+// 事件流互不可见、互不阻塞。
 func TestPR2TwoConnectionsEachOperateOwnSession(t *testing.T) {
 	gateA := newBindingGateProvider()
 	gateB := newBindingGateProvider()
+	// 创建队列 [A, B]:conn1/conn2 的 session/new 依次真新建 A/B(A2b1:创建
+	// 不动 current,连接的会话由它自己的声明决定)。
 	ctrl := newPR2DualControl(t, map[string]core.Provider{"A": gateA, "B": gateB}, "A", "B")
 	gate := NewSessionGate()
 
@@ -414,7 +488,8 @@ func TestPR2TwoConnectionsEachOperateOwnSession(t *testing.T) {
 		}
 	}
 
-	// 连接 1 session/new:Binding 指向声明落地会话 A(current)。
+	// 连接 1 session/new:真新建会话 A,Binding 指向声明落地会话(创建队列第
+	// 一项的确定性 id);wire 返回的 transport id 只进 promptable/active。
 	sid1 := func() string {
 		sid, err := client1.NewSession(context.Background(), "/repo-a")
 		if err != nil || sid == "" {
@@ -423,11 +498,11 @@ func TestPR2TwoConnectionsEachOperateOwnSession(t *testing.T) {
 		return sid
 	}()
 	if got := handler1.binding.Get(); got != "A" {
-		t.Fatalf("conn1 binding = %q, want A (session/new 后 Set 已注册 runtime id)", got)
+		t.Fatalf("conn1 binding = %q, want A (真新建落地的 runtime id)", got)
 	}
 
-	// current 切到 B(模拟 /new 换轨;A 保留在册——CR4),连接 2 session/new。
-	ctrl.switchCurrent("B")
+	// 连接 2 session/new:真新建 B(A2b1:不需要 /new 换轨——current 语义收缩,
+	// 连接 2 的会话由它自己的 create 决定;A 保留在册——CR4)。
 	sid2 := func() string {
 		sid, err := client2.NewSession(context.Background(), "/repo-b")
 		if err != nil || sid == "" {
@@ -493,10 +568,12 @@ func TestPR2TwoConnectionsEachOperateOwnSession(t *testing.T) {
 	waitFor(t, "run B cancelled", func() bool { return pr2RunGet(t, client2, "B", runB).State == string(runtimeagent.RunCancelled) })
 }
 
-// TestPR2LoadSwitchDoesNotDisturbOtherConnection(总方案 §十 PR2 完成标准,场景 2):
-// 连接 1 load/切到 Session B 不影响连接 2 的 Session A 的在途 run 与 attach。
+// TestPR2LoadSwitchDoesNotDisturbOtherConnection(总方案 §十 PR2 完成标准,场景 2;
+// Plan A2b1 语义对齐):连接 1 的会话选择切到 Session B(session/new 真新建 +
+// load 已注册会话)不影响连接 2 的 Session A 的在途 run 与 attach。
 func TestPR2LoadSwitchDoesNotDisturbOtherConnection(t *testing.T) {
 	gateA := newBindingGateProvider()
+	// 创建队列 [A(gateA), B(默认)]:conn2/conn1 的 session/new 依次真新建 A/B。
 	ctrl := newPR2DualControl(t, map[string]core.Provider{"A": gateA}, "A", "B")
 	gate := NewSessionGate()
 
@@ -510,7 +587,7 @@ func TestPR2LoadSwitchDoesNotDisturbOtherConnection(t *testing.T) {
 		}
 	}
 
-	// 连接 2 绑定 current A,attach(control) 后起一个在途 run(闸门阻塞)。
+	// 连接 2 session/new 真新建 A,attach(control) 后起一个在途 run(闸门阻塞)。
 	sid2, err := client2.NewSession(context.Background(), "/repo-a")
 	if err != nil || sid2 == "" {
 		t.Fatalf("conn2 NewSession: %v, %q", err, sid2)
@@ -524,15 +601,15 @@ func TestPR2LoadSwitchDoesNotDisturbOtherConnection(t *testing.T) {
 		t.Fatalf("runA state = %q, want running", st)
 	}
 
-	// current 切到 B;连接 1 session/new(Binding=B),再 load-current(B)——
-	// 「连接 1 load/切到 Session B」。
-	ctrl.switchCurrent("B")
+	// 连接 1 session/new 真新建 B(A2b1:不需要 /new 换轨),再 load(B)——
+	// 「连接 1 的会话选择 = B」:load 命中已注册 runtime(reload 分支,创建面
+	// 之外的 load 路径)并把 Binding 指向 B。
 	sid1, err := client1.NewSession(context.Background(), "/repo-b")
 	if err != nil || sid1 == "" {
 		t.Fatalf("conn1 NewSession: %v, %q", err, sid1)
 	}
 	if got := handler1.binding.Get(); got != "B" {
-		t.Fatalf("conn1 binding = %q, want B", got)
+		t.Fatalf("conn1 binding = %q, want B (真新建落地的 runtime id)", got)
 	}
 	if _, err := client1.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "B", Cwd: "/repo-b"}); err != nil {
 		t.Fatalf("conn1 LoadSession(B): %v", err)

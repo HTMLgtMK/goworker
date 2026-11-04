@@ -31,8 +31,18 @@ import (
 //     (P2P3 §6:断连不取消;重选同样不取消);
 //  3. 不自动获得新选择会话的 control lease——控制权经 attach(mode=control)
 //     显式获取(§七:会话选择、事件订阅、控制权获取是三个独立操作);
-//  4. 不影响其他连接的 Binding——Binding 连接私有,不存在全局 Binding 注册表,
-//     Service 与插件都不持有跨连接的 Binding 事实源(§二不变量 6)。
+//  4. 不影响其他连接的 Binding——Binding 连接私有。跨连接只存在一份生命周期
+//     登记事实源(BindingRegistry,bindings.go,Plan A2):它记录 clientID → 绑定
+//     sessionID,只服务运行时生命周期引用计数与 A3 的 state=active 判定;路由/
+//     解析(sessionRuntimeIn/RouteSession)不消费注册表,会话寻址仍只读本连接的
+//     SessionBinding 与 manager 注册表。
+//
+// 不变量 6 的收窄声明(Plan A2 有意的架构边界变化):PR2 的「不存在全局 Binding
+// 事实源(§二不变量 6)」收窄为「路由/解析不消费全局注册表」——生命周期计数
+// 需要跨连接的全局事实源,寻址不需要;PR2 把两者一并否定,Plan A2 只放行前者。
+// 与 SessionBinding 的分工:连接内寻址用本类型(ctx 载体、连接私有),跨连接
+// 计数用 BindingRegistry(登记点与本类型的 Set 点成对:handler 的 binding.Set
+// 处、/new 收口的 b.Set("") 处)。
 //
 // 不变量(PR2 收口):Binding 指向的会话必须是已注册 runtime。写入点
 // (session/new|load-current 的声明成功后)只 Set 统一解析点可路由的 runtime
@@ -80,6 +90,29 @@ func WithBinding(ctx context.Context, b *SessionBinding) context.Context {
 func BindingFromCtx(ctx context.Context) *SessionBinding {
 	b, _ := ctx.Value(bindingContextKey{}).(*SessionBinding)
 	return b
+}
+
+// clientIDContextKey 是连接句柄的 ctx 载体键(私有,与 bindingContextKey 同型):
+// Transport Adapter 把本连接的 connectionID 挂上请求 ctx,与 SessionBinding 同链
+// 流入命令 handler。消费点只有 /new 收口(Plan A2):闭包经 ClientIDFromCtx 取回
+// 发起方连接句柄,摘其在 BindingRegistry 的绑定登记——SessionBinding 是选择器
+// (无 clientID 语义),引用计数的账本键是 connectionID,必须随 ctx 单独携带。
+type clientIDContextKey struct{}
+
+// WithClientID 把连接句柄挂上请求 ctx。clientID 为空串时不包装(等价无连接身份
+// 的调用方,CLI/stdio/测试)。
+func WithClientID(ctx context.Context, clientID string) context.Context {
+	if clientID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, clientIDContextKey{}, clientID)
+}
+
+// ClientIDFromCtx 取回请求携带的连接句柄;空 = 无连接身份的调用方(CLI 命令、
+// stdio、测试),/new 收口据此跳过绑定登记摘除(无登记可摘)。
+func ClientIDFromCtx(ctx context.Context) string {
+	id, _ := ctx.Value(clientIDContextKey{}).(string)
+	return id
 }
 
 // SessionRouter 是会话寻址的窄接口(宿主注入):把调用方寻址的 sessionID 解析为
