@@ -39,6 +39,45 @@ import (
 // 并行性断言沿用 run_lifecycle_test.go 的「屏障代替计时」风格:唯一挂钟等待是
 // waitStarted(开工宣告)与终态 Wait 的超时上界,其余为确定性断言。
 
+func TestStartRunRejectsArchivedRuntime(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	_, _, _ = newSupRuntime(t, m, "archived", "reply", false)
+	rt := m.Get("archived")
+	if err := rt.Archive(nil); err != nil {
+		t.Fatalf("MarkArchived: %v", err)
+	}
+
+	if _, err := m.StartRun("archived", RunRequest{Input: "q"}, RunCallbacks{}); !errors.Is(err, ErrSessionArchived) {
+		t.Fatalf("StartRun after archive = %v, want ErrSessionArchived", err)
+	}
+}
+
+func TestMarkArchivedRejectsActiveRun(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	_, started, release := newSupRuntime(t, m, "active", "reply", true)
+	h, err := m.StartRun("active", RunRequest{Input: "q"}, RunCallbacks{})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	waitStarted(t, started)
+
+	if err := m.Get("active").Archive(nil); !errors.Is(err, ErrRunActive) {
+		t.Fatalf("MarkArchived while run active = %v, want ErrRunActive", err)
+	}
+
+	close(release)
+	if _, err := h.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if err := m.Get("active").Archive(nil); err != nil {
+		t.Fatalf("MarkArchived after run: %v", err)
+	}
+}
+
 // startOutcome 承载提交方 goroutine 的 StartRun 结果(提交方不 Wait 的形态)。
 type startOutcome struct {
 	h   RunHandle

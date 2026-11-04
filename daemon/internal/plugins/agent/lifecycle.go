@@ -74,10 +74,12 @@ func (p *AgentPlugin) isSuspendedRelease(sessionID string) bool {
 // 收口执行点做(原子复查,见其注释),本回调只做闸门,不在 execute goroutine 上
 // 携带判定状态。
 func (p *AgentPlugin) onSessionRunDone(sessionID string) {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
 	if !p.takeSuspendedRelease(sessionID) {
 		return
 	}
-	p.tryReleaseSession(sessionID)
+	p.tryReleaseSessionLocked(sessionID)
 }
 
 // BindConnectionSession 实现 model.ConnectionBinder(Plan A2 生命周期半边的
@@ -90,9 +92,15 @@ func (p *AgentPlugin) BindConnectionSession(clientID, sessionID string) {
 	if p.control == nil {
 		return
 	}
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	p.bindConnectionSessionLocked(clientID, sessionID)
+}
+
+func (p *AgentPlugin) bindConnectionSessionLocked(clientID, sessionID string) {
 	prev := p.control.BindSession(clientID, sessionID)
 	if prev != "" && prev != sessionID {
-		p.tryReleaseSession(prev)
+		p.tryReleaseSessionLocked(prev)
 	}
 }
 
@@ -137,6 +145,12 @@ func (p *AgentPlugin) BindConnectionSession(clientID, sessionID string) {
 // control/repo 为 nil(测试直构插件,零值容忍同 inFlightTracker)时:无登记
 // 事实源按零绑定处理、无持久化跳过 store 收口。
 func (p *AgentPlugin) tryReleaseSession(sessionID string) {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	p.tryReleaseSessionLocked(sessionID)
+}
+
+func (p *AgentPlugin) tryReleaseSessionLocked(sessionID string) {
 	if sessionID == "" {
 		return
 	}

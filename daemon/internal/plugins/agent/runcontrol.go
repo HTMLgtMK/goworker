@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -201,12 +202,11 @@ func (p *AgentPlugin) runJournalStore() *session.RunJournalStore {
 // 由 control 路由报 session not found(不改既有错误契约);cancel/run/get/attach
 // 等只读与终态管理面不查——归档是「只读保留」而非「下线不可触达」。
 func (p *AgentPlugin) StartRun(sessionID, connectionID, input, requestID string) (string, string, error) {
-	if rt := p.manager.Get(sessionID); rt != nil {
-		if st := p.storeFor(rt); st != nil && st.Archived() {
-			return "", "", fmt.Errorf("agent: session %q is archived and read-only", rt.ID)
-		}
+	runID, state, err := p.control.StartRun(sessionID, connectionID, input, requestID, runtimeagent.RunCallbacks{})
+	if errors.Is(err, runtimeagent.ErrSessionArchived) {
+		return "", "", fmt.Errorf("agent: session %q is archived and read-only", sessionID)
 	}
-	return p.control.StartRun(sessionID, connectionID, input, requestID, runtimeagent.RunCallbacks{})
+	return runID, state, err
 }
 
 // StartRunSync 是同步宿主入口(/agent、session/prompt、CLI prompt)的 Run 提交
@@ -217,7 +217,11 @@ func (p *AgentPlugin) StartRun(sessionID, connectionID, input, requestID string)
 // (ClientKindInternal 预留的启用点)。会话寻址由调用方先经 binding 形态解析点
 // (sessionRuntimeIn)解析出 rt 再传 rt.ID,与互斥/记账同源。
 func (p *AgentPlugin) StartRunSync(sessionID string, req runtimeagent.RunRequest, cb runtimeagent.RunCallbacks) (runtimeagent.RunHandle, error) {
-	return p.control.StartRunSync(sessionID, req, cb)
+	h, err := p.control.StartRunSync(sessionID, req, cb)
+	if errors.Is(err, runtimeagent.ErrSessionArchived) {
+		return runtimeagent.RunHandle{}, fmt.Errorf("agent: session %q is archived and read-only", sessionID)
+	}
+	return h, err
 }
 
 // CancelRunSync 是同步入口的 Run 取消委托(PR4,总方案 §九 Legacy 取消语义):

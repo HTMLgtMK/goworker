@@ -265,8 +265,8 @@ var ErrSessionUnknown = errors.New("session: unknown session")
 //
 // 与 ConnectionBinder 的分工：本接口是「声明动作」的执行面（创建/重开/reload
 // 的状态突变），ConnectionBinder 是「声明登记」的记账面（生命周期引用计数）；
-// handler 在声明成功点成对驱动两者（binding.Set + BindConnectionSession +
-// 本接口），登记零副作用、动作才碰共享状态。
+// 旧实现由 handler 在声明成功点成对驱动两者；实现 BoundSessionLoader 的后端则
+// 在连接级 load 临界区内完成历史快照与登记，避免 Runtime 在成功返回前被回收。
 type BoundSessionSource interface {
 	// CreateBoundSession 真新建一个会话（ACP session/new，定案需求 #2 的 ACP
 	// 面）：持久化 Create（创建即声明 workspace，Plan A1）→ 新 runtime 注册进
@@ -309,6 +309,11 @@ type BoundSessionSource interface {
 	// 收口等引用归零（A2a 机制自然处理）。已收口（不在册）的会话同样可归档
 	// （repo 层打开落标记后释放）。
 	ArchiveSession(sessionID, clientID string) error
+}
+
+// BoundSessionLoader lets a backend linearize load, history snapshot, and lifecycle binding.
+type BoundSessionLoader interface {
+	LoadBoundSessionForConnection(sessionID, cwd, connectionID string) ([]SessionUpdate, error)
 }
 
 // ConnectionBinder 是连接级会话绑定登记的可选能力面（Plan A2 生命周期半边，

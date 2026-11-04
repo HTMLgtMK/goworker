@@ -15,6 +15,9 @@ import (
 // daemon/internal/core/service/acp/coordinator.go 的 SessionGate——
 // 容量 1 channel + select ctx.Done(),锁不可被卡死客户端攥住。
 
+// ErrSessionArchived prevents new runs after a session reaches its terminal state.
+var ErrSessionArchived = errors.New("session: runtime is archived")
+
 // SessionRuntime 持有一个会话的独占执行权,是 SessionManager 注册的最小单元。
 // session 允许后置绑定(P0-2 的 daemon 在 startSession 前就要有 gate),
 // 也可为 nil(纯 gate 场景)。
@@ -25,6 +28,9 @@ type SessionRuntime struct {
 	session *Session
 	gate    chan struct{}
 	active  *AgentRun
+	// admissionMu serializes run reservation with the archived transition.
+	admissionMu sync.Mutex
+	archived    bool
 	// cwd/cwdErr 是本 runtime 的会话工作目录声明(P1-4 状态绑定收口):cwd 为
 	// 最近一次有效声明的绝对路径(空 = 未声明,工具回退 cfg.AllowedWorkDir),
 	// cwdErr 为最近一次声明的校验错误(非 nil 即无效标记,且 cwd 恒空——宿主
@@ -61,6 +67,61 @@ func NewSessionRuntime(id string, s *Session) *SessionRuntime {
 		session: s,
 		gate:    make(chan struct{}, 1),
 	}
+}
+
+// reserveRun atomically checks the admission state and records a queued run.
+func (r *SessionRuntime) reserveRun(run *AgentRun) (*Session, error) {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.archived {
+		return nil, ErrSessionArchived
+	}
+	if r.active != nil {
+		return nil, ErrRunActive
+	}
+	if r.session == nil {
+		return nil, ErrSessionNotBound
+	}
+	r.active = run
+	return r.session, nil
+}
+
+// releaseRunReservation removes a run that failed before execution started.
+func (r *SessionRuntime) releaseRunReservation(run *AgentRun) {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+
+	r.mu.Lock()
+	if r.active == run {
+		r.active = nil
+	}
+	r.mu.Unlock()
+}
+
+// Archive transitions the runtime to read-only and rolls it back if commit fails.
+func (r *SessionRuntime) Archive(commit func() error) error {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+
+	r.mu.Lock()
+	if r.active != nil {
+		r.mu.Unlock()
+		return ErrRunActive
+	}
+	r.archived = true
+	r.mu.Unlock()
+
+	if commit == nil {
+		return nil
+	}
+	if err := commit(); err != nil {
+		r.archived = false
+		return err
+	}
+	return nil
 }
 
 // AcquireRun 获取本会话的独占执行权;ctx 取消(如连接断开)时立即失败返回,

@@ -39,6 +39,7 @@ import (
 // 编译期断言：AgentPlugin 满足可选能力接口，handler 工厂 type-assert 获取
 // （RunControlSource/ConnectionBinder 先例，runcontrol.go）。
 var _ model.BoundSessionSource = (*AgentPlugin)(nil)
+var _ model.BoundSessionLoader = (*AgentPlugin)(nil)
 
 // boundSessionUnknownErr 构造 BoundSessionSource 契约的「会话不存在」错误：
 // 多 %w 同时包裹 model.ErrSessionUnknown（handler 据此映射 -32000 unknown
@@ -118,7 +119,9 @@ func (p *AgentPlugin) LoadBoundSession(sessionID, cwd string) error {
 				return fmt.Errorf("agent: reload session %s: %w", sessionID, err)
 			}
 		}
-		p.declareSessionCWD(rt, normalizeSessionCWDSilent(cwd))
+		if normalized := normalizeSessionCWDSilent(cwd); normalized != "" {
+			p.declareSessionCWD(rt, normalized)
+		}
 		return nil
 	}
 	// 分支 2：重开持久化但不在册的会话。纯内存降级（无 repo）下「不在册」即
@@ -152,6 +155,24 @@ func (p *AgentPlugin) LoadBoundSession(sessionID, cwd string) error {
 	}
 	p.declareSessionCWD(rt, restore)
 	return nil
+}
+
+func (p *AgentPlugin) LoadBoundSessionForConnection(sessionID, cwd, connectionID string) ([]model.SessionUpdate, error) {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+
+	if err := p.LoadBoundSession(sessionID, cwd); err != nil {
+		return nil, err
+	}
+	history, err := p.SessionHistory(sessionID)
+	if err != nil {
+		p.tryReleaseSessionLocked(sessionID)
+		return nil, err
+	}
+	if p.control != nil {
+		p.bindConnectionSessionLocked(connectionID, sessionID)
+	}
+	return history, nil
 }
 
 // SessionHistory 实现 model.BoundSessionSource：已注册会话的完整历史重放
@@ -221,6 +242,11 @@ func (p *AgentPlugin) mountRuntime(st *session.Store) (*runtimeagent.SessionRunt
 	deps.RunJournal = journalStore
 	deps.RunEvents = journalStore
 	rt := runtimeagent.NewSessionRuntime(st.SessionID(), runtimeagent.NewSession(deps))
+	if st.Archived() {
+		if err := rt.Archive(nil); err != nil {
+			return nil, fmt.Errorf("agent: restore archived runtime %s: %w", rt.ID, err)
+		}
+	}
 	if err := p.manager.Register(rt); err != nil {
 		return nil, fmt.Errorf("agent: register session runtime %s: %w", rt.ID, err)
 	}
@@ -345,6 +371,9 @@ func (p *AgentPlugin) ArchiveSession(sessionID, clientID string) error {
 	if p.control == nil {
 		return fmt.Errorf("agent: archive session: control plane unavailable")
 	}
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+
 	// ① 寻址（先于 fence：未知会话诚实拒绝，ErrSessionUnknown 契约）。
 	//    在册 runtime 的 store 经实例唯一缓存（runtime 持有的活实例，不重复
 	//    打开）；不在册走 repo.Open（flock 空闲即活实例，与 LoadBoundSession
@@ -368,20 +397,21 @@ func (p *AgentPlugin) ArchiveSession(sessionID, clientID string) error {
 		}
 		st = opened
 	}
-	// ②-④ fencing 临界区：lease 校验 + run 在飞拒绝 + MarkArchived 原子完成。
-	//   在飞判据是双查（rt.Active() 与挂起台账）：finalizeRun 先清 active 再触发
-	//   收口回调，两者的瞬间窗口里 run 刚终态、reaper（tryReleaseSession 的
-	//   Remove+CloseSession）尚未执行——此刻落 MarkArchived 会与 reaper 的 store
-	//   关闭并发（赢家不确定，输家撞已关句柄）。挂起台账命中即 busy：该会话
-	//   马上消失，归档等它收口后按「不在册」路径落标记（同幂等终态）。
+	// ②-④ fencing 临界区：lease 校验、Runtime admission 与 store 归档在同一生命周期
+	// 临界区内完成。Runtime 先进入只读状态，任何后续 Run 提交都会被拒绝；store
+	// 写失败则回滚 admission，避免出现内存只读但持久化未归档的半状态。
 	err := p.control.WithControl(sessionID, clientID, func() error {
 		if rt != nil {
-			if run := rt.Active(); run != nil {
-				return fmt.Errorf("agent: session %q is busy: run in flight (archive after the run reaches terminal state)", sessionID)
-			}
 			if p.isSuspendedRelease(sessionID) {
 				return fmt.Errorf("agent: session %q is busy: pending release after a run just finished (retry once the session settles)", sessionID)
 			}
+			if err := rt.Archive(st.MarkArchived); err != nil {
+				if errors.Is(err, runtimeagent.ErrRunActive) {
+					return fmt.Errorf("agent: session %q is busy: run in flight (archive after the run reaches terminal state): %w", sessionID, err)
+				}
+				return err
+			}
+			return nil
 		}
 		return st.MarkArchived()
 	})

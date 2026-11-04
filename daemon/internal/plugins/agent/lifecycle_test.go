@@ -240,5 +240,96 @@ func TestRunDoneHookIgnoresUnsuspendedSessions(t *testing.T) {
 	}
 }
 
-// 编译期守卫:model.ConnectionBinder 断言面与本包生命周期方法的对接点。
+func TestRunDoneDuringSuspendRegistration(t *testing.T) {
+	p, sidA := newBoundSession(t, "conn-1")
+	_ = newPersistedSession(t, p, fixedProvider{content: "x"})
+	rt := p.manager.Get(sidA)
+	gate, err := rt.AcquireRun(context.Background())
+	if err != nil {
+		t.Fatalf("AcquireRun: %v", err)
+	}
+	block := make(chan struct{})
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		rt.RecordRun(func(*runtimeagent.Session) (runtimeagent.RunResult, error) {
+			<-block
+			return runtimeagent.RunResult{State: runtimeagent.RunCompleted}, nil
+		})
+	}()
+	waitActive(t, rt)
+
+	releaseDone := make(chan struct{})
+	go func() {
+		p.ReleaseConnection("conn-1")
+		close(releaseDone)
+	}()
+	close(block)
+	<-runDone
+	<-releaseDone
+	gate()
+
+	if p.manager.Get(sidA) != nil {
+		t.Fatal("session should be released after the last binding and run completion")
+	}
+	if p.isSuspendedRelease(sidA) {
+		t.Fatal("run completion must consume the suspended release marker")
+	}
+}
+
+func TestLoadWithoutCWDPreservesWorkspace(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "x"})
+	sid := p.CurrentSessionID()
+	rt := p.manager.Get(sid)
+	cwd := t.TempDir()
+	p.applySessionCWD(rt, cwd, true)
+
+	if err := p.LoadBoundSession(sid, ""); err != nil {
+		t.Fatalf("LoadBoundSession: %v", err)
+	}
+	got, cwdErr := rt.DeclaredCWD()
+	if cwdErr != nil || got != cwd {
+		t.Fatalf("runtime cwd = %q, err=%v, want %q", got, cwdErr, cwd)
+	}
+	if got := p.storeFor(rt).Workspace(); got != cwd {
+		t.Fatalf("stored workspace = %q, want %q", got, cwd)
+	}
+}
+
+func TestConcurrentLoadAndRelease(t *testing.T) {
+	p, sidA := newBoundSession(t, "conn-1")
+	_ = newPersistedSession(t, p, fixedProvider{content: "x"})
+
+	start := make(chan struct{})
+	loadErr := make(chan error, 1)
+	releaseDone := make(chan struct{})
+	go func() {
+		<-start
+		_, err := p.LoadBoundSessionForConnection(sidA, "", "conn-2")
+		loadErr <- err
+	}()
+	go func() {
+		<-start
+		p.ReleaseConnection("conn-1")
+		close(releaseDone)
+	}()
+	close(start)
+
+	if err := <-loadErr; err != nil {
+		t.Fatalf("LoadBoundSessionForConnection: %v", err)
+	}
+	<-releaseDone
+
+	rt := p.manager.Get(sidA)
+	if rt == nil {
+		t.Fatal("load must keep the runtime registered after concurrent release")
+	}
+	if got := p.control.SessionBindings(sidA); len(got) != 1 || got[0] != "conn-2" {
+		t.Fatalf("bindings after concurrent load/release = %v, want [conn-2]", got)
+	}
+	if _, err := p.storeFor(rt).Commit([]core.Message{{Role: "user", Content: "still usable", MsgID: session.NewMsgID()}}); err != nil {
+		t.Fatalf("commit after concurrent load/release: %v", err)
+	}
+}
+
 var _ model.ConnectionBinder = (*AgentPlugin)(nil)

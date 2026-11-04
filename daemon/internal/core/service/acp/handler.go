@@ -533,29 +533,40 @@ func (h *FrontendHandler) LoadSession(_ context.Context, req protocol.LoadSessio
 		if !h.gate.tryAcquire() {
 			return sessionBusyError()
 		}
-		if err := h.multi.LoadBoundSession(req.SessionID, req.Cwd); err != nil {
-			h.gate.release()
-			if errors.Is(err, model.ErrSessionUnknown) {
+		var (
+			history       []model.SessionUpdate
+			loadErr       error
+			historyErr    error
+			boundByLoader bool
+		)
+		if loader, ok := h.multi.(model.BoundSessionLoader); ok {
+			history, loadErr = loader.LoadBoundSessionForConnection(req.SessionID, req.Cwd, h.connectionID)
+			boundByLoader = loadErr == nil
+		} else {
+			loadErr = h.multi.LoadBoundSession(req.SessionID, req.Cwd)
+			if loadErr == nil {
+				history, historyErr = h.multi.SessionHistory(req.SessionID)
+			}
+		}
+		h.gate.release()
+		if loadErr != nil {
+			if errors.Is(loadErr, model.ErrSessionUnknown) {
 				return &protocol.RPCError{
 					Code:    -32000,
 					Message: fmt.Sprintf("acp frontend: unknown session %q", req.SessionID),
 				}
 			}
-			return fmt.Errorf("acp frontend: load session %q: %w", req.SessionID, err)
+			return fmt.Errorf("acp frontend: load session %q: %w", req.SessionID, loadErr)
 		}
-		history, histErr := h.multi.SessionHistory(req.SessionID)
-		h.gate.release()
-		if histErr != nil {
-			return fmt.Errorf("acp frontend: load session %q history: %w", req.SessionID, histErr)
+		if historyErr != nil {
+			return fmt.Errorf("acp frontend: load session %q history: %w", req.SessionID, historyErr)
 		}
 
 		h.remember(req.SessionID)
 		// PR2:Binding 指向本连接刚加载的会话(连接私有状态,门禁外 Set;§6.2——
 		// 重选不删除原会话、不取消其后台 Run、不动 control lease、不影响其他连接)。
 		h.binding.Set(req.SessionID)
-		// Plan A2 生命周期半边:Set 处成对登记(改绑即替换,session/load 重开把
-		// 引用落回重开的会话;共享会话的双绑定各记一条连接引用)。
-		if h.binder != nil {
+		if !boundByLoader && h.binder != nil {
 			h.binder.BindConnectionSession(h.connectionID, req.SessionID)
 		}
 		if h.commands != nil {

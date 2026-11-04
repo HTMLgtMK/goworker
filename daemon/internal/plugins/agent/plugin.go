@@ -116,6 +116,8 @@ type AgentPlugin struct {
 	// (manager.WithRunDoneHook → onSessionRunDone)重判。台账只记挂起中的会话,
 	// 是钩子的消费闸门——无它则每次 run 收尾都会误判零绑定的 current 会话。
 	// 零值可用(测试直构插件)。
+	// lifecycleMu serializes binding changes, delayed reaping, and run completion handling.
+	lifecycleMu    sync.Mutex
 	suspendMu      sync.Mutex
 	suspendedReaps map[string]struct{}
 

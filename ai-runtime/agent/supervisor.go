@@ -143,23 +143,9 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	// 守恒:每笔预留恰一次归还——execute 各出口或本冲突路径,任一归还者执行
 	// 接收时其余接收者至多完成「预留总数-1」次,缓冲恒非空)。
 	run := newAgentRun(newRunID(), sessionID) // state 保持 RunQueued(不 transition,queued 状态由此启用),execute 内再推进 running
-	var (
-		sess   *Session
-		reject error // 冲突标志:锁内置非 nil,锁外归还令牌后以此返回
-	)
-	rt.mu.Lock()
-	switch {
-	case rt.active != nil: // 同会话第二 Run 不排队(总方案第四节「Session 在排队期间已经被占用,不能继续提交第二个 Run」)
-		reject = ErrRunActive
-	case rt.session == nil:
-		reject = ErrSessionNotBound
-	default:
-		rt.active = run
-		sess = rt.session
-	}
-	rt.mu.Unlock()
+	sess, reject := rt.reserveRun(run)
 	if reject != nil {
-		<-m.pending // ③ 预留的令牌原路归还(锁外——rt.mu 内不做 channel 操作)
+		<-m.pending // ③ 预留的令牌原路归还(锁外——runtime admission 已完成)
 		return RunHandle{}, reject
 	}
 
@@ -189,11 +175,7 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	// execute 未启动——零事件产出,无需回收。
 	hub, err := rt.bindEvents(sessionID, sess.deps.RunEvents)
 	if err != nil {
-		rt.mu.Lock()
-		if rt.active == run {
-			rt.active = nil
-		}
-		rt.mu.Unlock()
+		rt.releaseRunReservation(run)
 		<-m.pending // ③ 预留的令牌原路归还(锁外,同 ② 的拒绝路径)
 		return RunHandle{}, fmt.Errorf("agent: start run %s in session %s: %w", run.ID, sessionID, err)
 	}
@@ -223,11 +205,7 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 		State:     string(RunQueued),
 		At:        time.Now(),
 	}); err != nil {
-		rt.mu.Lock()
-		if rt.active == run {
-			rt.active = nil
-		}
-		rt.mu.Unlock()
+		rt.releaseRunReservation(run)
 		<-m.pending // ③ 预留的令牌原路归还(锁外,同 ②/⑥ 的拒绝路径)
 		return RunHandle{}, fmt.Errorf("agent: start run %s in session %s: %w: %w",
 			run.ID, sessionID, ErrRunJournalWrite, err)

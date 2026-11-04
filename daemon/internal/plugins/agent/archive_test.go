@@ -104,6 +104,54 @@ func TestAgentPlugin_ArchiveSessionBusyWhileRunInFlight(t *testing.T) {
 	}
 }
 
+// TestArchiveConcurrentWithStartRun verifies that archive and both run submission paths
+// have one admission order: archive wins and the run is rejected, or the run reserves
+// first and archive reports busy.
+func TestArchiveConcurrentWithStartRun(t *testing.T) {
+	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
+	p := newPersistedPlugin(t, gated)
+	sid := p.CurrentSessionID()
+	p.AcquireControl(sid, "conn-A")
+
+	start := make(chan struct{})
+	runResult := make(chan struct {
+		h   runtimeagent.RunHandle
+		err error
+	}, 1)
+	archiveResult := make(chan error, 1)
+	go func() {
+		<-start
+		h, err := p.StartRunSync(sid, runtimeagent.RunRequest{Input: "q"}, runtimeagent.RunCallbacks{})
+		runResult <- struct {
+			h   runtimeagent.RunHandle
+			err error
+		}{h: h, err: err}
+	}()
+	go func() {
+		<-start
+		archiveResult <- p.ArchiveSession(sid, "conn-A")
+	}()
+	close(start)
+
+	run := <-runResult
+	archiveErr := <-archiveResult
+	if run.err == nil {
+		if archiveErr == nil || !strings.Contains(archiveErr.Error(), "busy") {
+			t.Fatalf("archive after run admission = %v, want busy", archiveErr)
+		}
+		close(gated.release)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := run.h.Wait(ctx); err != nil {
+			t.Fatalf("run Wait: %v", err)
+		}
+		return
+	}
+	if archiveErr != nil || !strings.Contains(run.err.Error(), "archived and read-only") {
+		t.Fatalf("archive/run outcome = archive=%v run=%v, want archive success and archived run rejection", archiveErr, run.err)
+	}
+}
+
 // TestAgentPlugin_ArchiveSessionBusyWhileSuspended 验证挂起收口窗口的 busy：
 // run 刚终态（active 已清）而 reaper 尚未执行的瞬间，归档会与收口的 store 关闭
 // 并发——挂起台账（isSuspendedRelease）命中即拒。测试直接置台账模拟该窗口
