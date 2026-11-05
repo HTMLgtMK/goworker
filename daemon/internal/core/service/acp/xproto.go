@@ -15,15 +15,16 @@ import (
 // -32000 "x-goworker: control lease held by ..."。客户端按 -32601
 // method-not-found 降级的既有约定不变(拍板⑥:无 agentCapabilities 通告)。
 const (
-	XMethodRunStart        = "x-goworker/run/start"        // {sessionId,input,requestId} → {runId,state}
-	XMethodRunGet          = "x-goworker/run/get"          // {sessionId,runId} → {state,result?,latestSeq}
-	XMethodRunCancel       = "x-goworker/run/cancel"       // {sessionId,runId} → {accepted}
-	XMethodApprovalRespond = "x-goworker/approval/respond" // {sessionId,requestId,decision} → {accepted}
-	XMethodSessionAttach   = "x-goworker/session/attach"   // P5-8
-	XMethodSessionDetach   = "x-goworker/session/detach"   // P5-8
-	XMethodSessionEvents   = "x-goworker/session/events"   // 服务端通知(P5-8,Send only)
-	XMethodSessionArchive  = "x-goworker/session/archive"  // Plan A3:{sessionId} → {archived}
-	XMethodSessionModes    = "x-goworker/session/modes"    // Plan B 任务3:无 session 取 modes（草稿面板模型下拉）
+	XMethodRunStart         = "x-goworker/run/start"        // {sessionId,input,requestId} → {runId,state}
+	XMethodRunGet           = "x-goworker/run/get"          // {sessionId,runId} → {state,result?,latestSeq}
+	XMethodRunCancel        = "x-goworker/run/cancel"       // {sessionId,runId} → {accepted}
+	XMethodApprovalRespond  = "x-goworker/approval/respond" // {sessionId,requestId,decision} → {accepted}
+	XMethodSessionAttach    = "x-goworker/session/attach"   // P5-8
+	XMethodSessionDetach    = "x-goworker/session/detach"   // P5-8
+	XMethodSessionEvents    = "x-goworker/session/events"   // 服务端通知(P5-8,Send only)
+	XMethodSessionArchive   = "x-goworker/session/archive"  // Plan A3:{sessionId} → {archived}
+	XMethodSessionModes     = "x-goworker/session/modes"    // Plan B 任务3:无 session 取 modes（草稿面板模型下拉）
+	XMethodSessionProviders = "x-goworker/providers"        // provider 模型目录：无 session 取树 + 当前选择（UI 弹框）
 )
 
 // xgwErrorCode 是 x-goworker 方法面的统一 JSON-RPC 错误码:沿用既有 -32000
@@ -201,6 +202,26 @@ type SessionModeChoice struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
+}
+
+// XProviderCatalogResult 是 x-goworker/providers 的响应：provider→models 树
+// + 当前选择（UI 弹框数据源；模型层 model.ProviderCatalog 的直译）。无 LLM
+// 配置 → providers 空数组、current* 空。老扩展不认识本方法零感知；扩展侧对
+// -32601 降级为平铺 modes（既有约定）。
+type XProviderCatalogResult struct {
+	CurrentProviderID string                  `json:"currentProviderId"`
+	CurrentModel      string                  `json:"currentModel"`
+	CurrentEffort     string                  `json:"currentEffort"`
+	Providers         []XProviderCatalogEntry `json:"providers"`
+}
+
+// XProviderCatalogEntry 是 providers 的条目形状（id = provider 名，/model use
+// 的寻址面）。
+type XProviderCatalogEntry struct {
+	ID     string   `json:"id"`
+	Name   string   `json:"name"`
+	Type   string   `json:"type,omitempty"`
+	Models []string `json:"models"`
 }
 
 // XSessionArchiveResult 是 x-goworker/session/archive 的响应：archived=true

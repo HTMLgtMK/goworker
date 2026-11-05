@@ -100,6 +100,33 @@ type SessionSource interface {
 	SessionModes() *SessionModeState
 }
 
+// ProviderCatalogEntry 是 provider 模型目录的一个条目：id = provider 名
+// （/model use 的寻址面），Models 为该 provider 的模型目录（Models 配置非空
+// 用之，否则 [Model]）。
+type ProviderCatalogEntry struct {
+	ID     string   `json:"id"`
+	Name   string   `json:"name"`
+	Type   string   `json:"type,omitempty"`
+	Models []string `json:"models"`
+}
+
+// ProviderCatalog 是 provider 模型目录的只读快照（UI 弹框数据源）：current*
+// 取 DefaultProvider 的当前字段（model / thinking effort）。无 LLM 配置时
+// ProviderCatalog() 返回 nil。
+type ProviderCatalog struct {
+	CurrentProviderID string                 `json:"currentProviderId"`
+	CurrentModel      string                 `json:"currentModel"`
+	CurrentEffort     string                 `json:"currentEffort"`
+	Providers         []ProviderCatalogEntry `json:"providers"`
+}
+
+// ProviderCatalogSource 是 provider 模型目录的可选能力（x-goworker/providers
+// RPC 的数据面；工厂内对 SessionSource type-assert，与 RunControlSource 同款
+// 先例）。nil = 后端无目录能力（简化壳/测试桩），方法诚实报错。
+type ProviderCatalogSource interface {
+	ProviderCatalog() *ProviderCatalog
+}
+
 // PendingApprovalInfo 是一笔等待决策的审批快照的 daemon 侧扁平结构（P5-6）：
 // 字段取 hitl.InterruptRequest 按 wire 需要的最小面（requestId 寻址 + 展示所需
 // 的命令/风险/截止），不透传 agent 包的 PendingApproval 结构——model 是协议

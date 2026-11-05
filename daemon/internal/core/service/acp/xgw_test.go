@@ -2195,3 +2195,54 @@ func TestXGWControlFencingTakeoverStorm(t *testing.T) {
 			gotStarts, gotCancels, gotApprovals, baseStarts, baseCancels, baseApprovals)
 	}
 }
+
+// fakeProviderCatalog 是 model.ProviderCatalogSource 的测试桩(直调 handler,
+// 不走 wire 管道——目录是纯转发只读面,管道全栈由 run/approval 各测试覆盖)。
+type fakeProviderCatalog struct{ catalog *model.ProviderCatalog }
+
+func (f *fakeProviderCatalog) ProviderCatalog() *model.ProviderCatalog { return f.catalog }
+
+func TestXGWSessionProvidersForwardsCatalog(t *testing.T) {
+	handler := &FrontendHandler{providers: &fakeProviderCatalog{catalog: &model.ProviderCatalog{
+		CurrentProviderID: "zhipu",
+		CurrentModel:      "glm-4.7",
+		CurrentEffort:     "high",
+		Providers: []model.ProviderCatalogEntry{
+			{ID: "zhipu", Name: "zhipu", Type: "openai", Models: []string{"glm-4.7", "glm-4.6"}},
+		},
+	}}}
+	res, err := handler.xgwSessionProviders(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("xgwSessionProviders: %v", err)
+	}
+	got, ok := res.(XProviderCatalogResult)
+	if !ok {
+		t.Fatalf("result type = %T, want XProviderCatalogResult", res)
+	}
+	if got.CurrentProviderID != "zhipu" || got.CurrentModel != "glm-4.7" || got.CurrentEffort != "high" {
+		t.Fatalf("current = %+v, want zhipu/glm-4.7/high", got)
+	}
+	if len(got.Providers) != 1 || got.Providers[0].ID != "zhipu" ||
+		len(got.Providers[0].Models) != 2 || got.Providers[0].Models[1] != "glm-4.6" {
+		t.Fatalf("providers = %+v, want zhipu with 2 models", got.Providers)
+	}
+}
+
+func TestXGWSessionProvidersUnavailableAndEmpty(t *testing.T) {
+	handler := &FrontendHandler{}
+	if _, err := handler.xgwSessionProviders(context.Background(), nil); err == nil {
+		t.Fatal("want error without provider catalog source")
+	}
+	empty := &FrontendHandler{providers: &fakeProviderCatalog{}}
+	res, err := empty.xgwSessionProviders(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("xgwSessionProviders(nil catalog): %v", err)
+	}
+	got, ok := res.(XProviderCatalogResult)
+	if !ok {
+		t.Fatalf("result type = %T, want XProviderCatalogResult", res)
+	}
+	if got.Providers == nil || len(got.Providers) != 0 {
+		t.Fatalf("providers = %+v, want empty array", got.Providers)
+	}
+}

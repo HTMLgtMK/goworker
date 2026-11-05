@@ -51,6 +51,12 @@ func (c LLMConfig) WithDefaults() LLMConfig {
 				provider.Thinking.Effort = ThinkingEffortMedium
 			}
 		}
+		// Model 未填但目录非空：取目录首个兜底（models-only 配置零迁移）。
+		if provider.Model == "" {
+			if catalog := provider.ModelCatalog(); len(catalog) > 0 {
+				provider.Model = catalog[0]
+			}
+		}
 		clone.Providers[name] = provider
 	}
 	return clone
@@ -224,10 +230,10 @@ func ParseThinkingRequestMode(value string) (ThinkingRequestMode, error) {
 func ParseThinkingEffort(value string) (ThinkingEffort, error) {
 	effort := ThinkingEffort(strings.TrimSpace(value))
 	switch effort {
-	case ThinkingEffortLow, ThinkingEffortMedium, ThinkingEffortHigh:
+	case ThinkingEffortLow, ThinkingEffortMedium, ThinkingEffortHigh, ThinkingEffortMax:
 		return effort, nil
 	default:
-		return "", fmt.Errorf("无效 thinking effort: %s（可用: low/medium/high）", value)
+		return "", fmt.Errorf("无效 thinking effort: %s（可用: low/medium/high/max）", value)
 	}
 }
 

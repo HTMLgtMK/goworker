@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -397,7 +398,8 @@ func TestHandleModel_ThinkingHelpStatusAndValidation(t *testing.T) {
 		if !strings.Contains(out.String(), "✘") {
 			t.Errorf("handleModel(%s) output = %q, want rejection", setting, out.String())
 		}
-		if cfg.LLM.Thinking != beforeGlobal || cfg.LLM.Providers[cfg.LLM.DefaultProvider] != beforeProvider {
+		// ProviderConfig 含 Models slice，不可 == 比较，用 DeepEqual 判未突变。
+		if cfg.LLM.Thinking != beforeGlobal || !reflect.DeepEqual(cfg.LLM.Providers[cfg.LLM.DefaultProvider], beforeProvider) {
 			t.Errorf("handleModel(%s) mutated config after rejection", setting)
 		}
 	}

@@ -113,6 +113,12 @@ type FrontendHandler struct {
 	// (不经 wire 的直调形态):attach 诚实报错,泵无从建立。
 	events xgwEventSink
 
+	// providers 是 x-goworker/providers 的数据面(model.ProviderCatalogSource,
+	// 工厂内对 sessions type-assert 获得,runs/binder/multi 同款先例)。nil =
+	// 后端无目录能力(简化壳/测试桩):方法诚实报错,客户端按 -32601 降级平铺
+	// modes 的既有约定不变。
+	providers model.ProviderCatalogSource
+
 	// subs 是本连接的会话订阅表(P5-8):sessionID → 订阅回收句柄,每连接每会话
 	// 至多一订阅(重复 attach 先 cancel 旧泵再建新);泵退出自清按句柄指针身份
 	// 判重,换代/断连(Close)统一回收。与 promptable/readOnly 共用 h.mu。
@@ -210,6 +216,11 @@ func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Comma
 			// 降级路径)。
 			if multi, ok := sessions.(model.BoundSessionSource); ok {
 				handler.multi = multi
+			}
+			// provider 模型目录(x-goworker/providers 的数据面,可选能力,缺省
+			// nil 时方法诚实报错)。
+			if providers, ok := sessions.(model.ProviderCatalogSource); ok {
+				handler.providers = providers
 			}
 		}
 		return handler

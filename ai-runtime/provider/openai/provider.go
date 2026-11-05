@@ -140,7 +140,13 @@ func (p *Provider) buildChatRequest(req *core.ChatRequest) OpenAIChatRequest {
 	case runtimeconfig.ThinkingRequestEnable:
 		wireReq.EnableThinking = true
 	case runtimeconfig.ThinkingRequestEffort:
-		wireReq.ReasoningEffort = string(p.thinking.Effort)
+		// max 是 UI 侧最高档，wire 直传会被 API 拒（reasoning_effort 合法值
+		// low/medium/high），映射为 high。
+		effort := p.thinking.Effort
+		if effort == runtimeconfig.ThinkingEffortMax {
+			effort = runtimeconfig.ThinkingEffortHigh
+		}
+		wireReq.ReasoningEffort = string(effort)
 	}
 	return wireReq
 }

@@ -105,6 +105,7 @@ func registerXGWMethods(server *aiacp.Server, handler aiacp.SessionHandler) {
 	server.Handle(XMethodSessionDetach, fh.xgwSessionDetach)
 	server.Handle(XMethodSessionArchive, fh.xgwSessionArchive)
 	server.Handle(XMethodSessionModes, fh.xgwSessionModes)
+	server.Handle(XMethodSessionProviders, fh.xgwSessionProviders)
 }
 
 // xgwRunStart 处理 x-goworker/run/start:runs.StartRun(req.SessionID,
@@ -226,6 +227,39 @@ func (h *FrontendHandler) xgwSessionModes(_ context.Context, _ json.RawMessage) 
 		choices = append(choices, SessionModeChoice{ID: mode.ID, Name: mode.Name, Description: mode.Description})
 	}
 	return XSessionModesResult{CurrentModeID: state.CurrentModeID, AvailableModes: choices}, nil
+}
+
+// xgwSessionProviders 处理 x-goworker/providers：无 session 即取 provider 模型
+// 目录（provider→models 树 + 当前 provider/model/effort，UI 弹框数据源）。
+// 只读、无门禁——与 session/modes 同型的纯展示面；后端无目录能力（简化壳/
+// 测试桩）诚实报错，客户端按 -32601 降级平铺 modes 的既有约定不变。
+func (h *FrontendHandler) xgwSessionProviders(_ context.Context, _ json.RawMessage) (any, error) {
+	if h.providers == nil {
+		return nil, xgwError("%s: provider catalog unavailable", XMethodSessionProviders)
+	}
+	catalog := h.providers.ProviderCatalog()
+	if catalog == nil {
+		return XProviderCatalogResult{Providers: []XProviderCatalogEntry{}}, nil
+	}
+	entries := make([]XProviderCatalogEntry, 0, len(catalog.Providers))
+	for _, entry := range catalog.Providers {
+		models := entry.Models
+		if models == nil {
+			models = []string{}
+		}
+		entries = append(entries, XProviderCatalogEntry{
+			ID:     entry.ID,
+			Name:   entry.Name,
+			Type:   entry.Type,
+			Models: models,
+		})
+	}
+	return XProviderCatalogResult{
+		CurrentProviderID: catalog.CurrentProviderID,
+		CurrentModel:      catalog.CurrentModel,
+		CurrentEffort:     catalog.CurrentEffort,
+		Providers:         entries,
+	}, nil
 }
 
 // xgwApprovalRespond 处理 x-goworker/approval/respond(C1 修复 + 第三轮评审 I4
