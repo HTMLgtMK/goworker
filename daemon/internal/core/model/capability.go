@@ -102,11 +102,13 @@ type SessionSource interface {
 
 // ProviderCatalogEntry 是 provider 模型目录的一个条目：id = provider 名
 // （/model use 的寻址面），Models 为该 provider 的模型目录（Models 配置非空
-// 用之，否则 [Model]）。
+// 用之，否则 [Model]），Model 为该 provider 当前的生效模型（UI 一键切
+// provider 时与 id 配对提交）。
 type ProviderCatalogEntry struct {
 	ID     string   `json:"id"`
 	Name   string   `json:"name"`
 	Type   string   `json:"type,omitempty"`
+	Model  string   `json:"model,omitempty"`
 	Models []string `json:"models"`
 }
 

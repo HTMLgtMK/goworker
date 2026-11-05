@@ -189,6 +189,7 @@ func (p *AgentPlugin) ProviderCatalog() *model.ProviderCatalog {
 			ID:     name,
 			Name:   name,
 			Type:   string(provider.Type),
+			Model:  provider.Model,
 			Models: provider.ModelCatalog(),
 		})
 	}

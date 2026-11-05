@@ -255,6 +255,7 @@ func (h *FrontendHandler) xgwSessionProviders(_ context.Context, _ json.RawMessa
 			ID:     entry.ID,
 			Name:   entry.Name,
 			Type:   entry.Type,
+			Model:  entry.Model,
 			Models: models,
 		})
 	}

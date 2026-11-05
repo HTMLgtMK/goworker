@@ -219,11 +219,12 @@ type XProviderCatalogResult struct {
 }
 
 // XProviderCatalogEntry 是 providers 的条目形状（id = provider 名，/model use
-// 的寻址面）。
+// 的寻址面；model = 该 provider 当前的生效模型，UI 一键切 provider 配对提交）。
 type XProviderCatalogEntry struct {
 	ID     string   `json:"id"`
 	Name   string   `json:"name"`
 	Type   string   `json:"type,omitempty"`
+	Model  string   `json:"model,omitempty"`
 	Models []string `json:"models"`
 }
 
