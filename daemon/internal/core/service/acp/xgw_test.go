@@ -2246,3 +2246,95 @@ func TestXGWSessionProvidersUnavailableAndEmpty(t *testing.T) {
 		t.Fatalf("providers = %+v, want empty array", got.Providers)
 	}
 }
+
+// fakeProviderManage 是 model.ProviderManageSource 的测试桩（直调 handler，
+// 管理面是纯转发 + source 侧校验，管道全栈由 run/approval 各测试覆盖）。
+type fakeProviderManage struct {
+	detail func(id string) (*model.ProviderDetail, error)
+	upsert func(req model.ProviderUpsertRequest) (string, error)
+	remove func(id string) error
+}
+
+func (f *fakeProviderManage) ProviderDetail(id string) (*model.ProviderDetail, error) {
+	return f.detail(id)
+}
+
+func (f *fakeProviderManage) ProviderUpsert(req model.ProviderUpsertRequest) (string, error) {
+	return f.upsert(req)
+}
+
+func (f *fakeProviderManage) ProviderRemove(id string) error { return f.remove(id) }
+
+func TestXGWProviderManageForwarding(t *testing.T) {
+	var gotUpsert model.ProviderUpsertRequest
+	var gotRemoveID string
+	manage := &fakeProviderManage{
+		detail: func(id string) (*model.ProviderDetail, error) {
+			if id != "zhipu" {
+				return nil, fmt.Errorf("provider %q 不存在", id)
+			}
+			return &model.ProviderDetail{ID: "zhipu", Name: "zhipu", Type: "openai",
+				Endpoint: "https://api.example.com/v1", APIKeySet: true,
+				Models: []string{"glm-4.7"}, IsDefault: true}, nil
+		},
+		upsert: func(req model.ProviderUpsertRequest) (string, error) {
+			gotUpsert = req
+			return "zhipu", nil
+		},
+		remove: func(id string) error {
+			gotRemoveID = id
+			return fmt.Errorf("provider %q 是默认 provider，先切换默认后才能删除", id)
+		},
+	}
+	handler := &FrontendHandler{providerManage: manage}
+
+	detailRaw, err := handler.xgwProviderDetail(context.Background(), json.RawMessage(`{"id":"zhipu"}`))
+	if err != nil {
+		t.Fatalf("xgwProviderDetail: %v", err)
+	}
+	detail := detailRaw.(XProviderDetailResult)
+	if !detail.APIKeySet || !detail.IsDefault || detail.Models[0] != "glm-4.7" {
+		t.Fatalf("detail = %+v, want apiKeySet/isDefault/model forwarded", detail)
+	}
+	if _, err := handler.xgwProviderDetail(context.Background(), json.RawMessage(`{"id":"missing"}`)); err == nil {
+		t.Fatal("unknown provider detail should fail")
+	}
+
+	upRaw, err := handler.xgwProviderUpsert(context.Background(), json.RawMessage(
+		`{"id":"zhipu","name":"zhipu","type":"openai","endpoint":"https://api.example.com/v1","apiKey":"k-1","models":["glm-4.7"],"contextWindow":256000}`))
+	if err != nil {
+		t.Fatalf("xgwProviderUpsert: %v", err)
+	}
+	if up := upRaw.(XProviderUpsertResult); !up.Saved || up.ID != "zhipu" {
+		t.Fatalf("upsert result = %+v, want saved/zhipu", up)
+	}
+	if gotUpsert.APIKey != "k-1" || len(gotUpsert.Models) != 1 || gotUpsert.ContextWindow != 256000 {
+		t.Fatalf("forwarded upsert = %+v", gotUpsert)
+	}
+	if _, err := handler.xgwProviderUpsert(context.Background(), json.RawMessage(`{}`)); err == nil {
+		t.Fatal("upsert without id/name should fail")
+	}
+
+	if _, err := handler.xgwProviderRemove(context.Background(), json.RawMessage(`{"id":"zhipu"}`)); err == nil {
+		t.Fatal("remove rejection should surface as error")
+	}
+	if gotRemoveID != "zhipu" {
+		t.Fatalf("remove forwarded id = %q, want zhipu", gotRemoveID)
+	}
+	if _, err := handler.xgwProviderRemove(context.Background(), json.RawMessage(`{"id":""}`)); err == nil {
+		t.Fatal("remove without id should fail")
+	}
+}
+
+func TestXGWProviderManageUnavailable(t *testing.T) {
+	handler := &FrontendHandler{}
+	if _, err := handler.xgwProviderDetail(context.Background(), json.RawMessage(`{"id":"x"}`)); err == nil {
+		t.Fatal("detail without manage source should fail")
+	}
+	if _, err := handler.xgwProviderUpsert(context.Background(), json.RawMessage(`{"name":"x"}`)); err == nil {
+		t.Fatal("upsert without manage source should fail")
+	}
+	if _, err := handler.xgwProviderRemove(context.Background(), json.RawMessage(`{"id":"x"}`)); err == nil {
+		t.Fatal("remove without manage source should fail")
+	}
+}

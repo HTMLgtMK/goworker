@@ -25,6 +25,9 @@ const (
 	XMethodSessionArchive   = "x-goworker/session/archive"  // Plan A3:{sessionId} → {archived}
 	XMethodSessionModes     = "x-goworker/session/modes"    // Plan B 任务3:无 session 取 modes（草稿面板模型下拉）
 	XMethodSessionProviders = "x-goworker/providers"        // provider 模型目录：无 session 取树 + 当前选择（UI 弹框）
+	XMethodProviderDetail   = "x-goworker/provider/detail"  // 单 provider 全量配置（管理页表单；APIKey 不出域）
+	XMethodProviderUpsert   = "x-goworker/provider/upsert"  // provider 新建/更新（SaveConfig 即时生效）
+	XMethodProviderRemove   = "x-goworker/provider/remove"  // provider 删除（默认/最后一个拒绝）
 )
 
 // xgwErrorCode 是 x-goworker 方法面的统一 JSON-RPC 错误码:沿用既有 -32000
@@ -222,6 +225,61 @@ type XProviderCatalogEntry struct {
 	Name   string   `json:"name"`
 	Type   string   `json:"type,omitempty"`
 	Models []string `json:"models"`
+}
+
+// XProviderDetailParams 是 x-goworker/provider/detail 的入参。
+type XProviderDetailParams struct {
+	ID string `json:"id"`
+}
+
+// XProviderDetailResult 是 x-goworker/provider/detail 的响应（model.ProviderDetail
+// 直译）。APIKey 永不出域——只有 apiKeySet 布尔，密钥经 wire 回传 UI 是泄露面。
+type XProviderDetailResult struct {
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Type          string   `json:"type"`
+	Endpoint      string   `json:"endpoint"`
+	APIKeySet     bool     `json:"apiKeySet"`
+	Models        []string `json:"models"`
+	ContextWindow int      `json:"contextWindow,omitempty"`
+	MaxTokens     int      `json:"maxTokens,omitempty"`
+	AuthType      string   `json:"authType,omitempty"`
+	RequestMode   string   `json:"requestMode,omitempty"`
+	Effort        string   `json:"effort,omitempty"`
+	IsDefault     bool     `json:"isDefault"`
+}
+
+// XProviderUpsertParams 是 x-goworker/provider/upsert 的入参（更新 = merge：
+// apiKey 空串 = 保留原值；contextWindow/maxTokens/authType 零值 = 保留；thinking
+// 不在请求面即保留）。id 空 = 新建（name 即 map key）。
+type XProviderUpsertParams struct {
+	ID            string   `json:"id,omitempty"`
+	Name          string   `json:"name"`
+	Type          string   `json:"type"`
+	Endpoint      string   `json:"endpoint"`
+	APIKey        string   `json:"apiKey,omitempty"`
+	Models        []string `json:"models"`
+	ContextWindow int      `json:"contextWindow,omitempty"`
+	MaxTokens     int      `json:"maxTokens,omitempty"`
+	AuthType      string   `json:"authType,omitempty"`
+}
+
+// XProviderUpsertResult 是 x-goworker/provider/upsert 的响应：saved=true 表示
+// 已 Validate + SaveConfig 落盘（引擎内存同步，运行中即时生效）。
+type XProviderUpsertResult struct {
+	Saved bool   `json:"saved"`
+	ID    string `json:"id"`
+}
+
+// XProviderRemoveParams 是 x-goworker/provider/remove 的入参。
+type XProviderRemoveParams struct {
+	ID string `json:"id"`
+}
+
+// XProviderRemoveResult 是 x-goworker/provider/remove 的响应：removed=true
+// 表示已删除并落盘。默认 provider / 最后一个 provider → -32000 明确报错。
+type XProviderRemoveResult struct {
+	Removed bool `json:"removed"`
 }
 
 // XSessionArchiveResult 是 x-goworker/session/archive 的响应：archived=true

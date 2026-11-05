@@ -10,6 +10,7 @@ import (
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
+	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
 // xgw.go 是 FrontendHandler 的 x-goworker 扩展协议面(P5-7/P5-8):run/start|get|
@@ -106,6 +107,9 @@ func registerXGWMethods(server *aiacp.Server, handler aiacp.SessionHandler) {
 	server.Handle(XMethodSessionArchive, fh.xgwSessionArchive)
 	server.Handle(XMethodSessionModes, fh.xgwSessionModes)
 	server.Handle(XMethodSessionProviders, fh.xgwSessionProviders)
+	server.Handle(XMethodProviderDetail, fh.xgwProviderDetail)
+	server.Handle(XMethodProviderUpsert, fh.xgwProviderUpsert)
+	server.Handle(XMethodProviderRemove, fh.xgwProviderRemove)
 }
 
 // xgwRunStart 处理 x-goworker/run/start:runs.StartRun(req.SessionID,
@@ -260,6 +264,91 @@ func (h *FrontendHandler) xgwSessionProviders(_ context.Context, _ json.RawMessa
 		CurrentEffort:     catalog.CurrentEffort,
 		Providers:         entries,
 	}, nil
+}
+
+// xgwProviderDetail 处理 x-goworker/provider/detail：单 provider 全量配置
+// （管理页表单数据源）。只读、无门禁——与 providers 同型的纯展示面；APIKey
+// 不出域（source 侧只给 apiKeySet 布尔）。
+func (h *FrontendHandler) xgwProviderDetail(_ context.Context, params json.RawMessage) (any, error) {
+	if h.providerManage == nil {
+		return nil, xgwError("%s: provider management unavailable", XMethodProviderDetail)
+	}
+	var req XProviderDetailParams
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, xgwError("%s: invalid params: %v", XMethodProviderDetail, err)
+	}
+	if req.ID == "" {
+		return nil, xgwError("%s: id is required", XMethodProviderDetail)
+	}
+	detail, err := h.providerManage.ProviderDetail(req.ID)
+	if err != nil {
+		return nil, xgwError("%s: %v", XMethodProviderDetail, err)
+	}
+	return XProviderDetailResult{
+		ID:            detail.ID,
+		Name:          detail.Name,
+		Type:          detail.Type,
+		Endpoint:      detail.Endpoint,
+		APIKeySet:     detail.APIKeySet,
+		Models:        detail.Models,
+		ContextWindow: detail.ContextWindow,
+		MaxTokens:     detail.MaxTokens,
+		AuthType:      detail.AuthType,
+		RequestMode:   detail.RequestMode,
+		Effort:        detail.Effort,
+		IsDefault:     detail.IsDefault,
+	}, nil
+}
+
+// xgwProviderUpsert 处理 x-goworker/provider/upsert：新建/更新 provider 配置
+// （source 侧 candidate-clone + Validate + SaveConfig，运行中即时生效）。
+// 管理操作：无 control lease 要求——与 /model 命令同权限面（daemon 全局配置，
+// 非会话状态），错误经 -32000 明确回传（表单内联展示）。
+func (h *FrontendHandler) xgwProviderUpsert(_ context.Context, params json.RawMessage) (any, error) {
+	if h.providerManage == nil {
+		return nil, xgwError("%s: provider management unavailable", XMethodProviderUpsert)
+	}
+	var req XProviderUpsertParams
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, xgwError("%s: invalid params: %v", XMethodProviderUpsert, err)
+	}
+	if req.Name == "" && req.ID == "" {
+		return nil, xgwError("%s: name is required for create", XMethodProviderUpsert)
+	}
+	id, err := h.providerManage.ProviderUpsert(model.ProviderUpsertRequest{
+		ID:            req.ID,
+		Name:          req.Name,
+		Type:          req.Type,
+		Endpoint:      req.Endpoint,
+		APIKey:        req.APIKey,
+		Models:        req.Models,
+		ContextWindow: req.ContextWindow,
+		MaxTokens:     req.MaxTokens,
+		AuthType:      req.AuthType,
+	})
+	if err != nil {
+		return nil, xgwError("%s: %v", XMethodProviderUpsert, err)
+	}
+	return XProviderUpsertResult{Saved: true, ID: id}, nil
+}
+
+// xgwProviderRemove 处理 x-goworker/provider/remove：删除 provider（默认/
+// 最后一个 → source 侧 -32000 明确拒绝）。
+func (h *FrontendHandler) xgwProviderRemove(_ context.Context, params json.RawMessage) (any, error) {
+	if h.providerManage == nil {
+		return nil, xgwError("%s: provider management unavailable", XMethodProviderRemove)
+	}
+	var req XProviderRemoveParams
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, xgwError("%s: invalid params: %v", XMethodProviderRemove, err)
+	}
+	if req.ID == "" {
+		return nil, xgwError("%s: id is required", XMethodProviderRemove)
+	}
+	if err := h.providerManage.ProviderRemove(req.ID); err != nil {
+		return nil, xgwError("%s: %v", XMethodProviderRemove, err)
+	}
+	return XProviderRemoveResult{Removed: true}, nil
 }
 
 // xgwApprovalRespond 处理 x-goworker/approval/respond(C1 修复 + 第三轮评审 I4

@@ -127,6 +127,52 @@ type ProviderCatalogSource interface {
 	ProviderCatalog() *ProviderCatalog
 }
 
+// ProviderDetail 是单个 provider 的全量配置快照（管理面表单数据源）。
+// APIKey 永不出域：只给 APIKeySet 布尔——密钥经 wire 回传 UI 是泄露面。
+type ProviderDetail struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+	// Endpoint / APIKeySet / Models 是表单直接消费的三元组。
+	Endpoint  string   `json:"endpoint"`
+	APIKeySet bool     `json:"apiKeySet"`
+	Models    []string `json:"models"`
+	// 可选字段（openai/anthropic 各有取舍，零值 = 未配置）。
+	ContextWindow int    `json:"contextWindow,omitempty"`
+	MaxTokens     int    `json:"maxTokens,omitempty"`
+	AuthType      string `json:"authType,omitempty"`
+	RequestMode   string `json:"requestMode,omitempty"`
+	Effort        string `json:"effort,omitempty"`
+	// IsDefault = 该 provider 是 cfg.LLM.DefaultProvider（UI 据此禁用删除）。
+	IsDefault bool `json:"isDefault"`
+}
+
+// ProviderUpsertRequest 是 provider 新建/更新的请求面（更新 = merge：
+// Endpoint/Type/Models 覆盖；APIKey 空串 = 保留原值；ContextWindow/MaxTokens/
+// AuthType 零值 = 保留原值；thinking 字段不在请求面——表单不触碰即保留）。
+// ID 为空 = 新建（Name 即 map key，受 daemon 侧 validProviderName 约束）。
+type ProviderUpsertRequest struct {
+	ID            string   `json:"id,omitempty"`
+	Name          string   `json:"name"`
+	Type          string   `json:"type"`
+	Endpoint      string   `json:"endpoint"`
+	APIKey        string   `json:"apiKey,omitempty"`
+	Models        []string `json:"models"`
+	ContextWindow int      `json:"contextWindow,omitempty"`
+	MaxTokens     int      `json:"maxTokens,omitempty"`
+	AuthType      string   `json:"authType,omitempty"`
+}
+
+// ProviderManageSource 是 provider 配置管理的可选能力（x-goworker/provider/
+// detail|upsert|remove 的数据面；工厂内 type-assert，CatalogSource 同款先例）。
+// 全部走 hub.SaveConfig（写盘 + 引擎内存同步）——外部编辑配置文件无热加载，
+// RPC 经 SaveConfig 是唯一即时生效路径。ProviderUpsert 返回落盘后的 provider id。
+type ProviderManageSource interface {
+	ProviderDetail(id string) (*ProviderDetail, error)
+	ProviderUpsert(req ProviderUpsertRequest) (string, error)
+	ProviderRemove(id string) error
+}
+
 // PendingApprovalInfo 是一笔等待决策的审批快照的 daemon 侧扁平结构（P5-6）：
 // 字段取 hitl.InterruptRequest 按 wire 需要的最小面（requestId 寻址 + 展示所需
 // 的命令/风险/截止），不透传 agent 包的 PendingApproval 结构——model 是协议

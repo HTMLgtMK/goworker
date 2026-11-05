@@ -178,6 +178,13 @@ func validProviderName(name string) bool {
 	return true
 }
 
+// ValidProviderName 是 provider 命名规则的导出面（管理 RPC 前置校验用，规则
+// 与 validateProvider 内部一致：非空、不含点、仅字母/数字/-/_——map key 与
+// /model use 寻址面的同一约束）。
+func ValidProviderName(name string) bool {
+	return validProviderName(name)
+}
+
 // DefaultMemory 返回默认记忆配置。Dir 留空，由宿主按配置目录派生。
 func DefaultMemory() MemoryConfig {
 	return MemoryConfig{
