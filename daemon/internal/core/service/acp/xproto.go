@@ -25,6 +25,7 @@ const (
 	XMethodSessionArchive   = "x-goworker/session/archive"  // Plan A3:{sessionId} → {archived}
 	XMethodSessionModes     = "x-goworker/session/modes"    // Plan B 任务3:无 session 取 modes（草稿面板模型下拉）
 	XMethodSessionProviders = "x-goworker/providers"        // provider 模型目录：无 session 取树 + 当前选择（UI 弹框）
+	XMethodSessionDelete    = "x-goworker/session/delete"   // 物理删除会话（control lease + 在飞守卫）
 	XMethodProviderDetail   = "x-goworker/provider/detail"  // 单 provider 全量配置（管理页表单；APIKey 不出域）
 	XMethodProviderUpsert   = "x-goworker/provider/upsert"  // provider 新建/更新（SaveConfig 即时生效）
 	XMethodProviderRemove   = "x-goworker/provider/remove"  // provider 删除（默认/最后一个拒绝）
@@ -289,6 +290,19 @@ type XProviderRemoveResult struct {
 // 生命周期收口等引用归零）；run 在飞 → -32000 busy（瞬态，终态后重试）。
 type XSessionArchiveResult struct {
 	Archived bool `json:"archived"`
+}
+
+// XSessionDeleteParams 是 x-goworker/session/delete 的入参。删除需要调用方
+// connection 持有 control lease；source 侧会清理全部 binding、runtime、store
+// cache 后物理删除 per-id 目录。
+type XSessionDeleteParams struct {
+	SessionID string `json:"sessionId"`
+}
+
+// XSessionDeleteResult 是 x-goworker/session/delete 的响应：deleted=true 表示
+// 目录已物理删除。默认/legacy/在飞等错误以 -32000 返回。
+type XSessionDeleteResult struct {
+	Deleted bool `json:"deleted"`
 }
 
 // xgwError 按本协议错误约定构造 -32000 RPC 错误。

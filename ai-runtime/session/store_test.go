@@ -1852,3 +1852,22 @@ func TestMarkArchivedIdempotent(t *testing.T) {
 		t.Errorf("Workspace on unmarked store = %q, want empty", got)
 	}
 }
+
+func TestStoreTitleRoundTripLastWins(t *testing.T) {
+	s := openStore(t)
+	if got := s.Title(); got != "" {
+		t.Fatalf("initial Title = %q, want empty", got)
+	}
+	if err := s.SetTitle("  First title  "); err != nil {
+		t.Fatalf("SetTitle first: %v", err)
+	}
+	if err := s.SetTitle("Second title"); err != nil {
+		t.Fatalf("SetTitle second: %v", err)
+	}
+	if got := s.Title(); got != "Second title" {
+		t.Fatalf("Title = %q, want last title", got)
+	}
+	if err := s.SetTitle("   "); err == nil {
+		t.Fatal("empty title should fail")
+	}
+}

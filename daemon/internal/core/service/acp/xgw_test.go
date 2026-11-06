@@ -2338,3 +2338,44 @@ func TestXGWProviderManageUnavailable(t *testing.T) {
 		t.Fatal("remove without manage source should fail")
 	}
 }
+
+type fakeSessionDelete struct {
+	ids []string
+	err error
+}
+
+func (f *fakeSessionDelete) DeleteSession(sessionID, _ string) error {
+	f.ids = append(f.ids, sessionID)
+	return f.err
+}
+
+func TestXGWSessionDeleteForwarding(t *testing.T) {
+	deleter := &fakeSessionDelete{}
+	handler := &FrontendHandler{
+		sessionDelete: deleter,
+		gate:          NewSessionGate(),
+	}
+	res, err := handler.xgwSessionDelete(context.Background(), json.RawMessage(`{"sessionId":"s-delete"}`))
+	if err != nil {
+		t.Fatalf("xgwSessionDelete: %v", err)
+	}
+	got, ok := res.(XSessionDeleteResult)
+	if !ok || !got.Deleted {
+		t.Fatalf("result = %#v, want deleted=true", res)
+	}
+	if len(deleter.ids) != 1 || deleter.ids[0] != "s-delete" {
+		t.Fatalf("forwarded ids = %v", deleter.ids)
+	}
+}
+
+func TestXGWSessionDeleteUnavailableAndInvalid(t *testing.T) {
+	handler := &FrontendHandler{gate: NewSessionGate()}
+	if _, err := handler.xgwSessionDelete(context.Background(), json.RawMessage(`{"sessionId":"s"}`)); err == nil {
+		t.Fatal("delete without source should fail")
+	}
+	deleter := &fakeSessionDelete{}
+	handler.sessionDelete = deleter
+	if _, err := handler.xgwSessionDelete(context.Background(), json.RawMessage(`{}`)); err == nil {
+		t.Fatal("delete without sessionId should fail")
+	}
+}

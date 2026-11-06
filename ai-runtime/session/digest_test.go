@@ -32,6 +32,9 @@ func TestScanSessionDigestsCoversAllLayouts(t *testing.T) {
 	if _, err := v2.Commit([]core.Message{commMsg("m0", "user", "v2 hello")}); err != nil {
 		t.Fatalf("Commit v2: %v", err)
 	}
+	if err := v2.SetTitle("Generated v2 title"); err != nil {
+		t.Fatalf("SetTitle v2: %v", err)
+	}
 	v2ID := v2.SessionID()
 
 	// 存量 current.jsonl 目录（v1 兼容形态）+ archived 终态标记。目录名是合法
@@ -101,8 +104,8 @@ func TestScanSessionDigestsCoversAllLayouts(t *testing.T) {
 	if !ok {
 		t.Fatalf("v2 session %s missing from scan", v2ID)
 	}
-	if v2d.Workspace != "/tmp/wk-a" || v2d.Archived || v2d.FirstUserText != "v2 hello" {
-		t.Fatalf("v2 digest = %+v, want workspace/archived/first-user aligned", v2d)
+	if v2d.Workspace != "/tmp/wk-a" || v2d.Archived || v2d.FirstUserText != "v2 hello" || v2d.Title != "Generated v2 title" {
+		t.Fatalf("v2 digest = %+v, want workspace/archived/first-user/title aligned", v2d)
 	}
 
 	v1d, ok := byID[v1ID]

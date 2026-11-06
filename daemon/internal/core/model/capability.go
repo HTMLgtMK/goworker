@@ -386,6 +386,13 @@ type BoundSessionSource interface {
 	ArchiveSession(sessionID, clientID string) error
 }
 
+// SessionDeleteSource 是物理删除能力的可选扩展面。单独拆出是为了让已有
+// BoundSessionSource 测试桩/简化后端不被新增删除能力的接口变更打破；xgw
+// handler 对 nil 诚实返回 method-not-supported。
+type SessionDeleteSource interface {
+	DeleteSession(sessionID, clientID string) error
+}
+
 // BoundSessionLoader lets a backend linearize load, history snapshot, and lifecycle binding.
 type BoundSessionLoader interface {
 	LoadBoundSessionForConnection(sessionID, cwd, connectionID string) ([]SessionUpdate, error)

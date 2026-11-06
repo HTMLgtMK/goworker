@@ -2,10 +2,12 @@ package acp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
@@ -124,6 +126,10 @@ type FrontendHandler struct {
 	// nil = 后端无管理能力:方法诚实报错,客户端按 -32601 降级。
 	providerManage model.ProviderManageSource
 
+	// sessionDelete 是 x-goworker/session/delete 的可选物理删除面。与 multi
+	// 分开，保持旧 BoundSessionSource 测试桩/简化后端可编译。
+	sessionDelete model.SessionDeleteSource
+
 	// subs 是本连接的会话订阅表(P5-8):sessionID → 订阅回收句柄,每连接每会话
 	// 至多一订阅(重复 attach 先 cancel 旧泵再建新);泵退出自清按句柄指针身份
 	// 判重,换代/断连(Close)统一回收。与 promptable/readOnly 共用 h.mu。
@@ -231,6 +237,9 @@ func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Comma
 			// nil 时方法诚实报错)。
 			if manage, ok := sessions.(model.ProviderManageSource); ok {
 				handler.providerManage = manage
+			}
+			if deleter, ok := sessions.(model.SessionDeleteSource); ok {
+				handler.sessionDelete = deleter
 			}
 		}
 		return handler
@@ -461,6 +470,13 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 	}
 
 	output := &commandOutput{reporter: reporter, sessionID: sessionID}
+	// session_info_update 的顶层 sessionId 仍按 ACP 使用 transport id；Raw 扩展字段
+	// 额外带 store logical id，扩展侧用它精确 patch session/list（bridge 的 typed
+	// SessionInfoUpdate 不声明该字段，但 JSON parser 会保留时优先消费）。
+	infoSessionID := h.binding.Get()
+	if infoSessionID == "" {
+		infoSessionID = sessionID
+	}
 	commandContext := &model.Context{
 		// PR2:连接级 Binding 挂上执行链 ctx——Engine.Eval 把 model.Context 直通
 		// 命令 handler,插件的 binding 形态解析点(agentcontrol.BindingFromCtx)据此
@@ -482,6 +498,20 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 			// Decide 接上 ACP 授权请求：沙箱中间件的 HITL 决策经
 			// Reporter.RequestPermission 到客户端，nil 的静默拒绝不再吞掉危险命令提示。
 			Decide: model.DecideViaACP(ctx, reporter, sessionID),
+			// 首轮标题生成完成后的带外通知。用 Raw 透传 session_info_update
+			//（附带 sessionId，扩展窄化需要它；SDK hook 会以当前 bridge id 兜底）。
+			SessionInfo: func(title string) {
+				payload, err := json.Marshal(map[string]any{
+					"sessionUpdate": "session_info_update",
+					"sessionId":     infoSessionID,
+					"title":         title,
+					"updatedAt":     time.Now().UTC().Format(time.RFC3339),
+				})
+				if err != nil {
+					return
+				}
+				reporter.Update(sessionID, protocol.SessionUpdateBody{Raw: payload})
+			},
 			// Device tool source is gated on the initialize-time clientCapabilities
 			// of this connection. Assigning nil directly is safe: Session.Run and
 			// the plugin both treat a nil ToolSource as "no device tools".

@@ -32,6 +32,11 @@ const (
 	KindToolResult RenderKind = "tool_result"
 )
 
+// SessionInfo 是会话元信息的带外更新载荷（标题生成后推给前端）。
+type SessionInfo struct {
+	Title string
+}
+
 type RunCallbacks struct {
 	Write func(string)
 	// WriteToken 是 terminal renderer 的兼容回调；新 frontend 应消费 EmitToken 的结构化语义。
@@ -40,6 +45,10 @@ type RunCallbacks struct {
 	EmitToken func(core.Token)
 	Decide    func(*hitl.InterruptRequest) hitl.Decision
 	Publish   func(event string, data any)
+	// SessionInfo 推送会话元信息（标题生成完成后的带外通知；nil = 前端不消费，
+	// 标题仍已落盘、下次清单可见）。可能在 Run 返回后的 goroutine 中被调用——
+	// 实现方须自持连接生命周期（连接关闭后调用应为安全 no-op）。
+	SessionInfo func(SessionInfo)
 }
 
 // Session 是一段会话：收敛会话状态（conversation/usage）与核心操作（Run/Compact/…）。
@@ -96,4 +105,9 @@ type SessionDeps struct {
 	RunEvents            EventJournal                                           // nil = 不启用事件流（P2+P3 的 daemon 不接线，openQuestion ④；P5 随 x-goworker 协议接入；接口字段必须真 nil，typed-nil 陷阱同 Store/RunJournal）
 	PersistAllowRule     func(sandbox.AllowRule) error                          // 持久化 bash allow_always 规则
 	PersistToolAllowRule func(sandbox.ToolAllowRule) error                      // 持久化外部工具 allow_always 规则
+	// OnFirstCommit 在会话**首次**持久化提交成功后由独立 goroutine 调用一次
+	//（LLM 标题生成的触发点；nil = 不生成）。firstUserText 是本轮用户输入原文；
+	// notify 由实现方捕获，用于把生成结果实时推回前端（连接关闭后调用应安全
+	// no-op）。实现方自行落盘（store.SetTitle）——本层不关心标题存储。
+	OnFirstCommit func(firstUserText string, notify func(title string))
 }

@@ -105,6 +105,7 @@ func registerXGWMethods(server *aiacp.Server, handler aiacp.SessionHandler) {
 	server.Handle(XMethodSessionAttach, fh.xgwSessionAttach)
 	server.Handle(XMethodSessionDetach, fh.xgwSessionDetach)
 	server.Handle(XMethodSessionArchive, fh.xgwSessionArchive)
+	server.Handle(XMethodSessionDelete, fh.xgwSessionDelete)
 	server.Handle(XMethodSessionModes, fh.xgwSessionModes)
 	server.Handle(XMethodSessionProviders, fh.xgwSessionProviders)
 	server.Handle(XMethodProviderDetail, fh.xgwProviderDetail)
@@ -213,6 +214,30 @@ func (h *FrontendHandler) xgwSessionArchive(_ context.Context, params json.RawMe
 		return nil, xgwError("%s: %v", XMethodSessionArchive, err)
 	}
 	return XSessionArchiveResult{Archived: true}, nil
+}
+
+// xgwSessionDelete 处理 x-goworker/session/delete：物理删除会话目录。管理门禁
+// 与 archive 同型；source 内部再做 control lease fencing + Retire/在飞守卫。
+func (h *FrontendHandler) xgwSessionDelete(_ context.Context, params json.RawMessage) (any, error) {
+	if h.sessionDelete == nil {
+		return nil, xgwNotAvailableError(XMethodSessionDelete)
+	}
+	var req XSessionDeleteParams
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, xgwError("%s: invalid params: %v", XMethodSessionDelete, err)
+	}
+	if req.SessionID == "" {
+		return nil, xgwError("%s: sessionId is required", XMethodSessionDelete)
+	}
+	if !h.gate.tryAcquire() {
+		return nil, sessionBusyError()
+	}
+	err := h.sessionDelete.DeleteSession(req.SessionID, h.connectionID)
+	h.gate.release()
+	if err != nil {
+		return nil, xgwError("%s: %v", XMethodSessionDelete, err)
+	}
+	return XSessionDeleteResult{Deleted: true}, nil
 }
 
 // xgwSessionModes 处理 x-goworker/session/modes（Plan B 任务3）：无 session 即取

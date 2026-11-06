@@ -222,6 +222,17 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 					slog.Warn("session: commit failed", "err", err)
 					return RunResult{State: RunFailed, Err: fmt.Errorf("session: commit conversation: %w", err), Persisted: false}, nil
 				}
+				// 首次持久化提交（此前会话无 user 消息 = 新会话首轮）→ 标题生成
+				// 触发点：独立 goroutine 跑 LLM 标题 job，notify 经本轮 RunCallbacks
+				// 推送（实现方自持连接生命周期；Run 返回后调用为带外安全面）。
+				if s.deps.OnFirstCommit != nil && cb.SessionInfo != nil && !convHadUserMessage(conv) {
+					notify := func(title string) {
+						if cb.SessionInfo != nil {
+							cb.SessionInfo(SessionInfo{Title: title})
+						}
+					}
+					go s.deps.OnFirstCommit(input, notify)
+				}
 			}
 			// 提交后自动打 checkpoint，作为 /rewind 回溯锚点（plan「核心模型」）
 			if err := s.deps.Store.Checkpoint(Truncate(input, 80)); err != nil {
@@ -569,4 +580,15 @@ func (s *Session) buildSystemPrompt(cfg *runtimeconfig.Config, tools []core.Tool
 	}
 	b.WriteString("\nRespond naturally. Use tools when needed.")
 	return b.String()
+}
+
+// convHadUserMessage 报告会话历史里是否已有真实 user 消息（compact 摘要是 system，
+// 不会被计入）。首次持久化提交判定（标题生成触发）的依据。
+func convHadUserMessage(conv []core.Message) bool {
+	for _, m := range conv {
+		if m.Role == "user" && strings.TrimSpace(m.Content) != "" {
+			return true
+		}
+	}
+	return false
 }

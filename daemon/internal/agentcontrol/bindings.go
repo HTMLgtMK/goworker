@@ -87,6 +87,26 @@ func (r *BindingRegistry) Unbind(clientID string) (prev string) {
 	return prev
 }
 
+// UnbindSession 解除一个会话上的全部连接绑定，返回被摘除的 clientID（升序）。
+// 删除会话专用：登记表本身只记账、不做生命周期副作用；调用方在锁外收口
+// runtime/store。空 sessionID 幂等返回空切片。
+func (r *BindingRegistry) UnbindSession(sessionID string) []string {
+	if sessionID == "" {
+		return []string{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	clients := make([]string, 0, 2)
+	for client, sid := range r.byClient {
+		if sid == sessionID {
+			clients = append(clients, client)
+			delete(r.byClient, client)
+		}
+	}
+	sort.Strings(clients)
+	return clients
+}
+
 // Bindings 返回当前绑定在 sessionID 上的全部连接 id（升序拷贝，调用方可安全
 // 持有/遍历）。无绑定返回空切片（非 nil，len 判定即「引用归零」）。这是生命周期
 // 归零判定与 A3 state=active 判定的取数点。

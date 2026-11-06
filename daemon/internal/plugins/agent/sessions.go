@@ -80,9 +80,14 @@ func (p *AgentPlugin) ListSessions() []model.SessionSummary {
 	entries := make([]entry, 0, len(digests))
 	for _, d := range digests {
 		id := d.Metadata.SessionID
+		// 标题来源优先级：title 记录（LLM 生成，last-wins）> 首条 user 消息派生。
+		titleSource := d.FirstUserText
+		if d.Title != "" {
+			titleSource = d.Title
+		}
 		info := model.SessionSummary{
 			SessionID: id,
-			Title:     truncateTitle(d.FirstUserText),
+			Title:     truncateTitle(titleSource),
 			Cwd:       d.Workspace,
 			UpdatedAt: d.ModTime.Format(time.RFC3339),
 			Archived:  d.Archived,

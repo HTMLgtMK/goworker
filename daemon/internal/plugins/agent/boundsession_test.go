@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -649,5 +651,29 @@ func TestACPManagementOpsConcurrentCreateSerializes(t *testing.T) {
 		if got := p.control.SessionBindings(id); len(got) != 1 {
 			t.Fatalf("bindings(%s) = %v, want exactly one connection", id, got)
 		}
+	}
+}
+
+func TestDeleteSessionRemovesPersistedDirectory(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "title"})
+	sid := p.CurrentSessionID()
+	if sid == "" {
+		t.Fatal("current session id is empty")
+	}
+	dir := filepath.Join(p.cfg.Session.Dir, sid)
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("session directory before delete: %v", err)
+	}
+	if !p.AcquireControl(sid, "conn-delete") {
+		// acquire returns false for the first holder by contract.
+	}
+	if err := p.DeleteSession(sid, "conn-delete"); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("session directory after delete err = %v, want not exist", err)
+	}
+	if p.manager.Get(sid) != nil {
+		t.Fatal("deleted runtime remains registered")
 	}
 }

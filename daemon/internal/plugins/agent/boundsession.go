@@ -241,6 +241,7 @@ func (p *AgentPlugin) mountRuntime(st *session.Store) (*runtimeagent.SessionRunt
 	journalStore := session.NewRunJournalStore(p.repo, st)
 	deps.RunJournal = journalStore
 	deps.RunEvents = journalStore
+	deps.OnFirstCommit = p.makeFirstCommitTitle(st)
 	rt := runtimeagent.NewSessionRuntime(st.SessionID(), runtimeagent.NewSession(deps))
 	if st.Archived() {
 		if err := rt.Archive(nil); err != nil {
@@ -251,6 +252,88 @@ func (p *AgentPlugin) mountRuntime(st *session.Store) (*runtimeagent.SessionRunt
 		return nil, fmt.Errorf("agent: register session runtime %s: %w", rt.ID, err)
 	}
 	return rt, nil
+}
+
+// DeleteSession 实现 model.BoundSessionSource.DeleteSession：物理删除会话目录。
+// 管理门禁由 xgw handler 持有；这里负责 control lease fencing、runtime admission
+// （在飞拒绝）、全部 binding 清账、runtime/event/store 收口与 Repository.Delete。
+// Delete 与 Archive 的关键差异：删除成功后数据不可重开，所有引用必须先摘干净。
+func (p *AgentPlugin) DeleteSession(sessionID, clientID string) error {
+	if p.repo == nil {
+		return fmt.Errorf("agent: session persistence disabled")
+	}
+	if p.control == nil {
+		return fmt.Errorf("agent: delete session: control plane unavailable")
+	}
+	if sessionID == "" {
+		return fmt.Errorf("agent: delete session: session id is required")
+	}
+	if p.repo.IsLegacyImmutable(sessionID) {
+		return fmt.Errorf("agent: delete session %s: %w", sessionID, session.ErrLegacyImmutable)
+	}
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+
+	rt := p.RouteSession(sessionID)
+	var st *session.Store
+	if rt != nil {
+		st = p.storeFor(rt)
+		if st == nil {
+			return fmt.Errorf("agent: session %q has no persisted store", sessionID)
+		}
+	} else {
+		opened, err := p.repo.Open(sessionID)
+		if err != nil {
+			if errors.Is(err, session.ErrSessionNotFound) {
+				return boundSessionUnknownErr(sessionID)
+			}
+			return fmt.Errorf("agent: delete session %s: %w", sessionID, err)
+		}
+		st = opened
+	}
+
+	// Lease 校验与 Retire 在同一临界区内完成：接管后旧 holder 不可能在
+	// Retire 前提交新 run；ErrRunActive 直接转 busy，避免删目录仍有 journal 写入。
+	if err := p.control.WithControl(sessionID, clientID, func() error {
+		if rt != nil {
+			if p.isSuspendedRelease(sessionID) {
+				return fmt.Errorf("agent: session %q is busy: pending release after a run just finished", sessionID)
+			}
+			if err := rt.Retire(); err != nil {
+				if errors.Is(err, runtimeagent.ErrRunActive) {
+					return fmt.Errorf("agent: session %q is busy: run in flight (delete after the run reaches terminal state): %w", sessionID, err)
+				}
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		if rt == nil {
+			_ = p.repo.CloseSession(sessionID)
+		}
+		return err
+	}
+
+	// 先停事件与 runtime，再逐出 store cache，最后 RemoveAll。current 便利指针
+	// 若指向被删 runtime 一并清空；没有其它 current 事实可迁移，后续 load/new
+	// 会重新建立。
+	if rt != nil {
+		p.manager.Remove(sessionID)
+		rt.CloseEvents()
+		if p.currentSession() == rt {
+			p.current.Store(nil)
+		}
+	}
+	p.control.UnbindAllSession(sessionID)
+	if err := p.repo.CloseSession(sessionID); err != nil {
+		return fmt.Errorf("agent: delete session %s: close store: %w", sessionID, err)
+	}
+	if err := p.repo.Delete(context.Background(), sessionID); err != nil {
+		return fmt.Errorf("agent: delete session %s: %w", sessionID, err)
+	}
+	p.clearSuspendedRelease(sessionID)
+	slog.Info("agent: session deleted", "session", sessionID, "client", clientID)
+	return nil
 }
 
 // declareSessionCWD 把一次 cwd 声明落到 runtime（及会话本体与会话 store）：
