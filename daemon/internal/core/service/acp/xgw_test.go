@@ -2195,3 +2195,187 @@ func TestXGWControlFencingTakeoverStorm(t *testing.T) {
 			gotStarts, gotCancels, gotApprovals, baseStarts, baseCancels, baseApprovals)
 	}
 }
+
+// fakeProviderCatalog 是 model.ProviderCatalogSource 的测试桩(直调 handler,
+// 不走 wire 管道——目录是纯转发只读面,管道全栈由 run/approval 各测试覆盖)。
+type fakeProviderCatalog struct{ catalog *model.ProviderCatalog }
+
+func (f *fakeProviderCatalog) ProviderCatalog() *model.ProviderCatalog { return f.catalog }
+
+func TestXGWSessionProvidersForwardsCatalog(t *testing.T) {
+	handler := &FrontendHandler{providers: &fakeProviderCatalog{catalog: &model.ProviderCatalog{
+		CurrentProviderID: "zhipu",
+		CurrentModel:      "glm-4.7",
+		CurrentEffort:     "high",
+		Providers: []model.ProviderCatalogEntry{
+			{ID: "zhipu", Name: "zhipu", Type: "openai", Models: []string{"glm-4.7", "glm-4.6"}},
+		},
+	}}}
+	res, err := handler.xgwSessionProviders(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("xgwSessionProviders: %v", err)
+	}
+	got, ok := res.(XProviderCatalogResult)
+	if !ok {
+		t.Fatalf("result type = %T, want XProviderCatalogResult", res)
+	}
+	if got.CurrentProviderID != "zhipu" || got.CurrentModel != "glm-4.7" || got.CurrentEffort != "high" {
+		t.Fatalf("current = %+v, want zhipu/glm-4.7/high", got)
+	}
+	if len(got.Providers) != 1 || got.Providers[0].ID != "zhipu" ||
+		len(got.Providers[0].Models) != 2 || got.Providers[0].Models[1] != "glm-4.6" {
+		t.Fatalf("providers = %+v, want zhipu with 2 models", got.Providers)
+	}
+}
+
+func TestXGWSessionProvidersUnavailableAndEmpty(t *testing.T) {
+	handler := &FrontendHandler{}
+	if _, err := handler.xgwSessionProviders(context.Background(), nil); err == nil {
+		t.Fatal("want error without provider catalog source")
+	}
+	empty := &FrontendHandler{providers: &fakeProviderCatalog{}}
+	res, err := empty.xgwSessionProviders(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("xgwSessionProviders(nil catalog): %v", err)
+	}
+	got, ok := res.(XProviderCatalogResult)
+	if !ok {
+		t.Fatalf("result type = %T, want XProviderCatalogResult", res)
+	}
+	if got.Providers == nil || len(got.Providers) != 0 {
+		t.Fatalf("providers = %+v, want empty array", got.Providers)
+	}
+}
+
+// fakeProviderManage 是 model.ProviderManageSource 的测试桩（直调 handler，
+// 管理面是纯转发 + source 侧校验，管道全栈由 run/approval 各测试覆盖）。
+type fakeProviderManage struct {
+	detail func(id string) (*model.ProviderDetail, error)
+	upsert func(req model.ProviderUpsertRequest) (string, error)
+	remove func(id string) error
+}
+
+func (f *fakeProviderManage) ProviderDetail(id string) (*model.ProviderDetail, error) {
+	return f.detail(id)
+}
+
+func (f *fakeProviderManage) ProviderUpsert(req model.ProviderUpsertRequest) (string, error) {
+	return f.upsert(req)
+}
+
+func (f *fakeProviderManage) ProviderRemove(id string) error { return f.remove(id) }
+
+func TestXGWProviderManageForwarding(t *testing.T) {
+	var gotUpsert model.ProviderUpsertRequest
+	var gotRemoveID string
+	manage := &fakeProviderManage{
+		detail: func(id string) (*model.ProviderDetail, error) {
+			if id != "zhipu" {
+				return nil, fmt.Errorf("provider %q 不存在", id)
+			}
+			return &model.ProviderDetail{ID: "zhipu", Name: "zhipu", Type: "openai",
+				Endpoint: "https://api.example.com/v1", APIKeySet: true,
+				Models: []string{"glm-4.7"}, IsDefault: true}, nil
+		},
+		upsert: func(req model.ProviderUpsertRequest) (string, error) {
+			gotUpsert = req
+			return "zhipu", nil
+		},
+		remove: func(id string) error {
+			gotRemoveID = id
+			return fmt.Errorf("provider %q 是默认 provider，先切换默认后才能删除", id)
+		},
+	}
+	handler := &FrontendHandler{providerManage: manage}
+
+	detailRaw, err := handler.xgwProviderDetail(context.Background(), json.RawMessage(`{"id":"zhipu"}`))
+	if err != nil {
+		t.Fatalf("xgwProviderDetail: %v", err)
+	}
+	detail := detailRaw.(XProviderDetailResult)
+	if !detail.APIKeySet || !detail.IsDefault || detail.Models[0] != "glm-4.7" {
+		t.Fatalf("detail = %+v, want apiKeySet/isDefault/model forwarded", detail)
+	}
+	if _, err := handler.xgwProviderDetail(context.Background(), json.RawMessage(`{"id":"missing"}`)); err == nil {
+		t.Fatal("unknown provider detail should fail")
+	}
+
+	upRaw, err := handler.xgwProviderUpsert(context.Background(), json.RawMessage(
+		`{"id":"zhipu","name":"zhipu","type":"openai","endpoint":"https://api.example.com/v1","apiKey":"k-1","models":["glm-4.7"],"contextWindow":256000}`))
+	if err != nil {
+		t.Fatalf("xgwProviderUpsert: %v", err)
+	}
+	if up := upRaw.(XProviderUpsertResult); !up.Saved || up.ID != "zhipu" {
+		t.Fatalf("upsert result = %+v, want saved/zhipu", up)
+	}
+	if gotUpsert.APIKey != "k-1" || len(gotUpsert.Models) != 1 || gotUpsert.ContextWindow != 256000 {
+		t.Fatalf("forwarded upsert = %+v", gotUpsert)
+	}
+	if _, err := handler.xgwProviderUpsert(context.Background(), json.RawMessage(`{}`)); err == nil {
+		t.Fatal("upsert without id/name should fail")
+	}
+
+	if _, err := handler.xgwProviderRemove(context.Background(), json.RawMessage(`{"id":"zhipu"}`)); err == nil {
+		t.Fatal("remove rejection should surface as error")
+	}
+	if gotRemoveID != "zhipu" {
+		t.Fatalf("remove forwarded id = %q, want zhipu", gotRemoveID)
+	}
+	if _, err := handler.xgwProviderRemove(context.Background(), json.RawMessage(`{"id":""}`)); err == nil {
+		t.Fatal("remove without id should fail")
+	}
+}
+
+func TestXGWProviderManageUnavailable(t *testing.T) {
+	handler := &FrontendHandler{}
+	if _, err := handler.xgwProviderDetail(context.Background(), json.RawMessage(`{"id":"x"}`)); err == nil {
+		t.Fatal("detail without manage source should fail")
+	}
+	if _, err := handler.xgwProviderUpsert(context.Background(), json.RawMessage(`{"name":"x"}`)); err == nil {
+		t.Fatal("upsert without manage source should fail")
+	}
+	if _, err := handler.xgwProviderRemove(context.Background(), json.RawMessage(`{"id":"x"}`)); err == nil {
+		t.Fatal("remove without manage source should fail")
+	}
+}
+
+type fakeSessionDelete struct {
+	ids []string
+	err error
+}
+
+func (f *fakeSessionDelete) DeleteSession(sessionID, _ string) error {
+	f.ids = append(f.ids, sessionID)
+	return f.err
+}
+
+func TestXGWSessionDeleteForwarding(t *testing.T) {
+	deleter := &fakeSessionDelete{}
+	handler := &FrontendHandler{
+		sessionDelete: deleter,
+		gate:          NewSessionGate(),
+	}
+	res, err := handler.xgwSessionDelete(context.Background(), json.RawMessage(`{"sessionId":"s-delete"}`))
+	if err != nil {
+		t.Fatalf("xgwSessionDelete: %v", err)
+	}
+	got, ok := res.(XSessionDeleteResult)
+	if !ok || !got.Deleted {
+		t.Fatalf("result = %#v, want deleted=true", res)
+	}
+	if len(deleter.ids) != 1 || deleter.ids[0] != "s-delete" {
+		t.Fatalf("forwarded ids = %v", deleter.ids)
+	}
+}
+
+func TestXGWSessionDeleteUnavailableAndInvalid(t *testing.T) {
+	handler := &FrontendHandler{gate: NewSessionGate()}
+	if _, err := handler.xgwSessionDelete(context.Background(), json.RawMessage(`{"sessionId":"s"}`)); err == nil {
+		t.Fatal("delete without source should fail")
+	}
+	deleter := &fakeSessionDelete{}
+	handler.sessionDelete = deleter
+	if _, err := handler.xgwSessionDelete(context.Background(), json.RawMessage(`{}`)); err == nil {
+		t.Fatal("delete without sessionId should fail")
+	}
+}

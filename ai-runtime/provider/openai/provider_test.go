@@ -184,6 +184,13 @@ func TestProvider_RequestThinkingModes(t *testing.T) {
 			wantValue:  "high",
 			absentKeys: []string{"enable_thinking"},
 		},
+		{
+			name:       "reasoning effort max maps to high on wire",
+			options:    runtimeprovider.ThinkingOptions{RequestMode: runtimeconfig.ThinkingRequestEffort, Effort: runtimeconfig.ThinkingEffortMax},
+			wantField:  "reasoning_effort",
+			wantValue:  "high",
+			absentKeys: []string{"enable_thinking"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

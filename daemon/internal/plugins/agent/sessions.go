@@ -80,9 +80,14 @@ func (p *AgentPlugin) ListSessions() []model.SessionSummary {
 	entries := make([]entry, 0, len(digests))
 	for _, d := range digests {
 		id := d.Metadata.SessionID
+		// 标题来源优先级：title 记录（LLM 生成，last-wins）> 首条 user 消息派生。
+		titleSource := d.FirstUserText
+		if d.Title != "" {
+			titleSource = d.Title
+		}
 		info := model.SessionSummary{
 			SessionID: id,
-			Title:     truncateTitle(d.FirstUserText),
+			Title:     truncateTitle(titleSource),
 			Cwd:       d.Workspace,
 			UpdatedAt: d.ModTime.Format(time.RFC3339),
 			Archived:  d.Archived,
@@ -165,6 +170,41 @@ func (p *AgentPlugin) SessionModes() *model.SessionModeState {
 		CurrentModeID:  p.cfg.LLM.DefaultProvider,
 		AvailableModes: modes,
 	}
+}
+
+// ProviderCatalog 实现 model.ProviderCatalogSource（x-goworker/providers 的
+// 数据面）：UI 弹框的 provider→models 树 + 当前选择。数据源 cfg.LLM——目录
+// 取 ProviderConfig.ModelCatalog()（Models 非空用之，否则 [Model]）；current*
+// 取 DefaultProvider 的字段（model / thinking effort，anthropic provider 无
+// effort 时留空）。providers 按名字排序（与 SessionModes 同序）。无 providers
+// 或无配置返回 nil（响应省略）。
+func (p *AgentPlugin) ProviderCatalog() *model.ProviderCatalog {
+	if p.cfg == nil || len(p.cfg.LLM.Providers) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(p.cfg.LLM.Providers))
+	for name := range p.cfg.LLM.Providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	entries := make([]model.ProviderCatalogEntry, 0, len(names))
+	for _, name := range names {
+		provider := p.cfg.LLM.Providers[name]
+		entries = append(entries, model.ProviderCatalogEntry{
+			ID:     name,
+			Name:   name,
+			Type:   string(provider.Type),
+			Model:  provider.Model,
+			Models: provider.ModelCatalog(),
+		})
+	}
+	catalog := &model.ProviderCatalog{Providers: entries}
+	if name, provider, err := p.cfg.LLM.ResolveDefault(); err == nil {
+		catalog.CurrentProviderID = name
+		catalog.CurrentModel = provider.Model
+		catalog.CurrentEffort = string(provider.Thinking.Effort)
+	}
+	return catalog
 }
 
 // currentSessionCwd 返回当前会话最近一次有效声明的 cwd（P1-4 起声明随 current

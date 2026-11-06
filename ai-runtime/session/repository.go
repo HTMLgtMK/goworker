@@ -12,10 +12,10 @@
 // 三个关键决策（评审点，对应实施计划 §3 P1-1）：
 //
 //  1. 不新增 metadata.json：会话身份所需字段已有事实源——ID/CreatedAt 是 jsonl 内
-//     不可变 metadata 记录（store.go:30-33，一次写入永不改写），Title 可由首条 user
-//     消息扫描得出（daemon sessions.go:436-461 的 firstUserTitle），CWD 属会话运行态
-//     （P1-4 再与 Session 绑定）。P1 拒绝引入第二个身份事实源：目录发现即索引——
-//     <root> 下扫一遍就是全部活跃会话，不存在「目录在但索引丢了」或反向的漂移。
+//     不可变 metadata 记录；标题由 title record（LLM 生成后追加，last-wins）或清单
+//     方按需扫描首条 user 消息得出，CWD 属会话运行态（P1-4 再与 Session 绑定）。
+//     P1 拒绝引入第二个身份事实源：目录发现即索引——<root> 下扫一遍就是全部
+//     活跃会话，不存在「目录在但索引丢了」或反向的漂移。
 //     这比总方案第九节的 metadata.json 更保守，是有意为之。
 //
 //  2. 不移动 legacy 文件：<root>/current.jsonl 原地挂载为 legacy 会话（Open 命中
@@ -74,10 +74,10 @@ var (
 	ErrRunExists = errors.New("session: run journal already exists")
 )
 
-// CreateOptions 是 Create 的选项。Title 仍按 P1-1 计划仅作接口占位：本层不持久化
-// （决策 1：不新增 metadata.json，避免第二个身份事实源）——标题由清单方按需扫描
-// 首条 user 消息得出。CWD 自 Plan A1 起接通：cwd 兼任 workspace（定案需求 #4），
-// Create 以 workspace 记录「创建即声明」持久化到会话 jsonl。
+// CreateOptions 是 Create 的选项。Title 是兼容占位：新会话创建时不主动生成/写入，
+// 首轮用户消息提交后由 Agent Session 的 OnFirstCommit 生成并经 Store.SetTitle 落盘；
+// CWD 自 Plan A1 起接通：cwd 兼任 workspace（定案需求 #4），Create 以 workspace
+// 记录「创建即声明」持久化到会话 jsonl。
 type CreateOptions struct {
 	Title string
 	CWD   string
@@ -112,7 +112,8 @@ func (r *Repository) Create(ctx context.Context, opts CreateOptions) (*Store, er
 		return nil, err
 	}
 
-	// opts.Title 仍被有意忽略（决策 1），_ = 显式表明这不是遗漏；
+	// opts.Title 是兼容占位：标题在首轮提交后的 OnFirstCommit 阶段生成；这里不触发
+	// LLM，避免 session/new 变成有外部副作用的管理操作。
 	// opts.CWD 已接通（Plan A1）：空 CWD 不落 workspace 记录——「未声明」的表达
 	// 是不写记录而非空声明（DeclareWorkspace 注释），执行域语义（A4 空 cwd 注入
 	// tmp）落地前维持现状。
@@ -274,6 +275,20 @@ func (r *Repository) List(ctx context.Context) ([]Metadata, error) {
 		out = append(out, m)
 	}
 	return out, nil
+}
+
+// IsLegacyImmutable reports whether id resolves to the legacy root slot. It is a
+// read-only preflight for lifecycle operations that must avoid retiring an in-memory
+// runtime before discovering that Repository.Delete cannot remove legacy data.
+func (r *Repository) IsLegacyImmutable(id string) bool {
+	if !validSessionID(id) {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(r.root, id)); err == nil {
+		return false
+	}
+	metadata, ok := resolveSlotMetadata(filepath.Join(r.root, legacyDataFileName))
+	return ok && metadata.SessionID == id
 }
 
 // Delete 删除会话。判定顺序（按计划 §3 P1-1）：

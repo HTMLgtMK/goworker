@@ -20,6 +20,7 @@ const (
 	kindMetadata   = "metadata"
 	kindWorkspace  = "workspace" // Plan A1：cwd 兼任 workspace，last-wins 声明
 	kindArchived   = "archived"  // Plan A1：归档终态标记（只读保留、不可逆）
+	kindTitle      = "title"     // 会话标题（LLM 生成后落盘；last-wins，清单展示优先于首条 user 消息派生）
 )
 
 // msgFields 真实消息（含 compact 时的保留段副本）。
@@ -86,19 +87,26 @@ type archivedFields struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// titleFields 会话标题（LLM 生成后追加，last-wins；空串值不落盘）。
+type titleFields struct {
+	Title     string    `json:"title,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // Record 是 jsonl 记录的统一视图：kind 判别 + 对应类型的字段组。
 // 磁盘格式保持扁平单行，序列化/反序列化见 MarshalJSON/UnmarshalJSON。
 type Record struct {
 	Kind string `json:"kind"`
 
-	Msg  *msgFields        // kind == kindMsg（含副本）
-	Comp *compactFields    // kind == kindCompact
-	Head *headFields       // kind == kindHead
-	CK   *checkpointFields // kind == kindCheckpoint
-	Cur  *cursorFields     // kind == kindCursor
-	Meta *metadataFields   // kind == kindMetadata
-	Ws   *workspaceFields  // kind == kindWorkspace
-	Arc  *archivedFields   // kind == kindArchived
+	Msg    *msgFields        // kind == kindMsg（含副本）
+	Comp   *compactFields    // kind == kindCompact
+	Head   *headFields       // kind == kindHead
+	CK     *checkpointFields // kind == kindCheckpoint
+	Cur    *cursorFields     // kind == kindCursor
+	Meta   *metadataFields   // kind == kindMetadata
+	Ws     *workspaceFields  // kind == kindWorkspace
+	Arc    *archivedFields   // kind == kindArchived
+	TitleF *titleFields      // kind == kindTitle
 }
 
 // NodeID 返回节点 id（msg/compact/checkpoint 有，head/cursor 无则空串）。
@@ -170,6 +178,10 @@ func (r Record) Created() time.Time {
 		if r.Arc != nil {
 			return r.Arc.CreatedAt
 		}
+	case kindTitle:
+		if r.TitleF != nil {
+			return r.TitleF.CreatedAt
+		}
 	}
 	return time.Time{}
 }
@@ -203,6 +215,7 @@ func (r Record) MarshalJSON() ([]byte, error) {
 		MsgID       string                     `json:"msg_id,omitempty"`
 		SessionID   string                     `json:"session_id,omitempty"`
 		Path        string                     `json:"path,omitempty"`
+		Title       string                     `json:"title,omitempty"`
 		CreatedAt   time.Time                  `json:"created_at"`
 	}
 
@@ -243,6 +256,10 @@ func (r Record) MarshalJSON() ([]byte, error) {
 	case kindArchived:
 		// archived 无附加字段：created_at 已在 flat 初始化时由 r.Created() 填充。
 		// case 保留为文档锚点，与本函数上方的同步纪律注释呼应。
+	case kindTitle:
+		if r.TitleF != nil {
+			f.Title = r.TitleF.Title
+		}
 	}
 	return json.Marshal(f)
 }
@@ -307,6 +324,12 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		r.Arc = &f
+	case kindTitle:
+		var f titleFields
+		if err := json.Unmarshal(data, &f); err != nil {
+			return err
+		}
+		r.TitleF = &f
 	}
 	return nil
 }
@@ -362,6 +385,11 @@ func newWorkspaceRecord(path string, created time.Time) Record {
 // 只落时间戳，不搬文件）。
 func newArchivedRecord(created time.Time) Record {
 	return Record{Kind: kindArchived, Arc: &archivedFields{CreatedAt: created}}
+}
+
+// newTitleRecord 构造会话标题记录（last-wins；LLM 生成后追加）。
+func newTitleRecord(title string, created time.Time) Record {
+	return Record{Kind: kindTitle, TitleF: &titleFields{Title: title, CreatedAt: created}}
 }
 
 // ── 记录与消息互转 ──────────────────────────────────────────────────────

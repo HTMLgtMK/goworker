@@ -100,6 +100,81 @@ type SessionSource interface {
 	SessionModes() *SessionModeState
 }
 
+// ProviderCatalogEntry 是 provider 模型目录的一个条目：id = provider 名
+// （/model use 的寻址面），Models 为该 provider 的模型目录（Models 配置非空
+// 用之，否则 [Model]），Model 为该 provider 当前的生效模型（UI 一键切
+// provider 时与 id 配对提交）。
+type ProviderCatalogEntry struct {
+	ID     string   `json:"id"`
+	Name   string   `json:"name"`
+	Type   string   `json:"type,omitempty"`
+	Model  string   `json:"model,omitempty"`
+	Models []string `json:"models"`
+}
+
+// ProviderCatalog 是 provider 模型目录的只读快照（UI 弹框数据源）：current*
+// 取 DefaultProvider 的当前字段（model / thinking effort）。无 LLM 配置时
+// ProviderCatalog() 返回 nil。
+type ProviderCatalog struct {
+	CurrentProviderID string                 `json:"currentProviderId"`
+	CurrentModel      string                 `json:"currentModel"`
+	CurrentEffort     string                 `json:"currentEffort"`
+	Providers         []ProviderCatalogEntry `json:"providers"`
+}
+
+// ProviderCatalogSource 是 provider 模型目录的可选能力（x-goworker/providers
+// RPC 的数据面；工厂内对 SessionSource type-assert，与 RunControlSource 同款
+// 先例）。nil = 后端无目录能力（简化壳/测试桩），方法诚实报错。
+type ProviderCatalogSource interface {
+	ProviderCatalog() *ProviderCatalog
+}
+
+// ProviderDetail 是单个 provider 的全量配置快照（管理面表单数据源）。
+// APIKey 永不出域：只给 APIKeySet 布尔——密钥经 wire 回传 UI 是泄露面。
+type ProviderDetail struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+	// Endpoint / APIKeySet / Models 是表单直接消费的三元组。
+	Endpoint  string   `json:"endpoint"`
+	APIKeySet bool     `json:"apiKeySet"`
+	Models    []string `json:"models"`
+	// 可选字段（openai/anthropic 各有取舍，零值 = 未配置）。
+	ContextWindow int    `json:"contextWindow,omitempty"`
+	MaxTokens     int    `json:"maxTokens,omitempty"`
+	AuthType      string `json:"authType,omitempty"`
+	RequestMode   string `json:"requestMode,omitempty"`
+	Effort        string `json:"effort,omitempty"`
+	// IsDefault = 该 provider 是 cfg.LLM.DefaultProvider（UI 据此禁用删除）。
+	IsDefault bool `json:"isDefault"`
+}
+
+// ProviderUpsertRequest 是 provider 新建/更新的请求面（更新 = merge：
+// Endpoint/Type/Models 覆盖；APIKey 空串 = 保留原值；ContextWindow/MaxTokens/
+// AuthType 零值 = 保留原值；thinking 字段不在请求面——表单不触碰即保留）。
+// ID 为空 = 新建（Name 即 map key，受 daemon 侧 validProviderName 约束）。
+type ProviderUpsertRequest struct {
+	ID            string   `json:"id,omitempty"`
+	Name          string   `json:"name"`
+	Type          string   `json:"type"`
+	Endpoint      string   `json:"endpoint"`
+	APIKey        string   `json:"apiKey,omitempty"`
+	Models        []string `json:"models"`
+	ContextWindow int      `json:"contextWindow,omitempty"`
+	MaxTokens     int      `json:"maxTokens,omitempty"`
+	AuthType      string   `json:"authType,omitempty"`
+}
+
+// ProviderManageSource 是 provider 配置管理的可选能力（x-goworker/provider/
+// detail|upsert|remove 的数据面；工厂内 type-assert，CatalogSource 同款先例）。
+// 全部走 hub.SaveConfig（写盘 + 引擎内存同步）——外部编辑配置文件无热加载，
+// RPC 经 SaveConfig 是唯一即时生效路径。ProviderUpsert 返回落盘后的 provider id。
+type ProviderManageSource interface {
+	ProviderDetail(id string) (*ProviderDetail, error)
+	ProviderUpsert(req ProviderUpsertRequest) (string, error)
+	ProviderRemove(id string) error
+}
+
 // PendingApprovalInfo 是一笔等待决策的审批快照的 daemon 侧扁平结构（P5-6）：
 // 字段取 hitl.InterruptRequest 按 wire 需要的最小面（requestId 寻址 + 展示所需
 // 的命令/风险/截止），不透传 agent 包的 PendingApproval 结构——model 是协议
@@ -309,6 +384,13 @@ type BoundSessionSource interface {
 	// 收口等引用归零（A2a 机制自然处理）。已收口（不在册）的会话同样可归档
 	// （repo 层打开落标记后释放）。
 	ArchiveSession(sessionID, clientID string) error
+}
+
+// SessionDeleteSource 是物理删除能力的可选扩展面。单独拆出是为了让已有
+// BoundSessionSource 测试桩/简化后端不被新增删除能力的接口变更打破；xgw
+// handler 对 nil 诚实返回 method-not-supported。
+type SessionDeleteSource interface {
+	DeleteSession(sessionID, clientID string) error
 }
 
 // BoundSessionLoader lets a backend linearize load, history snapshot, and lifecycle binding.

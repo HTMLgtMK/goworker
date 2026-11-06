@@ -279,6 +279,11 @@ func callbacksFromPlugin(ctx *model.Context) runtimeagent.RunCallbacks {
 		Decide:  ctx.Decide,
 		Publish: ctx.Publish,
 	}
+	if ctx.SessionInfo != nil {
+		cb.SessionInfo = func(info runtimeagent.SessionInfo) {
+			ctx.SessionInfo(info.Title)
+		}
+	}
 	if ctx.EmitToken != nil {
 		cb.EmitToken = ctx.EmitToken
 	}

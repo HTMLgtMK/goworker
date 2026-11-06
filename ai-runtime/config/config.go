@@ -51,6 +51,12 @@ func (c LLMConfig) WithDefaults() LLMConfig {
 				provider.Thinking.Effort = ThinkingEffortMedium
 			}
 		}
+		// Model 未填但目录非空：取目录首个兜底（models-only 配置零迁移）。
+		if provider.Model == "" {
+			if catalog := provider.ModelCatalog(); len(catalog) > 0 {
+				provider.Model = catalog[0]
+			}
+		}
 		clone.Providers[name] = provider
 	}
 	return clone
@@ -172,6 +178,13 @@ func validProviderName(name string) bool {
 	return true
 }
 
+// ValidProviderName 是 provider 命名规则的导出面（管理 RPC 前置校验用，规则
+// 与 validateProvider 内部一致：非空、不含点、仅字母/数字/-/_——map key 与
+// /model use 寻址面的同一约束）。
+func ValidProviderName(name string) bool {
+	return validProviderName(name)
+}
+
 // DefaultMemory 返回默认记忆配置。Dir 留空，由宿主按配置目录派生。
 func DefaultMemory() MemoryConfig {
 	return MemoryConfig{
@@ -224,10 +237,10 @@ func ParseThinkingRequestMode(value string) (ThinkingRequestMode, error) {
 func ParseThinkingEffort(value string) (ThinkingEffort, error) {
 	effort := ThinkingEffort(strings.TrimSpace(value))
 	switch effort {
-	case ThinkingEffortLow, ThinkingEffortMedium, ThinkingEffortHigh:
+	case ThinkingEffortLow, ThinkingEffortMedium, ThinkingEffortHigh, ThinkingEffortMax:
 		return effort, nil
 	default:
-		return "", fmt.Errorf("无效 thinking effort: %s（可用: low/medium/high）", value)
+		return "", fmt.Errorf("无效 thinking effort: %s（可用: low/medium/high/max）", value)
 	}
 }
 

@@ -15,15 +15,20 @@ import (
 // -32000 "x-goworker: control lease held by ..."。客户端按 -32601
 // method-not-found 降级的既有约定不变(拍板⑥:无 agentCapabilities 通告)。
 const (
-	XMethodRunStart        = "x-goworker/run/start"        // {sessionId,input,requestId} → {runId,state}
-	XMethodRunGet          = "x-goworker/run/get"          // {sessionId,runId} → {state,result?,latestSeq}
-	XMethodRunCancel       = "x-goworker/run/cancel"       // {sessionId,runId} → {accepted}
-	XMethodApprovalRespond = "x-goworker/approval/respond" // {sessionId,requestId,decision} → {accepted}
-	XMethodSessionAttach   = "x-goworker/session/attach"   // P5-8
-	XMethodSessionDetach   = "x-goworker/session/detach"   // P5-8
-	XMethodSessionEvents   = "x-goworker/session/events"   // 服务端通知(P5-8,Send only)
-	XMethodSessionArchive  = "x-goworker/session/archive"  // Plan A3:{sessionId} → {archived}
-	XMethodSessionModes    = "x-goworker/session/modes"    // Plan B 任务3:无 session 取 modes（草稿面板模型下拉）
+	XMethodRunStart         = "x-goworker/run/start"        // {sessionId,input,requestId} → {runId,state}
+	XMethodRunGet           = "x-goworker/run/get"          // {sessionId,runId} → {state,result?,latestSeq}
+	XMethodRunCancel        = "x-goworker/run/cancel"       // {sessionId,runId} → {accepted}
+	XMethodApprovalRespond  = "x-goworker/approval/respond" // {sessionId,requestId,decision} → {accepted}
+	XMethodSessionAttach    = "x-goworker/session/attach"   // P5-8
+	XMethodSessionDetach    = "x-goworker/session/detach"   // P5-8
+	XMethodSessionEvents    = "x-goworker/session/events"   // 服务端通知(P5-8,Send only)
+	XMethodSessionArchive   = "x-goworker/session/archive"  // Plan A3:{sessionId} → {archived}
+	XMethodSessionModes     = "x-goworker/session/modes"    // Plan B 任务3:无 session 取 modes（草稿面板模型下拉）
+	XMethodSessionProviders = "x-goworker/providers"        // provider 模型目录：无 session 取树 + 当前选择（UI 弹框）
+	XMethodSessionDelete    = "x-goworker/session/delete"   // 物理删除会话（control lease + 在飞守卫）
+	XMethodProviderDetail   = "x-goworker/provider/detail"  // 单 provider 全量配置（管理页表单；APIKey 不出域）
+	XMethodProviderUpsert   = "x-goworker/provider/upsert"  // provider 新建/更新（SaveConfig 即时生效）
+	XMethodProviderRemove   = "x-goworker/provider/remove"  // provider 删除（默认/最后一个拒绝）
 )
 
 // xgwErrorCode 是 x-goworker 方法面的统一 JSON-RPC 错误码:沿用既有 -32000
@@ -203,12 +208,101 @@ type SessionModeChoice struct {
 	Description string `json:"description,omitempty"`
 }
 
+// XProviderCatalogResult 是 x-goworker/providers 的响应：provider→models 树
+// + 当前选择（UI 弹框数据源；模型层 model.ProviderCatalog 的直译）。无 LLM
+// 配置 → providers 空数组、current* 空。老扩展不认识本方法零感知；扩展侧对
+// -32601 降级为平铺 modes（既有约定）。
+type XProviderCatalogResult struct {
+	CurrentProviderID string                  `json:"currentProviderId"`
+	CurrentModel      string                  `json:"currentModel"`
+	CurrentEffort     string                  `json:"currentEffort"`
+	Providers         []XProviderCatalogEntry `json:"providers"`
+}
+
+// XProviderCatalogEntry 是 providers 的条目形状（id = provider 名，/model use
+// 的寻址面；model = 该 provider 当前的生效模型，UI 一键切 provider 配对提交）。
+type XProviderCatalogEntry struct {
+	ID     string   `json:"id"`
+	Name   string   `json:"name"`
+	Type   string   `json:"type,omitempty"`
+	Model  string   `json:"model,omitempty"`
+	Models []string `json:"models"`
+}
+
+// XProviderDetailParams 是 x-goworker/provider/detail 的入参。
+type XProviderDetailParams struct {
+	ID string `json:"id"`
+}
+
+// XProviderDetailResult 是 x-goworker/provider/detail 的响应（model.ProviderDetail
+// 直译）。APIKey 永不出域——只有 apiKeySet 布尔，密钥经 wire 回传 UI 是泄露面。
+type XProviderDetailResult struct {
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Type          string   `json:"type"`
+	Endpoint      string   `json:"endpoint"`
+	APIKeySet     bool     `json:"apiKeySet"`
+	Models        []string `json:"models"`
+	ContextWindow int      `json:"contextWindow,omitempty"`
+	MaxTokens     int      `json:"maxTokens,omitempty"`
+	AuthType      string   `json:"authType,omitempty"`
+	RequestMode   string   `json:"requestMode,omitempty"`
+	Effort        string   `json:"effort,omitempty"`
+	IsDefault     bool     `json:"isDefault"`
+}
+
+// XProviderUpsertParams 是 x-goworker/provider/upsert 的入参（更新 = merge：
+// apiKey 空串 = 保留原值；contextWindow/maxTokens/authType 零值 = 保留；thinking
+// 不在请求面即保留）。id 空 = 新建（name 即 map key）。
+type XProviderUpsertParams struct {
+	ID            string   `json:"id,omitempty"`
+	Name          string   `json:"name"`
+	Type          string   `json:"type"`
+	Endpoint      string   `json:"endpoint"`
+	APIKey        string   `json:"apiKey,omitempty"`
+	Models        []string `json:"models"`
+	ContextWindow int      `json:"contextWindow,omitempty"`
+	MaxTokens     int      `json:"maxTokens,omitempty"`
+	AuthType      string   `json:"authType,omitempty"`
+}
+
+// XProviderUpsertResult 是 x-goworker/provider/upsert 的响应：saved=true 表示
+// 已 Validate + SaveConfig 落盘（引擎内存同步，运行中即时生效）。
+type XProviderUpsertResult struct {
+	Saved bool   `json:"saved"`
+	ID    string `json:"id"`
+}
+
+// XProviderRemoveParams 是 x-goworker/provider/remove 的入参。
+type XProviderRemoveParams struct {
+	ID string `json:"id"`
+}
+
+// XProviderRemoveResult 是 x-goworker/provider/remove 的响应：removed=true
+// 表示已删除并落盘。默认 provider / 最后一个 provider → -32000 明确报错。
+type XProviderRemoveResult struct {
+	Removed bool `json:"removed"`
+}
+
 // XSessionArchiveResult 是 x-goworker/session/archive 的响应：archived=true
 // 表示终态标记已持久化（幂等——重复归档 no-op 返回 true）；session/list 随即
 // 反映 state=archived。绑定中的会话允许归档（绑定保留、prompt 转为只读拒绝、
 // 生命周期收口等引用归零）；run 在飞 → -32000 busy（瞬态，终态后重试）。
 type XSessionArchiveResult struct {
 	Archived bool `json:"archived"`
+}
+
+// XSessionDeleteParams 是 x-goworker/session/delete 的入参。删除需要调用方
+// connection 持有 control lease；source 侧会清理全部 binding、runtime、store
+// cache 后物理删除 per-id 目录。
+type XSessionDeleteParams struct {
+	SessionID string `json:"sessionId"`
+}
+
+// XSessionDeleteResult 是 x-goworker/session/delete 的响应：deleted=true 表示
+// 目录已物理删除。默认/legacy/在飞等错误以 -32000 返回。
+type XSessionDeleteResult struct {
+	Deleted bool `json:"deleted"`
 }
 
 // xgwError 按本协议错误约定构造 -32000 RPC 错误。

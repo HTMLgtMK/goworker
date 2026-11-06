@@ -31,6 +31,9 @@ type SessionDigest struct {
 	// FirstUserText 是首条 user 消息的原文（清单 title 的原料；无 user 消息
 	// 或全是坏行的空会话为空串）。
 	FirstUserText string
+	// Title 是 title 记录的 last-wins 值（LLM 生成后落盘）；空串 = 未生成，
+	// 清单展示回落 FirstUserText 派生。
+	Title string
 	// Workspace 是最后一条 workspace 声明（last-wins，Plan A1；从未声明为空）。
 	Workspace string
 	// Archived 报告是否已落 archived 终态标记（Plan A1 原位终态，只读保留）。
@@ -111,6 +114,14 @@ func digestFromPath(path string) (SessionDigest, bool) {
 	for _, r := range recs {
 		if r.Kind == kindMsg && r.Msg != nil && r.Msg.Role == "user" {
 			d.FirstUserText = r.Msg.Content
+			break
+		}
+	}
+	// title 记录（last-wins）优先于首条 user 消息派生——LLM 生成的短标题落盘
+	// 后覆盖清单展示；未生成过保持派生值。
+	for i := len(recs) - 1; i >= 0; i-- {
+		if recs[i].Kind == kindTitle && recs[i].TitleF != nil {
+			d.Title = recs[i].TitleF.Title
 			break
 		}
 	}

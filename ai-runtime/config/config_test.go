@@ -109,13 +109,57 @@ func TestParseThinkingRequestMode(t *testing.T) {
 }
 
 func TestParseThinkingEffort(t *testing.T) {
-	for _, value := range []string{"low", "medium", "high"} {
+	for _, value := range []string{"low", "medium", "high", "max"} {
 		if _, err := ParseThinkingEffort(value); err != nil {
 			t.Errorf("ParseThinkingEffort(%q): %v", value, err)
 		}
 	}
 	if _, err := ParseThinkingEffort("extreme"); err == nil {
 		t.Error("unknown thinking effort should fail")
+	}
+}
+
+func TestProviderModelCatalog(t *testing.T) {
+	cases := []struct {
+		name     string
+		provider ProviderConfig
+		want     []string
+	}{
+		{"models 非空去空白返回", ProviderConfig{Model: "m-current", Models: []string{"m-a", " m-b ", ""}}, []string{"m-a", "m-b"}},
+		{"models 空回落 [Model]", ProviderConfig{Model: "m-only"}, []string{"m-only"}},
+		{"全空返回 nil", ProviderConfig{Models: []string{"  "}}, nil},
+	}
+	for _, tc := range cases {
+		got := tc.provider.ModelCatalog()
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: catalog = %v, want %v", tc.name, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("%s: catalog = %v, want %v", tc.name, got, tc.want)
+				break
+			}
+		}
+	}
+}
+
+func TestWithDefaultsFillsModelFromCatalog(t *testing.T) {
+	cfg := LLMConfig{
+		DefaultProvider: "p",
+		Providers: map[string]ProviderConfig{
+			"p": {Type: ProviderTypeOpenAI, Endpoint: "http://localhost:8000/v1",
+				ContextWindow: 1000, Models: []string{"m-a", "m-b"},
+				Thinking: ProviderThinkingConfig{RequestMode: ThinkingRequestAuto, Effort: ThinkingEffortMedium}},
+		},
+		CompressAt: 0.8, CompactKeep: 10, MaxIterations: 15,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	provider := cfg.WithDefaults().Providers["p"]
+	if provider.Model != "m-a" {
+		t.Errorf("Model = %q, want catalog head m-a", provider.Model)
 	}
 }
 

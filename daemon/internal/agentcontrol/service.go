@@ -164,6 +164,12 @@ func (s *Service) SessionBindings(sessionID string) []string {
 	return s.bindings.Bindings(sessionID)
 }
 
+// UnbindAllSession 解除一个会话上的全部连接绑定，返回被摘除的 clientID（升序）。
+// 删除会话后由宿主调用；登记面不触碰 lease/runtime，调用方负责其它收口。
+func (s *Service) UnbindAllSession(sessionID string) []string {
+	return s.bindings.UnbindSession(sessionID)
+}
+
 // WithControl 是受 lease 保护的操作提交入口的宿主面(LeaseRegistry.WithControl
 // 的 Service 透传;Plan A3 的归档 fencing 消费——run/cancel/审批的 fencing 编排
 // 都封装在 Service 的对应方法内,归档的动作面(MarkArchived)持在宿主(plugin),

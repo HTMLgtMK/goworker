@@ -100,6 +100,8 @@ type FrontendContext struct {
 	WriteToken func(kind RenderKind, content string, done bool) // 前端注入：terminal renderer 兼容回调
 	EmitToken  func(core.Token)                                 // 前端注入：保留结构化语义的用户可见 token 流
 	Publish    func(event string, data any)                     // 可选：广播事件（status bar 用），线程安全
+	// SessionInfo 是会话元信息带外更新（标题生成完成后）；nil = 不消费。
+	SessionInfo func(title string)
 }
 
 // Context 是命令执行的上下文。

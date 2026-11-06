@@ -28,6 +28,9 @@ const (
 	ThinkingEffortLow    ThinkingEffort = "low"
 	ThinkingEffortMedium ThinkingEffort = "medium"
 	ThinkingEffortHigh   ThinkingEffort = "high"
+	// ThinkingEffortMax 是 UI 侧的最高档：wire 层映射为各协议的最高合法值
+	// （openai reasoning_effort 直传 low/medium/high，见 provider/openai）。
+	ThinkingEffortMax ThinkingEffort = "max"
 )
 
 type ThinkingConfig struct {
@@ -58,14 +61,37 @@ const (
 
 // ProviderConfig 是一个命名 Provider 的连接与协议配置。
 type ProviderConfig struct {
-	Type          ProviderType           `yaml:"type"`
-	Endpoint      string                 `yaml:"endpoint"`
-	Model         string                 `yaml:"model"`
-	APIKey        string                 `yaml:"api_key"`
+	Type     ProviderType `yaml:"type"`
+	Endpoint string       `yaml:"endpoint"`
+	// Model 是当前生效的模型；Models 是该 provider 的模型目录（UI 树数据源，
+	// 空时目录视为 [Model]——旧配置零迁移）。两者独立：Model 可以是 Models
+	// 之外的值（/model set model= 任意串），目录只是选择面。
+	Model  string   `yaml:"model"`
+	Models []string `yaml:"models,omitempty"`
+	APIKey string   `yaml:"api_key"`
+
 	ContextWindow int                    `yaml:"context_window"`
 	Thinking      ProviderThinkingConfig `yaml:"thinking,omitempty"`
 	AuthType      AnthropicAuthType      `yaml:"auth_type,omitempty"`
 	MaxTokens     int                    `yaml:"max_tokens,omitempty"`
+}
+
+// ModelCatalog 返回该 provider 的模型目录：Models 非空用之，否则 [Model]
+// （Model 空返回 nil）。目录是展示/选择面，不参与请求装配。
+func (p ProviderConfig) ModelCatalog() []string {
+	trimmed := make([]string, 0, len(p.Models))
+	for _, m := range p.Models {
+		if m = strings.TrimSpace(m); m != "" {
+			trimmed = append(trimmed, m)
+		}
+	}
+	if len(trimmed) > 0 {
+		return trimmed
+	}
+	if m := strings.TrimSpace(p.Model); m != "" {
+		return []string{m}
+	}
+	return nil
 }
 
 // LLMConfig 保存 Provider 注册表与全局 Agent/UI 策略。

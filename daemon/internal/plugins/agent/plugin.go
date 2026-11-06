@@ -688,6 +688,9 @@ func (p *AgentPlugin) startSession() {
 		journalStore := session.NewRunJournalStore(p.repo, st)
 		p.deps.RunJournal = journalStore
 		p.deps.RunEvents = journalStore
+		p.deps.OnFirstCommit = p.makeFirstCommitTitle(st)
+	} else {
+		p.deps.OnFirstCommit = nil
 	}
 	// 指令快照与记忆组件同开关：memory disabled 时留 nil，buildSystemPrompt 跳过指令段。
 	// 会话边界（Init / /new）经 startSession 重载 —— system prompt 在会话创建前就绪。

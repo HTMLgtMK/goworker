@@ -576,6 +576,35 @@ func (s *Store) Archived() bool {
 	return archivedFromRecords(s.recs)
 }
 
+// SetTitle 追加会话标题记录（last-wins；LLM 生成后落盘）。空串拒绝——
+// 「未生成」的表达是不写记录而非空声明（与 DeclareWorkspace 的空串纪律同型）。
+func (s *Store) SetTitle(title string) error {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return fmt.Errorf("session: set title: empty title")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec := newTitleRecord(title, time.Now())
+	if err := s.appendRecord(rec); err != nil {
+		return fmt.Errorf("session: set title: %w", err)
+	}
+	s.recs = append(s.recs, rec)
+	return nil
+}
+
+// Title 返回当前标题记录值（last-wins）；未生成过返回空串。
+func (s *Store) Title() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.recs) - 1; i >= 0; i-- {
+		if s.recs[i].Kind == kindTitle && s.recs[i].TitleF != nil {
+			return s.recs[i].TitleF.Title
+		}
+	}
+	return ""
+}
+
 // ── 内部辅助 ──────────────────────────────────────────────────────────
 
 // buildActiveView 从记录集与 head 构建活跃视图：沿 parent 链回溯到根（带 visited
