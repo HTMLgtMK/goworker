@@ -231,12 +231,10 @@ func TestRequestRegistryErrorNotRecorded(t *testing.T) {
 	}
 }
 
-// TestRequestRegistryJoinerGetsError:leader 失败时并发 joiner 拿到同一错误
-// (等待同一结果包含失败结果,joiner 不重试、不挂死)。在途 flight 由测试直接
-// 注入(in-package 白盒,等价于「leader 已登记、提交在途」的注册表状态):
-// 失败提交不入表(设计使然,迟到的重试必须重新起跑),join-on-error 的等待
-// 路径因此无法靠调度时序钉住——直接构造该状态,断言零时序依赖。leader 侧的
-// 失败路径由 TestRequestRegistryErrorNotRecorded 覆盖。
+// TestRequestRegistryJoinerGetsError 验证 leader 失败时并发 joiner 收到同一错误，
+// 既不重试也不挂死。失败提交不入表，join-on-error 的等待路径无法靠调度时序稳定
+// 触发，因此测试以包内白盒方式直接注入一个已登记的在途 flight。leader 自身的失败
+// 路径由 TestRequestRegistryErrorNotRecorded 覆盖。
 func TestRequestRegistryJoinerGetsError(t *testing.T) {
 	r := NewRequestRegistry()
 	key := RequestKey{SessionID: "sess", RequestID: "req-join-err"}

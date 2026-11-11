@@ -6,14 +6,11 @@ import (
 )
 
 // client 是 Client 接口的 stdio 实现。
-// 后续接入 HTTP/SSE 传输时新增实现，接口不变。
 type client struct {
 	transport *StdioTransport
 }
 
-// NewStdioClient 启动 command 进程并返回 MCP 客户端。
-// 返回的 client 尚未握手，调用方需先调用 Initialize。
-// 返回 Client 接口（而非具体类型），后续换 HTTP/SSE 实现时调用方不变。
+// NewStdioClient 启动 command 进程并返回尚未握手的 MCP 客户端。
 func NewStdioClient(command string, args []string) (Client, error) {
 	tr, err := NewStdioTransport(command, args)
 	if err != nil {

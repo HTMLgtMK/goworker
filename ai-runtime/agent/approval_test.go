@@ -14,9 +14,7 @@ import (
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
-// 本文件是 P4-1 ApprovalManager 骨架的验收测试(纯单元面,零 Provider、零
-// LLM):Wait/Resolve/Pending 的决策-超时-取消三出口、单次有效决策、迟到
-// 拒绝、过期过滤。语义铁律见 approval.go 头注释(总方案 §6)。
+// 本文件验证审批的决策、超时、取消、过期和重复请求语义。
 
 // approvalReq 构造一笔最小 InterruptRequest:ExpiresAt 由用例给定(唯一超时
 // 事实源)。
@@ -238,13 +236,9 @@ func TestApprovalLateResolveRejected(t *testing.T) {
 	}
 }
 
-// TestApprovalSweepsResolvedExpiredEntries(P4 评审 issue3):已 resolved 且
-// 已过期超过 approvalResolvedRetention 宽限窗的滞留条目,在后续 Wait / Resolve
-// 入口被顺带清扫(Pending 可能从不被调——客户端的事实源是 permission.requested
-// 事件流);宽限窗内的迟到 Resolve 仍报 ErrApprovalResolved(TestApprovalLate
-// ResolveRejected 钉死),宽限窗外落 ErrApprovalUnknown。ExpiresAt 回拨为
-// 白箱操作(同包单元测试,免真实等待 30s);断言直读 m.pending——Pending 的
-// 读时清扫会抢跑,不能作为本用例的观察面。
+// TestApprovalSweepsResolvedExpiredEntries 验证 Wait/Resolve 会清扫超过保留期的已解决条目。
+// 宽限期内迟到决策仍返回 ErrApprovalResolved，期外返回 ErrApprovalUnknown。
+// 测试回拨 ExpiresAt 避免真实等待 30 秒，并直接检查 m.pending，防止 Pending 的读时清扫抢先。
 func TestApprovalSweepsResolvedExpiredEntries(t *testing.T) {
 	m := NewApprovalManager()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -313,18 +307,9 @@ func TestApprovalSweepsResolvedExpiredEntries(t *testing.T) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// P4-2:StartRun 审批回退接线 + waiting 迁移(总方案第十一节
-// TestApprovalAfterReconnect → 本步)。
-//
-// 测试装置:scriptedChatProvider(非流式脚本,含 tool call 轮,零真实 LLM)+
-// newHitlRunRuntime(真实 bash + 真实 HITL 中间件链:CollectTools=DefaultTools、
-// 沙箱 normal 模式——管道命令命中 DefaultRiskyPatterns 的 `\|`,RiskMedium →
-// DecisionHitl,ai-sandbox/defaults.go:31、policy.go:106-113;实测探针确认
-// decision=hitl)。审批面零真实连接:「原连接断开」= 提交方 goroutine 返回后
-// 不再存在(StartRun 无 ctx 参数,API 形状即保证连接无关);「新控制端」= 测试
-// 主 goroutine 经 manager 的 ResolveApproval 直转投递。
-// ─────────────────────────────────────────────────────────────────────────────
+// P4-2 验证 StartRun 的审批回退与 waiting 迁移。
+// 测试使用脚本 provider、真实 bash 和 normal 模式 HITL 链；管道命令命中默认风险规则。
+// StartRun 不绑定连接 ctx，因此提交方返回模拟断连，新控制端直接调用 ResolveApproval。
 
 // hitlProbeCommand 是 HITL 触发命令:管道命中默认风险规则(normal 模式 →
 // DecisionHitl),但命令本身无副作用、可真实执行(approve 后输出 HITL-OK)。
@@ -369,12 +354,8 @@ func (p *scriptedChatProvider) ChatStream(context.Context, *core.ChatRequest) (<
 	return nil, errors.New("not implemented")
 }
 
-// newHitlRunRuntime 构造「真实 bash+HITL 链」的 runtime 并注册进 manager:
-// CollectTools 返回 DefaultTools(真实 bash 执行面,default_tools.go),沙箱用
-// 默认配置(Mode=normal,ai-runtime/config/config.go:195)并把 AllowedWorkDir
-// 锚定到临时目录(bash cmd.Dir;探针命令无文件副作用)。RunJournal 可为 nil
-// (journalRunState 按 nil 跳过)。返回会话 id(= runtime id,StartRun/
-// PendingApprovals 的寻址键)。
+// newHitlRunRuntime 注册带真实 bash/HITL 中间件的 runtime；沙箱工作目录指向临时目录，
+// 探针命令无文件副作用。RunJournal 可选；返回值是 StartRun 与审批查询共用的 runtime ID。
 func newHitlRunRuntime(t *testing.T, m *SessionManager, id string, pv core.Provider, jr *stubRunJournal) string {
 	t.Helper()
 	cfg := runtimeconfig.Default()
@@ -482,15 +463,10 @@ func TestApprovalAfterReconnect(t *testing.T) {
 	}
 }
 
-// TestApprovalTimeoutFailsTool:超时 = 安全拒绝(不挂死、不隐式放行)。
-// 中间件给 interrupt 硬编码 ExpiresAt=now+DefaultTimeout(2min,hitl.go:280,
-// 常量不可注入),故本测试以「调用方自带 Decide」形态(契约③:StartRun 不
-// 覆盖)把中间件原始请求收短成可测窗口后交给**同一条** Wait——超时出口
-// (ExpiresAt 到点 reject)由 Wait 真实计时触发,P4-1 单元测试覆盖的到点
-// 路径在真实 bash+HITL 链上端到端收敛:工具结果 = 「⛔ rejected by user」
-// (hitl.go:443 文案),命令从未执行,run 继续 RunCompleted。
-// (decideFunc 只是 Wait 的纯转发,等待期迁移由 TestApprovalAfterReconnect/
-// TestStartRunJournalsWaiting 覆盖,不因本窗口收短而失真。)
+// TestApprovalTimeoutFailsTool 验证超时安全拒绝：命令不执行，run 仍完成。
+// 中间件的 ExpiresAt 固定为 2 分钟，因此测试通过调用方 Decide 收短同一个 Wait 的请求窗口，
+// 让真实超时路径在真实 bash+HITL 链上可测。decideFunc 仅转发 Wait；等待态迁移另由
+// TestApprovalAfterReconnect 和 TestStartRunJournalsWaiting 覆盖。
 func TestApprovalTimeoutFailsTool(t *testing.T) {
 	m := NewSessionManager()
 	defer m.Close()
@@ -596,20 +572,10 @@ func TestStartRunJournalsWaiting(t *testing.T) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// P4 评审 issue1 回归(确定性时序缺陷,跨组件:GetDecision × ApprovalManager.Wait):
-// 中间件侧 GetDecision(hitl/channel_decision_provider.go:12-53)与 agent 侧
-// decideFunc 的 ApprovalManager.Wait(approval.go:78-143)对同一 interrupt 的
-// 同一 ExpiresAt 各起计时器、共用容量 1 的 decisions 缓冲(session.go:149)。
-// 一次超时后(GetDecision 先到期返回),Wait 的超时 reject 残留缓冲无人消费
-// (后台 decideFunc → streamTokens 投递);同 run 下一个 interrupt 的 GetDecision
-// 若不排空,select 立即吃到上一轮的决策——第二次审批用户看不到就被自动拒绝
-// 且级联。sync 路径同型隐患:调用方 Decide 在窗口关闭后的迟到响应同样残留
-// 缓冲。以下用例在纯 provider 面复现该序列(agent 级端到端复现不可行:中间件
-// 恒硬编码 ExpiresAt=now+DefaultTimeout 2min 窗口,hitl.go:137/238/280/343,
-// TestApprovalTimeoutFailsTool 头注释已记录该约束——其「收短 Decide 侧副本」
-// 恰好让陈旧值被就地消费,缓冲保持干净,无法触发毒化)。
-// ─────────────────────────────────────────────────────────────────────────────
+// 回归：GetDecision 与 ApprovalManager.Wait 为同一审批分别计时，却共用容量为 1 的决策缓冲。
+// GetDecision 先超时后，Wait 的迟到 reject 可能留在缓冲中并被下一次审批误消费；
+// 同步路径的迟到 Decide 也有相同问题。中间件超时时长固定为 2 分钟，故在 provider 层
+// 构造该序列；收短 Decide 副本的端到端用例无法复现残留决策。
 
 // TestChannelDecisionProviderDrainsStaleReject:第一个 interrupt 短窗超时后,
 // 其陈旧 reject(后台 Wait 超时的形态)残留缓冲;第二个 interrupt 的

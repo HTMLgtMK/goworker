@@ -79,15 +79,9 @@ func TestRunJournalRoundTrip(t *testing.T) {
 	}
 }
 
-// TestRunJournalRejectsLockedStore 验证 custody 与跨进程锁的两道防线：
-//
-//	① 会话未在本 Repository 的 open 缓存 → ErrSessionNotOpen（即使该会话存在于
-//	   磁盘且被另一实例持有）；
-//	② 跨进程模拟：另一 Repository（同 root）Open 同 id → ErrStoreLocked（flock
-//	   宁拒勿双写，store_lock_test.go 语义延伸）——Journal 无独立锁面却仍然不可
-//	   能出现第二写者（勘察修正 C）。
-//	顺带钉死 validRunID 的 traversal 防线：畸形 runID 在拼路径前拒绝，runs/ 目录
-//	不被创建。
+// TestRunJournalRejectsLockedStore verifies repository custody (unopened IDs fail),
+// cross-instance flock exclusion (ErrStoreLocked), and rejection of malformed/traversal
+// run IDs before creating the runs directory.
 func TestRunJournalRejectsLockedStore(t *testing.T) {
 	ctx := context.Background()
 	root := tempDir(t)
@@ -185,19 +179,9 @@ func TestRunJournalDoubleCreateRejected(t *testing.T) {
 	}
 }
 
-// TestRestoreInterruptedRun 完整版（总方案第十一节 → P2-2）：daemon 重启后对
-// 上一进程遗留 runs/ 的恢复语义——
-//
-//	① 末条 state 非终态的 run（run-B）被追加恰好一条 interrupted 标记，原有记录
-//	   前缀不被改写；
-//	② 已终态的 run（run-A）逐字节不动；
-//	③ current.jsonl（legacy 布局根槽）的 ActiveView 历史完整可读；
-//	④ 除 interrupted 标记外无任何新增记录——恢复绝不执行工具/不重跑，用记录数
-//	   断言钉死；
-//	⑤ 幂等：重扫无新增标记。
-//
-// run-A/run-B 文件名不经 validRunID：恢复扫描的文件名来自 os.ReadDir 而非调用
-// 方输入（validRunID 注释）。
+// TestRestoreInterruptedRun verifies restart recovery: truncate only a partial tail,
+// append one interrupted marker for nonterminal runs, leave terminal runs and
+// current.jsonl byte-for-byte unchanged, never rerun work, and remain idempotent.
 func TestRestoreInterruptedRun(t *testing.T) {
 	ctx := context.Background()
 	root := tempDir(t)
@@ -399,18 +383,9 @@ func uint64sEqual(a, b []uint64) bool {
 	return true
 }
 
-// TestEventRecordsCrossFileRoundTrip 钉死 P3-1 的核心不变量「文件名序=seq 序」：
-// 两个 run 文件、Seq 跨文件连续（run-1: 1..3 含一条合并 [2..3] 记录；run-2:
-// 4..5），ReadEvents(0) 全量有序拼接。顺带验证：
-//
-//	① state/event 同文件混存互不误读（loadStateRecords 只见 state、ReadEvents
-//	   只见 event）；
-//	② handles 缓存 state/event 共用：run-1 的 state 记录建文件后事件走缓存句柄
-//	   追加（ErrRunExists 即失败）；
-//	③ run-2 无 state 记录先行，AppendEvent 自行建文件（OpenRunJournal 路径）；
-//	④ 终态逐出后对同一 run 的 AppendEvent 被拒（ErrRunExists）——AppendEvent
-//	   注释的次序约束（事件必须先于终态 state 记录）；
-//	⑤ EventRecord 逐字段往返一致（含 FromSeq 合并声明与 Payload 原字节）。
+// TestEventRecordsCrossFileRoundTrip verifies filename/Seq ordering across run files,
+// mixed state/event decoding, shared handles, rejection after terminal eviction, and
+// field-for-field event round trips including batch range and payload bytes.
 func TestEventRecordsCrossFileRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	root := tempDir(t)
@@ -563,13 +538,9 @@ func TestReadEventsFiltersAfterSeq(t *testing.T) {
 	}
 }
 
-// TestSeqRangeSeedsFromDisk 钉死 SeqRange 的播种语义（hub 构造用）：
-//
-//	① 空 runs/ → ok=false；
-//	② 只有 state 记录（无事件）→ ok=false；
-//	③ 非连续事件（3/5/7）→ (3,7,true)，min/max 而非「首末即边界」假设；
-//	④ 新 Repository 实例 + 新 RunJournalStore（重启模拟，句柄缓存全空）仍从
-//	   磁盘播种——播种不依赖进程内状态。
+// TestSeqRangeSeedsFromDisk verifies empty/state-only histories do not seed, noncontiguous
+// event sequences produce min/max bounds, and a fresh repository restores the bounds
+// from disk rather than process-local handles.
 func TestSeqRangeSeedsFromDisk(t *testing.T) {
 	ctx := context.Background()
 	root := tempDir(t)
@@ -753,16 +724,9 @@ func TestEventTailRecovery(t *testing.T) {
 	}
 }
 
-// TestReadEventsFiltersBySessionID 钉死 P5-3 的 SessionID 过滤（勘察修正 I 的
-// 收口）：同一 runs/ 目录混入异 SessionID 的事件记录（历史混存模拟：Archive
-// 同目录换 SessionID，store.go:556）→ ReadEvents 与 SeqRange 均不含它们，本
-// session 记录照常返回——attach 回放不串他 incarnation 的事件。覆盖两种混存
-// 形态：
-//
-//	① 同文件混行：AppendEvent 只按 RunID 寻址、不校验 rec.SessionID，异 id 记录
-//	   可与本 id 记录同文件混行（写入侧无拦截，过滤只在读取侧）；
-//	② 独立异 id run 文件：整文件来自历史 incarnation（读路径文件名不走
-//	   validRunID，TestRestoreInterruptedRun 同款手写先例）。
+// TestReadEventsFiltersBySessionID ensures replay and SeqRange exclude foreign-session
+// records from mixed files and separate run files, while retaining local events. It
+// covers both write-side mixed rows and historical files from another incarnation.
 func TestReadEventsFiltersBySessionID(t *testing.T) {
 	ctx := context.Background()
 	root := tempDir(t)

@@ -19,25 +19,7 @@ import (
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
-// 本文件是 P2-5 的后台执行验收测试(总方案第十一节 → 本步),全部模拟 Provider
-// (复用 gatedProvider/newFakeStoreSession/fakeConversationStore,run_lifecycle_test.go):
-//   - TestRunSurvivesDisconnect:提交方 goroutine 不 Wait、直接返回(模拟断连),
-//     后台 Run 不受影响跑完并持久化——宿主 ctx 是 runCtx 的父,调用方 ctx 不参与;
-//   - TestStartRunQueuedOnGlobalSlot:全局槽占满时后续 StartRun 立即返回且保持
-//     RunQueued(同步段零阻塞、排队发生在全局槽一级);
-//   - TestStartRunPendingBounded:pending 有界,排队满即拒(ErrTooManyPending);
-//   - TestStartRunSecondRunRejected:同会话第二 StartRun 被拒(ErrRunActive);
-//   - TestStartRunAtomicOccupy:同会话并发 StartRun 的检查/占位原子性(C1 修复
-//     验收)——成功数严格 == 1,其余全部 ErrRunActive/ErrTooManyPending,成功
-//     run 可被 CancelRun 定位(Active() 即该 run);
-//   - TestStartRunJournalsQueuedBeforeReturn:StartRun 返回时 queued 记录已在
-//     (durable-first,总方案第七节);
-//   - TestStartRunRejectsWhenQueuedJournalFails:queued 记录持久化失败 → 拒绝
-//     启动(I1 修复验收,failing journal stub 注错:错误链上抛、零句柄、journal/
-//     active/pending/provider 四面无残留)。
-//
-// 并行性断言沿用 run_lifecycle_test.go 的「屏障代替计时」风格:唯一挂钟等待是
-// waitStarted(开工宣告)与终态 Wait 的超时上界,其余为确定性断言。
+// 本文件验证后台 Run 的排队、取消、持久化与事件生命周期。
 
 func TestStartRunRejectsArchivedRuntime(t *testing.T) {
 	m := NewSessionManager()
@@ -377,19 +359,9 @@ func TestStartRunSecondRunRejected(t *testing.T) {
 	waitHandle(t, h1)
 }
 
-// TestStartRunAtomicOccupy(C1 修复验收):200 个 goroutine 并发对同一 Session
-// StartRun——「检查 active」与「占位 active」必须原子(同一 rt.mu 临界区,
-// supervisor.go ②),否则并发提交可双双通过检查、后占位者覆盖先占位者的
-// rt.active(C1 的检查/占位 TOCTOU)。断言:
-//   - 成功数严格 == 1,其余全部 ErrRunActive/ErrTooManyPending(排队面满即拒
-//     与会话占用拒都是合法拒绝面——③ 预留先于 ②,满载风暴下两者都会出现);
-//   - 成功 run 的记账可被 CancelRun 定位:Active() 即该 run、CancelRun 成功
-//     (active 被覆盖时 CancelRun 撞 ErrRunNotFound,正是 C1 的危害面);
-//   - provider 恰被调用一次、store 恰一轮提交(被拒者从未执行)。
-//
-// provider 挂起(hang)而非正常返回:终态化会清 active,正常返回时 Active()/
-// CancelRun 断言与 run 完成存在竞态——挂起把成功 run 钉在在途,断言窗口确定;
-// 取消 + release 后经 execute ⑤ 的取消归一收敛 RunCancelled。
+// TestStartRunAtomicOccupy 验证并发提交时 active 检查与占位原子化：200 个请求恰有一个成功，
+// 成功 run 可被 Active/CancelRun 定位，且 provider 与 store 仅执行一次。
+// provider 挂起以稳定断言窗口；取消后释放 provider，确认 run 收敛为 RunCancelled。
 func TestStartRunAtomicOccupy(t *testing.T) {
 	m := NewSessionManager()
 	defer m.Close()
@@ -451,9 +423,8 @@ func TestStartRunAtomicOccupy(t *testing.T) {
 	}
 }
 
-// TestStartRunJournalsQueuedBeforeReturn:sink stub 断言 StartRun 返回时 queued
-// 记录已在(durable-first:「run/start 响应在 Run 被接受并持久化登记后立即返回」,
-// 总方案第七节);完成后记录流为 queued → running → completed,RunID 同源。
+// TestStartRunJournalsQueuedBeforeReturn 验证 StartRun 返回前 queued 已同步持久化，
+// 随后状态按 queued → running → completed 记录且 RunID 一致。
 func TestStartRunJournalsQueuedBeforeReturn(t *testing.T) {
 	m := NewSessionManager()
 	defer m.Close()
@@ -512,18 +483,9 @@ func TestStartRunJournalsQueuedBeforeReturn(t *testing.T) {
 	}
 }
 
-// TestStartRunRejectsWhenQueuedJournalFails(I1 修复验收,failing journal stub
-// 故障注入):queued 接受记录持久化失败 → StartRun 拒绝启动——返回包裹
-// ErrRunJournalWrite 与底层错误的链、零值 RunHandle,绝不产生「已接受但无法
-// 追踪」的 Run。无痕断言四件套:
-//   - journal 零记录(stub 注错不收;真 journal 形态下恢复扫描对无 state 记录的
-//     run 亦跳过——失败发生在任何记录之前);
-//   - active 已清退:同会话后续提交不再撞 ErrRunActive;
-//   - pending 令牌已归还:WithRunLimits(1,1) 下 pending 容量恰为 1,若 ⑤ 失败
-//     路径未归还会令牌,恢复后的下一次提交必撞 ErrTooManyPending——两项清退由
-//     「恢复后同会话重提成功」联合证明(确定性,无计时断言);
-//   - provider 未开工:被拒 run 的 execute 从未启动(goroutine 未创建,确定性),
-//     恢复后的 run 才开工。
+// TestStartRunRejectsWhenQueuedJournalFails 验证 queued 写失败时拒绝接收且清理资源：
+// 返回错误链和零句柄，不启动 provider，不留 journal/active/pending 残留。
+// journal 恢复后同会话重提成功，联合证明 active 和 pending 令牌均已归还。
 func TestStartRunRejectsWhenQueuedJournalFails(t *testing.T) {
 	m := NewSessionManager(WithRunLimits(1, 1)) // pending 容量 1:令牌守恒的探针
 	defer m.Close()
@@ -590,21 +552,9 @@ func TestStartRunRejectsWhenQueuedJournalFails(t *testing.T) {
 	waitHandle(t, h2)
 }
 
-// TestStartRunRejectsWhenEventHubSeedingFails(第三轮评审 I3 修复验收,I1 断言
-// 形态;第四轮评审 N1 修复更新 journal 断言):EventJournal.SeqRange 播种
-// (Journal 读取)失败 → ⑥ bindEvents/NewEventHub 失败 → StartRun 显式拒绝,
-// pending/active 无痕清退——绝不带着「看似健康」的 hub(旧形态把读取失败当空
-// 历史:replayIntegrity 报 complete 且 seq 从 1 重起,与既有记录冲突)进入执行。
-// N1:hub 接线已物理提到 queued 接受记录写入之前,失败时 journal 快照为空——
-// 不留「看似已接受但从未执行、无终态」的孤儿 queued Run(旧形态的残留 queued
-// 由恢复扫描标 interrupted 补救)。无痕断言四件套(同
-// TestStartRunRejectsWhenQueuedJournalFails):
-//   - 错误链包裹底层原因(errors.Is),零值 RunHandle;
-//   - active 已清退 + pending 令牌已归还:恢复播种后同会话重提成功(确定性,
-//     容量 1 探针);
-//   - provider 未开工:被拒 run 的 execute 从未启动;
-//   - journal 快照为空、零记录(queued 写入在 hub 接线成功之后才发生——无
-//     queued 残留、无终态/事件记录)。
+// TestStartRunRejectsWhenEventHubSeedingFails 验证 SeqRange 读取失败时 StartRun 拒绝并清理。
+// hub 播种先于 queued 写入，因此失败不留孤儿 queued 记录；provider 不启动，句柄归零。
+// journal 恢复后重提成功证明 active/pending 均已释放。
 func TestStartRunRejectsWhenEventHubSeedingFails(t *testing.T) {
 	m := NewSessionManager(WithRunLimits(1, 1)) // pending 容量 1:令牌守恒的探针
 	defer m.Close()
@@ -673,13 +623,8 @@ func TestStartRunRejectsWhenEventHubSeedingFails(t *testing.T) {
 	waitHandle(t, h2)
 }
 
-// ---------------------------------------------------------------------------
-// P2-6:CancelRun + 排队取消路径(总方案第十一节 TestCancelIsolation → 本步)。
-//
-// plan P2-6「取消相关 stub provider 必须 select ctx.Done 及时返回」:gatedProvider
-// 的挂起不感知 ctx,取消后仍要等 release 才返回,无法证明取消及时生效——取消
-// 测试专用 cancelAwareProvider(单轮使用,每测试独立实例)。
-// ---------------------------------------------------------------------------
+// P2-6 验收 CancelRun 的运行中与排队取消路径。gatedProvider 不响应 ctx，
+// 因此取消及时性由专用 cancelAwareProvider 的 ctx.Done 分支测试。
 
 // cancelAwareProvider 是取消测试专用的单轮 stub provider:开工即宣告 started,
 // 随后 select 挂起在 release 与 ctx.Done 上——release 关闭则正常返回(内容为
@@ -909,15 +854,8 @@ func TestCancelSyncRunRejected(t *testing.T) {
 	waitRunResult(t, done)
 }
 
-// ---------------------------------------------------------------------------
-// P3-4:supervisor 事件接线(总方案第十一节 TestSlowSubscriber → 本步)。
-//
-// 测试装置:scriptedStreamProvider(流式脚本)+ eventRunFixture(真 Repository
-// → 真 *session.Store → RunJournalStore 同时充当 RunJournal 与 RunEvents 注入
-// SessionDeps)——「StartRun 全链」= manager → runtime → Session → ai-core
-// agent(kernel 消费流式 provider)→ streamTokens/中间件 → tee → EventHub →
-// RunJournalStore 落盘。
-// ---------------------------------------------------------------------------
+// P3-4 验收 Run 的事件接线。eventRunFixture 使用真实 Repository/Store，
+// RunJournalStore 同时提供 RunJournal 与 RunEvents，覆盖 StartRun 到持久化的全链路。
 
 // scriptedStreamProvider 是流式 stub provider:第 i 次模型调用回放 rounds[i]
 // 脚本(向 ch 发增量;流式重组契约:末 token 携带 Response,ai-core agent 的
@@ -1011,15 +949,9 @@ func eventRunCallbacks() RunCallbacks {
 	}
 }
 
-// TestSlowSubscriber(总方案第十一节 → 本步):StartRun 全链,provider 挂起中
-// 注册订阅者、放行后灌大量 EmitToken,慢订阅者(Subscribe 后不读)被背压断开:
-//
-//	① 该订阅者通道最终被关闭——其 ctx 从不取消、hub 从不 Close,关闭只能来自
-//	  fan-out 满缓冲断开(pump 经 hubSub.dead 从阻塞投递中感知断开并退出);
-//	② Publish/execute 不阻塞:run 正常 RunCompleted+Persisted,且耗时在上界内
-//	  (若 tee/hub 阻塞执行,Wait 超时或耗时断言失败);
-//	③ 其他正常消费的订阅者收全事件:seq 恰为 1..N 无缺口无重复,且含
-//	  assistant.message_finalized(key 事件经真 journal durable-first 后广播)。
+// TestSlowSubscriber 验证慢订阅者被背压断开时不阻塞 Publish/execute，且健康订阅者
+// 仍收到连续完整事件。慢订阅者不取消 ctx、不关闭 hub，因此其通道关闭只能来自断开；
+// run 必须完成并落盘。
 func TestSlowSubscriber(t *testing.T) {
 	m := NewSessionManager()
 	defer m.Close()
@@ -1156,16 +1088,9 @@ func TestSlowSubscriber(t *testing.T) {
 	}
 }
 
-// TestStartRunEmitsJournalEvents(P3-4):RunEvents=真 RunJournalStore → 跑一轮
-// 带工具循环的流式 StartRun → ReadEvents(0) 断言:
-//   - key 事件 durable-first 落盘:tool_call/tool_result/assistant.message_finalized
-//     各恰一条、FromSeq=0(逐事件)、RunID/SessionID 同源;
-//   - delta 呈合并记录:每条 delta 记录带 [FromSeq..Seq] 合并范围,且持久化
-//     记录数严格少于实时事件数(同型增量收进单条合并记录);
-//   - Seq 全局连续无重复:全部记录的 [FromSeq..Seq](逐条即 [Seq..Seq])区间
-//     恰好铺满 [1..N],无缺口、无重叠。
-//   - state 与事件同文件混存:raw 文件恰 3 条 state(queued/running/completed)
-//   - 全部事件记录,首行 queued、末行 completed(事件先于终态落盘的次序铁律)。
+// TestStartRunEmitsJournalEvents 验证真实 RunJournalStore 中的事件与 state 记录。
+// 断言 key 事件逐条 durable-first、delta 合并范围有效、Seq 覆盖连续且无重复，
+// 并检查 queued/running/completed 与事件记录混存且 completed 最后落盘。
 func TestStartRunEmitsJournalEvents(t *testing.T) {
 	m := NewSessionManager()
 	defer m.Close()
@@ -1253,14 +1178,9 @@ func TestStartRunEmitsJournalEvents(t *testing.T) {
 		deltaRecords++
 		deltaEvents += int(rec.Seq - rec.FromSeq + 1)
 	}
-	// Seq 全局连续无重复(P3-4 验收口径,记录面的可观测不变量):
-	//   - 连续:全部记录的 [lo..Seq] 区间并集覆盖 [1..N] 无缺口;
-	//   - 无重复:记录 Seq(=ToSeq,回放侧实际投递的游标值)两两不同。
-	// 注意**不**断言区间两两不交:合并按 Type 分桶(plan P3-2「deltaBuf key=
-	// type,同型合并」),同型合并范围可横跨其他类型事件的 seq(如 usage 合并
-	// [1..6] 覆盖了 seq 2/3 的 thinking/text)——FromSeq 是范围声明而非所有权
-	// (P3-1 契约「FromSeq 只作范围声明」;TestAttachReplayNoGap 的覆盖记账即
-	// 同款语义)。每 seq 的所有权唯一由 hub 单调分配保证,不可从记录面观测。
+	// 记录区间并集须覆盖 [1..N] 且末 Seq 唯一；区间不必互斥。
+	// 同类型 delta 批次范围可跨其他类型事件的 Seq，FromSeq 只是范围声明，
+	// 实际 Seq 归属由 hub 分配，不能从 journal 记录面推断。
 	sort.Slice(ranges, func(i, j int) bool { return ranges[i].lo < ranges[j].lo })
 	seenSeq := map[uint64]string{}
 	var cursor uint64
@@ -1334,24 +1254,9 @@ func TestStartRunEmitsJournalEvents(t *testing.T) {
 	}
 }
 
-// TestStartRunJournalsRealTokens(C2 修复验收):daemon run/start 的生产提交形态
-// ——RunCallbacks{} 全 nil(runcontrol.go StartRun)——下,真实 Token 流仍进事件
-// journal。C2 修复前 teeRunCallbacks 只包装非 nil 入口,streamTokens/中间件对
-// nil 回调直接跳过(session.go 的 nil 检查),后台 Run 的 text.delta/tool_call/
-// assistant.message_finalized 全部丢失,Re-Attach 只见 run.* 生命周期事件;修复
-// 后 tee 在 hub 非 nil 时对 nil 的 EmitToken/Publish 主动装上事件映射版。
-//
-// 装置与 TestStartRunEmitsJournalEvents 同款真 journal 全链(manager → runtime →
-// Session → ai-core kernel → streamTokens → tee → hub → RunJournalStore 落盘),
-// 差异仅在提交回调:全 nil。断言(ReadEvents(0) 全量回放):
-//   - 含 text.delta(两轮模型的文本增量)、tool_call(未注册工具的调用,ai-core
-//     kernel 产出)与 assistant.message_finalized(kernel 收尾空 content Done
-//     token,恰 1 条——ai-core 剥掉增量 Done,agent.go chat());
-//   - tool_call 载荷可还原 token 全貌(payload=整个 core.Token 的 JSON,P3-4 表,
-//     含结构化 ToolCall 关联);
-//   - 全部记录 Seq 连续无重复:记录的 [FromSeq..Seq] 区间并集铺满 [1..N]
-//     (FromSeq 是范围声明非所有权,区间可横跨其他类型事件的 seq——与
-//     TestStartRunEmitsJournalEvents 的覆盖记账同款语义,不断言两两不交)。
+// TestStartRunJournalsRealTokens 验证 RunCallbacks 全 nil 时，真实 Token 仍进入事件 journal。
+// 断言覆盖 text.delta、tool_call/result、assistant.message_finalized 与结构化载荷，
+// 并以 Seq 区间并集检查连续性。合并区间只作范围声明，不代表事件所有权。
 func TestStartRunJournalsRealTokens(t *testing.T) {
 	m := NewSessionManager()
 	defer m.Close()
@@ -1477,15 +1382,8 @@ func TestStartRunJournalsRealTokens(t *testing.T) {
 // SDK 侧透传证明)。
 // ---------------------------------------------------------------------------
 
-// TestStartRunInjectsRunContextValues:WithRunContext 声明的键值对随 StartRun
-// 派生的 runCtx 透传,在 Session.Run 内的两个读点可见:
-//   - ToolSource 探测点(session.go:128,Session.Run 以 runCtx 直接调用
-//     req.ToolSource(ctx));
-//   - 工具 Execute 读点(ai-core 的 toolCtx := context.WithTimeout(agentCtx,
-//     60s)(ai-core/agent/agent.go:147),值沿 runCtx → agentCtx(WithCancel)→
-//     toolCtx 的 ctx 链传播)——后者是 P5-1 死锁契约的关键读点:hub 工具的嵌套
-//     Eval(daemon commands.go withSession 的 ctx.Value(sessionGateKey{}))就
-//     发生在 Execute ctx 上。
+// TestStartRunInjectsRunContextValues 验证 WithRunContext 注入值可见于 ToolSource
+// 与工具 Execute 两个读点，包括 sessionGateKey 死锁契约涉及的 Execute ctx。
 func TestStartRunInjectsRunContextValues(t *testing.T) {
 	type probeKeyA struct{}
 	type probeKeyB struct{}
@@ -1662,17 +1560,9 @@ func assertEventBeforeTerminalState(t *testing.T, fx eventRunFixture, runID, typ
 	}
 }
 
-// TestStartRunEmitsRunLifecycleEvents(P5-2):RunEvents=真 RunJournalStore →
-// ReadEvents 断言 run.* 四类的产出面与次序铁律:
-//   - 正常 run:run.started 先于 run.finished(Seq 序),finished 的行先于终态
-//     completed state 记录(文件序);
-//   - failed run(captureProvider.chatErr 注入,AC-1 归一 RunFailed):含
-//     run.error{err} 且先于 run.finished,两者都先于终态 state 记录;
-//   - 取消 run(CancelRun,early-exit 路径):含 run.finished{cancelled},且无
-//     run.started(run 未达 running)。
-//
-// 全部走真 journal 全链(manager → runtime → Session → ai-core → tee → hub →
-// RunJournalStore 落盘,装置同 TestStartRunEmitsJournalEvents)。
+// TestStartRunEmitsRunLifecycleEvents 检查 run.* 事件的产出、顺序与终态 journal 顺序。
+// 覆盖 completed、failed（error 先于 finished）及 queued cancel（无 started）三条路径，
+// 全部使用真实 RunJournalStore。
 func TestStartRunEmitsRunLifecycleEvents(t *testing.T) {
 	t.Run("completed run emits started then finished before terminal state", func(t *testing.T) {
 		m := NewSessionManager()

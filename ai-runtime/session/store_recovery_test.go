@@ -1,5 +1,4 @@
-// store_recovery_test.go 验证崩溃尾记录截断修复（P1-2 存储层前置；完整版
-// TestRestoreInterruptedRun 依赖 Run 状态持久化，按实施计划 §3/§4 划归 P2）。
+// 验证打开存储时会修复不完整的尾记录。
 package session
 
 import (

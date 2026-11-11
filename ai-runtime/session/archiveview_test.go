@@ -9,11 +9,7 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 )
 
-// seedArchiveFile 在 dir/archive/ 下直接构造一个归档 jsonl 夹具：用一次性 store
-// 造出记录集，关闭后把数据文件字节原样搬进归档目录。Plan A 定案 #2/#9 删除
-// Store.Archive() 后不再有「轮转出归档文件」的写路径，归档文件的磁盘形态与
-// 会话数据文件完全一致（同一 record 模型），直接构造是等价且诚实的夹具方式。
-// 返回归档文件路径；造数期需要对照的快照由 seed 闭包内自行捕获。
+// seedArchiveFile copies a Store's JSONL data into archive/ as a read-only fixture.
 func seedArchiveFile(t *testing.T, dir, name string, seed func(s *Store)) string {
 	t.Helper()
 	scratch := filepath.Join(t.TempDir(), "seed-slot")

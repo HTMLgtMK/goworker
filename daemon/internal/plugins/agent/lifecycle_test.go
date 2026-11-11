@@ -14,19 +14,9 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// lifecycle_test.go 是 Plan A2 生命周期半边的验收(定案需求 #2/#8):
-//   - /new 单绑定归零即收口:发起连接是唯一引用 → runtime 注销 + store 关闭并
-//     逐出 repo 缓存,重开经 flock 慢路径拿活实例(A2.1①);
-//   - run 在飞解绑 → 延迟到 run 终态才收口(挂起 + WithRunDoneHook 唤醒重判);
-//   - 挂起期间的新绑定 → 取消挂起收口(收口执行点的原子复查);
-//
-// 多连接绑定的存活语义(另一连接仍绑旧会话 → 不收口)在 binding_test.go 的
-// TestHandleNewKeepsSessionWhileOtherConnectionBound 覆盖;BindingRegistry 的
-// 记账契约在 agentcontrol/bindings_test.go 覆盖。
-//
-// 挂起面的在飞 run 用 rt.RecordRun 直接占位(manager.StartRun 的 queued/running
-// 同样落在 rt.active,finalizeRun 是两条路径共享的终态化点——run-done 通知在
-// 两形态下同源触发,无需 provider 参与即可确定性断言)。
+// lifecycle_test.go 验证引用归零时的会话收口、run 在途时延迟收口，以及新增绑定
+// 对挂起收口的取消。多连接存活和绑定记账分别由 binding_test.go 与 agentcontrol
+// 测试覆盖。挂起 run 通过 runtime active 状态直接构造，避免依赖 provider 时序。
 
 // waitActive 等待 rt 的 active 记账就位(RecordRun 在独立 goroutine 上推进)。
 func waitActive(t *testing.T, rt *runtimeagent.SessionRuntime) {
@@ -41,12 +31,11 @@ func waitActive(t *testing.T, rt *runtimeagent.SessionRuntime) {
 	t.Fatal("run did not occupy rt.active in time")
 }
 
-// newBoundSession 复用 newPersistedPlugin 的装配(真实 NewPlugin/Init,manager
-// 带 WithRunDoneHook、control 已接线),再经 newPersistedSession 建一个独立目录
-// 新会话(生产 /new 后的拓扑:current 与 manager 条目同一 runtime),登记一条
-// 连接绑定并返回插件与会话 id。不直接用 Init 的首会话:refreshSession 的同 id
-// 重建会在 manager 里留旧条目(current 不在册),那是纯内存降级的夹具形态,
-// 与本文件断言的持久化拓扑无关。
+// newBoundSession 复用 newPersistedPlugin 的装配（真实 NewPlugin/Init、manager
+// 带 WithRunDoneHook、control 已接线），再经 newPersistedSession 建一个独立目录
+// 新会话并登记连接绑定，返回插件与会话 id。不直接用 Init 的首会话，因为
+// refreshSession 的同 id 重建会在 manager 里留下 current 不在册的旧条目，那是
+// 纯内存降级夹具，与本文件断言的持久化拓扑无关。
 func newBoundSession(t *testing.T, connID string) (*AgentPlugin, string) {
 	t.Helper()
 	p := newPersistedPlugin(t, fixedProvider{content: "x"})
@@ -335,12 +324,11 @@ func TestConcurrentLoadAndRelease(t *testing.T) {
 
 var _ model.ConnectionBinder = (*AgentPlugin)(nil)
 
-// TestStartRunConcurrentWithRelease 覆盖「Run 提交」与「最后解绑收口」的竞态:
-// StartRunSync 可能已经路由到 rt,随后 ReleaseConnection 完成 Retire+Remove。
-// 合法结果只有两种——Run 先占位(收口挂起,终态后注销),或收口先 Retire
-// (提交在 reserveRun 处被拒,绝不落到已关闭的 hub/store)。核心断言:被拒的
-// 提交不能把已注销的 runtime 复活回注册表(ensureRegistered 的陈旧指针修复
-// 曾把这个失败窗口放大成「run 写在已关 store 上」)。
+// TestStartRunConcurrentWithRelease 覆盖「Run 提交」与「最后解绑收口」的竞态：
+// StartRunSync 可能已路由到 rt，随后 ReleaseConnection 完成 Retire+Remove。
+// 合法结果只有两种——Run 先占位（收口挂起，终态后注销），或收口先 Retire
+// （提交在 reserveRun 被拒，绝不落到已关闭的 hub/store）。核心断言：被拒的提交
+// 不能复活已注销的 runtime；旧 ensureRegistered 指针曾把该窗口放大成写坏 store。
 func TestStartRunConcurrentWithRelease(t *testing.T) {
 	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
 	p := newPersistedPlugin(t, fixedProvider{content: "x"})

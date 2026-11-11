@@ -13,20 +13,9 @@ import (
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
-// 本文件是 P2-3 的 Run journal 接线验收测试(RecordRun → RunStateJournal):
-//   - TestRecordRunJournalsStartAndFinish:一轮 RecordRun 恰好两条 state 记录
-//     (running + 终态 completed),RunID/SessionID 同源、终态带 Persisted=true;
-//   - TestRecordRunJournalCommitFailureInjectsFailed:Commit 失败注入
-//     (fakeConversationStore.commitErr,总方案第十一节的 journal 对偶)→ 终态
-//     记录 state=="failed" && !persisted,记录流中绝不出现 completed;
-//   - TestRecordRunJournalAppendErrorNonFatal:AppendState 失败只 warn 不阻塞,
-//     Run 照常完成(journal 可用性低于执行可用性);
-//   - TestRecordRunJournalsProviderFailureAsFailed(AC-1):provider 失败(chatErr
-//     注入,经 runErrorCapture)→ 终态记录 state=="failed" && persisted=true
-//     (错误 note 已提交)——关闭「provider 失败被记 completed」的缺口。
-//
-// 编译期断言 `var _ RunStateJournal = (*session.RunJournal)(nil)` 按计划推迟到
-// P2-7(session 侧聚合类型 RunJournalStore 引入时补),本步测试用本地 stub。
+// 本文件验收 RecordRun 的 RunStateJournal 接线、状态顺序与失败处理。
+// 覆盖持久化失败终态、journal 写失败不阻断执行，以及 provider 错误映射；
+// 测试使用本地 stub，RunJournalStore 接口断言留待 session 聚合类型接入时补齐。
 
 // stubRunJournal 是 RunStateJournal 的内存测试桩:记录按序收进 recs;appendErr
 // 非 nil 时注入 AppendState 失败(记录不收)。
@@ -178,13 +167,9 @@ func TestRecordRunJournalAppendErrorNonFatal(t *testing.T) {
 	}
 }
 
-// TestRecordRunJournalsProviderFailureAsFailed:provider 失败(chatErr 注入,错误
-// 经 runErrorCapture 走 AC-1 主映射)跑 RecordRun → 终态 journal 记录
-// state=="failed" 且 persisted=true(错误 note 已随 messages 提交)——P2-3 journal
-// 对偶的补全,关闭「provider 失败被记 completed」的缺口(总方案第十一节 ai-core
-// 修正对偶;此前该场景 journal 终态为 completed 的行为在 run_test.go P2-1 实测
-// 留痕)。终态断言同时是「fire 先于 msgCh 发送」次序依赖的 journal 面钉死
-// (plan §6 风险 1):次序破坏时 capture 读不到错误、终态退回 completed。
+// TestRecordRunJournalsProviderFailureAsFailed 验证 provider 错误经 runErrorCapture
+// 映射为 failed，且错误 note 已提交所以 Persisted=true。该终态也钉死 fire 先于
+// msgCh 发送的顺序：若顺序反转，capture 读不到错误，run 会错误地记为 completed。
 func TestRecordRunJournalsProviderFailureAsFailed(t *testing.T) {
 	jr := &stubRunJournal{}
 	s := newJournaledSessionWithProvider(&fakeConversationStore{}, jr, &captureProvider{chatErr: errors.New("boom")})

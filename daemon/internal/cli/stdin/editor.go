@@ -13,13 +13,9 @@ import (
 
 const maxHistory = 50
 
-// LineEditor 是一个 raw mode 下的行编辑器，支持 ↑↓ 历史、←→ 光标、Delete。
-//
-// 字节解码（UTF-8 累积、CSI 解析、Esc 判定）由 KeyDecoder 完成，editor
-// 只消费语义清晰的按键事件。它是责任链栈上的行消费者：
-//   - 只关注编辑键（字符/Enter/Backspace/方向键），无活跃读行会话时放行
-//   - 取消键（KeyEsc/KeyCtrlC）放行给栈底 keyWatcher，keyWatcher 通过
-//     cancelCh 通知阻塞的 ReadLine 放弃输入
+// LineEditor edits input in raw mode with history, cursor movement, and completion.
+// KeyDecoder translates bytes to key events; this consumer handles editing keys only.
+// Cancellation keys pass through to keyWatcher, which interrupts ReadLine via cancelCh.
 type LineEditor struct {
 	keyCh    chan KeyEvent   // dispatch 投递的编辑按键
 	cancelCh <-chan struct{} // keyWatcher 触发的取消信号

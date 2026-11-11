@@ -10,12 +10,11 @@ import (
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
-// 本文件是 P1-4 状态绑定收口的 daemon 侧验收：cwd 声明随会话边界走 runtime 级
-// 迁移——旧 current runtime 的有效声明在 /new（startSession 重建）后迁入新
-// runtime 并应用到新会话；无效声明作废，不毒化新会话的 prompt 门。
-// SDK 层的 CWD/Usage 会话隔离（含 Session().cwd() 断言）由 ai-runtime/agent 的
-// TestSessionStateIsolation 覆盖；本文件只锁 daemon 的迁移接线（Session.cwd 为
-// SDK 内部态，daemon 侧以 runtime 声明与插件读面为断言对象）。
+// 本文件是 P1-4 状态绑定收口的 daemon 侧验收：cwd 声明随会话边界做 runtime 级
+// 迁移——旧 runtime 的有效声明在 /new 后迁入新 runtime 并应用到新会话，无效
+// 声明作废且不污染新会话的 prompt 门。SDK 层的 CWD/Usage 会话隔离由
+// TestSessionStateIsolation 覆盖；本文件只锁 daemon 迁移接线，断言 runtime
+// 声明与插件读面，而非 SDK 内部的 Session.cwd。
 
 // TestCWDDeclarationSurvivesNew：legacy 槽 runtime 上有效声明 → /new → 新 runtime
 // 继承声明且插件读面（currentSessionCwd）不变；无效声明 → /new → 作废（新

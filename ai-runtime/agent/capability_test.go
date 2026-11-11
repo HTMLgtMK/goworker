@@ -17,12 +17,8 @@ import (
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
-// 本文件是 P4-3 CapabilityRegistry / ClientToolProxy 构造面与 P4-4 等待/失效
-// 语义的验收测试:Bind/Lookup 的幂等往返与 TTL 过期、重绑刷新、跨 connection
-// 隔离(不存在隐式路由面)、代理构造断言(Name/Description/Schema/Metadata
-// 透传 + capability_wait 标记)、Execute 的直通/等待/超时单元面,以及四个
-// StartRun 全链测试(TestToolBindingDisconnect 等,总方案第十一节 → P4-4)。
-// 语义铁律见 capability.go 头注释(总方案 §8);全部模拟 Provider,零真实 LLM。
+// 本文件验收 CapabilityRegistry/ClientToolProxy 的绑定隔离、TTL、代理构造及执行等待语义，
+// 并覆盖等待/失效状态和 StartRun 全链路。所有用例使用模拟 Provider；语义契约见 capability.go。
 
 // fakeClientExecutor 是 ClientToolExecutor 的测试桩:记录调用次数,返回预置
 // 结果。各绑定用独立实例,靠指针相等断言 Lookup 返回的正是登记的执行通道。
@@ -431,17 +427,9 @@ func TestCapabilityInvokeFailureClassification(t *testing.T) {
 	})
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// P4-4:等待/安全超时/失效语义 + waiting_capability + 观察者注入(总方案
-// 第十一节 TestToolBindingDisconnect → 本步,P4 完成线)。
-//
-// 测试装置:scriptedChatProvider(approval_test.go,非流式脚本,tool call 轮
-// 经真实 kernel 工具循环 + HITL 中间件链)+ newCapabilityRunRuntime(仅
-// ToolSource 工具面)+ fakeClientExecutor(绑定执行通道,Invoke 计数钉死
-// 「不静默路由」)。断连的确定性编排:EmitToken 钩子看到本工具的 tool_call
-// token 即 Unbind——ai-core 对 tool_call token 的发送阻塞在消费面
-// (streamTokens)上,解绑严格先于工具 Execute,无竞态窗口。
-// ─────────────────────────────────────────────────────────────────────────────
+// P4-4 验收等待/超时/失效、waiting_capability 与观察者注入。
+// 断连测试用 tool_call token 的 EmitToken 回调触发解绑；调用面未保证回调先于 Execute，
+// 因此需要确定性先后关系的断连场景必须在 StartRun 前完成解绑。
 
 // capToolName 是能力测试的代理工具名:sys_ 前缀命中 HITL 的 checkSys 面
 // (hitl.go:201-249),metadata risk_level 声明即策略(never=normal 模式直接
@@ -506,17 +494,9 @@ func waitRunState(t *testing.T, h RunHandle, want RunState) {
 	}
 }
 
-// waitToolCallUnbound 返回 EmitToken 钩子:首个本工具 tool_call token 到达时
-// 执行 disconnect(解绑 conn-A)并关闭 done。toolResults 收集 tool_result 文本
-// (单写者 = 执行 goroutine;主 goroutine 在 Wait 返回后读取,happens-before)。
-//
-// 时序警示(修正旧注「token 消费先于工具 Execute」的过度声明):tool_call
-// token 的发送是 ai-core 执行 goroutine 到 streamTokens 消费 goroutine 的通道
-// 交接(agent.go emitToken),交接完成执行面即继续跑中间件与 Execute——钩子的
-// disconnect 何时被调度无保证,满载 -race 全量下可晚于 Invoke。需要严格先于
-// Execute 的编排(如断连)必须先验完成,不得放进本钩子;钩子只承载无时序要求
-// 的通知/收集面(见 TestToolBindingDisconnect 与 daemon 侧
-// TestDeviceToolBindingRebindAfterDisconnect 的同款竞态修正)。
+// waitToolCallUnbound 收集 tool_result，并在目标 tool_call 到达时执行 disconnect。
+// EmitToken 的通道交接完成后 Execute 可能先于回调运行，因此回调不能承担严格的先行编排；
+// 需要先于 Execute 的断连必须预先完成。该钩子只用于无时序要求的通知和收集。
 func waitToolCallUnbound(disconnect func(), toolResults *[]string) (cb RunCallbacks, done chan struct{}) {
 	done = make(chan struct{})
 	fired := false // 仅执行 goroutine 读写(EmitToken 单调用面)
@@ -535,17 +515,9 @@ func waitToolCallUnbound(disconnect func(), toolResults *[]string) (cb RunCallba
 	return cb, done
 }
 
-// TestToolBindingDisconnect(总方案第十一节 → 本步):StartRun + ToolSource
-// 返回代理(绑 conn-A 的 dead executor,Invoke 置失败做陷阱)+ scripted
-// provider 先发 tool_call 再 final → StartRun 前先验断连(UnbindConnection,
-// 确定性编排,理由见 waitToolCallUnbound 的时序警示)→ run 到工具调用时
-// lookup 必然 miss → run 迁移 RunWaitingCapability → Bind(conn-B, 含同名
-// 工具, 新 executor)→ 工具在 conn-B 执行完成 → RunCompleted。dead executor
-// 的 Invoke 计数==0:等待重绑绝不把请求静默路由到已断开(或任何未显式重绑)
-// 的连接(总方案 §8 :650 断言钉死;若被静默重绑/路由,Invoke 必失败且计数,
-// 陷阱照常触发)。「在途 Invoke 失败→即时 Invalidate→等待」路径由
-// TestCapabilityInvokeFailureClassification「plain error invalidates and
-// waits」单测钉死。
+// TestToolBindingDisconnect 验证解绑后 run 等待显式重绑，不会静默路由到旧连接；
+// 断连在 StartRun 前确定性完成。重绑后仅新 executor 被调用；在途 Invoke 失败后的
+// 即时失效与等待由 TestCapabilityInvokeFailureClassification 覆盖。
 func TestToolBindingDisconnect(t *testing.T) {
 	m := NewSessionManager()
 	defer m.Close()
@@ -709,12 +681,9 @@ func TestRebindRequiresCapabilityMatch(t *testing.T) {
 	}
 }
 
-// TestRebindReconfirmViaHITL:重绑后的执行再次触发 interrupt——代理把
-// risk_level 原样透传进 Metadata,HITL 门控读固化在工具定义上的 Metadata 在
-// 每次「调用」裁决:第 1 次调用(approve)在 conn-A 上 Invoke 失败 → Invalidate
-// → 等待 → 重绑 conn-B → 等待收敛后重新 Invoke;第 2 次调用在重绑后的
-// conn-B 上执行前再次触发 interrupt——第二次 permission.requested,危险操作
-// 重绑后仍需确认(总方案 §6 :524)。
+// TestRebindReconfirmViaHITL 验证风险 metadata 在重绑后仍触发审批。
+// 首次 Invoke 失败后失效并等待 conn-B 重绑；重试调用再次请求确认，确保危险操作
+// 不会因连接重绑绕过 HITL。
 func TestRebindReconfirmViaHITL(t *testing.T) {
 	m := NewSessionManager()
 	defer m.Close()

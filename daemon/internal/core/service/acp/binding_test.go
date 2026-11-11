@@ -21,18 +21,10 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// binding_test.go 是 PR2(统一 Session 路由,总方案 §六/§十)的协议级集成测试:
-// 两条 FrontendHandler 连接各自 session/new 后,标准 ACP(prompt)按连接级
-// SessionBinding 路由、x-goworker/*(run/start|get|cancel、attach)按显式
-// sessionId(CR4)路由,两连接互不影响。控制面走真实 agentcontrol.Service
-// (per-session lease fencing),执行面走真实 SessionManager/Session/EventHub,
-// 零真实 LLM(模拟 Provider)。
-//
-// 与 xgwLiveControl 的差异:那边单 runtime(current 校验锚点=SetSession 写入的
-// transport id);本 shim 双 runtime("A"/"B",store id 形态),current 由测试
-// 显式切换(模拟 /new 换轨——A 保留在册,CR4),CurrentSessionID 返回 runtime
-// id(与生产 plugin 的 store id 同语义)。SessionSource 的元数据面(list/load
-// 重放/modes)是 PR2 binding 面的非消费方,给最小空实现。
+// TestACPConnectionBinding routes standard prompts through each connection's Binding and
+// x-goworker calls through explicit session IDs. It uses real lease, session, and event-hub
+// services with a mock provider; the dual-runtime fixture differs from the single-runtime
+// x-goworker fixture by explicitly switching its current-session pointer.
 
 // bindingGateProvider 是闸门 Provider:Chat 进入即 close(started),阻塞到
 // release 关闭(或 ctx 取消——run/cancel 的取消语义经 runCtx 传导至此)。
@@ -77,15 +69,9 @@ func (p bindingFixedProvider) ChatStream(context.Context, *core.ChatRequest) (<-
 	return nil, errors.New("not implemented")
 }
 
-// pr2DualControl 是双 runtime 的 SessionSource + RunControlSource + SessionRouter
-// 测试 shim:控制操作全部委托真实 agentcontrol.Service(per-session lease、幂等
-// single-flight 与生产同源);SubscribeEvents 走真实 Service(路由/EnsureHub/
-// hub.Subscribe/完整性快照与生产同源)。
-//
-// Plan A2b1 语义对齐:本 shim 实现 model.BoundSessionSource——CreateBoundSession
-// 按创建队列真新建 runtime 并注册(handler 的 session/new 据此绑定,现「真新建」
-// 语义),current 由测试经 switchCurrent 显式驱动且创建不动它(A2b1:current 是
-// CLI/stdin 便利指针,ACP 声明不再落 current;无 Binding 调用方回落才消费)。
+// pr2DualControl is a dual-runtime test shim. It delegates lease, idempotency, and
+// subscriptions to the real agentcontrol.Service; CreateBoundSession creates runtimes from
+// a deterministic queue without changing current, which tests switch explicitly.
 type pr2DualControl struct {
 	mu      sync.Mutex
 	current string // 当前 runtime id(测试显式驱动;创建不动,A2b1 语义)
@@ -307,12 +293,9 @@ func (f *pr2DualControl) UnbindCapabilities(connectionID string) {
 
 func (f *pr2DualControl) CapabilityWaitTimeout() time.Duration { return 45 * time.Second }
 
-// newPR2DualControl 构造 shim。Plan A2b1 语义:ids 是 **CreateBoundSession 的
-// 创建队列**(第 n 次 session/new 真新建第 n 个 id 的 runtime 并注册——生产
-// 的 repo.Create + 新 runtime 注册形态;providers 按 id 配置队列项的 provider,
-// 缺省回落 bindingFixedProvider),不预注册任何 runtime,current 置空(创建
-// 不动 current,A2b1 语义;需要时测试经 switchCurrent 显式驱动)。每个 runtime
-// 自带 RunEvents=memEventJournal → attach 可建真 hub。
+// newPR2DualControl builds an empty dual-runtime fixture. IDs and providers are consumed in
+// CreateBoundSession order; no runtime is pre-registered, and creation does not change current.
+// Each created runtime has an in-memory event journal for attach tests.
 func newPR2DualControl(t *testing.T, providers map[string]core.Provider, ids ...string) *pr2DualControl {
 	t.Helper()
 	if len(ids) < 2 {
@@ -465,11 +448,9 @@ func pr2Attach(t *testing.T, client *aiacp.Client, sessionID string) XSessionAtt
 	return res
 }
 
-// TestPR2TwoConnectionsEachOperateOwnSession(总方案 §十 PR2 完成标准,场景 1;
-// Plan A2b1 语义对齐:session/new 真新建):两条连接各自 session/new(各创建
-// Session A/B)→ 各自 prompt/attach/cancel 互不影响。prompt 按连接级 Binding
-// 路由(标准 ACP);run/attach 按显式 sessionId(CR4);两会话的 lease、run、
-// 事件流互不可见、互不阻塞。
+// TestPR2TwoConnectionsEachOperateOwnSession verifies two connections create distinct sessions
+// and route prompts by Binding and run/attach/cancel by session ID. Leases, runs, and event streams
+// remain isolated across the sessions.
 func TestPR2TwoConnectionsEachOperateOwnSession(t *testing.T) {
 	gateA := newBindingGateProvider()
 	gateB := newBindingGateProvider()

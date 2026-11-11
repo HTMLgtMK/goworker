@@ -20,12 +20,9 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// xgw_test.go 是 x-goworker 扩展协议面(P5-7)的测试:JSON-RPC 全栈(管道两端
-// 跑真实 ai-acp Server/Client,零 mock 传输层)验证 wire 契约与 control lease
-// 守卫,外加 Service.accept 路径的 Close 钩子测试。管道用 net.Pipe(全双工
-// 内存管道,io.Pipe 的成对等价物)——ai-acp client_server_test 的既有全栈模式。
-// 后台 Run 面全部用模拟 source(零真实 LLM),幂等承诺由 fake 建模(承诺在
-// source 层,P5-6)。
+// xgw_test.go runs real ai-acp peers over net.Pipe to verify extension wire contracts, lease
+// fencing, and the connection Close hook. A scripted source models background runs and
+// idempotency; xgw_integration_test.go covers real runtime orchestration.
 
 // fakeStartCall / fakeCancelCall / fakeApprovalCall 是 source 层收到的调用记录。
 type fakeStartCall struct {
@@ -58,15 +55,9 @@ func fakeLeaseLostErr(sessionID, connectionID string) error {
 	return fmt.Errorf("fakeRunControl: session %q: connection %q: %w", sessionID, connectionID, errFakeLeaseLost)
 }
 
-// fakeRunControl 是 model.RunControlSource 的脚本化 fake(内嵌 fakeSessionSource
-// 补齐 SessionSource 面,供工厂 type-assert 命中)。幂等:runByReq 记账,同
-// requestID 重试返回原 runID 与当前状态快照(建模 P5-6 承诺,不起跑)。
-// approvalOwner 是服务端记录的审批归属(C1 修复建模:mirror runcontrol.go——
-// 未知 requestID → ErrApprovalUnknown 语义;归属会话与调用方声明不一致 → 越权
-// 拒绝),由用例按 wire 会话 id 预置。第三轮评审 I4 起,控制类操作
-// (StartRun/CancelRun/ResolveApproval)mirror 生产的 fencing 契约:先校验
-// connectionID 持有该会话的 lease(未持有/被接管 → errFakeLeaseLost),校验
-// 通过才落账——接管的 AcquireControl 同锁(f.mu),镜像「校验后不可能被接管」。
+// fakeRunControl scripts RunControlSource behavior, including idempotent retries, server-side
+// approval ownership, and lease fencing. Its mutex keeps validation and submission atomic with
+// takeover, matching the production contract.
 type fakeRunControl struct {
 	*fakeSessionSource
 
@@ -82,13 +73,8 @@ type fakeRunControl struct {
 	resolveErr    error                                                         // ResolveApproval 脚本化失败
 	nextRun       int
 
-	// P5-8 附加面:attachHub 配置后,StartRun 在其上产出 3 条 key 事件(建模
-	// 「StartRun 产事件」,事件经真 EventHub 的 Publish 路径)并把活动 run 快照
-	// 置为 (run-N, running) 供 SubscribeEvents 的 CurrentRun 快照返回;attachErr
-	// 脚本化 SubscribeEvents 失败。
-	// I1 修正后 ActiveRun 按会话路由,fake 同型按会话记账(mirror runcontrol.go:
-	// 每会话各自的活动快照,StartRun 置账、本 fake 不清账——快照观察面,对照
-	// 会话查不到即 null)。
+	// With attachHub configured, StartRun publishes three key events and exposes an active-run
+	// snapshot; ActiveRun is tracked per session. attachErr scripts subscription failure.
 	attachHub  *runtimeagent.EventHub
 	attachErr  error
 	activeRuns map[string]fakeActiveRun
@@ -174,11 +160,8 @@ func (f *fakeRunControl) PendingApprovals(sessionID string) ([]model.PendingAppr
 	return nil, nil
 }
 
-// ResolveApproval mirror runcontrol.go 的 C1 契约 + 第三轮评审 I4 fencing(归属
-// 三段校验的 source 侧,fencing 后四步同锁原子):resolveErr 脚本化失败优先;
-// lease 校验(未持有/被接管 → errFakeLeaseLost);未知 requestID →
-// ErrApprovalUnknown 语义;归属会话与调用方声明不一致 → 越权拒绝(服务端记录
-// 为准,不信客户端声明);匹配才记账。
+// ResolveApproval mirrors production lease fencing and ownership checks: scripted failures and
+// unknown IDs reject; only the matching server-recorded session owner is accepted.
 func (f *fakeRunControl) ResolveApproval(sessionID, connectionID, requestID string, decision hitl.Decision) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -199,12 +182,9 @@ func (f *fakeRunControl) ResolveApproval(sessionID, connectionID, requestID stri
 	return nil
 }
 
-// SubscribeEvents(P5-8 测试面;PR3 订阅契约):mirror agentcontrol.Service.
-// SubscribeEvents 的生产序——hub.Subscribe 建立订阅(配置的 attachHub 充当被
-// 路由会话的 hub,与生产 EnsureHub 同型)→ 创建订阅后读 latestSeq/
-// replayIntegrity(不缓存旧状态)→ activeRuns 快照组 CurrentRun;attachErr
-// 脚本化失败,Subscribe 的 ErrCursorExpired 原样上抛(失败路径 cancel 收 ctx,
-// 零残留)。
+// SubscribeEvents mirrors the production sequence: subscribe first, then snapshot cursor,
+// replay integrity, and active run. Cursor errors propagate and failed subscriptions leave no
+// retained context.
 func (f *fakeRunControl) SubscribeEvents(sessionID string, afterSeq uint64) (agentcontrol.AttachResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -574,13 +554,9 @@ func TestXGWRunGetAndCancelForwarding(t *testing.T) {
 	}
 }
 
-// TestXGWReplayIntegrityForwarding(I4 验收):回放完整性三态在 daemon 两个响应
-// 面的 wire 断言(老字段 eventsComplete 布尔 → replayIntegrity 三态字符串):
-//   - run/get:source RunStatus 返回的三态原样透传(此处脚本 incomplete,模拟
-//     本进程发生过 key 事件落盘失败/合并 flush 失败的粘滞态);
-//   - attach:真 EventHub 的 replayIntegrity 上 wire——注错 journal 的 key 事件
-//     发布失败 → incomplete(粘滞),响应显式携带;complete 面由
-//     TestXGWSessionAttachReplayNoGap(健康 hub)覆盖。
+// TestXGWReplayIntegrityForwarding verifies the three-state replay integrity is forwarded by
+// run/get and attach, including sticky incomplete after a journal write failure. The healthy
+// complete case is covered by TestXGWSessionAttachReplayNoGap.
 func TestXGWReplayIntegrityForwarding(t *testing.T) {
 	frc := newFakeRunControl()
 	stack := newXGWStack(t, nil, frc)
@@ -630,12 +606,9 @@ func TestXGWReplayIntegrityForwarding(t *testing.T) {
 	}
 }
 
-// TestXGWApprovalRespondForwardsDecision(P5-7 审批面):decision wire 形状
-// (interrupt_id/type,与 hitl.Decision JSON 同形)白名单映射转发;未知/空
-// type 一律 -32000 且绝不触达 source(零值 DecisionType 穿透中间件=放行,
-// 映射的失败方向必须是拒绝);source 错误归一 -32000。持照走生产路径
-// attach(mode=control) 建立 sid 的 lease,respond 携带 sessionId(C1 修复
-// 后的 wire 形状)按会话过守卫;fake 的服务端归属预置 req-9 → sid。
+// TestXGWApprovalRespondForwardsDecision checks that valid decisions reach the source, while
+// unknown/empty wire types and source errors fail closed as -32000. The test acquires the target
+// session's control lease and verifies its server-recorded approval owner.
 func TestXGWApprovalRespondForwardsDecision(t *testing.T) {
 	frc := newFakeRunControl()
 	hub := mustNewEventHub(t, "sess-store-1", &memEventJournal{})
@@ -738,14 +711,9 @@ func TestXGWApprovalRespondForwardsDecision(t *testing.T) {
 	}
 }
 
-// TestXGWApprovalCrossSessionOwnership(C1 修复验收):A 控制会话 A、B 控制会话
-// B,B 会话有挂起审批(服务端记录归属 sidB)时——A 声明 sidB 应答 → handler 守卫
-// 按 wire sessionId 判 lease 拒绝(A 不持 sidB 的 lease,不触达 source);A 声明
-// 自己控制的 sidA 应答 B 的审批 → handler 守卫放行但 source 按服务端记录的归属
-// 拒绝(「服务端记录为准,不信客户端声明」,审批不被消费);A/B 各自应答本会话
-// 的审批 → 成功且 source 收到的会话归属与 wire 声明一致;未知 requestID → 明确
-// 错误。修复前 requireControlForApproval 的「持有任意会话 lease 即放行」允许 ①
-// 直接应答他会话审批。
+// TestXGWApprovalCrossSessionOwnership verifies that a lease only authorizes decisions for
+// its session and that source-side ownership checks reject a forged session declaration. Valid
+// same-session decisions succeed; unknown request IDs fail explicitly.
 func TestXGWApprovalCrossSessionOwnership(t *testing.T) {
 	frc := newFakeRunControl()
 	hub := mustNewEventHub(t, "sess-store-1", &memEventJournal{})
@@ -1068,11 +1036,8 @@ func (j *memEventJournal) SeqRange() (earliest, latest uint64, ok bool, err erro
 	return earliest, latest, true, nil
 }
 
-// errEventJournal 是注错 journal(I4 测试面):AppendEvent 一律失败(模拟磁盘
-// 故障),读面恒空——SeqRange (0,0,false,nil)(诚实空历史播种,不触发 Unknown,
-// 也不触发 I3 的 NewEventHub 拒绝——本 stub 的注错面只在写侧)、ReadEvents 空
-// (Subscribe/attach 可正常建立),专供 replayIntegrity 的失败置位路径。编译期
-// 断言同 memEventJournal。
+// errEventJournal simulates persistent-write failures while allowing empty history to seed and
+// subscriptions to succeed. It isolates the sticky replay-integrity failure path.
 var _ runtimeagent.EventJournal = (*errEventJournal)(nil)
 
 type errEventJournal struct{}
@@ -1192,12 +1157,9 @@ func handlerSubCount(h *FrontendHandler) int {
 	return len(h.subs)
 }
 
-// TestXGWSessionAttachReplayNoGap(P5-8 主路径):先经协议面 run/start 产事件
-// (fake 在真 EventHub 上产出 seq 1..3)→ 后 attach afterSeq=0 → 客户端收齐
-// (0, latest] 无重无缺,Replay+Live 无缝续上 attach 后发布的事件;响应形状
-// {currentRun,latestSeq,replayIntegrity}(tookOver 省略,I4 起 eventsComplete
-// 布尔改三态字符串)、事件线上形状 = SessionEvent 原样 JSON(蛇形键,总方案 §7
-// 报文)。
+// TestXGWSessionAttachReplayNoGap starts events before attach and verifies replay plus live
+// delivery has no gaps or duplicates. It also checks the attach snapshot and raw SessionEvent
+// wire shape.
 func TestXGWSessionAttachReplayNoGap(t *testing.T) {
 	stack, hub := newAttachStack(t)
 	sid := stack.initAndNew(t)
@@ -1326,13 +1288,9 @@ func TestXGWSessionAttachCursorExpired(t *testing.T) {
 	}
 }
 
-// TestXGWSessionAttachControlTakeover(P5-8 Observe/Control;I3 后同会话接管):
-// attach(mode=control) 经 wire 获取该会话 lease(空闲获取 tookOver 省略);
-// 第二连接对**同一会话** attach(mode=control) 显式接管(tookOver=true 回显);
-// 接管后原 holder 的 approval/respond 被 source 侧的 lease 守卫拒绝(第三轮
-// 评审 I4 fencing:其对该会话的 lease 已易主,校验与提交同临界区),新 holder 可用;lease 易主不断原 holder 的事
-// 件流。跨会话互不影响由 TestXGWSessionAttachControlPerSession 单独覆盖(I3:
-// 接管只发生在同一会话上)。
+// TestXGWSessionAttachControlTakeover verifies a second connection can take over the same
+// session's lease, after which the previous holder's control request is fenced. Takeover does
+// not interrupt its event stream; cross-session isolation is covered separately.
 func TestXGWSessionAttachControlTakeover(t *testing.T) {
 	frc := newFakeRunControl()
 	hub := mustNewEventHub(t, "sess-store-1", &memEventJournal{})
@@ -1682,12 +1640,9 @@ func TestXGWHandlerCloseReclaimsSubscriptions(t *testing.T) {
 	stack.handler.Close()
 }
 
-// TestXGWSessionAttachFailureKeepsSubscriptionAndLease(I4 修复验收,准备/提交
-// 两阶段的失败路径):A attach(control) 建立订阅并持有 lease 后,B 对同一会话
-// 带超前游标 attach(control) → hub.Subscribe 的 ErrCursorExpired 原样上抛为
-// -32000,且准备阶段的失败绝不触碰既有状态——旧订阅句柄原样(A 仍收实时
-// 事件)、A 的 lease 未被夺走(B 的 would-be 接管回滚/未发生,B 无 lease 亦无
-// 候选,B 的 approval/respond 同样被拒)。
+// TestXGWSessionAttachFailureKeepsSubscriptionAndLease verifies failed preparation with an
+// expired cursor leaves the existing subscription and lease intact, and does not grant control
+// to the failed requester.
 func TestXGWSessionAttachFailureKeepsSubscriptionAndLease(t *testing.T) {
 	frc := newFakeRunControl()
 	hub := mustNewEventHub(t, "sess-store-1", &memEventJournal{})
@@ -1770,11 +1725,8 @@ func TestXGWSessionAttachFailureKeepsSubscriptionAndLease(t *testing.T) {
 	waitFor(t, "live event on the untouched subscription", func() bool { return logA.count() >= 1 })
 }
 
-// TestXGWSessionAttachConcurrentSinglePump(I4 修复验收,并发 attach):同连接
-// 同会话并发 attach 的句柄替换在 h.mu 内原子换入——并发结束后表内恰一现任
-// 句柄(done 未关),settle 后发布的实时事件恰好投递一次(无未登记的残留泵
-// 在投递;换代 replay 的跨代重复是客户端显式要求 afterSeq=0 的预期行为,不在
-// 本断言面)。并发的 lease 获取幂等(同连接同会话)。
+// TestXGWSessionAttachConcurrentSinglePump verifies concurrent same-session attaches leave
+// one active pump and deliver post-settlement events once; lease acquisition is idempotent.
 func TestXGWSessionAttachConcurrentSinglePump(t *testing.T) {
 	stack, hub := newAttachStack(t)
 	sid := stack.initAndNew(t)
@@ -1847,13 +1799,9 @@ func TestXGWSessionAttachConcurrentSinglePump(t *testing.T) {
 	}
 }
 
-// TestXGWSessionAttachCloseCommitBarrier(I2 修复验收,preCommitHook 确定性
-// 交错,不用 time.Sleep):钩子挂在 Subscribe 成功与提交临界区之间的真实锁外
-// 边界(生产可达窗口),同步跑生产 Close → 提交段 closed 检查命中 → attach 被
-// 拒。复现评审 I2 的 Close/Attach 竞态:修复前该窗口内 attach 会照常换入订阅、
-// 启动泵并 AcquireControl——连接关闭后复活订阅与 lease。断言四件事:attach
-// 报错;订阅未复活(表空、泵未启动,负向无投递是结构事实,不做宽限睡眠断言);
-// lease 未获取(HoldControl 恒 false);closed 置位后后续 attach 一律拒绝。
+// TestXGWSessionAttachCloseCommitBarrier deterministically closes the handler after subscription
+// preparation but before commit. The attach must fail without restoring a subscription or lease;
+// the test avoids sleeps by using the production pre-commit hook.
 func TestXGWSessionAttachCloseCommitBarrier(t *testing.T) {
 	stack, _ := newAttachStack(t)
 	sid := stack.initAndNew(t)
@@ -1890,15 +1838,10 @@ func TestXGWSessionAttachCloseCommitBarrier(t *testing.T) {
 	}
 }
 
-// TestXGWSessionAttachDetachConcurrentLifecycle(I2 修复验收):attach 与
-// detach 并发时,终态订阅/lease 状态符合 h.mu 内操作序——attach 提交段(换表
-// +取 lease)与 detach(摘表+还 lease)各自单事务,以 h.mu 全序,后者完整胜出:
-// 要么订阅存活且 lease 在手(attach 段在后),要么表空且 lease 空闲(detach 段
-// 在后);被换下/被摘除的订阅句柄一律已 stop(无未登记泵)。第一段用
-// preCommitHook 把生产 detach 确定性插在 attach#2 的 Subscribe 之后、提交临界
-// 区之前(真实锁外边界)——detach 的 mu 操作序严格在前 → attach#2 正常提交
-// 获胜(终态:新订阅存活且 lease 在手);第二段并发轰 attach(control)+
-// detach(control) 断言不变式。
+// TestXGWSessionAttachDetachConcurrentLifecycle verifies attach and detach linearize under
+// h.mu: the later operation determines both subscription and lease state, and removed pumps
+// stop. A pre-commit hook makes one interleaving deterministic; a concurrent stress phase checks
+// the same invariant under repeated operations.
 func TestXGWSessionAttachDetachConcurrentLifecycle(t *testing.T) {
 	stack, hub := newAttachStack(t)
 	sid := stack.initAndNew(t)
@@ -2030,13 +1973,9 @@ func TestXGWSessionAttachDetachConcurrentLifecycle(t *testing.T) {
 	}
 }
 
-// TestXGWSessionAttachCrossConnectionCurrentRun(I1 修复验收,wire 面):会话 A
-// 有在途 run 时,另一连接(其当前会话是 B)对 A 的 attach 响应 currentRun 非
-// null 且为 A 的在途快照——评审 I1 的场景「Session A: Run 在后台执行;Client
-// attach(A) → 响应不得 currentRun=null」。协议面忠实转发 source 的 ActiveRun
-// (按会话路由),source 侧 current-only 回归在 runcontrol_test.go 的
-// TestActiveRunNonCurrentSession;对照:B 对无在途 run 的 sidB attach →
-// currentRun=null。
+// TestXGWSessionAttachCrossConnectionCurrentRun verifies attach reports session A's active run
+// even when the attaching connection currently selects session B; a session without an active
+// run returns null.
 func TestXGWSessionAttachCrossConnectionCurrentRun(t *testing.T) {
 	frc := newFakeRunControl()
 	hub := mustNewEventHub(t, "sess-store-1", &memEventJournal{})
@@ -2082,13 +2021,9 @@ func TestXGWSessionAttachCrossConnectionCurrentRun(t *testing.T) {
 	}
 }
 
-// TestXGWControlFencingTakeoverStorm(第三轮评审 I4 修复验收,wire 面):接管后
-// 原 holder 的 run/start、run/cancel、approval/respond 全部 -32000(control
-// lease)且 source 计数不再增长(fencing:lease 校验内移 source,与提交原子,
-// fake 以同构 lease 校验镜像生产契约)。基线(start/cancel/respond 各成功一次,
-// 审批恰好送达一次)先行,B 显式接管后,A 的操作与 B 的并发接管/释放交错轰炸
-// ——被接管的旧持有者在任意交错下都无法再落地控制操作,接管前已提交的审批
-// 恰好一次(approvals 恒 1)。
+// TestXGWControlFencingTakeoverStorm verifies takeover fences the old holder's start, cancel,
+// and approval operations even under concurrent acquire/release calls. The accepted approval is
+// delivered exactly once, and rejected requests do not reach the source.
 func TestXGWControlFencingTakeoverStorm(t *testing.T) {
 	frc := newFakeRunControl()
 	frc.mu.Lock()

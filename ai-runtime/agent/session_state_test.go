@@ -6,10 +6,7 @@ import (
 	"testing"
 )
 
-// 本文件是 P1-4 状态绑定收口的 SDK 层验收（总方案第十一节「CWD/Usage 会话隔离」）：
-// CWD 声明（P1-4 起 runtime 级）与 usage 账本（Session 级，spec.go usage
-// *core.UsageTracker 随会话实例走、跨轮累计、/new 换实例清零）都随会话绑定，
-// manager 里并存的多个 runtime 互不污染。
+// 本文件验证多个 runtime 的 CWD 与 usage 状态相互隔离。
 
 // TestSessionStateIsolation：manager 注册 A/B 两个 runtime，各自声明不同 cwd、
 // 各跑一轮 → 双方 DeclaredCWD / Session.cwd 互不覆盖；A 再跑一轮 → usage 各自

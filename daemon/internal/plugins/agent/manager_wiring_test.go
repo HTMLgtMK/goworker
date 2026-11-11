@@ -19,11 +19,10 @@ import (
 )
 
 // P0-4 接线测试：plugin 的会话持有从「裸 Session 指针」升级为「manager 注册的
-// SessionRuntime」，current 为唯一解析点。锁死的语义（P5-5 起收口反转了旧的
-// 「旧 runtime 保留在册」）：/new（经 startSession）后 current 指向新 runtime，
-// 旧 runtime 在 handleNew 尾部（CheckpointSync 完成后）注销出 manager——归档
-// 固化窗口内它仍在册，窗口结束即收口（注册表不再随 /new 无界累积）；
-// current 切换后 withSession 的互斥落在新 runtime 上（解析与互斥同源）。
+// SessionRuntime」，current 为唯一解析点。P5-5 起收口语义为：/new 后 current
+// 指向新 runtime，旧 runtime 在 handleNew 尾部（CheckpointSync 完成后）注销出
+// manager，注册表不再随 /new 无界累积；current 切换后 withSession 的互斥落在
+// 新 runtime 上，解析与互斥同源。
 
 // TestCurrentSessionSwapsOnNew 模拟 /new：current 换到新 runtime，旧 runtime 在
 // 收口后不再可 Get。走真实 startSession 装配首会话（memory/持久化/MCP 全关，零
@@ -174,21 +173,11 @@ func (p *toolCallProvider) ChatStream(context.Context, *core.ChatRequest) (<-cha
 	return nil, errors.New("not implemented")
 }
 
-// TestStartRunCarriesGateReentryMarker(P5-1):NewPlugin 装配的 manager 携带
-// sessionGateKey 重入标记 → StartRun 后台 Run 的 execute 持有会话 gate → run 内
-// hub 工具 Execute(collectTools 的 p.hub.Eval 路径,tools.go:34-42)嵌套
-// Eval("/usage") → withSession 判 owner == p 直接放行 → 命令正常返回、run 正常
-// 完成。若无标记,嵌套 withSession 会对同一 runtime gate 二次 AcquireRun——永久
-// 死锁,直到 ai-core 的 toolCtx 60s 超时才把错误塞回工具结果;测试以 10s Wait
-// 上界先行失败,回归显式暴露。
-//
-// hub 装配说明(plan「真实 hub 装配(newAgentPlugin 形态)」的落地形态):完整
-// Engine 装配内嵌生产 provider 工厂(acpworker.ProviderFactory),与挂起式 stub
-// provider 编排冲突——按 plan 预留的调整空间,采用 newAgentPlugin 形态 + 真实
-// 命令注册面:经真实 Init(hub) 注册全部命令(hub.RegisterCommand 收录真实
-// handler),hub.Eval 按 Engine.Eval 同型规则(engine.go:264-285:解析 → 查表 →
-// 填 ctx.Args → Handler)分发。嵌套链与生产逐环一致:
-// 工具 Execute → hub.Eval("/usage") → handleUsage → withSession(标记放行)。
+// TestStartRunCarriesGateReentryMarker 验证 P5-1 的 gate 重入标记：manager 携带
+// sessionGateKey，后台 Run 持有会话 gate 时，工具经 hub.Eval("/usage") 嵌套进入
+// withSession，凭 owner 标记放行并正常完成。缺少标记会令同一 gate 二次
+// AcquireRun 永久死锁至 toolCtx 60s 超时，测试以 10s 上界先行暴露回归。hub 经
+// 真实 Init 注册命令，按 Engine.Eval 同型规则分发，嵌套链与生产一致。
 func TestStartRunCarriesGateReentryMarker(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	cfg.Session.Enabled = false // 纯内存,不碰真实会话目录
@@ -289,13 +278,10 @@ func TestStartRunCarriesGateReentryMarker(t *testing.T) {
 // P5-5:/new 收口 —— 旧 runtime 注销出 manager + 旧 store Close(遗留①)。
 // ---------------------------------------------------------------------------
 
-// TestNewRemovesOldRuntimeAndClosesStore(P5-5,持久化启用):真实 legacy 挂载 +
-// handleNew → ① manager.Get(旧 id) == nil(注册表不再随 /new 累积旧 runtime);
-// ② 旧 store 已 Close——判据用「写入必须失败」:handleNew 里 Archive 会重开旧
-// store 的句柄(store.go Archive),若收口漏了 Close,Commit 必然成功、断言即
-// 失败;已关闭实例 file/lock 均为 nil,Commit 走 appendRecord 对 nil file 的
-// Write → 错误返回。再补一条 Close 幂等断言(对已关闭实例再 Close 仍 nil)。
-// ③ 新会话照常:current 换轨、新 runtime 在册、新 store 独立可写。
+// TestNewRemovesOldRuntimeAndClosesStore 验证 P5-5 的 /new 收口：① 旧 runtime
+// 从 manager 注销；② 旧 store 已 Close，用「写入必须失败」作为判据——关闭后
+// file/lock 为 nil，Commit 走 appendRecord 必然报错；并断言 Close 幂等；
+// ③ 新会话正常换轨、在册且 store 独立可写。
 func TestNewRemovesOldRuntimeAndClosesStore(t *testing.T) {
 	root := t.TempDir()
 	legacyID := seedLegacySession(t, root, "旧会话的问题")

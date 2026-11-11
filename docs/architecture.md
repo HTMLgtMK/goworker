@@ -42,6 +42,16 @@ daemon/                         [module github.com/tinguo/goworker/daemon] agent
   internal/cli/                 # stdin REPL + statusbar（addon 订阅 ai-runtime 事件）；外部编辑器经 internal/core/service/acp 的 frontend/acp.sock 接入
 ```
 
+## 模块文档（当前实现）
+
+上面的模块图概览依赖方向；多会话运行时的现行行为以模块文档和源码/测试为准：
+
+- [`ai-runtime` 文档](../ai-runtime/docs/README.md)：Session Runtime、Run/事件流、会话持久化与迁移。
+- [`daemon` 文档](../daemon/docs/README.md)：会话绑定与收口、Control Lease、ACP 控制面。
+- [Android ACP 协议](../daemon/mobile/PROTOCOL.md)：标准 ACP 与 `x-goworker/*` wire contract、事件续传和兼容行为。
+
+`docs/multi-session-runtime-plan.md` 与 `docs/multi-session-p*-implementation.md` 是历史设计/实施记录，不是当前 API 或 wire 规范。两个工具安全策略功能的批准计划仍分别位于 [`001-command-decision-engine`](../specs/001-command-decision-engine/plan.md) 和 [`005-unified-tool-risk-policy`](../specs/005-unified-tool-risk-policy/plan.md)。
+
 依赖方向（禁止反向）：
 
 ```

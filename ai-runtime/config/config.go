@@ -231,14 +231,8 @@ func ParseThinkingEffort(value string) (ThinkingEffort, error) {
 	}
 }
 
-// ParseContextWindow 解析上下文窗口大小，支持纯数字或 k/m 后缀：
-//
-//	"32768" → 32768
-//	"32k"   → 32768
-//	"1.5m"  → 1572864
-//
-// k/m 按 1024 进制换算，贴合主流模型 2 的幂窗口（32768/65536/131072）。
-// 返回 token 数，非法输入返回错误。
+// ParseContextWindow 解析正数 token 数，支持无后缀及 k/m 后缀（1024 进制），如
+// 32768、32k、1.5m；非法输入返回错误。
 func ParseContextWindow(s string) (int, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {

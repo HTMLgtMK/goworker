@@ -1,19 +1,6 @@
-// digest.go 提供会话清单的一次性只读解析面（Plan A3）：ScanSessionDigests 扫描
-// root 下全部会话（per-id 目录 + legacy 根槽），对每个会话一次 loadRecords 提取
-// 清单所需的全部事实（身份/首条 user 文本/workspace 声明/archived 终态标记/数据
-// 文件 mtime），供 daemon 侧 session/list 重写消费。
-//
-// 为什么不是 repo.List + 逐会话 repo.Open：清单需要 title/updatedAt/cwd/state
-// 等超出 Metadata 的事实，而 Open 会把每个会话的 Store 实例塞进实例唯一缓存并
-// 持有跨进程 flock——清单是客户端高频操作，50 个会话全量常驻缓存（句柄 + 锁）
-// 不可接受；SessionArchived 的「探测性打开」取舍（A2b1）在单会话探测上成立，
-// 在全量清单上不成立。本文件与 OpenArchiveView 同级：只读打开、解析后即弃，
-// 不进实例唯一缓存、不取写句柄、不加目录锁——清单扫描与运行中的 store 追加
-// 并发安全（坏行跳过与 loadRecords 同策略；mtime 取 Stat 快照）。
-//
-// 与 repo.List 的分工：repo.List 保持 Metadata 面（身份清单，既有消费方）；
-// 本文件是清单专用富事实面。两者的目录扫描逻辑（双探测 + legacy 根槽）同源
-// （都走 resolveDataFilePath/resolveSlotMetadata），不存在第二套布局决议。
+// ScanSessionDigests 只读扫描 per-id 目录与 legacy 根槽，提取清单所需的会话事实。
+// 它不创建 Store、不持有写句柄或目录锁；单会话解析错误按坏行策略跳过。目录解析
+// 与 Repository 共用同一组路径和身份解析函数。
 package session
 
 import (
@@ -23,7 +10,7 @@ import (
 	"time"
 )
 
-// SessionDigest 是单个会话的清单事实快照（Plan A3）。全部字段为解析时刻的
+// SessionDigest 是单个会话的清单事实快照。全部字段为解析时刻的
 // 只读快照；Title 原料（FirstUserText）不做截断/单行化——展示策略归调用方
 // （daemon 的 truncateTitle），本层不引入展示语义。
 type SessionDigest struct {
@@ -31,29 +18,19 @@ type SessionDigest struct {
 	// FirstUserText 是首条 user 消息的原文（清单 title 的原料；无 user 消息
 	// 或全是坏行的空会话为空串）。
 	FirstUserText string
-	// Workspace 是最后一条 workspace 声明（last-wins，Plan A1；从未声明为空）。
+	// Workspace 是最后一条 workspace 声明（last-wins；从未声明为空）。
 	Workspace string
-	// Archived 报告是否已落 archived 终态标记（Plan A1 原位终态，只读保留）。
+	// Archived 报告是否已落 archived 终态标记（原位终态，只读保留）。
 	Archived bool
 	// ModTime 是数据文件的修改时间（清单 updatedAt 的原料；Stat 失败为零值）。
 	ModTime time.Time
 }
 
-// ScanSessionDigests 扫描 root 下全部会话的清单事实（Plan A3 的 session/list
-// 数据源）。扫描序与 repo.List 同源：
-//   - per-id 目录：<root>/<dir>/ 的数据文件按 v2/v1 双探测存在且可给出稳定
-//     身份（metadata 优先，缺失按首节点/内容摘要合成 legacy id）→ 收录；
-//   - legacy 根槽：<root>/current.jsonl 存在且可解析身份 → 收录（A4 一次性
-//     迁移前维持兼容挂载语义）。
-//
-// 归档目录（<root>/archive/ 与 <root>/<id>/archive/）不扫描：Plan A1 起 archived
-// 是原位终态标记（MarkArchived 不搬文件），显式归档与 A4 迁移的会话都停在
-// 数据文件位置；存量轮转归档（Store.Archive() 的历史产物）已由 A4 一次性迁移
-// （migrate.go，daemon 启动链调用）以 archived 态迁回 per-id 目录后回归清单，
-// 本扫描层对未迁移的旧快照维持「归档目录不扫描」的口径。
-//
-// 读错误（root 不可读）上抛；单个会话的解析失败（坏行/Stat 失败）按坏行策略
-// 跳过该会话（与 loadRecords 的容错一致，清单可用性优先于单条完整性）。
+// ScanSessionDigests 以与 repo.List 相同的路径决议扫描清单事实：探测 per-id
+// 目录的 v2/v1 文件并优先取 metadata 身份，缺失时按首节点或内容摘要合成 legacy id；
+// 迁移前仍收录可解析的 legacy 根槽 current.jsonl。归档目录不扫描：当前归档为原位
+// archived 标记，历史轮转归档由启动迁移恢复到 per-id 目录。root 读取错误上抛，
+// 单会话坏行或 Stat 失败则跳过，保持 loadRecords 的容错边界。
 func ScanSessionDigests(root string) ([]SessionDigest, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -70,7 +47,7 @@ func ScanSessionDigests(root string) ([]SessionDigest, error) {
 			out = append(out, d)
 		}
 	}
-	// legacy 根槽（决策 2）：root 自身的 current.jsonl 也是一个活跃会话。
+	// legacy 根槽：root 自身的 current.jsonl 也是一个活跃会话。
 	if d, ok := digestFromPath(filepath.Join(root, legacyDataFileName)); ok {
 		out = append(out, d)
 	}

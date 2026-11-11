@@ -12,12 +12,8 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 )
 
-// binding_test.go 是 PR2(统一 Session 路由,总方案 §六/§十)的插件侧测试:
-// AgentPlugin 的 binding 形态解析点(sessionRuntimeIn/boundSessionIn/currentStoreIn)
-// 的路由语义——Binding 优先(命中非 current 的已注册 runtime,CR4)、空 Binding
-// 回落 current(无绑定调用方默认)、悬空 Binding(被生命周期收口的旧会话)诚实
-// 失败;以及 /new 收口「只摘发起方的 binding」+ Plan A2 的引用计数存活语义
-// (其他连接仍绑旧会话 → 不收口)。
+// binding_test.go 验证连接级 binding 的路由优先级、空/悬空 binding 行为，以及
+// /new 和断连时只释放发起方引用、保留仍被其他连接绑定的会话。
 
 // TestBindingRoutesPromptToBoundSession:current 已是 B 时,Binding→A 的连接
 // prompt(handleAgent)路由到 A 的 runtime/store,B 的会话不受影响。
@@ -111,13 +107,9 @@ func TestBindingDanglingSessionFailsHonest(t *testing.T) {
 	}
 }
 
-// TestHandleNewKeepsSessionWhileOtherConnectionBound(Plan A2 生命周期半边):
-// 两条连接的 Binding 同指 A 且都经 BindingRegistry 登记(生产由 handler 的
-// CreateSession 经 model.ConnectionBinder 完成,这里按登记点同款直调),连接 1
-// 发起 /new → 只摘发起方(b1 清空 + 登记解除),但连接 2 仍绑 A → 引用未归零,
-// A 不收口、可继续 prompt——多 session 并行的存活语义。随后连接 2 断连
-// (ReleaseConnection)→ A 引用归零 → 收口,残留指向 A 的 Binding 解析诚实失败
-// (PR2 悬空语义),store 数据保留、经 repo.Open 重开拿活实例(A2.1①)。
+// TestHandleNewKeepsSessionWhileOtherConnectionBound verifies that /new only releases
+// the initiating connection's binding. Another connection keeps the old session alive;
+// releasing its final binding closes the runtime but preserves data for repository reopen.
 func TestHandleNewKeepsSessionWhileOtherConnectionBound(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "x"})
 	sidA := p.CurrentSessionID()

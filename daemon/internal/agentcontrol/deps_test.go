@@ -10,25 +10,9 @@ import (
 	"testing"
 )
 
-// TestTransitiveDependencyClosure(A1,第四轮评审):constraint_test.go 的
-// TestPackageImportConstraint 是源码级直接依赖检查(go/parser 扫 import 声明),
-// 只能证明「agentcontrol 没有直接 import 越界包」;本测试是 CI 级传递闭包检查
-// ——go list -deps -json ./internal/agentcontrol 解析完整编译依赖闭包,断言
-// 闭包内不含 daemon/internal/plugins、daemon/internal/core/service、
-// daemon/internal/core/model 的任何包。两者互补:源码级=直接依赖,go list 级
-// =传递闭包——ai-runtime 等下层包未来若引入对 daemon/internal 的依赖(或生成
-// 文件、build tag 门控的 import 绕过源码扫描),直接依赖检查不可见,本测试拦截。
-//
-// build tags 两形态各跑一次(A1 明确要求):无 tag(默认形态)与
-// -tags goworker_no_dispatcher(mobile 裁剪形态,dispatcher/register.go、
-// builtin/dispatcher.go 的 //go:build 门控面,见 mobile/doc.go)——不同形态下
-// 实际编译图可能不同,约束对两形态都必须成立。CI 的既有 go list 门禁
-// (.github/workflows/ci.yml)只对 ./cmd/goworker 闭包在 dispatcher/minimal
-// 变体下 grep plugins/agent,本测试把同一性质钉到 agentcontrol 自身闭包、
-// 常规 go test 即可执行,不依赖 CI 脚本存活。
-//
-// 命令形态与验收/CI 逐字一致:cmd.Dir 定到 daemon 模块根(go.mod 所在),模式
-// 串即 ./internal/agentcontrol。
+// TestTransitiveDependencyClosure complements the direct-import parser check with go list's
+// full dependency closure. It rejects daemon-internal dependencies in both default and
+// goworker_no_dispatcher builds, covering transitive and build-tagged imports.
 func TestTransitiveDependencyClosure(t *testing.T) {
 	// forbidden 是闭包黑名单前缀(总方案 §三依赖方向的 go list 面复核):
 	// agentcontrol 的 goworker 自有依赖只允许 ai-* 前缀,daemon/internal 兄弟包

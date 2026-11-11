@@ -12,11 +12,8 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// archive_test.go 是 Plan A3 归档执行面（x-goworker/session/archive 的插件侧
-// 实现，boundsession.go ArchiveSession）的验收：fencing（control lease，run/cancel
-// 同款）、run 在飞 busy（定案需求 #8）、挂起收口 busy（reaper 竞态窗口封闭）、
-// 终态落盘与清单立即反映、幂等、不在册会话的 repo 路径归档，以及 A7 设计点 4
-// 的 prompt 只读执法（store.Archived() 为唯一事实源）。
+// archive_test.go 验证会话归档的 fencing、运行中拒绝、持久终态、清单更新和
+// prompt/run/维护写入只读策略。
 
 // TestAgentPlugin_ArchiveSessionFencingAndTerminalState 验证 fencing 与终态：
 //   - 未知会话诚实未知（ErrSessionUnknown 契约，handler 映射 -32000）；
@@ -57,9 +54,8 @@ func TestAgentPlugin_ArchiveSessionFencingAndTerminalState(t *testing.T) {
 	}
 }
 
-// TestAgentPlugin_ArchiveSessionBusyWhileRunInFlight 验证 run 在飞拒绝（定案
-// 需求 #8「在飞即活跃」）：终态标记与在飞 run 并存会让只读执法与事件面失真
-// ——瞬态 busy，等 run 终态后重试即成功。
+// TestAgentPlugin_ArchiveSessionBusyWhileRunInFlight 验证运行中的会话不能归档；
+// run 结束后重试应成功。
 func TestAgentPlugin_ArchiveSessionBusyWhileRunInFlight(t *testing.T) {
 	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
 	p := newPersistedPlugin(t, gated)
@@ -207,11 +203,8 @@ func TestAgentPlugin_ArchiveSessionUnregistered(t *testing.T) {
 	}
 }
 
-// TestHandleAgentArchivedSessionReadOnly 验证 A7 设计点 4 的 prompt 只读执法：
-// archived 终态会话拒绝 prompt，执法数据源是 store.Archived()（持久事实，
-// 重启后依然拒）而非 handler 的连接级 readOnly 集合（只覆盖「load 过归档的
-// 连接」——归档一个仍有绑定的会话后，未 load 过它的连接 prompt 也必须被挡）。
-// 错误文案与 handler 归档拒写同形（read-only），客户端按同一契约分流。
+// TestHandleAgentArchivedSessionReadOnly 验证归档会话拒绝 prompt，且拒绝依据是
+// 持久化的 store 标记，而非连接本地状态。
 func TestHandleAgentArchivedSessionReadOnly(t *testing.T) {
 	p, st, _ := sessionFixture(t, 0)
 	if err := st.MarkArchived(); err != nil {
@@ -229,13 +222,11 @@ func TestHandleAgentArchivedSessionReadOnly(t *testing.T) {
 	}
 }
 
-// TestStartRunArchivedSessionRejected 验证后台提交面的 A7④ 同源执法（返工，
-// 定案 #1「archived = 只读保留终态」的 run 半边）：xgw run/start 经
-// runcontrol.go StartRun 的委托前检查拒——堵「prompt 拒了、后台 run 仍可往
-// archived store 追加 run 记录」的旁路；错误文案与 handleAgent 同形，客户端按
-// 同一契约分流。对照面：cancel（终态管理面）在归档会话上照常触达 manager——
-// 未知 run 诚实 ErrRunNotFound 而非被 archived 拦截，归档语义是只读保留，
-// 不是下线不可触达（run/get/attach/detach 同理不查）。
+// TestStartRunArchivedSessionRejected 验证后台提交面与 prompt 面同源执行归档只读：
+// xgw run/start 在 StartRun 的委托前检查处被拒，堵住「prompt 已拒、后台 run 仍可
+// 向 archived store 追加记录」的旁路。错误文案与 handleAgent 同形，客户端按同一
+// 契约分流。对照面：cancel 等终态管理操作在归档会话上仍可触达 manager，未知 run
+// 返回 ErrRunNotFound，体现归档是只读保留而非下线。
 func TestStartRunArchivedSessionRejected(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "ok"})
 	sid := p.CurrentSessionID()

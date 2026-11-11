@@ -10,10 +10,7 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 )
 
-// migrate_test.go 是 Plan A4 一次性布局迁移（MigrateLegacyLayout）的验收：四类
-// 存量夹具（legacy 根槽 / root 归档 / per-id v1 与目录名错位 / 空壳）迁移后的
-// 布局不变量、archived 态回归、失败条目丢弃、幂等重跑零变化。夹具形态对齐
-// digest_test.go 的手工种子模式（种子句柄造数 + 关闭释放锁，不依赖迁移自身）。
+// 测试旧布局迁移、迁移后的数据不变量及幂等性。
 
 // seedSessionDir 在 root 下手工种一个 per-id 会话目录：目录名 dirName，数据文件
 // 落 fileName（v1 current.jsonl 或 v2 <dirName>.jsonl），metadata 身份为 metaID

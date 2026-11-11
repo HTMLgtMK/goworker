@@ -34,10 +34,8 @@ type Metadata struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// ErrStoreLocked 表示会话目录的跨进程文件锁已被占用：另一进程（或本进程的
-// 另一实例）正持有该目录的 Store。总方案第九节「多进程同时打开同一 Session
-// 时拒绝第二个写者」——宁拒勿双写。调用方用 errors.Is 判定；非 unix 平台为
-// 无锁桩（lock_other.go），不会返回该错误。
+// ErrStoreLocked 表示会话目录的跨进程文件锁已被占用，调用方可用 errors.Is 判定。
+// 非 Unix 平台使用无锁实现，不返回此错误。
 var ErrStoreLocked = errors.New("session: store is locked by another holder")
 
 // Store 管理会话的 jsonl 持久化存储。
@@ -56,15 +54,11 @@ type Store struct {
 	cursor   string // 固化游标指向的消息 id
 }
 
-// Open 打开或创建 dir 下的会话存储。目录不存在则创建，jsonl 文件不存在则新建。
-// 数据文件名按 v2 决议（Plan A1，见 resolveDataFilePath）：会话形态目录
-// （basename 匹配 session_<hex>/legacy_<hex>）优先 <dir>/<basename>.jsonl，
-// 存量 current.jsonl 兼容读；非会话形态目录（测试目录、legacy 根槽等）恒用
-// current.jsonl，行为与 v1 完全一致。
-// 目录就绪后对 dir 加跨进程排它文件锁（flock，LOCK_EX|LOCK_NB，见 lock_unix.go）：
-// 已被占用（另一进程或本进程的另一实例正持有）→ ErrStoreLocked，第二写者被拒绝
-// （宁拒勿双写）。锁随 Store 生命周期持有，Close 释放；锁文件常驻不删除
-// （unlink 竞态，见 lock_unix.go 文件头）。
+// Open opens or creates dir with 0700 permissions, then acquires its nonblocking
+// directory flock before reading data; contention fails with ErrStoreLocked. Session-shaped
+// directories prefer the v2 <basename>.jsonl file and fall back to legacy current.jsonl;
+// non-session directories keep the v1 filename. The lock is held until Close and its file
+// must remain linked to avoid the inode-unlink race.
 func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("session: create dir %s: %w", dir, err)
@@ -512,15 +506,11 @@ func (s *Store) AdvanceCursor(id string) error {
 	return nil
 }
 
-// ── workspace / archived 声明（Plan A1）─────────────────────────────────
+// ── workspace / archived 声明 ──────────────────────────────────────────
 
-// DeclareWorkspace 追加一条 workspace 记录，声明会话的工作目录。
-//
-// Plan A1：cwd 兼任 workspace（定案需求 #4），session/new 自带的 CWD 在创建时
-// 声明（repository.Create「创建即声明」），此后换绑工作目录同样再追加一条、
-// last-wins 生效。纯追加：旧记录不删除不改写（文件头原则），Workspace() 取
-// 最后一条。空串拒绝——「未声明」的表达方式是不写记录（repository.Create 对
-// 空 CWD 直接跳过），而非落一条空声明把最后一条有效声明冲掉。
+// DeclareWorkspace appends a non-empty workspace declaration; the latest record wins,
+// while prior rows remain unchanged. Empty paths are rejected: absence of a declaration
+// is represented by no record, not by an empty row that would shadow the last valid path.
 func (s *Store) DeclareWorkspace(path string) error {
 	if path == "" {
 		return fmt.Errorf("session: declare workspace: empty path")
@@ -538,21 +528,17 @@ func (s *Store) DeclareWorkspace(path string) error {
 
 // Workspace 返回最后一条 workspace 记录声明的路径（last-wins）；从未声明返回
 // 空串。锁内 O(n) 扫描——调用方是会话清单等低频路径，不值得为它维护一份
-// 常驻缓存字段（Plan A1 的取舍：追加面零成本、读面 O(n)）。
+// 常驻缓存字段（取舍：追加面零成本、读面 O(n)）。
 func (s *Store) Workspace() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return workspaceFromRecords(s.recs)
 }
 
-// MarkArchived 追加 archived 终态标记。
-//
-// 幂等语义：已存在 archived 记录时 no-op 返回 nil。取舍论证——archived 是
-// 终态（定案需求 #1「只读保留、不可逆」），重复标记不是新事实而是调用方缺陷：
-// no-op 让归档时间定格在首次声明（终态时间戳不应随重复调用漂移），也让 A4 的
-// 一次性迁移天然幂等（中断重跑不会追加重复行）。选 no-op 而非无条件追加的
-// 代价是「读后判断」，但该判断在 s.mu 内完成、同目录的跨进程写者又被 flock
-// 排他（ErrStoreLocked 宁拒勿双写），check-then-append 的 TOCTOU 已封闭。
+// MarkArchived appends the irreversible, read-only terminal marker once. Repeated calls
+// are no-ops, preserving the first timestamp and making migration retries idempotent.
+// The check and append run under s.mu; the directory flock excludes other processes,
+// closing the check-then-append race.
 func (s *Store) MarkArchived() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -568,8 +554,8 @@ func (s *Store) MarkArchived() error {
 	return nil
 }
 
-// Archived 报告会话是否已有 archived 记录。Plan A3 的只读执法数据源：
-// prompt 命中终态标记走既有只读拒写路径（重启后依然拒，A7 设计点 4）。
+// Archived 报告会话是否已有 archived 记录，是只读执法的数据源：
+// prompt 命中终态标记走既有只读拒写路径（重启后依然拒写）。
 func (s *Store) Archived() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -647,7 +633,7 @@ func metadataFromRecords(recs []Record) (Metadata, bool) {
 }
 
 // workspaceFromRecords 返回最后一条 workspace 记录声明的路径（last-wins，
-// Plan A1；无声明返回空串）。Store.Workspace 与 ArchiveView.Workspace 共用，
+// 无声明返回空串）。Store.Workspace 与 ArchiveView.Workspace 共用，
 // 语义天然一致。
 func workspaceFromRecords(recs []Record) string {
 	for i := len(recs) - 1; i >= 0; i-- {
@@ -800,19 +786,14 @@ func (s *Store) remapCursor(retainIDs []string, cloneMap map[string]string, last
 
 // ── 文件操作 ──────────────────────────────────────────────────────────
 
-// legacyDataFileName 是 v1 数据文件名。Plan A1 起会话形态目录改用 v2 名
-// <basename>.jsonl，本名保留两处身份：存量数据的兼容读路径（A4 一次性迁移前
+// legacyDataFileName 是 v1 数据文件名。会话形态目录改用 v2 名
+// <basename>.jsonl，本名保留两处身份：存量数据的兼容读路径（一次性布局迁移前
 // 不重命名）与非会话形态目录（测试目录、legacy 根槽）的恒定文件名。
 const legacyDataFileName = "current.jsonl"
 
-// sessionShapedBasename 严格判定目录名是否为真实会话 id 形态：session_<hex> 或
-// legacy_<hex>（id.go 仅有的两种真实前缀），后缀为非空小写 hex（两种 id 的
-// 后缀都由 hex.EncodeToString 产出，恒小写）。
-//
-// 为什么要严格模式（Plan A1）：v2 文件名只对真实会话 id 生效。放宽判定（任意
-// basename 拼同名 jsonl）会让测试目录、legacy 根槽（<root> 本身，basename 是
-// 配置目录名）等被卷进 v2 决议，破坏既有测试与 legacy 挂载语义；严格形态也让
-// v2 名不可能与用户自建目录意外撞名。
+// sessionShapedBasename accepts only generated session_<lower-hex> and legacy_<lower-hex>
+// IDs. Strict matching limits v2 filenames to real sessions; test/config directories and
+// the legacy root slot continue using current.jsonl and cannot collide with v2 resolution.
 func sessionShapedBasename(name string) bool {
 	for _, prefix := range []string{"session_", "legacy_"} {
 		if strings.HasPrefix(name, prefix) && isLowerHex(name[len(prefix):]) {
@@ -838,7 +819,7 @@ func isLowerHex(s string) bool {
 }
 
 // newDataFileName 返回「新建」场景的数据文件名（无存量探测）：会话形态目录用
-// v2 名 <basename>.jsonl（Plan A1），否则维持 current.jsonl。
+// v2 名 <basename>.jsonl，否则维持 current.jsonl。
 // resolveDataFilePath 在两个候选都不存在时回落到同一结果（新建路径一致）。
 func newDataFileName(dir string) string {
 	if sessionShapedBasename(filepath.Base(dir)) {
@@ -847,16 +828,10 @@ func newDataFileName(dir string) string {
 	return legacyDataFileName
 }
 
-// resolveDataFilePath 决议 dir 下的会话数据文件路径（Plan A1 v2 文件名）。
-// 会话形态目录的探测顺序：
-//
-//  1. <dir>/<basename>.jsonl 存在 → 用它（v2 名，Create/迁移后的正式形态）；
-//  2. 否则 <dir>/current.jsonl 存在 → 用它（兼容读存量；A4 一次性迁移负责
-//     改名，读路径不 rename——保持纯追加原则，不在读路径改写文件布局）；
-//  3. 两者都不存在（新建）→ v2 名。
-//
-// 非会话形态目录（sessionShapedBasename 不匹配）恒返回 current.jsonl。
-// Store.Open、Repository.Open/List 的探测都经本函数，保证读写两侧决议不漂移。
+// resolveDataFilePath prefers <basename>.jsonl for session-shaped directories, falls back
+// to current.jsonl for legacy data, and chooses the v2 name when neither exists. Legacy
+// files are read without renaming; non-session directories always use current.jsonl.
+// Store and Repository share this resolver to keep read/write path selection consistent.
 func resolveDataFilePath(dir string) string {
 	current := filepath.Join(dir, legacyDataFileName)
 	if !sessionShapedBasename(filepath.Base(dir)) {
@@ -872,14 +847,10 @@ func resolveDataFilePath(dir string) string {
 	return v2
 }
 
-// loadRecords 从 jsonl 文件加载全部记录，坏行跳过并 warn。
-// 除记录外返回 lastGoodEnd：最后一条合法记录行末的字节偏移（含行尾 '\n'，即
-// 下一条记录应写入的位置；无任何合法记录时为 0）。若文件末尾一行（或半行）
-// 无法解析——进程在 appendRecord 写入中途崩溃留下的部分行——lastGoodEnd 停在
-// 该坏行之前，Open 据此把文件截断回最后一条合法记录；坏行若在文件中部（其后
-// 还有合法记录），lastGoodEnd 会越过它并与文件大小相等，Open 不做任何截断，
-// 中部坏行维持跳过语义（纯追加原则，文件头注释）。文件在最后一条合法记录之后
-// 只剩空白字节时同样会触发截断（本存储从不写空行，此为无害的手工修复）。
+// loadRecords skips malformed JSONL rows with a warning and returns the byte offset of
+// the last valid row. Open truncates only an invalid trailing row (or trailing whitespace)
+// and syncs the repair; an interior bad row followed by valid data is preserved and skipped,
+// maintaining append-only history.
 func loadRecords(path string) (recs []Record, lastGoodEnd int64, err error) {
 	lastGoodEnd, err = scanJSONL(path, func(line []byte, lineEnd int64) bool {
 		var r Record
@@ -896,13 +867,10 @@ func loadRecords(path string) (recs []Record, lastGoodEnd int64, err error) {
 	return recs, lastGoodEnd, nil
 }
 
-// scanJSONL 是 loadRecords 与 run journal 解析（journal.go loadStateRecords）
-// 共用的行扫描骨架：单行最大 1MB，超出视为坏行（由 handle 返回 false 跳过）；
-// 空行跳过。对每个非空行调用 handle(line, lineEnd)，handle 返回 true 表示该行
-// 为合法记录。返回 lastGoodEnd：最后一条合法记录行末的字节偏移（含行尾 '\n'，
-// 即下一条记录应写入的位置；无任何合法记录时为 0）。文件末行无 '\n' 时该行的
-// lineEnd 报到 size+1，循环后统一钳回文件大小（该行合法即无截断需求，钳回后
-// 恰为行末）。扫描 I/O 错误返回 err，此时 lastGoodEnd 为 0。
+// scanJSONL is the shared JSONL scanner for session and run journals. It skips empty
+// lines; oversized or invalid rows are rejected by handle. It returns the last accepted
+// row's ending offset, clamps a valid unterminated final line to file size, and returns
+// scan errors explicitly with a zero offset.
 func scanJSONL(path string, handle func(line []byte, lineEnd int64) bool) (int64, error) {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
@@ -951,13 +919,9 @@ func truncate(s string, max int) string {
 
 // ── detectCompact 纯函数 ──────────────────────────────────────────────
 
-// DetectCompact 检测新旧对话之间是否发生了压缩。
-// oldView: 压缩前活跃视图（带 MsgID）
-// newConv: 压缩后对话（带 MsgID）
-// 返回 covered_from, covered_to, summary 和是否检测到压缩。
-//
-// 条件：len(newConv) < len(oldView) 且 newConv[0].Role=="system"
-// 找 oldView 中第一个仍出现在 newConv 的 id 位置 i，covered = oldView[:i]（必须连续前缀）。
+// DetectCompact detects compression when the new conversation is shorter and starts with
+// a system summary. It returns the contiguous old-view prefix ending before the first
+// surviving message; if no messages overlap, it covers the entire old view when IDs exist.
 func DetectCompact(oldView, newConv []core.Message) (from, to, summary string, ok bool) {
 	if len(newConv) >= len(oldView) || len(newConv) == 0 {
 		return "", "", "", false

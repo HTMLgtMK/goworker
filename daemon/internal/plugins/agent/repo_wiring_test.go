@@ -11,17 +11,8 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 )
 
-// P1-3 接线测试：plugin 的持久化从全局单 Store 换轨 Repository（每会话独立目录
-// + legacy 根槽兼容挂载）。本文件锁死 P1-3 验收要求的两条语义：
-//   - /new 换轨后，新会话经 Repository.Create 产出独立目录（<root>/<新id>/
-//     <新id>.jsonl，Plan A1 v2 文件名），与旧会话数据互不串扰（Plan A2 起 /new
-//     不再归档旧会话——定案 #2 纯新建，旧会话数据原位保留，引用归零后由生命
-//     周期收口关闭）；
-//   - ReloadCurrentSession / CurrentSessionHistory 的取数随 current 换轨，
-//     /new 前后各自返回所属会话的数据。
-//
-// 走真实装配路径：NewPlugin + startSession（首周期 legacy 槽挂载）+ handleNew
-// （Create 换轨 + 引用归零收口），除持久化外全部资源关闭（memory/MCP），零外部依赖。
+// repo_wiring_test.go 验证 repository 持久化接线：/new 创建独立会话，旧会话数据
+// 保留并可重开，current 换轨后历史互不串扰。覆盖真实插件装配路径，不依赖外部资源。
 
 // seedLegacySession 在 root 播种带一条 user 消息的 legacy 根槽：一次性 Open（生成
 // metadata）→ Commit → Close 释放文件锁，供 startSession 的 repo.Open 原地挂载。
@@ -43,11 +34,10 @@ func seedLegacySession(t *testing.T, root, userText string) string {
 }
 
 // TestNewCreatesIndependentStore：临时 Session.Dir 造 legacy 槽 → startSession
-// （Plan A4 首周期：一次性迁移把槽迁入 per-id，current 是 Create 的新会话）→
-// /new（经 handler）→ ① 新会话目录 <root>/<新id>/<新id>.jsonl 存在且 id ≠ 旧 id
-// （Plan A1 v2 文件名）；② 旧会话不轮转、迁移后的数据原样保留在 per-id 目录，
-// 且因引用归零被生命周期收口（Plan A2：runtime 注销 + repo 缓存逐出，重开走
-// flock 慢路径拿活实例）；③ 新 store ActiveView 为空（旧历史不串入）。
+// 首周期迁移到 per-id，current 是 Create 的新会话 → /new 后断言：① 新会话目录
+// <root>/<新id>/<新id>.jsonl 存在且 id ≠ 旧 id；② 旧数据原位保留不轮转，因
+// 引用归零被生命周期收口（runtime 注销、repo 缓存逐出，重开走 flock 慢路径）；
+// ③ 新 store 的 ActiveView 为空，旧历史不串入。
 func TestNewCreatesIndependentStore(t *testing.T) {
 	root := t.TempDir()
 	oldID := seedLegacySession(t, root, "旧会话的问题")

@@ -16,15 +16,8 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 )
 
-// P5-6:RunControlSource 的 AgentPlugin 实现测试(后台 Run 的 daemon 面)。
-// 全部用模拟 Provider(零真实 LLM);固定 provider 形态沿用 newAgentPluginP +
-// fixedProvider 先例(plugin_test.go:197-222)。
-//
-// PR1(总方案 §四/§五)适配:StartRun/CancelRun/RunStatus/ResolveApproval 与
-// lease 四操作已迁 agentcontrol.Service,本文件经插件委托面全链路验证——fencing
-// 确定性、幂等 single-flight、跨会话独立、接管风暴的语义逐条保留(错误 sentinel
-// 现定义在 agentcontrol);幂等表记账断言改经 Service.TrackedRequest(原 reqMu/
-// runRequests 内部字段随迁删除)。
+// runcontrol_test.go 验证 AgentPlugin 对 RunControlSource 的委托，包括 lease fencing、
+// request id 幂等、会话隔离、审批授权和并发接管。使用模拟 provider，不调用真实 LLM。
 
 // waitForRunStatus 轮询 RunStatus 直至 want 状态或超时(P5-6 的 RunStatus 是
 // 唯一跨包可用的状态观测面;StartRun 返回的 RunHandle 归 supervisor,daemon
@@ -283,12 +276,11 @@ func TestControlLeasePerSession(t *testing.T) {
 	}
 }
 
-// TestAttachEnsureHubAndJournalStatus(P5-6 追加覆盖,持久化变体):① attach
-// 先于任何 StartRun → SubscribeEvents 经 EnsureHub 即建 hub(遗留③「重启后
-// attach 时 hub 未建」的解法,SeqRange 磁盘播种 latest=0);② StartRun 完成后
-// active 已清,RunStatus 走 journal 权威路径返回 completed 且 latestSeq > 0
-// (事件已落盘);③ hub 复用同一实例(bindEvents 创建恰好一次);④
-// RunStatus/SubscribeEvents 对非 current 会话诚实报错。
+// TestAttachEnsureHubAndJournalStatus 验证持久化变体下的 P5-6 行为：① attach
+// 先于 StartRun 时，SubscribeEvents 经 EnsureHub 即建 hub，SeqRange 从磁盘
+// 播种；② StartRun 完成后 active 已清，RunStatus 走 journal 权威路径返回
+// completed 且 latestSeq > 0；③ hub 复用同一实例，bindEvents 只创建一次；
+// ④ RunStatus/SubscribeEvents 对非 current 会话诚实报错。
 func TestAttachEnsureHubAndJournalStatus(t *testing.T) {
 	root := t.TempDir()
 	cfg := runtimeconfig.Default()
@@ -512,12 +504,11 @@ func (p *gatedProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan c
 	return nil, errors.New("not implemented")
 }
 
-// newPersistedSession 模拟 /new 的会话边界:repo 复用 → repo.Create 新 store →
-// RunJournalStore 同源注入 deps → refreshSession(新 id 注册置 current,旧
-// runtime 保留在册),返回新会话的稳定 SessionID。手工重建 deps 而不调
-// startSession 的原因:startSession 全量组装会把 NewProvider 换回真实 provider
-// 工厂,覆盖测试注入的固定 provider;这里按 startSession 的组装序只重建测试
-// 需要的段,会话边界语义(新 id 注册、current 切换)与生产一致。
+// newPersistedSession 模拟 /new 的会话边界：复用 repo → repo.Create 新 store →
+// 同源注入 RunJournalStore → refreshSession 注册新 id 并切换 current，返回稳定
+// SessionID。不直接调 startSession，因为其全量组装会把 NewProvider 换回真实
+// provider 工厂，覆盖测试注入的固定 provider；这里按 startSession 的组装序重建
+// 必需段，会话边界语义与生产一致。
 func newPersistedSession(t *testing.T, p *AgentPlugin, pv core.Provider) string {
 	t.Helper()
 	if p.repo == nil {
@@ -693,13 +684,11 @@ func TestCrossSessionRequestIdempotency(t *testing.T) {
 	}
 }
 
-// TestCrossSessionApprovalOwnership(C1 修复验收,真实 RunControlSource 实现):
-// 服务端记录的审批归属是授权事实源——会话 B 挂起的审批,由声明 sidA 的调用方
-// 应答 → agentcontrol.ErrApprovalOwnership 越权拒绝(即便 sidA 是真实注册会话)且审批不被
-// 消费;归属会话本人应答 → 成功且决策送达 Wait;resolved 后归属仍可查(滞留
-// 条目),迟到决策报 ErrApprovalResolved 而非归属错误/未知;未知 requestID →
-// ErrApprovalUnknown;未知会话 → 路由层 ErrSessionNotFound。修复前 Resolve
-// 按 requestID 全局寻址直接投递,无任何归属校验。
+// TestCrossSessionApprovalOwnership 验证 C1 修复后的审批归属：服务端归属是授权
+// 事实源——其他会话的调用方应答 B 的挂起审批会得到 ErrApprovalOwnership 且审批
+// 不被消费；归属会话本人应答成功并送达 Wait；resolved 后归属仍可查，迟到决策
+// 报 ErrApprovalResolved；未知 requestID 报 ErrApprovalUnknown，未知会话由路由
+// 层报 ErrSessionNotFound。
 func TestCrossSessionApprovalOwnership(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "approval-A"})
 	sidA := p.CurrentSessionID()
@@ -776,16 +765,11 @@ func TestCrossSessionApprovalOwnership(t *testing.T) {
 	}
 }
 
-// TestActiveRunNonCurrentSession(第二轮评审 I1 修复验收):Session A 的后台
-// run 在途时创建 Session B(current 切到 B,A 的 runtime 保留在册)——
-// ActiveRun(A) 必须返回 A 自己的在途快照 (runA, running, true)(修复前
-// requireCurrentSession 对非 current 会话恒 ok=false,attach 响应的
-// currentRun=null 与「A 确有在途 run」的事实不符);对照:B 无在途 run →
-// false;未知会话 → false;A 的 run 终态后 active 清空 → ActiveRun(A) 归位
-// false。ActiveRun 的快照与 attach 响应 currentRun 的事实源同观察点
-// (rt.Active();PR3 起后者经 SubscribeEvents 的 CurrentRun 快照上 wire,
-// wire 面转发契约由 service/acp 的 TestXGWSessionAttachCrossConnectionCurrentRun
-// 钉住)。
+// TestActiveRunNonCurrentSession 验证第二轮评审 I1 的修复：会话 A 的后台 run
+// 在途时切到会话 B，ActiveRun(A) 仍返回 A 自己的在途快照；修复前
+// requireCurrentSession 对非 current 会话恒返回 false，attach 的 currentRun=null
+// 与事实不符。对照：B 无在途 run、未知会话返回 false，A 终态后归位 false；该
+// 快照与 attach 的 currentRun 同源于 rt.Active()。
 func TestActiveRunNonCurrentSession(t *testing.T) {
 	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
 	p := newPersistedPlugin(t, gated)
@@ -844,13 +828,11 @@ func TestActiveRunNonCurrentSession(t *testing.T) {
 // DE2-I1 后锁粒度=会话,跨会话互不阻塞)。
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestControlFencingTakeoverStorm(第三轮评审 I4 修复验收):A 持 lease,
-// 「A 的 ResolveApproval/StartRun/CancelRun」与「B AcquireControl 接管」并发
-// 轰炸。断言:操作开始时已观察到接管 → 该操作必返回 agentcontrol.ErrControlLeaseLost
-// (fencing 生效:校验通过后到提交完成之间不可能被接管);风暴落定后 A 的全部
-// 控制操作一律 agentcontrol.ErrControlLeaseLost;接管前基线提交的审批决策恰好送达一次,
-// 风暴期的应答要么接管前成功(送达恰好一次,Manager 单次投递保证)要么被
-// fencing 拒绝,绝不出现第二条。
+// TestControlFencingTakeoverStorm 验证第三轮评审 I4 的 fencing：A 持 lease 时，
+// A 的 ResolveApproval/StartRun/CancelRun 与 B 的 AcquireControl 并发竞争；
+// 一旦操作开始时已观察到接管，操作必须返回 ErrControlLeaseLost，风暴落定后 A
+// 的所有控制操作同样被拒。接管前基线提交的审批决策恰好送达一次；风暴期应答
+// 要么在接管前成功送达一次，要么被 fencing 拒绝，绝不产生第二条决策。
 func TestControlFencingTakeoverStorm(t *testing.T) {
 	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
 	p := newPersistedPlugin(t, gated)
@@ -997,13 +979,11 @@ func TestControlFencingTakeoverStorm(t *testing.T) {
 // (某会话 StartRun 同步段的 journal fsync 挂起不再阻塞其他会话的控制面)。
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestControlFencingDeterministicTakeover(DE2-M1 修复验收):纯顺序、零
-// goroutine 的确定性 fencing 断言——风暴测试(TestControlFencingTakeoverStorm)
-// 的「接管先于操作」由 goroutine 调度决定,本测试把时序钉死:A 空闲获取 →
-// A 未释放时 B 接管(tookOver=true)→ A 的 StartRun/ResolveApproval/CancelRun
-// 全部 agentcontrol.ErrControlLeaseLost。fencing 校验先于幂等表/审批归属/manager 存在性判
-// 定(请求ID 未记账、审批不存在、run 不存在都不影响拒绝语义),且被拒的
-// StartRun 不得入幂等表。
+// TestControlFencingDeterministicTakeover 是 DE2-M1 的确定性 fencing 断言：纯
+// 顺序、零 goroutine，把风暴测试依赖调度的「接管先于操作」钉死——A 空闲获取
+// lease，未释放时 B 接管，随后 A 的 StartRun/ResolveApproval/CancelRun 全部
+// 返回 ErrControlLeaseLost。fencing 校验先于幂等表、审批归属与 manager 存在性
+// 判定，因此被拒的 StartRun 不得写入幂等表。
 func TestControlFencingDeterministicTakeover(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	cfg.Session.Enabled = false
@@ -1046,13 +1026,11 @@ func TestControlFencingDeterministicTakeover(t *testing.T) {
 	}
 }
 
-// gatedRunJournal 是 RunStateJournal 闸门包装(DE2-I1 修复验收的确定性接缝,
-// 挂在生产真实存在的 journal 写点上,非测试专用执行分支):首个 AppendState
-// (StartRun 同步段 ⑤ 的 queued 记录 durable-first,含 journal fsync)挂起在
-// release 上,模拟本会话慢盘;close(release) 后透传内嵌的真实 store——
-// queued/running/completed 记录照常落账,RunStatus 的 journal 权威分支不受影
-// 响。entered 在进入 AppendState 时关闭,给测试一个确定性的「已进入同步段写
-// 点(此刻 guard 必被本会话 StartRun 持有)」信号。
+// gatedRunJournal 是 RunStateJournal 的闸门包装，挂在生产真实的 journal 写点上：
+// 首个 AppendState（StartRun 同步段的 queued durable-first 记录）挂起在 release
+// 上，模拟本会话慢盘；放行后透传给内嵌 store，queued/running/completed 照常
+// 落账。entered 在进入 AppendState 时关闭，为测试提供「已进入同步段写点、guard
+// 必被本会话 StartRun 持有」的确定性信号。
 type gatedRunJournal struct {
 	*session.RunJournalStore
 	entered chan struct{}
@@ -1068,14 +1046,11 @@ func (j *gatedRunJournal) AppendState(rec session.RunStateRecord) error {
 	return j.RunJournalStore.AppendState(rec)
 }
 
-// TestCrossSessionStartRunNotBlockedByFsync(DE2-I1 修复验收):会话 A 的
-// StartRun 停在同步段 journal 写点(guard 持有中,fsync 挂起)期间——
-// ① 会话 B 的 AcquireControl/StartRun 照常完成(per-session guard:慢盘不再
-// 跨会话串行;修复前全局 leaseMu 会把 A 的慢 fsync 放大为 B 的控制面卡顿);
-// ② B 对 A 会话的接管在 A 提交完成前无法插入(校验+提交同临界区,fencing 在
-// guard 锁内线性化——确定性断言,不依赖调度);③ 放行后 A 的提交完成、接管
-// 随后发生,且 A 已提交的后台 Run 不被接管撤销(DE2-I2 语义)、两会话的 run
-// 各自收敛 completed。
+// TestCrossSessionStartRunNotBlockedByFsync 验证 DE2-I1 的会话级锁粒度：会话 A
+// 的 StartRun 停在同步段 journal 写点（持 guard、fsync 挂起）期间——① 会话 B
+// 的 AcquireControl/StartRun 照常完成，慢盘不再跨会话串行；② B 对 A 的接管在
+// 提交前无法插入（校验与提交同临界区）；③ 放行后 A 提交完成、接管随后发生，
+// 已提交的后台 Run 不被撤销，两会话各自收敛 completed。
 func TestCrossSessionStartRunNotBlockedByFsync(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "cross-fsync"})
 	sidA := p.CurrentSessionID()

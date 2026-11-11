@@ -76,16 +76,9 @@ type ConnOptions struct {
 	MaxMessageBytes int
 }
 
-// Conn 是双向 JSON-RPC 连接，Client/Agent 两端共用。
-// Serve 在后台逐行读取并分发。分发语义是有意不对称的：
-//
-//   - 请求各自在独立 goroutine 中处理 —— 长任务 handler（session/prompt）
-//     不得阻塞读循环，否则并发的 session/cancel 通知永远到不了；
-//   - 请求 handler 会在连接关闭或读循环终止时收到取消；
-//   - 通知也是异步分发（handler 阻塞不得卡死读循环），但串成 FIFO 链：
-//     线上顺序即送达顺序，session/update 的流式渲染依赖这一点；
-//   - handler 的 panic 被就地兜住：请求回 -32603，通知丢弃并记日志，
-//     连接保持存活 —— handler 代码烂了不该拖垮整个进程。
+// Conn 是双向 JSON-RPC 连接，Client/Agent 两端共用。Serve 并发处理请求、
+// 以 FIFO 异步处理通知，避免长请求阻塞读循环，同时保留通知顺序；连接关闭
+// 或读循环终止会取消请求。handler panic 转为请求 -32603 或丢弃通知并记日志，连接保持存活。
 type Conn struct {
 	rwc             io.ReadWriteCloser
 	maxMessageBytes int
@@ -277,15 +270,8 @@ func (c *Conn) dispatch(line []byte) {
 }
 
 func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.RawMessage) {
-	// 通知(id 为空/null):FIFO 链位必须在读循环内同步获取。链位决定 handler
-	// 的启动顺序——若在下方新起的 goroutine 里才取(历史实现),相邻通知的
-	// goroutine 调度竞争会让链位与线上顺序脱钩:读循环按序 spawn,但两个
-	// goroutine 各自穿过 registerRequest/methods 查找后竞争 notifMu,后发的
-	// 通知可能先占链位,handler 乱序执行(回归测试
-	// TestNotificationsDeliveredInWireOrder 在历史实现上即时复现)。
-	// dispatchNotification 自身把 handler 挂上 FIFO 链、由后台 goroutine 依次
-	// 执行,读循环不阻塞于 handler 执行;通知无响应、无需 ctx 取消,不占用
-	// registerRequest 的 cancel 表。
+	// 必须在读循环中取得通知的 FIFO 位置；放到 goroutine 内会因调度导致乱序。
+	// handler 异步执行；通知无响应，不占用请求取消表。
 	if len(id) == 0 || string(id) == "null" {
 		c.dispatchNotification(method, params)
 		return

@@ -1,16 +1,4 @@
-// Package statusbar 提供可插拔的状态栏编排器。
-//
-// 用法：
-//
-//	bar := statusbar.New()
-//	bar.Use(addon1, addon2)
-//	bar.Start()
-//	go bar.Run(ctx, pauseFn)
-//	// ... agent 运行 ...
-//	bar.Stop()
-//
-// 各 frontend 可以自行实现 Addon，也可以复用 statusbar 包下的内置 addon。
-// 当前内置 addon 在 internal/cli/stdin/ 下：ProgressAddon、IterationAddon。
+// Package statusbar provides a pluggable status bar for CLI frontends.
 package statusbar
 
 import (
@@ -22,27 +10,8 @@ import (
 	"time"
 )
 
-// Addon 定义状态栏的一个可插拔段。
-//
-// 每个 Addon 只负责产出一段字符串（不含尾部分隔符），
-// 由 Bar 编排器合并渲染。Render() 返回空字符串表示该段不显示。
-//
-// 可选附加接口：
-//   - Registerer：注册时订阅事件
-//   - Stopper：收到停用通知时切换显示状态
-//
-// 实现示例：
-//
-//	type MyAddon struct {
-//	    value atomic.Int64
-//	}
-//	func (a *MyAddon) Name() string             { return "my" }
-//	func (a *MyAddon) Tick(ctx context.Context)  {}
-//	func (a *MyAddon) Render() string {
-//	    if n := a.value.Load(); n > 0 { return fmt.Sprintf("v: %d", n) }
-//	    return ""
-//	}
-//	func (a *MyAddon) Reset() { a.value.Store(0) }
+// Addon supplies an optional status-bar segment. Empty Render output hides it.
+// Registerer and Stopper are optional lifecycle hooks.
 type Addon interface {
 	// Name 返回唯一标识符，用于日志/调试。
 	Name() string
@@ -75,21 +44,7 @@ type Stopper interface {
 	OnStop()
 }
 
-// Bar 是状态栏编排器。
-//
-// 职责：
-//   - 管理 addon 列表
-//   - 提供 Run 循环（定时刷新）
-//   - 提供 Clear/Draw 供 WithLock 回调内操作
-//   - 提供 WithLock 与外部共享同一把互斥锁
-//   - 提供 Publish/Subscribe 事件总线，addon 和外部代码通过事件解耦
-//
-// 典型生命周期：
-//
-//	bar.Use(addon1, addon2)    // 构造时注册（触发 Registerer.OnRegister）
-//	bar.Start()                 // agent 运行前
-//	go bar.Run(ctx, pause)      // 启动刷新循环
-//	bar.Stop()                  // agent 结束后
+// Bar coordinates addons, refresh cycles, event delivery, and terminal rendering.
 type Bar struct {
 	mu     sync.Mutex
 	active bool

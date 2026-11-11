@@ -16,20 +16,8 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// syncrun_test.go 是 PR4(总方案 §九「同步与后台 Run 最终统一」)的插件侧验收:
-// 同步 prompt 入口(handleAgent → StartRunSync → manager.StartRun)与后台路径
-// (xgw run/start)进入同一套门禁与记账。复用 runcontrol_test.go 的 gatedProvider
-// (开工/放行屏障代替计时)与 runjournal_wiring_test.go 的 readRunJournalFile。
-//
-//   - TestSyncRunSurvivesSubmitterExit:TestRunSurvivesDisconnect 的 daemon 委托
-//     层等价物——提交 API 无 ctx 参数,runCtx 来自宿主;提交方 goroutine 不 Wait、
-//     直接退出,Run 照常跑完并持久化;RunStatus 对在跑/已终态 run 的观测面可用;
-//   - TestHandleAgentCallerCtxCancelCancelsRun:Legacy 取消语义——调用方请求 ctx
-//     取消经 Adapter 显式 CancelRunSync 落地(不依赖请求 ctx 传播),prompt 返回
-//     时终态已落盘(queued→running→cancelled),「prompt 返回 = run 完成」;
-//   - TestHandleAgentBusyRejectedWhileRunInFlight:统一门禁——同会话第二提交
-//     (同步 prompt 与 xgw 后台提交)在飞期间均被 ErrRunActive 拒绝,释放后后台
-//     提交恢复(xgw 后台 Run 能力不受影响)。
+// syncrun_test.go 验证同步 prompt 与后台 run 共用 SessionManager 的提交和记账，
+// 调用方退出不影响已提交 run，取消路径能收敛，活动 run 期间重复提交会被拒绝。
 
 // readStateRecords 读一个 run journal 文件并只保留 kind=="state" 的记录
 // (事件记录与 state 记录同文件混存,journal_store.go P3-1)。
@@ -274,12 +262,9 @@ func TestHandleAgentBusyRejectedWhileRunInFlight(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 第四轮评审 R1/R2 修复验收:Legacy 取消契约——CancelRunSync 结果分类 + 有界
-// 收尾等待。同步屏障/确定性编排,不用 time.Sleep 对齐:CancelRunSync 的失败
-// 注入经 SessionRouter 窄接口的测试替身(stubRouter)与 provider 闸门完成；Service
-// 在 handleAgent 启动前固定，StartRunSync 走 normal 路由后再通过线程安全的模式切换
-// 注入 miss/barrier。channel happens-before 链(go execute → close(started) →
-// setMode → cancel() → close(done) → Wait 返回)在 race 检测下无数据竞争。
+// 第四轮评审 R1/R2 修复验收：取消契约覆盖结果分类与有界收尾等待，用同步屏障而非
+// time.Sleep 对齐；失败注入经 stubRouter 与 provider 闸门完成，channel
+// happens-before 链在 race 检测下无数据竞争。
 // ─────────────────────────────────────────────────────────────────────────────
 
 // stubRouter 是 CancelRunSync 故障注入的确定性接缝(SessionRouter 窄接口的测试
@@ -511,12 +496,11 @@ func TestHandleAgentCancelUnexpectedErrorPropagates(t *testing.T) {
 	}
 }
 
-// TestHandleAgentCancelRunNotFoundRaceReadsRealTerminalState(R2 竞争分支):
-// 取消与完成竞争落败——barrier router 把 handleAgent 挂在 CancelRunSync 的路由
-// 点内,测试在该确定性窗口内让 run 自然收敛 completed 并等 active 清退,放行后
-// manager.CancelRun 对已终态 Run 必报 ErrRunNotFound(幂等空操作)。断言:
-// handleAgent 不报错、不虚构取消终态——收尾 Wait 读到真实终态 completed 并落盘,
-// 「prompt 返回 = run 完成」与「CancelRun 竞争落败」交错同收敛。
+// TestHandleAgentCancelRunNotFoundRaceReadsRealTerminalState 覆盖 R2 的竞争分支：
+// 取消与完成竞争落败。barrier router 把 handleAgent 挂在 CancelRunSync 的路由点
+// 内，测试在该确定性窗口让 run 自然收敛 completed 并等 active 清退；放行后
+// manager.CancelRun 对已终态 Run 报 ErrRunNotFound（幂等空操作）。断言
+// handleAgent 不报错、不虚构取消终态——收尾 Wait 读到真实终态 completed 并落盘。
 func TestHandleAgentCancelRunNotFoundRaceReadsRealTerminalState(t *testing.T) {
 	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
 	p := newPersistedPlugin(t, gated)

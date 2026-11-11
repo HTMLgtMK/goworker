@@ -13,7 +13,7 @@ import (
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
-// testSessionWithStore 构造一个带 store 的 Session，用于集成测试。
+// testSessionWithStore 构造带持久化 store 的测试会话。
 func testSessionWithStore(t *testing.T, pv core.Provider) (*Session, *session.Store, *runtimeconfig.Config, string) {
 	t.Helper()
 	dir := t.TempDir()
