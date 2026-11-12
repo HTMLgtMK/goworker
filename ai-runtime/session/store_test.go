@@ -625,7 +625,7 @@ func TestPendingAfterCursor(t *testing.T) {
 	})
 }
 
-// TestConcurrentAppendRace 验证并发追加 -race 安全。
+// TestConcurrentAppendRace exercises concurrent commits.
 func TestConcurrentAppendRace(t *testing.T) {
 	s := openStore(t)
 
@@ -663,7 +663,6 @@ func TestConcurrentAppendRace(t *testing.T) {
 	}
 }
 
-// TestArchive 验证 Archive 后旧文件进 archive/，新文件空。
 func assertPrivateMode(t *testing.T, path string) {
 	t.Helper()
 	info, err := os.Stat(path)
@@ -1675,7 +1674,7 @@ func TestStoreMigratesLegacyJSONLWithStableIdentity(t *testing.T) {
 	}
 }
 
-// ── Plan A1：v2 文件名决议 + workspace / archived 声明 ───────────────────
+// ── Workspace and archive declarations ───────────────────────────────
 
 // countRecordsOfKind 统计 jsonl 文件中指定 kind 的记录条数（幂等/追加数断言用）。
 func countRecordsOfKind(t *testing.T, path, kind string) int {
@@ -1690,10 +1689,7 @@ func countRecordsOfKind(t *testing.T, path, kind string) int {
 	return n
 }
 
-// TestOpenDataFileNameV2 验证 v2 文件名决议（Plan A1）三分支：
-// ① 会话形态目录（basename = session_<hex>）新建 → 写 <id>.jsonl、不产生 current.jsonl，重开仍走 v2 文件；
-// ② 会话形态目录存量 current.jsonl → 兼容读、追加仍落 current.jsonl，且读路径不做重命名迁移（改名归 A4 一次性迁移）；
-// ③ 非会话形态 basename（测试目录等）→ 恒用 current.jsonl，行为同 v1。
+// TestOpenDataFileNameV2 verifies v2 naming, legacy-file compatibility, and v1 fallback.
 func TestOpenDataFileNameV2(t *testing.T) {
 	// ① 新建 → v2 名
 	shaped := filepath.Join(t.TempDir(), NewSessionID())
@@ -1770,8 +1766,7 @@ func TestOpenDataFileNameV2(t *testing.T) {
 	}
 }
 
-// TestDeclareWorkspaceLastWins 验证 workspace 记录 last-wins（Plan A1）：
-// 多次声明取最后一条；落盘跨重开保持；空串声明被拒绝。
+// TestDeclareWorkspaceLastWins verifies last-write-wins persistence and rejects empty paths.
 func TestDeclareWorkspaceLastWins(t *testing.T) {
 	s := openStore(t)
 	if got := s.Workspace(); got != "" {
@@ -1810,8 +1805,7 @@ func TestDeclareWorkspaceLastWins(t *testing.T) {
 	}
 }
 
-// TestMarkArchivedIdempotent 验证 archived 终态标记（Plan A1）：
-// 首次标记落盘、重复标记 no-op（文件里只有一条 archived 记录）、跨重开保留。
+// TestMarkArchivedIdempotent verifies the terminal marker persists and is appended once.
 func TestMarkArchivedIdempotent(t *testing.T) {
 	s := openStore(t)
 	if s.Archived() {

@@ -69,8 +69,8 @@ func TestRecord_UnmarshalOldFormat(t *testing.T) {
 	}
 }
 
-// TestRecord_WorkspaceArchivedRoundtrip Plan A1 新增 kind 的读回往返：
-// marshal → unmarshal 后字段组与 Created() 时间戳保真。
+// TestRecord_WorkspaceArchivedRoundtrip verifies workspace and archived records preserve
+// their fields and creation timestamps through JSON round trips.
 func TestRecord_WorkspaceArchivedRoundtrip(t *testing.T) {
 	now := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
 
@@ -114,9 +114,8 @@ func TestRecord_WorkspaceArchivedRoundtrip(t *testing.T) {
 	}
 }
 
-// TestRecord_UnknownKindTolerated 关闭 Plan A1 的兼容确认项：旧版 daemon 读到
-// 新 kind（此处模拟未来 kind）不报错、按无字段组记录收下、不进坏行跳过路径
-// ——旧版读新文件只是看不到新声明，无害。
+// TestRecord_UnknownKindTolerated verifies unknown kinds deserialize without errors
+// or populating a known field group.
 func TestRecord_UnknownKindTolerated(t *testing.T) {
 	var r Record
 	if err := json.Unmarshal([]byte(`{"kind":"future_kind","x":1,"created_at":"2024-06-01T12:00:00Z"}`), &r); err != nil {

@@ -212,30 +212,12 @@ func TestManagerCloseWaitsActiveRun(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// P3-5:生命周期收口——Manager.Close 逐 runtime 关闭 EventHub。
-//
-// 装置复用 supervisor_test.go 的 P3-4 编排(eventRunFixture:真 Repository →
-// 真 *session.Store → RunJournalStore 同时充当 RunJournal 与 RunEvents 注入
-// SessionDeps;StartRun 经 bindEvents 创建 hub——「两个 runtime 各带 hub」的
-// 唯一构造路径)。
-// ---------------------------------------------------------------------------
+// P3-5 验收 Manager.Close 逐个关闭 runtime 的 EventHub。
+// 复用 supervisor_test.go 的 eventRunFixture，通过 RunEvents 接线确保 StartRun 创建 hub。
 
-// TestManagerCloseClosesEventHubs(P3-5):两个 runtime 各带 hub,其一在途
-// (cancelAwareProvider 挂起,宿主 ctx 取消是唯一出口——与 TestCancelRunningRun
-// 同款单轮契约,release 永不关闭)、其一已完成(流式脚本产事件,事件已落盘)。
-// Close(等待在途 run 终态 → 逐 runtime closeEvents → 清表)后断言:
-//   - Close 前两 hub 活体对照:Subscribe 成功(证明后文的 ErrHubClosed 确由本次
-//     Close 触发,而非 hub 从未启用);
-//   - 在途 run 已到终态(RunCancelled:宿主取消经 runCtx 传播,execute 层归一);
-//   - 两 hub 均 Closed:Publish/Subscribe 一律 ErrHubClosed(P3-0 表第 5 行
-//     「关掉的事件流不能再产出事件」);
-//   - journal 当前句柄已关(重读文件完整):在途 run 的 state 序恰为
-//     queued→running→cancelled、末行即终态(终态之后无任何追加),且该 run 的
-//     句柄已被终态逐出——再追加撞 ErrRunExists(宁拒勿双写,文件已封口;若
-//     句柄仍被缓存,追加会复用句柄静默成功);
-//   - 已完成 run 的重读文件完整:事件记录 [FromSeq..Seq] 覆盖并集恰为
-//     [1..LatestSeq] 无缺口(EndRun flush 先于终态落盘的次序铁律在文件序可见)。
+// TestManagerCloseClosesEventHubs 覆盖在途和已完成 runtime 的停机收口。
+// Close 等待在途 run 终态后关闭两 hub，并校验取消状态、拒绝后续读写、journal 文件完整封口，
+// 以及已完成 run 的事件序号覆盖范围。
 func TestManagerCloseClosesEventHubs(t *testing.T) {
 	m := NewSessionManager()
 	t.Cleanup(m.Close) // 幂等:主体已 Close 时为空操作,失败路径也收尾
@@ -315,14 +297,8 @@ func TestManagerCloseClosesEventHubs(t *testing.T) {
 	assertRunEventCoverage(t, fxB, hB.RunID, latestB)
 }
 
-// assertSealedRunJournal 从磁盘重读一个 run 的 journal 文件并断言「当前句柄
-// 已关、文件完整」:
-//   - 每行均为合法 JSON(无半行/撕裂写);
-//   - state 记录恰为 wantStates 序列(queued→running→终态);
-//   - 末行即终态 state 记录(事件收口先于终态落盘的次序铁律,
-//     TestStartRunEmitsJournalEvents 同款断言——终态之后无任何追加);
-//   - 追加探测句柄已关:终态逐出(RunJournalStore.AppendState 的句柄生命周期,
-//     journal_store.go)后文件已封口,再追加必撞 ErrRunExists。
+// assertSealedRunJournal 重读磁盘文件，验证 JSON 完整、state 顺序及终态位于末行。
+// 末尾追加探测确认终态后句柄已逐出；封口文件上的追加应返回 ErrRunExists。
 func assertSealedRunJournal(t *testing.T, fx eventRunFixture, runID string, wantStates []string) {
 	t.Helper()
 	data, err := os.ReadFile(fx.runJournalPath(runID))

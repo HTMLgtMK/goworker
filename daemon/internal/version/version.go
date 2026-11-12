@@ -1,15 +1,4 @@
-// Package version 汇总两路版本信息来源：构建期注入 + Go 工具链自带。
-//
-// 分工是这样的：
-//
-//   - 语义化版本号（v1.2.3）**只能**靠 CI 用 -ldflags -X 注入。本地 go build
-//     没有 tag 可依据，buildinfo 里主模块版本恒为 "(devel)"。
-//   - commit / 提交时间 / 工作区是否脏，Go 1.18+ 由 -buildvcs（默认开启）自动
-//     嵌进二进制，debug.ReadBuildInfo() 直接读，不需要注入。这意味着本地
-//     go run 出来的也能报出真实 commit，而不是一片 unknown。
-//
-// 所以别把 commit/date 也塞进 ldflags —— 那是重复劳动，而且一旦 CI 忘了传就
-// 退化成 unknown，白白丢掉工具链本来免费给的信息。
+// Package version combines build-time version injection with Go's VCS metadata.
 package version
 
 import (
@@ -18,12 +7,7 @@ import (
 	"runtime/debug"
 )
 
-// 以下三个由构建期注入：
-//
-//	go build -ldflags "-X github.com/tinguo/goworker/daemon/internal/version.version=v1.0.0"
-//
-// 刻意保持未导出：注入点私有，读取一律走 Get()。外部包拿不到原始变量，
-// 也就绕不过回落逻辑去用空串。
+// Build-time overrides are optional; Get fills missing fields from VCS metadata.
 var (
 	version string
 	commit  string

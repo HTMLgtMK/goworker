@@ -7,19 +7,11 @@ import (
 	"sync"
 )
 
-// lease.go 是 per-session control lease 的 fencing 实现(总方案 §五):从 plugin
-// runcontrol.go 的 sessionControlGuard / controlGuard / snapshotControlGuards
-// 原样迁出,保留锁语义——每会话一把互斥锁,校验与提交同临界区,接管在同锁内
-// 线性化。第四轮评审 DE2-I1 确立的「会话粒度」不变:某会话 manager.StartRun
-// 同步段的 journal fsync 只占住本会话的 lease,跨会话的 Acquire/Release 与其他
-// 控制操作互不阻塞(全局锁会把单会话慢盘放大为全 daemon 控制面卡顿)。
+// 控制权按会话隔离；租约校验、控制操作提交和接管使用同一把会话锁。
+// 跨层锁序和权限语义见 ../../docs/README.md。
 
-// ErrControlLeaseLost 是控制操作 fencing 的拒绝 sentinel(第三轮评审 I4 修复,
-// 原 runcontrol.go 迁入):调用方声明的 clientID 在校验时刻不持有该会话的
-// control lease(从未持有、已被接管或已释放)。控制类操作(StartRun/CancelRun/
-// ResolveApproval)把 lease 校验合并进本会话 lease.mu 提交临界区(WithControl)
-// ——与接管 Acquire 同锁,「校验通过 → 提交」之间不可能被接管,旧持有者绝不
-// 能在失权后落地控制操作。
+// ErrControlLeaseLost indicates the caller does not hold the session's control lease.
+// Fenced operations use it when the lease is absent, released, or taken over.
 var ErrControlLeaseLost = errors.New("control lease not held by the caller")
 
 // controlLeaseLostErr 是 fencing 拒绝的定位化包装(sessionID + clientID 可观测;
@@ -28,16 +20,8 @@ func controlLeaseLostErr(sessionID, clientID string) error {
 	return fmt.Errorf("agent: session %q: connection %q: %w", sessionID, clientID, ErrControlLeaseLost)
 }
 
-// SessionLease 是单会话的 control lease fencing guard(原 sessionControlGuard
-// 迁入):mu 是本会话全部控制操作(lease 校验 + 提交)与接管的线性化点,holder
-// 是当前持有者 clientID(空 = 空闲)。fencing 语义与迁移前逐字一致:校验与提交
-// 同临界区,接管在锁内线性化——会话维度上「校验通过后到提交完成」不可能被
-// 接管。lease 不持任何其他锁、临界区内不回调 handler,是锁序图中的叶节点。
-//
-// 不要为了「提升并发性能」改成先读 holder、锁外执行提交:那会把原来的竞态换
-// 一种形式(总方案 §五「控制权的线性化规则」原文;fencing token 化需要底层
-// 接受 Run 的位置做可靠校验才等价,V1 不做)。当前每 Session 一把控制锁已经
-// 足够好。
+// SessionLease is one session's fencing guard. Its mutex linearizes lease validation,
+// control submission, and takeover; holder is empty when the lease is free.
 type SessionLease struct {
 	mu     sync.Mutex
 	holder string
@@ -53,9 +37,6 @@ func (l *SessionLease) holds(clientID string) bool {
 // 迁入):mu 只护表结构的 get-or-create 与快照(叶锁,临界区无 I/O 无回调),
 // 与 lease.mu 永不嵌套。lease 条目只增不删(与会话注册表同生命周期量级,单
 // 条目仅一把互斥锁 + 一个字符串;删除须与并发控制操作同步,徒增 fencing 复杂度)。
-// sessionID 取调用方寻址原串:lease 与控制操作/接管以同一寻址串对齐(ACP 面的
-// attach/control 与 run/start|cancel|approval 传同一 sessionId);纯内存降级的
-// 空串是合法租约键(CurrentSessionID() 为空串的会话句柄形态)。
 type LeaseRegistry struct {
 	mu     sync.Mutex
 	leases map[string]*SessionLease
@@ -82,11 +63,9 @@ func (r *LeaseRegistry) lease(sessionID string) *SessionLease {
 	return l
 }
 
-// Acquire 获取 (sessionID, clientID) 的 control lease:该会话空闲 → 占用并返回
-// false;他人持有 → 显式接管(置新 holder,返回 true 并 slog.Info 审计——
-// 「权限检查必须在 Daemon 侧完成」,总方案 §7.4);同持有者重复 acquire → false
-// (非接管)。空 clientID 拒绝(调用方句柄恒为非空随机 hex,防御空串与「空闲」
-// 不可辨)。
+// Acquire grants a free lease and returns false, or takes over an existing lease and returns
+// true after recording an audit log. The same holder reacquiring returns false. Empty
+// client IDs are rejected so they cannot be confused with an unheld lease.
 func (r *LeaseRegistry) Acquire(sessionID, clientID string) bool {
 	if clientID == "" {
 		return false
@@ -129,12 +108,9 @@ func (r *LeaseRegistry) Hold(sessionID, clientID string) bool {
 	return l.holds(clientID)
 }
 
-// WithControl 是受 lease 保护的操作提交入口(fencing 提交入口,总方案 §五):
-// 本会话 lease.mu 临界区内先校验 holder 再执行 fn——校验通过后到 fn 返回之间
-// 不可能被接管,旧持有者的提交一律明确拒绝。fn 必须是短提交操作(一次校验 +
-// 一次提交/接受,如 manager.StartRun 的同步段),绝不是整个 AgentRun;后台执行
-// 仍在锁外完成。本方法只供控制层内部(Service)调用,不向协议层暴露任意长时间
-// callback 的注入口。
+// WithControl validates the holder and runs the short commit while holding that
+// session's lease mutex, preventing takeover between authorization and submission.
+// The commit may perform persistence I/O, but must not run the entire agent or call back into the handler.
 func (r *LeaseRegistry) WithControl(sessionID, clientID string, fn func() error) error {
 	l := r.lease(sessionID)
 	l.mu.Lock()
@@ -145,15 +121,8 @@ func (r *LeaseRegistry) WithControl(sessionID, clientID string, fn func() error)
 	return fn()
 }
 
-// ReleaseConnection 释放 clientID 持有的全部会话的 control lease(断连收口,
-// handler.Close 一次调用替代逐会话归还)。连接不持有任何租约时幂等空操作。
-//
-// 锁纪律(DE2-I1 原样):先在 registry.mu 下快照全部 lease,再逐个锁 lease.mu
-// 清本 client 持有者——registry.mu 与 lease.mu 永不嵌套,某会话 lease 被慢盘
-// 控制操作占住时不阻塞其他会话的清理,也不与并发控制操作成环。快照后新建的
-// lease 不可能持本 client 租约(holder 只经 Acquire 置入,而快照覆盖此刻已存在
-// 的全部会话键;handler 侧 Close 与 attach 提交段同以 h.mu 串行,断连窗口内无
-// 新租约)。
+// ReleaseConnection snapshots the lease pointers under registry.mu, then clears the
+// client's holder under each lease lock. The locks are never nested.
 func (r *LeaseRegistry) ReleaseConnection(clientID string) {
 	if clientID == "" {
 		return

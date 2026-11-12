@@ -291,11 +291,9 @@ func TestSessionHandleCancel(t *testing.T) {
 	}
 }
 
-// TestNotificationsDeliveredInWireOrder 钉死 dispatchNotif 的注释契约「送达
-// 顺序与线上顺序一致」:服务端背靠背连发 N 条通知,客户端 handler 的启动顺序
-// 必须与线上顺序逐条一致。历史缺陷:通知走 dispatchRequest 的新 goroutine,
-// FIFO 链位在 goroutine 内部才获取,相邻通知的调度竞争使链位与线上顺序脱钩
-// (实测三条连发即可按 [1,3,2] 送达)——修复后链位在读循环内同步获取。
+// TestNotificationsDeliveredInWireOrder verifies the dispatch-order contract: handlers must
+// observe the wire order, even for back-to-back notifications. The regression was caused by
+// goroutine scheduling after FIFO position assignment; assigning positions in the read loop fixes it.
 func TestNotificationsDeliveredInWireOrder(t *testing.T) {
 	serverEnd, clientEnd := net.Pipe()
 	server := ServeConn(serverEnd, &lifecycleHandler{})

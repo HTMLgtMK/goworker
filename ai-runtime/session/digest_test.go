@@ -11,12 +11,8 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 )
 
-// digest_test.go 是 Plan A3 清单解析面（ScanSessionDigests）的验收：v2/v1 双
-// 探测、legacy 根槽、archived/workspace/首条 user 事实提取、空/坏文件跳过。
-
-// TestScanSessionDigestsCoversAllLayouts 验证扫描并集：per-id v2 目录、per-id
-// 存量 current.jsonl 目录、legacy 根槽三类全部收录，事实字段逐项正确；
-// 归档目录与杂散文件不入清单。
+// TestScanSessionDigestsCoversAllLayouts verifies current and legacy layouts, extracted
+// metadata, and exclusion of archive and stray files.
 func TestScanSessionDigestsCoversAllLayouts(t *testing.T) {
 	root := t.TempDir()
 

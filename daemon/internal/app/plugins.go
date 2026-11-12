@@ -1,11 +1,6 @@
-// 插件装配链（composition root）：决定哪些内置插件被编进二进制、以什么依赖
-// 注册进 engine。壳层（cmd/goworker、mobile）经 app.New 间接使用，不感知具体插件。
-//
-// 每个可选插件对应一对构建标签文件：plugins_<name>.go（//go:build !goworker_no_<name>）
-// 与 plugins_<name>_off.go（//go:build goworker_no_<name>）。off-tag 缺省不生效，
-// 所以裸 go build（CI/release/README 流程）始终全量装配；CMake 的 GOWORKER_NO_PLUGINS
-// 参数负责把要剔除的插件翻译成对应 off-tag 传给 go build。
-// 新增插件：加一对文件 + 在 RegisterPlugins 里追加一段装配调用。
+// Plugin composition root: compiled-in plugins are registered here in dependency
+// order. Optional plugins use paired build-tag files; CMake maps exclusions to off-tags.
+// Add a plugin by adding its tagged files and registry factory.
 package app
 
 import (

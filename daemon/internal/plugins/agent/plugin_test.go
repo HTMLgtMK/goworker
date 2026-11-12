@@ -252,11 +252,10 @@ func (p *AgentPlugin) setMemory(c *memory.Client) {
 }
 
 // refreshSession 用当前 deps 重建会话并接线 current runtime，对齐 startSession
-// 的会话边界构造（Register 进 manager + 置为 current；测试不读真实文件 ——
-// deps 由测试直接注入）。runtime id 与生产同规则（P1-3 ④）：deps 注入了
-// *session.Store 时取其 SessionID（currentStore() 经 repo 缓存解析取数的键），
-// 纯内存维持 "current" 稳定单例。重复调用（setMemory 等）即 /new 式重建：同 id
-// 注册冲突时旧 runtime 保留在 manager，current 换新。
+// 的会话边界构造：Register 进 manager 并置为 current。测试直接注入 deps，不读
+// 真实文件。runtime id 与生产同规则：注入了 *session.Store 时取其 SessionID，
+// 纯内存则保持 "current" 单例。重复调用（如 setMemory）等价于 /new 式重建，
+// 同 id 注册冲突时旧 runtime 保留在 manager，current 换新。
 func (p *AgentPlugin) refreshSession() {
 	s := runtimeagent.NewSession(p.deps)
 	id := "current"

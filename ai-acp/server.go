@@ -26,6 +26,13 @@ type SessionHandler interface {
 	Prompt(ctx context.Context, sessionID string, prompt []protocol.ContentBlock, reporter Reporter) (string, error)
 }
 
+// InitializeReady runs after the successful initialize response is written to the
+// transport. Clients must register reverse request handlers before initialize;
+// a completed write does not mean the client has processed the response.
+type InitializeReady interface {
+	InitializeReady(ctx context.Context, reporter Reporter)
+}
+
 // SessionCreator is optional. The server allocates the ACP session ID and
 // gives it to the adapter so it can attach application state to that ID.
 type SessionCreator interface {
@@ -215,6 +222,17 @@ func (s *Server) Close() error {
 	return err
 }
 
+type initializeResult struct {
+	protocol.InitializeResponse
+	ready func(ctx context.Context) `json:"-"`
+}
+
+func (r initializeResult) AfterResponseWritten(ctx context.Context) {
+	if r.ready != nil {
+		r.ready(ctx)
+	}
+}
+
 func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (any, error) {
 	var req protocol.InitializeRequest
 	if err := json.Unmarshal(params, &req); err != nil {
@@ -231,10 +249,14 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 	s.initMu.Lock()
 	s.clientCaps = req.ClientCapabilities
 	s.initMu.Unlock()
-	return protocol.InitializeResponse{
+	result := initializeResult{InitializeResponse: protocol.InitializeResponse{
 		ProtocolVersion:   protocol.Version,
 		AgentCapabilities: caps,
-	}, nil
+	}}
+	if ready, ok := s.handler.(InitializeReady); ok {
+		result.ready = func(ctx context.Context) { ready.InitializeReady(ctx, s) }
+	}
+	return result, nil
 }
 
 // ClientCapabilities returns the capabilities the peer declared during

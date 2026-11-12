@@ -18,8 +18,8 @@ const (
 	kindCheckpoint = "checkpoint"
 	kindCursor     = "cursor"
 	kindMetadata   = "metadata"
-	kindWorkspace  = "workspace" // Plan A1：cwd 兼任 workspace，last-wins 声明
-	kindArchived   = "archived"  // Plan A1：归档终态标记（只读保留、不可逆）
+	kindWorkspace  = "workspace" // 工作目录声明，读取时采用最后一条
+	kindArchived   = "archived"  // 不可逆的归档终态标记
 )
 
 // msgFields 真实消息（含 compact 时的保留段副本）。
@@ -73,15 +73,13 @@ type metadataFields struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// workspaceFields 工作目录声明（Plan A1，cwd 兼任 workspace，定案需求 #4）。
-// last-wins：同 kind 重复追加时取最后一条，旧记录保留不改写（纯追加原则）。
+// workspaceFields 保存工作目录声明。重复追加时取最后一条，旧记录保持不变。
 type workspaceFields struct {
 	Path      string    `json:"path,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// archivedFields 归档终态标记（Plan A1）。只记归档时间，不搬文件——
-// 归档 = 只读保留终态（定案需求 #1），可 load 重放、不可逆。
+// archivedFields 保存归档终态标记。会话数据不搬移，归档后只读。
 type archivedFields struct {
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -174,14 +172,10 @@ func (r Record) Created() time.Time {
 	return time.Time{}
 }
 
-// MarshalJSON 把 Record 展平为磁盘单行。用临时扁平结构保证字段名与 key 顺序
-// 跟旧聚合格式一致（追加文件兼容读旧数据，也便于人工比对）。
-//
-// 注意：新增字段需同步改 3 处——类型化 struct（msgFields 等）、下方 flat struct、
-// MarshalJSON 的 switch 填充；新增 record kind 则需同步 5 处——字段组 struct、
-// flat struct（如引入新字段名）、MarshalJSON 的 switch 填充、UnmarshalJSON 的
-// switch 分发、Created() 的 switch。漏改任一处 = 字段静默丢失、kind 读不回来
-// 或时间戳丢失，record_format_test.go 的字节级断言会兜底抓漏。
+// MarshalJSON flattens Record to the legacy-compatible single-line JSON format and key
+// order. Adding a field requires updating its typed struct, flat struct, and marshal
+// switch; adding a kind also requires updating unmarshal dispatch and Created().
+// record_format_test.go guards against silently lost fields, kinds, or timestamps.
 func (r Record) MarshalJSON() ([]byte, error) {
 	type flat struct {
 		Kind        string                     `json:"kind"`
@@ -352,14 +346,12 @@ func newMetadataRecord(sessionID string, created time.Time) Record {
 	return Record{Kind: kindMetadata, Meta: &metadataFields{SessionID: sessionID, CreatedAt: created}}
 }
 
-// newWorkspaceRecord 构造 workspace 声明记录（Plan A1：创建即声明 + 换绑
-// last-wins 追加，旧记录保留不改写）。
+// newWorkspaceRecord 构造 workspace 声明记录；重复声明时由读取方采用最后一条。
 func newWorkspaceRecord(path string, created time.Time) Record {
 	return Record{Kind: kindWorkspace, Ws: &workspaceFields{Path: path, CreatedAt: created}}
 }
 
-// newArchivedRecord 构造 archived 终态标记记录（Plan A1：归档 = 只读保留终态，
-// 只落时间戳，不搬文件）。
+// newArchivedRecord 构造只读归档终态标记。
 func newArchivedRecord(created time.Time) Record {
 	return Record{Kind: kindArchived, Arc: &archivedFields{CreatedAt: created}}
 }

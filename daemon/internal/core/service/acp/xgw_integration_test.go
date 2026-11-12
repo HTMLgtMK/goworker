@@ -24,33 +24,10 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// xgw_integration_test.go 是 x-goworker 扩展协议的协议级集成测试(P5-10 完成线,
-// 总方案第十一节):JSON-RPC over net.Pipe 全栈(真实 ai-acp Server/Client +
-// 真实 FrontendHandler 注册面 + 真实 SessionManager/Session/HITL 中间件/
-// ApprovalManager/EventHub),零真实 LLM(全部模拟 Provider)。
-//
-// 与 xgw_test.go 的分工:xgw_test.go 用脚本化 fakeRunControl 钉 wire 契约与
-// lease 守卫;本文件把 RunControlSource 换成「真实 SDK 编排」的测试 shim
-// (xgwLiveControl,mirror runcontrol.go 的纯内存契约),验证协议面与运行面
-// 的接缝:attach 后 run/start 的事件经真实 tee/decideFunc 流到客户端、HITL
-// 审批跨连接应答、requestId 幂等在真实 manager 上成立、标准方法面逐字不变。
-//
-// 复用 xgw_test.go 的既有编排 helper:memEventJournal(内存事件 journal)、
-// xgwEventLog(通知收集)、waitFor、wantXGWError;复用 handler_test.go 的
-// decodeCaps。栈构造(newXGWLiveStack)与 helper 形态对齐 newXGWStack,因
-// 会话源类型不同(xgwLiveControl ≠ *fakeRunControl)单独成列。
-//
-// 事件面(C2 修复后的真实链路覆盖,原「诚实适配」信息项已消解):supervisor 的
-// tee 在 hub 非 nil 时主动供给 EmitToken/Publish 的事件采集(ai-runtime/agent/
-// supervisor.go teeRunCallbacks,C2 修复)——daemon 的 run/start 虽仍以
-// RunCallbacks{} 全 nil 提交后台 Run(runcontrol.go 注释对齐),真实 token 派生
-// 事件(text.delta/assistant.message_finalized)与 usage 类事件照常进事件流。
-// 真实后台 run 全链由 TestXGWIntegrationBackgroundRunEventsAndIdempotency 与
-// TestXGWIntegrationTokenEventWireShapesRealChain(追加的真实链路变体,含
-// tool_call)经 attach 订阅逐条钉住;TestXGWIntegrationTokenEventWireShapes 保留
-// 为 hub.Publish(teePublish 的生产发布面)直发的信封形状对偶面。tool_call 的
-// SDK 侧 journal 回归在 ai-runtime/agent 的 TestStartRunJournalsRealTokens
-// (真 journal 全链)。
+// This net.Pipe integration test exercises the real ai-acp client/server, handler, session
+// manager, HITL, approval manager, and event hub with mock providers. It covers the wire-to-runtime
+// seam for background events, cross-connection approvals, and idempotency; companion xgw_test.go
+// focuses on scripted sources and wire errors. The real supervisor tee supplies run events.
 
 // xgwDeviceToolName 是 ④ 的 fake 设备工具注册名(sys_ 前缀 + 客户端原名)。
 const xgwDeviceToolName = "sys_vibrate"
@@ -88,14 +65,9 @@ func (p *xgwScriptedProvider) ChatStream(context.Context, *core.ChatRequest) (<-
 	return nil, errors.New("not implemented")
 }
 
-// xgwLiveControl 是「真实 SDK 编排」的 RunControlSource 测试 shim:内嵌
-// fakeSessionSource 补齐 SessionSource 面(工厂 type-assert 同时命中两接口),
-// RunControlSource 语义 mirror runcontrol.go 的纯内存契约——requestId 幂等表
-// (reqMu + map)、current 会话校验(CurrentSessionID 由 handler 的
-// session/new → SetSession 写入)、lease 三件套、SubscribeEvents 走 rt.EnsureHub、
-// RunStatus 走 rt.Active + 幂等表反查(纯内存分支,无 RunJournalStore)。
-// 与生产实现的差异仅在簿记宿主(测试 shim vs AgentPlugin),管理面
-// (manager.StartRun/ResolveApproval/EnsureHub)全部真实。
+// xgwLiveControl mirrors the production run-control contract with in-memory idempotency and
+// leases, while using a real runtime for runs, approvals, and event subscriptions. Its only
+// test-specific part is session/lease bookkeeping.
 type xgwLiveControl struct {
 	*fakeSessionSource
 
@@ -110,12 +82,9 @@ type xgwLiveControl struct {
 	startRuns int // 仅真实新起跑;幂等命中不记
 }
 
-// newXGWLiveControl 构造 shim 并注册一个真实 runtime:真实 Session(脚本化
-// provider + 真实工具链) + memEventJournal 作 RunEvents(StartRun ⑥ 的
-// bindEvents 据此建真 hub;RunEvents 为 nil 则 hub 为 nil,attach 诚实报错)。
-// RunJournal 留真 nil(typed-nil 纪律):RunStatus 走纯内存分支。HITL 集成
-// (测试②)传 CollectTools=DefaultTools + 沙箱 normal,危险管道命令触发
-// DecisionHitl(与 SDK TestApprovalAfterReconnect 同款探针)。
+// newXGWLiveControl registers a real runtime with a scripted provider and in-memory event
+// journal. HITL uses the real default tools and normal sandbox; leaving RunJournal nil exercises
+// the in-memory RunStatus path.
 func newXGWLiveControl(t *testing.T, id string, pv core.Provider, collect func(*sandbox.Config) []core.Tool) *xgwLiveControl {
 	t.Helper()
 	m := runtimeagent.NewSessionManager()
@@ -186,17 +155,9 @@ func (f *xgwLiveControl) SessionArchived(sessionID string) bool {
 	return ok
 }
 
-// ArchiveSession shim(A3):归档动作落 f.archived 终态标记(值为 nil 的脚本
-// 项——SessionArchived 据此为真,ArchivedSessionHistory 无脚本按其既有报错
-// 形态走);run 在飞拒绝镜像生产语义——判据直接查注册表 rt.Active() 非 nil
-// (与生产 boundsession.go ArchiveSession 同一谓词;不走 f.ActiveRun,它前置
-// requireCurrent 的 V1 校验,而生产的归档寻址没有该限制);lease fencing 不
-// 模拟(见 pr2DualControl 同名注释,真插件链路的 fencing 验收在 plugins/agent
-// 的 ArchiveSession 测试)。未知会话诚实未知。
-//
-// 锁序注意:在飞检查只触 manager 内部锁,与本 shim 的 f.mu 无嵌套;终态落回
-// 持 f.mu(short critical section)。在飞检查与落标记之间的窗口对本 shim 的
-// 单线程用例无影响(生产侧的同类窗口由生产实现的 WithControl 临界区封闭)。
+// ArchiveSession in this fixture marks the session archived and rejects active runs. It does
+// not simulate lease fencing, which is covered by plugin-level tests. The run check uses the
+// manager lock before taking f.mu; production serializes check and archive under its lease guard.
 func (f *xgwLiveControl) ArchiveSession(sessionID, clientID string) error {
 	if rt := f.m.Get(f.sid); rt != nil {
 		if run := rt.Active(); run != nil {
@@ -335,13 +296,9 @@ func (f *xgwLiveControl) PendingApprovals(sessionID string) ([]model.PendingAppr
 	return out, nil
 }
 
-// ResolveApproval mirror runcontrol.go 的 C1 契约 + 第三轮评审 I4 fencing(四步
-// 同锁原子):wire 会话声明先过 requireCurrent(本 shim 的会话路由锚点),随后
-// leaseMu 临界区内完成「lease 校验 + 归属校验 + Resolve 提交」——归属按服务端
-// 记录(ApprovalOwner)与 runtime id(f.sid)校验——比较用 runtime id 而非
-// wire 原串,与生产 runcontrol.go 的寻址模型一致;未持有 lease(含被接管的旧
-// 持有者)→ errFakeLeaseLost,未知 requestID → ErrApprovalUnknown 语义,归属
-// 不符 → 越权拒绝;匹配才直转 manager。
+// ResolveApproval mirrors production fencing: under one lease lock it verifies the holder and
+// server-recorded approval owner before submission. The owner is compared with the runtime
+// session ID; unknown, cross-session, or stale-holder requests fail.
 func (f *xgwLiveControl) ResolveApproval(sessionID, connectionID, requestID string, decision hitl.Decision) error {
 	if err := f.requireCurrent(sessionID); err != nil {
 		return err
@@ -361,11 +318,8 @@ func (f *xgwLiveControl) ResolveApproval(sessionID, connectionID, requestID stri
 	return f.m.ResolveApproval(requestID, decision)
 }
 
-// SubscribeEvents mirror agentcontrol.Service.SubscribeEvents(PR3 订阅契约):
-// requireCurrent(本 shim 的会话路由锚点)→ rt.EnsureHub(遗留③解法:attach
-// 即建,含 SeqRange 播种;I3:播种失败显式上抛)→ hub.Subscribe(afterSeq)
-// (ErrCursorExpired 原样上抛,失败路径 cancel 收 ctx 零残留)→ 创建订阅后读
-// latestSeq/replayIntegrity(第四轮评审:不缓存旧状态)→ rt.Active() 快照。
+// SubscribeEvents mirrors production: validate the session, ensure a hub, subscribe from the
+// requested cursor, then read cursor/integrity and active-run snapshots. Cursor errors propagate.
 func (f *xgwLiveControl) SubscribeEvents(sessionID string, afterSeq uint64) (agentcontrol.AttachResult, error) {
 	if err := f.requireCurrent(sessionID); err != nil {
 		return agentcontrol.AttachResult{}, err
@@ -495,6 +449,26 @@ func (f *xgwLiveControl) ClientToolSource(connectionID string, caller model.Devi
 	}
 }
 
+// BindClientToolSpecs consumes the initialize-time contract without probing again.
+func (f *xgwLiveControl) BindClientToolSpecs(sessionID, connectionID string, specs []runtimeagent.ClientToolSpec, caller model.DeviceCaller) bool {
+	if len(specs) == 0 || caller == nil || sessionID != f.sid {
+		return false
+	}
+	return f.m.Capabilities().BindConnectionSpecs(sessionID, connectionID, specs, xgwDeviceExecutor{caller: caller})
+}
+
+// ClientToolSourceForSpecs reuses the negotiated schema and waits for compatible rebinding.
+func (f *xgwLiveControl) ClientToolSourceForSpecs(sessionID string, specs []runtimeagent.ClientToolSpec) func(context.Context) []core.Tool {
+	if sessionID != f.sid || len(specs) == 0 {
+		return nil
+	}
+	reg := f.m.Capabilities()
+	wait := f.CapabilityWaitTimeout()
+	return func(context.Context) []core.Tool {
+		return runtimeagent.NewSpecAwareClientToolProxy(reg, sessionID, specs, wait)
+	}
+}
+
 // startRunCount 供幂等断言(真实新起跑次数)。
 func (f *xgwLiveControl) startRunCount() int {
 	f.reqMu.Lock()
@@ -557,14 +531,9 @@ func (s *xgwLiveStack) liveInitializeWithDeviceCaps(t *testing.T) {
 	}
 }
 
-// liveNewSession 走 session/new,返回服务端签发的 transport 会话 id。
-//
-// Plan A2b1 语义对齐:handler 的 session/new 现经 CreateBoundSession 声明(落地
-// 本 shim 的 runtime id,Binding 指向之),不再经 SetSession 写 current——本
-// fixture 在声明成功后把 transport 会话 id 显式写成 shim 的 current 校验锚点
-// (requireCurrent 的 V1 形态镜像)。与本 shim 的既有记账一致:xgw wire 调用与
-// 标准 ACP 共用同一 transport id(单 runtime 世界里 runtime id ≠ wire id 的
-// 分离只在事件 session_id 断言处可观测,hub 以 rt.ID 为会话键)。
+// liveNewSession calls session/new and records the returned transport ID as this single-runtime
+// fixture's current-session anchor. The Binding uses the runtime ID; event assertions distinguish
+// that runtime ID from the transport ID where relevant.
 func (s *xgwLiveStack) liveNewSession(t *testing.T) string {
 	t.Helper()
 	sid, err := s.client.NewSession(context.Background(), "/repo")
@@ -637,11 +606,8 @@ func waitForEventPayload(t *testing.T, log *xgwEventLog, what, wantType string) 
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ①:initialize → session/new → attach(control) → run/start → 逐条收
-// session/events(Seq 连续)+ ③ 的 requestId 幂等 / afterSeq 断点续传 /
-// ErrCursorExpired。
-// ─────────────────────────────────────────────────────────────────────────────
+// This case covers initialize → new → attach → background events, plus idempotent retry and
+// afterSeq replay including an expired-cursor error.
 
 func TestXGWIntegrationBackgroundRunEventsAndIdempotency(t *testing.T) {
 	src := newXGWLiveControl(t, "xgw-proto-run", &xgwScriptedProvider{}, nil)
@@ -690,11 +656,8 @@ func TestXGWIntegrationBackgroundRunEventsAndIdempotency(t *testing.T) {
 		t.Fatalf("run/start result %s missing runId", raw)
 	}
 
-	// 逐条收 session/events:真实后台 run 的事件流(C2 修复后 tee 自供给采集,
-	// 见文件头)= run.started 打头 → usage.progress(iteration/usage 中间件经
-	// cb.Publish 的映射)→ text.delta(非流式整段文本)→
-	// assistant.message_finalized(kernel 收尾 Done)→ run.finished 收尾。
-	// 以「末位是 run.finished」为收齐锚点(流长度不再恒为 2)。
+	// Verify the real run's event order from run.started through run.finished, including usage,
+	// text, and finalized-message events.
 	waitFor(t, "run finished event", func() bool {
 		events, _, bad := log.snapshot()
 		return len(bad) == 0 && len(events) > 0 && events[len(events)-1].Type == session_event_run_finished
@@ -788,12 +751,8 @@ func TestXGWIntegrationBackgroundRunEventsAndIdempotency(t *testing.T) {
 		t.Fatalf("future cursor message = %q, want ErrCursorExpired text", rpcErr.Message)
 	}
 
-	// ③ afterSeq 断点续传:以 assistant.message_finalized(key 事件,不进合并
-	// 缓冲)的 seq 为已确认游标重新 attach → 恰好补齐 (cursor, latest] =
-	// [run.finished] 一条,无缺无重。不以 seq=1 续传:回放侧的合并 delta 批次
-	// 记录已展开为原始 per-seq 事件(CR3-I1;wire 上单条/批次不可区分),游标
-	// 之后的批次部分按各自 seq 逐条重放、游标之前的部分不重发——本用例的
-	// (1, latest] 内 usage.progress 合并段均 <= 游标,恰补一条 run.finished。
+	// Resume from the acknowledged key-event cursor and assert the remaining run.finished event
+	// arrives once; merged delta replay must respect individual sequence numbers.
 	before := log.count()
 	resumeFrom := uint64(events[idxFinal].Seq)
 	resumeWant := len(events) - int(resumeFrom) // = 1(run.finished)
@@ -827,11 +786,8 @@ const (
 	session_event_run_finished = "run.finished"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ②:run 内触发 HITL → 第二连接 attach(control,接管)→ approval/respond →
-// run 完成 → run/get 返回 completed + latestSeq(TestApprovalAfterReconnect 的
-// 协议级对偶)。
-// ─────────────────────────────────────────────────────────────────────────────
+// This case covers HITL approval across connections: a second control attachment takes over,
+// responds to the approval, and observes the run complete through run/get.
 
 func TestXGWIntegrationApprovalAfterReconnect(t *testing.T) {
 	// 真实 bash + 真实 HITL 中间件链:管道命令命中 DefaultRiskyPatterns 的
@@ -1002,11 +958,8 @@ func TestXGWIntegrationApprovalAfterReconnect(t *testing.T) {
 		t.Fatalf("permission events: requested@%d resolved@%d, want 成对且 requested 在先", requestedAt, resolvedAt)
 	}
 
-	// 双连接同流:B 的订阅(attach afterSeq=0:回放历史 + live 续传)与 A 并存
-	// (多观察者;观察/控制分离)。回放侧的合并 delta 批次记录已展开为原始
-	// per-seq 事件(CR3-I1,实时与回放形状一致),逐条全等对 B 的全流成立:
-	// B 的 Seq>bAttachLatest 段与 A 的同段逐条对齐,且两流末位 seq/类型一致
-	// (同一会话游标)、B 全流 seq 严格递增。
+	// Both connections observe the same replay/live stream; assert strictly increasing sequence
+	// numbers and matching event tails across subscribers.
 	waitFor(t, "B receives the same stream", func() bool {
 		eventsB, _, badB := logB.snapshot()
 		return len(badB) == 0 && len(eventsB) > 0 && eventsB[len(eventsB)-1].Seq == lastSeq
@@ -1063,11 +1016,8 @@ const (
 	session_event_permission_resolved  = "permission.resolved"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ①(补):token 派生事件(tool_call / text.delta / assistant.message_finalized)
-// 的线上形状 —— 经 hub.Publish(teePublish 的生产发布面)脚本产出,attach 后
-// 逐条到达;SessionEvent 信封(蛇形键 + seq 连续)是协议契约。
-// ─────────────────────────────────────────────────────────────────────────────
+// This case checks token-derived event wire shapes published through the event hub and delivered
+// after attach.
 
 func TestXGWIntegrationTokenEventWireShapes(t *testing.T) {
 	stack, hub := newAttachStack(t)
@@ -1121,14 +1071,9 @@ const (
 	session_event_message_finalized = "assistant.message_finalized"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ①(补二,C2 修复回归):token 派生事件的真实后台生产链 —— run/start 以全 nil
-// 回调提交的后台 run 经 tee 自供给的采集回调(supervisor.go teeRunCallbacks)产
-// 出 tool_call / tool_result / text.delta / assistant.message_finalized,attach
-// 订阅逐条到达。与 TestXGWIntegrationTokenEventWireShapes(hub.Publish 直发)
-// 互为对偶:生产者是真实 manager → Session → ai-core kernel → tee → hub 链,
-// 线上信封(蛇形键 + seq 连续)同一契约。
-// ─────────────────────────────────────────────────────────────────────────────
+// Real background-run event chain: run/start with empty callbacks still emits token-derived
+// events through the supervisor tee and attach subscription. This complements the direct-publish
+// wire-shape test below.
 
 func TestXGWIntegrationTokenEventWireShapesRealChain(t *testing.T) {
 	// 未注册工具探针(与 SDK TestStartRunEmitsJournalEvents 同型):kernel 照常
@@ -1221,11 +1166,8 @@ func TestXGWIntegrationTokenEventWireShapesRealChain(t *testing.T) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ③(补):标准方法(session/new|load|prompt|list)响应形状回归 —— x-goworker
-// 注册与真实运行面并存时,标准面逐字不变(与 TestXGWStandardMethodsUnaffected
-// 的 fake 面互为对偶,此处经真实 shim)。
-// ─────────────────────────────────────────────────────────────────────────────
+// This case verifies standard ACP method responses remain unchanged when x-goworker extensions
+// are registered alongside the live session source.
 
 func TestXGWIntegrationStandardMethodShapes(t *testing.T) {
 	src := newXGWLiveControl(t, "xgw-proto-std", &xgwScriptedProvider{}, nil)
@@ -1268,12 +1210,9 @@ func TestXGWIntegrationStandardMethodShapes(t *testing.T) {
 	}
 }
 
-// TestXGWIntegrationSessionArchive(Plan A3):x-goworker/session/archive 的协议
-// 级契约——响应形状逐字 {"archived":true}(重复归档幂等同形)、缺参与未知会话
-// 归一 -32000、管理门禁满即 busy(与 session/new|load 互斥的 wire 面);归档后
-// SessionArchived 探测为真,session/load 随即走只读重放分支(既有归档 load 用例
-// 的脚本面由本命令真实驱动)。run 在飞 busy 与 lease fencing 的语义验收在
-// plugins/agent 的 ArchiveSession 测试(真插件链路),shim 不模拟。
+// TestXGWIntegrationSessionArchive checks the archive response, error normalization, busy gate,
+// and read-only load after archival. Active-run rejection and lease fencing are covered by the
+// plugin-level archive tests.
 func TestXGWIntegrationSessionArchive(t *testing.T) {
 	src := newXGWLiveControl(t, "xgw-proto-archive", &xgwScriptedProvider{}, nil)
 	l := newXGWLiveStack(t, nil, src)
@@ -1328,16 +1267,9 @@ func TestXGWIntegrationSessionArchive(t *testing.T) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ④:设备工具(P5-9)协议级可达面 —— initialize 声明 x-device → session/prompt
-// 经 wire 触发 binder 探测(x-device/tools 过线)→ 工具经 x-device/call 过线
-// 在客户端执行 → 断连收口解绑。等待重绑/超时的 run 级编排(后台 run + 断连 +
-// 二连接重绑)在协议栈内需跨连接的 prompt 工具收集,而 handler 会话门禁串行化
-// 了跨连接 prompt(在飞 prompt 持 gate 至返回),协议级编排会自锁——该语义由
-// daemon 集成层覆盖(daemon/internal/plugins/agent/capability_test.go:
-// TestDeviceToolBindingRebindAfterDisconnect / TestDeviceToolBindingTimeoutFails,
-// 真实 binder + 真实 registry + 真实 proxy + fake caller),本测试钉协议接缝。
-// ─────────────────────────────────────────────────────────────────────────────
+// Device-tool wire coverage: initialize negotiates x-device, prompt discovers and calls a tool,
+// and disconnect unbinds it. Cross-connection rebind/timeout behavior is covered at the plugin
+// integration layer because this handler serializes prompts through one session gate.
 
 func TestXGWIntegrationDeviceToolBinderProbeAndDisconnectUnbind(t *testing.T) {
 	pv := &xgwScriptedProvider{msgs: []core.Message{
@@ -1372,8 +1304,6 @@ func TestXGWIntegrationDeviceToolBinderProbeAndDisconnectUnbind(t *testing.T) {
 	}
 	l := newXGWLiveStack(t, evaluate, src)
 	t.Cleanup(l.handler.Close)
-	l.liveInitializeWithDeviceCaps(t)
-
 	// 客户端义务:x-device/tools 应答声明清单;x-device/call 计数并回放结果
 	// (协议级 fake caller —— caller 即 ai-acp Server 的 client-ward Call 通道)。
 	var callMu sync.Mutex
@@ -1387,6 +1317,7 @@ func TestXGWIntegrationDeviceToolBinderProbeAndDisconnectUnbind(t *testing.T) {
 		callMu.Unlock()
 		return json.RawMessage(`{"result":"from-A"}`), nil
 	})
+	l.liveInitializeWithDeviceCaps(t)
 
 	sid := l.liveNewSession(t)
 	type promptResult struct {

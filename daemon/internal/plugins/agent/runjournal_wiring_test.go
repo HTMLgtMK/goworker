@@ -17,15 +17,11 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// 编译期断言（P2-3 遗留，plan P2-3「新增文件：无」节指定落在本步）：agent 包的
-// RunStateJournal 消费面由 session 包的聚合类型 *session.RunJournalStore 满足。
-// 断言必须放 daemon（消费方）侧——session 包不得反向 import agent（RunState 是
-// agent 类型，勘察修正 D），反向断言无处落地。
+// 编译期断言：daemon 使用的聚合 journal 满足 agent 的状态 journal 接口。
+// 断言放在消费方，避免 session 包反向依赖 agent。
 var _ runtimeagent.RunStateJournal = (*session.RunJournalStore)(nil)
 
-// writeRunJournalFile 以 P2-2 的字节格式写一个 run journal 文件（json.Encoder
-// 单行 + '\n'，对齐 appendRunStateRecord，journal.go:106-119），模拟上一进程的
-// 遗留；返回写入的原始字节供前缀/逐字节对照。
+// writeRunJournalFile 用生产格式写入 run journal 记录，模拟上一进程留下的数据。
 func writeRunJournalFile(t *testing.T, path string, recs ...session.RunStateRecord) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -59,9 +55,7 @@ func readRunJournalFile(t *testing.T, path string) []session.RunStateRecord {
 	return recs
 }
 
-// initHub 构造可跑完整 Init 的最小 hub（同 TestInit_OpensMemory 先例，
-// plugin_test.go:1005-1010：testHub 不带 RegisterCommand/SetFallbackHandler，
-// Init 注册命令时会对 nil 函数调用 panic）。
+// initHub 构造可跑 Init 的最小 hub；testHub 缺少 Init 注册命令所需的回调。
 func initHub(cfg *runtimeconfig.Config) *model.Hub {
 	return &model.Hub{
 		Config:             cfg,
@@ -71,15 +65,8 @@ func initHub(cfg *runtimeconfig.Config) *model.Hub {
 	}
 }
 
-// TestStartSessionMarksInterruptedRuns 验证 P2-7 的启动恢复接线在 Plan A4 之后
-// 的完整链（总方案第九节「Daemon 重启后」的 daemon 落地）：临时 Session.Dir 造
-// legacy 槽 + 上一进程遗留的 <root>/runs/（run-<nano>-1 末记录 running、
-// run-<nano>-0 已终态 completed）→ NewPlugin+Init（startSession 首周期先执行
-// 一次性迁移：legacy 槽迁入 per-id、runs/ 随迁 <root>/<sid>/runs/）→
-// LoadBoundSession 重开迁移后的会话（A2b1 重开路径承担恢复扫描——迁移退役了
-// 「挂载 legacy 槽为 current」的启动行为，current 是 Create 的新会话、无 journal
-// 可扫）→ 未收尾的 run 被追加恰好一条 interrupted 标记且原内容为字节前缀
-// （不动）；已终态的 run 逐字节不动。runs/ 的随迁由此一并验收。
+// TestStartSessionMarksInterruptedRuns 验证 legacy 会话与 runs 迁移后，重开会话
+// 只为未终态 run 追加一条 interrupted 记录；原记录保留，已终态文件不变。
 func TestStartSessionMarksInterruptedRuns(t *testing.T) {
 	root := t.TempDir()
 
@@ -171,18 +158,8 @@ func TestStartSessionMarksInterruptedRuns(t *testing.T) {
 	}
 }
 
-// TestAgentRunJournalsThroughDaemon 验证 PR4(总方案 §九)的 journal 接线穿透
-// daemon 全链:持久化启用路径跑一轮 /agent(handleAgent → StartRunSync →
-// manager.StartRun),当前会话 runs/ 下出现恰一个 run 文件,state 记录序
-// queued → running → completed(与后台 Run 同型——queued 是 StartRun 的
-// durable-first 接受记录,PR4 起同步 prompt 与后台 run 同一记账面;RecordRun
-// 形态的 running 起跑记录已退役)。事件记录与 state 记录同文件混存
-// (journal_store.go P3-1),断言只认 kind=="state" 的行。
-//
-// 固定 provider 经 setMemory 同款手法注入（plugin_test.go:240-244）：SessionDeps
-// 是值拷贝，改 p.deps 后必须 refreshSession 重建会话生效；refreshSession 与
-// startSession 的会话边界构造一致（Register 进 manager + 置 current），新会话
-// 继承 startSession 注入的 Store + RunJournal（真实 startSession 接线由此穿透）。
+// TestAgentRunJournalsThroughDaemon 验证同步 prompt 将 queued、running、completed
+// 状态写入当前会话的 journal，且事件与状态共用同一 journal store。
 func TestAgentRunJournalsThroughDaemon(t *testing.T) {
 	root := t.TempDir()
 	cfg := runtimeconfig.Default()

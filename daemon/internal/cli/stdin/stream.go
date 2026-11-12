@@ -11,20 +11,10 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// streamRenderer 负责流式 token 的增量上屏与定稿替换。
-//
-// 策略（行级流式 + 整段定稿）：增量文本先以原始形式逐行上屏（不跑 markdown
-// 渲染），流结束（done / kind 切换 / tool token）时擦除全部原始行，用 glamour
-// 对整条消息一次性渲染替换。不做分段定稿：按空行拆段会把同属一个列表/代码块
-// 的段落切成多个锚点块（孤立 ●、列表结构丢失），glamour 的边距也会在每次独立
-// 渲染时不一致——正是排版间距混乱的来源。
-//
-// 粒度选行而不是字符：行边界与状态栏"独占一行"协议天然兼容，无需光标列寻址
-// （折行/宽字符下列计算存在终端歧义）。
-//
-// 终端协议与 Write() 一致：状态栏活跃时每次上屏 = 清栏 → 写内容 → 换行 →
-// 重绘栏，状态栏始终独占已写内容的下一行；由此擦除时的光标位置是确定的
-// （栏行或最后内容行的下一行行首），上移 rows 行即回到消息起始行。
+// streamRenderer prints complete lines as tokens arrive, then replaces them with
+// one Markdown-rendered message when the stream ends or its kind changes. Rendering
+// the whole message preserves Markdown blocks; line-level output keeps terminal
+// cursor handling deterministic, including wrapped lines and status-bar redraws.
 type streamRenderer struct {
 	f *StdinFrontend
 

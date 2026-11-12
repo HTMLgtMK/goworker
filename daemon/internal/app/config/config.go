@@ -1,10 +1,6 @@
-// Package config 定义 goworker 的全局配置结构。
-//
-// 配置从 YAML 文件加载，缺失字段由默认值兜底。
-// 文件路径：~/.config/goworker/config.yaml（可用 GOWORKER_CONFIG_DIR 覆盖目录）。
-//
-// 分层：本包是 YAML 解析层 + 路径中枢；runtime 段(LLM/Memory/Session/MCP)用 ai-runtime/config，
-// Sandbox 保留本地解析层（risky_patterns 字符串/结构体双格式兼容），经 ToRuntime() 转成 ai-runtime 的聚合配置注入插件。
+// Package config loads goworker's YAML configuration and centralizes config paths.
+// Runtime settings are defined in ai-runtime/config; sandbox settings are converted
+// here to preserve compatibility with both legacy and structured risky_patterns entries.
 package config
 
 import (

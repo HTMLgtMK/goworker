@@ -1,25 +1,6 @@
-// journal.go 实现 Run 状态 Journal（P2-2）：每 run 一个 jsonl 文件，落点
-// <会话目录>/runs/<runID>.jsonl，durable-first 追加（marshal 单行 + '\n' +
-// file.Sync，字节格式对齐 Store.appendRecord，store.go:680-693）。这是总方案
-// 第九节「Run 状态持久化」的存储面，加上同节「Daemon 重启后」的恢复扫描
-// （MarkInterruptedRuns：尾部坏行截断 + 非终态标记 interrupted，绝不自动重跑）。
-//
-// 并发与锁论证（custody，勘察修正 C）：Journal 不新增锁面——<dir>/lock 的
-// flock（lock_unix.go）只保护 Store 写者，Journal 若独立持锁需新增锁面。本设计
-// 让 Journal 写权依附于「该会话 Store 在本 Repository 的 open 缓存」（OpenRunJournal
-// ①-② 强制），而 store 进缓存必经 Store.Open 持 flock——跨进程第二写者开不了
-// Store ⇒ 开不了 Journal（宁拒勿双写）；同 runID 的重复创建被 O_EXCL 拒绝
-// （ErrRunExists，P2-1 跨重启 RunID 的碰撞兜底）；单文件追加由 j.mu 串行，且
-// 每 run 至多一个 RunJournal 实例，无多写者。
-//
-// Delete 安全：open 缓存命中 ⇒ Delete 必拒（repository.go ErrSessionInUse）
-// ⇒ Journal（依附在缓存 store）存在期间会话目录不可能被 RemoveAll——「删目录
-// 而 Journal 仍写」不可达，无需给 Journal 建独立占用登记。
-//
-// P3-1 起本文件还承载事件记录契约：EventRecord/SessionEvent（总方案第五节的
-// 存储面与传输形状）、事件类型常量与 IsKeyEvent。事件记录（kind=="event"）与
-// state 记录（kind=="state"）同文件混存（runs/<runID>.jsonl），逐行 kind 域
-// 自辨，custody 论证不变。
+// journal.go 持久化每个 Run 的状态与事件到同一 JSONL 文件，追加落盘；恢复时
+// 截断尾部坏行并将未终态标记为 interrupted，不自动重跑。写入依附 Repository
+// 缓存中的 Store 目录 flock；O_EXCL 阻止重复 runID，RunJournal.mu 串行文件追加。
 package session
 
 import (
@@ -35,13 +16,11 @@ import (
 	"time"
 )
 
-// RunStateRecord 是 run journal 中的一条 run 状态记录。kind 自立门户恒为
-// "state"：P3 事件记录与它同文件混存（runs/<runID>.jsonl）零格式迁移。
-// State 用 string：agent.RunState 字符串化（session 不得反向 import agent，
-// 勘察修正 D），另有 journal 自有的 StateInterrupted。
+// RunStateRecord is a persisted run-state entry. State is a string to avoid an
+// import cycle with agent; StateInterrupted is specific to recovery.
 type RunStateRecord struct {
 	Kind      string    `json:"kind"`       // 恒 "state"
-	SessionID string    `json:"session_id"` // 诊断字段（勘察修正 I：Archive 换 id 后的归属可辨）
+	SessionID string    `json:"session_id"` // 诊断字段（Archive 换 id 后的归属可辨）
 	RunID     string    `json:"run_id"`
 	State     string    `json:"state"` // agent.RunState 字符串化；另有 StateInterrupted
 	Err       string    `json:"err,omitempty"`
@@ -50,12 +29,12 @@ type RunStateRecord struct {
 }
 
 // stateKind 是 RunStateRecord 的 kind 值。恢复扫描只认 kind=="state" 的记录
-// （P3 起事件记录与 state 同文件混存，末条行未必是 state 记录）。
+// （事件记录与 state 同文件混存，末条行未必是 state 记录）。
 const stateKind = "state"
 
 // StateInterrupted 是 journal 自有的恢复标记态：恢复扫描发现上一进程留下的
-// 非终态 run 时追加（总方案第九节「Run Running → 标记 Interrupted」）。属
-// journal 语义，不进 agent.RunState 枚举（P2 无产生方）。
+// 非终态 run 时追加（「Run Running → 标记 Interrupted」）。属
+// journal 语义，不进 agent.RunState 枚举（无产生方）。
 const StateInterrupted = "interrupted"
 
 // eventKind 是 EventRecord 的 kind 值：事件记录与 state 记录同文件混存，逐行
@@ -63,23 +42,14 @@ const StateInterrupted = "interrupted"
 // kind=="state"，互不误读）。
 const eventKind = "event"
 
-// ── 事件契约（P3-1，总方案第五节）──────────────────────────────────────
+// ── 事件契约 ───────────────────────────────────────────────────────────
 
-// EventRecord 是 run journal 中的一条事件记录（kind 恒 "event"，与 state 记录
-// 同文件混存）。Seq 是会话维度严格递增游标（P3-0 契约表：EventHub 单调分配，
-// 跨 Run 不重复）；Seq 记「记录末事件序号」，合并批次记录（FromSeq>0）的
-// Seq=批次末事件 seq、FromSeq=批次首事件 seq。
-//
-// FromSeq 批次语义（CR3-I1 定稿，与 agent 侧 event_hub.go 的回放注释同文）：
-// FromSeq==0 = 单条事件记录（key 事件与逐条落盘形态）；FromSeq>0 = 合并批次
-// 记录，payload 为 agent.DeltaBatch JSON（窗内逐事件 {seq,payload} 按序保留）。
-// 批次是**按 Type 分桶**的产物：批次记录只含同型 delta 的 part，区间内其他
-// 类型事件是独立记录（与批次 seq 交错）——FromSeq/Seq 只是存储层的批次标记，
-// 消费方（agent.EventHub 的 Subscribe 回放）按批次内 per-part seq 展开投递，
-// wire 上单条与批次不可区分（SessionEvent 已无 FromSeq 字段）。
+// EventRecord is the persisted event shape. Seq is session-wide; FromSeq > 0 marks
+// a stored delta batch whose payload preserves each event's sequence and content.
+// Replay expands batches to the same per-event SessionEvent shape used live.
 type EventRecord struct {
 	Kind      string          `json:"kind"`       // 恒 "event"（AppendEvent 强制，存储层不变量）
-	SessionID string          `json:"session_id"` // 诊断字段（勘察修正 I，同 RunStateRecord.SessionID）
+	SessionID string          `json:"session_id"` // 诊断字段（同 RunStateRecord.SessionID）
 	RunID     string          `json:"run_id"`
 	Type      string          `json:"type"`               // 事件类型常量之一（下方两组）
 	Seq       uint64          `json:"seq"`                // 记录末事件序号（合并批次记录=批次末 seq）
@@ -88,15 +58,9 @@ type EventRecord struct {
 	Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
-// SessionEvent 是事件回放/实时投递的传输形状（总方案第五节，agent 侧 EventHub
-// 消费）。与 EventRecord 的差异：无 Kind 信封（存储信封对传输方不可见），无
-// FromSeq（批次只存在于存储面——CR3-I1 起 Subscribe 回放把合并批次展开为
-// 原始 per-seq 事件，实时与回放形状彻底一致，wire 上单条/批次不可区分，断点
-// 恢复精确到 seq），Payload 不 omit 空值。EventHub.Publish 把 IngressEvent 包
-// 成本类型后既广播又落盘（P3-2）；Subscribe 的回放把持久化记录（单条或合并
-// 批次）展开为本类型逐事件投递（P3-3）。
-//
-// 客户端游标以实际收到的每条事件 Seq 逐条推进。
+// SessionEvent is the per-event wire shape. Storage-only Kind/FromSeq fields are
+// omitted; replay expands stored batches, so clients advance their cursor by each
+// received Seq just as they do for live delivery.
 type SessionEvent struct {
 	SessionID string          `json:"session_id"`
 	RunID     string          `json:"run_id"`
@@ -106,11 +70,11 @@ type SessionEvent struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
-// 关键事件类型（P3-0 契约表的 9 类 key 事件）：必须持久化且 durable-first
-// （journal fsync 成功后才广播，P3-2；失败不广播）。tool_call/tool_result/
-// permission.*/assistant.message_finalized 由 P3-4 的 teeRunCallbacks 从
+// 关键事件类型（契约表的 9 类 key 事件）：必须持久化且 durable-first
+// （journal fsync 成功后才广播；失败不广播）。tool_call/tool_result/
+// permission.*/assistant.message_finalized 由 teeRunCallbacks 从
 // RunCallbacks 三入口产出（源自 streamTokens 实际流 session.go:213-249）；
-// run.* 四类是 run 生命周期事件的落码预留（supervisor 状态迁移时产出，P3-4）。
+// run.* 四类是 run 生命周期事件的落码点（supervisor 状态迁移时产出）。
 const (
 	EventToolCall                  = "tool_call"
 	EventToolResult                = "tool_result"
@@ -123,9 +87,9 @@ const (
 	EventRunError                  = "run.error"
 )
 
-// 高频 delta 事件类型（P3-0 契约表的 3 类）：进合并缓冲，50ms/4KB 窗合并为
-// 一条批次记录（FromSeq..Seq 范围声明 + DeltaBatch payload，CR3-I1）落盘
-// （P3-2）；实时广播仍逐事件（per-event seq）。命名对齐
+// 高频 delta 事件类型（契约表的 3 类）：进合并缓冲，50ms/4KB 窗合并为
+// 一条批次记录（FromSeq..Seq 范围声明 + DeltaBatch payload）落盘；
+// 实时广播仍逐事件（per-event seq）。命名对齐
 // runtimeconfig.Event* 既有风格（config/spec.go:251-252）。
 const (
 	EventTextDelta     = "text.delta"
@@ -151,7 +115,7 @@ func IsKeyEvent(typ string) bool {
 
 // isTerminalRunState 判定 state 是否为 run 终态：恢复扫描据其判定「该 run 已
 // 收尾，无需处理」。completed/failed/cancelled 与 agent.RunState 的字符串化
-// 一致（run.go:18-22，P2-1 已把取消归一为 cancelled）；StateInterrupted 是
+// 一致（run.go:18-22，取消已归一为 cancelled）；StateInterrupted 是
 // journal 自有的恢复标记，同属终态——这是幂等的关键：重扫不再追加第二个标记。
 func isTerminalRunState(state string) bool {
 	switch state {
@@ -172,9 +136,7 @@ type RunJournal struct {
 	path string
 }
 
-// Append 追加一条 state 记录：marshal 单行 + '\n'（字节格式对齐 appendRecord，
-// store.go:680-693）+ file.Sync——durable-first。单次 Write 写整行，崩溃最多
-// 留半行，由恢复扫描的尾截断修复（「部分写入的尾记录有明确截断修复策略」）。
+// Append appends and syncs a state record. A partial trailing write is repaired during recovery.
 func (j *RunJournal) Append(rec RunStateRecord) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -184,11 +146,8 @@ func (j *RunJournal) Append(rec RunStateRecord) error {
 	return appendRunStateRecord(j.f, rec)
 }
 
-// AppendEvent 追加一条事件记录（P3-1：与 state 记录同文件混存）。串行与
-// durable-first 语义同 Append（j.mu + fsync）；Kind 在存储边界强制为
-// eventKind——「EventRecord.Kind 恒 event」是本层不变量，不依赖调用方自觉
-// （agent 侧 state 记录由调用方显式置 Kind 的先例见 runtime.go:155，事件侧
-// 改为存储层强制：kind 错误会导致回放静默丢事件，代价不对称）。
+// AppendEvent appends and syncs an event in the run journal. Kind is set at the
+// storage boundary so malformed records cannot silently disappear during replay.
 func (j *RunJournal) AppendEvent(rec EventRecord) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -267,13 +226,9 @@ func loadStateRecords(path string) (recs []RunStateRecord, lastGoodEnd int64, er
 	return recs, lastGoodEnd, nil
 }
 
-// loadEventRecords 从 run journal 文件加载事件记录（kind=="event"，P3-1）。
-// 行扫描骨架与坏行策略同 loadStateRecords（scanJSONL：坏行跳过并 warn）；
-// state 行是合法 json（Unmarshal 进 EventRecord 不报错，未知字段忽略），按
-// kind 域过滤丢弃——对偶面是 MarkInterruptedRuns 的末条 state 判定同样只认
-// kind==stateKind（loadStateRecords 逐行收集、由它过滤），事件行不干扰恢复
-// 语义，混存互不误读。返回值无 lastGoodEnd：本读取方不做尾截断（那是
-// MarkInterruptedRuns 经 loadStateRecords 的职责），坏行一律跳过即可。
+// loadEventRecords 只收 kind==event 的记录；合法 state 行按 kind 丢弃，避免混存时
+// 误读。与 loadStateRecords 共用 scanJSONL，坏行跳过并 warn；不返回偏移、不截断，
+// 尾部修复由 MarkInterruptedRuns 负责。
 func loadEventRecords(path string) (recs []EventRecord, err error) {
 	_, err = scanJSONL(path, func(line []byte, _ int64) bool {
 		var rec EventRecord
@@ -292,12 +247,9 @@ func loadEventRecords(path string) (recs []EventRecord, err error) {
 	return recs, nil
 }
 
-// validRunID 拒绝空 id、路径分隔符与非 "run-<十进制>-<十进制>" 形的 run id
-// （P2-1 newRunID 的格式，run.go:107-110）。OpenRunJournal 以
-// <dir>/runs/<runID>.jsonl 拼路径，恶意/畸形 runID 必须在拼路径前卡死
-// （防 traversal，同 validSessionID 的论证，repository.go:321-333）。
-// MarkInterruptedRuns 的扫描方不经此校验：文件名来自 os.ReadDir（不可能含
-// 路径分隔符），runID 取自文件名而非调用方输入。
+// validRunID accepts only run-<decimal>-<decimal> IDs. It rejects traversal before
+// OpenRunJournal joins the ID into a path; recovery scanning trusts only names returned
+// by os.ReadDir and therefore does not use this caller-input validator.
 func validRunID(id string) bool {
 	if !validSessionID(id) {
 		return false
@@ -320,12 +272,9 @@ func validRunID(id string) bool {
 	return true
 }
 
-// OpenRunJournal 为已打开会话的一个 run 创建状态 journal 文件（custody 入口）。
-// 前置（custody，见文件头论证）：sessionID 的 Store 必须已在本 Repository 的
-// open 缓存中，否则 ErrSessionNotOpen（journal 依附 Store in-cache，不新增锁）。
-// 文件以 O_CREATE|O_EXCL 创建：同 runID 的 journal 已存在（含 P2-1 的 RunID
-// 跨重启碰撞）→ ErrRunExists——碰撞变成可观测错误而非静默覆盖（run.go:100-104）。
-// 无效 runID 在拼路径前拒绝（validRunID，防 traversal）。
+// OpenRunJournal creates a run journal only for a Store cached by this Repository;
+// otherwise it returns ErrSessionNotOpen. O_EXCL makes runID collisions observable as
+// ErrRunExists rather than overwriting data; validate IDs before constructing the path.
 func (r *Repository) OpenRunJournal(ctx context.Context, sessionID, runID string) (*RunJournal, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -364,18 +313,10 @@ func (r *Repository) OpenRunJournal(ctx context.Context, sessionID, runID string
 	return &RunJournal{f: f, path: path}, nil
 }
 
-// MarkInterruptedRuns 执行恢复扫描（总方案第九节「Daemon 重启后」）：对会话
-// runs/ 下的每个 journal 文件（文件名序）：
-//  1. 按 loadRecords 同策略解析（scanJSONL：坏行跳过，lastGoodEnd = 最后一条
-//     合法记录行末），末尾坏行截断回 lastGoodEnd——「部分写入的尾记录有明确
-//     截断修复策略」，与 Store.Open 对 current.jsonl 的修复一致（store.go:101-118）；
-//  2. 末条 state 记录非终态（completed/failed/cancelled/interrupted 之外）→
-//     O_APPEND 追加 {kind:"state", state:"interrupted", run_id:文件名 runID}。
-//
-// 幂等：已终态（含 interrupted）的 run 跳过，重扫不追加第二个标记。
-// 恢复绝不自动重跑：本方法只做截断与标记，不产生任何其他记录、不触碰
-// current.jsonl——「不盲目重新执行」由恢复路径纯标记的构造保证
-// （TestRestoreInterruptedRun 用记录数断言钉死）。
+// MarkInterruptedRuns scans run journals in filename order, truncates only a malformed
+// tail to the last valid record (matching Store.Open), then appends one interrupted
+// marker for each run whose last state is nonterminal. It is idempotent, never reruns
+// work, and leaves current.jsonl untouched; recovery failures are returned to caller.
 func (r *Repository) MarkInterruptedRuns(ctx context.Context, sessionID string) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

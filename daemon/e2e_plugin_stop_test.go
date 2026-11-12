@@ -21,37 +21,8 @@ import (
 	agentplugin "github.com/tinguo/goworker/daemon/internal/plugins/agent"
 )
 
-// e2e_plugin_stop_test.go 补齐重构方案 §十测试矩阵的最后一行（PR5）：
-//
-//	场景          | 验收条件
-//	--------------+--------------------------------------------------------
-//	Plugin Stop   | 不遗留失控 goroutine、连接订阅或 Store 句柄
-//
-// 其余矩阵行由既有测试钉死（引用，不在本文件重复）：
-//   - 多客户端多会话（A/B 各自创建/启动/取消互不影响，PR2；Plan A2 起旧会话
-//     在其他连接仍绑定时保持存活）：
-//     daemon/internal/plugins/agent/binding_test.go（TestBindingRoutesPromptToBoundSession、
-//     TestHandleNewKeepsSessionWhileOtherConnectionBound）、runcontrol_test.go
-//     （TestCrossSessionRunControl、TestCrossSessionRequestIdempotency）；
-//   - Lease 接管（新持有者先提交后旧操作拒绝）：
-//     daemon/internal/agentcontrol/lease_test.go（TestLeaseRegistryTakeover、
-//     TestLeaseRegistryWithControlFencing）、service_test.go（TestServiceStartRunFencing）；
-//   - 后台运行/Replay-Live/审批隔离/幂等重试：acp 包 xgw_test.go 与
-//     xgw_integration_test.go、agentcontrol/idempotency_test.go、
-//     ai-runtime/agent 的 run_lifecycle/event_hub 测试族。
-//
-// 本文件用真实插件装配链（NewPlugin+Init → 真实 provider 工厂 → mock LLM HTTP
-// 服务）跑端到端 Stop：在飞后台 Run → 插件 Stop →
-//   ① run 收敛取消终态（journal 末条 cancelled，磁盘可证）；
-//   ② manager 停机（提交面拒绝，注册表清空）；
-//   ③ 事件订阅随 hub 收口关闭（订阅通道关闭可观测）；
-//   ④ Store 句柄释放（包外视角：对会话目录 session.Open 重开成功 ⇒ 插件的
-//     flock 已释放；若 Stop 泄漏句柄，同进程第二次持锁被 ErrStoreLocked 拒绝）。
-// 失控 goroutine 的两个来源面（在飞 Run 执行体、订阅泵）分别由 ①的终态收敛与
-// ③的通道关闭覆盖；不直接断言 runtime.NumGoroutine（并行测试基线不可靠）。
-
-// TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles:在飞 run → Stop →
-// run 终态、manager closed、订阅关闭、Store 句柄释放（无泄漏）。
+// TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles verifies that Stop
+// cancels an active run, closes its subscription, and releases the session store.
 func TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles(t *testing.T) {
 	// mock LLM：挂在 release 上直到客户端 ctx 取消（runCtx 取消 → HTTP 请求
 	// 中止 → run 收敛取消）。release 是防御性兜底：若取消链失效，放行使 run
@@ -168,11 +139,9 @@ func TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles(t *testing.T) {
 	}
 }
 
-// e2eAssertStoreHandleReleased 从包外视角断言 Store 句柄已释放：对插件挂载的
-// 会话目录（<Session.Dir>/<sid>/）session.Open 重开成功 ⇒ 插件 Stop 已 Close
-// store 并释放跨进程文件锁；若句柄泄漏（flock 仍被插件实例持有），同进程的
-// 第二次 LOCK_EX|LOCK_NB 被拒绝（ErrStoreLocked，store.go「宁拒勿双写」）。
-// 重开实例随即 Close，不留新句柄。
+// e2eAssertStoreHandleReleased reopens the session from outside the plugin to verify Stop
+// released its flock. A leaked handle makes the second LOCK_EX|LOCK_NB fail with ErrStoreLocked;
+// the reopened test handle is closed afterward.
 func e2eAssertStoreHandleReleased(t *testing.T, root, sid string) {
 	t.Helper()
 	st, err := session.Open(filepath.Join(root, sid))

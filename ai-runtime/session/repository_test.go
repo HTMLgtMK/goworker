@@ -40,10 +40,7 @@ func listContains(list []Metadata, id string) bool {
 	return false
 }
 
-// TestRepositoryCreateOpenListDelete 覆盖四操作往返：
-// Create → List 含新 id（目录名 == 文件内 SessionID 的种入不变量）→
-// Open 返回同一实例 → Delete 各分支（in-use / 未知 id / 成功删除）。
-// 另以第二个 Repository 重新打开同一 root，验证身份与历史跨重启可恢复。
+// TestRepositoryCreateOpenListDelete checks create, list, open, delete, and reopen behavior.
 func TestRepositoryCreateOpenListDelete(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -159,9 +156,7 @@ func TestRepositoryCreateOpenListDelete(t *testing.T) {
 	}
 }
 
-// TestConcurrentStoreOpen 验证进程内实例唯一（决策 3）：并发 Open 同一 id N 次，
-// 全部返回同一 *Store 指针（输家在双检中关闭多余句柄，不产生双重打开的文件）。
-// 会话经第二个 Repository 落盘后关闭，保证被测 repo 走的是缓存未命中的慢路径。
+// TestConcurrentStoreOpen verifies concurrent opens share one Store instance.
 func TestConcurrentStoreOpen(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -217,11 +212,7 @@ func TestConcurrentStoreOpen(t *testing.T) {
 	}
 }
 
-// TestLegacyRootMount 验证 legacy 布局的兼容挂载（决策 2）：在 root 自身造出
-// legacy 槽（root/current.jsonl + root/archive/ 夹具，归档文件直接构造——
-// Store.Archive() 已随 Plan A 定案 #2/#9 删除），之后 Open(legacy id) 原地
-// 挂载、List 含它且不含归档、Delete 被拒绝。轮转语义已不存在：/new 纯新建
-// （定案 #2），legacy 槽淘汰由 A4 一次性迁移负责。
+// TestLegacyRootMount verifies that a legacy root slot remains readable and immutable.
 func TestLegacyRootMount(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -312,12 +303,9 @@ func TestLegacyRootMount(t *testing.T) {
 	}
 }
 
-// ── Plan A1 / A2.1①：CWD 接通、v2 双探测、CloseSession 逐出 ──────────────
+// ── Workspace persistence, legacy path compatibility, and cache eviction ──
 
-// TestRepositoryCreateDeclaresWorkspace 验证 Create 接通 CWD（Plan A1「创建即声明」）：
-// CWD 非空 → workspace 记录落 v2 数据文件、Workspace() 可读、跨重启可恢复；
-// CWD 为空 → 不落记录（「未声明」= 不写记录，DeclareWorkspace 注释论证）；
-// Title 仍被忽略（决策 1）。
+// TestRepositoryCreateDeclaresWorkspace verifies non-empty CWD persistence and recovery.
 func TestRepositoryCreateDeclaresWorkspace(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -375,9 +363,7 @@ func TestRepositoryCreateDeclaresWorkspace(t *testing.T) {
 	}
 }
 
-// TestRepositoryOpenListDualProbe 验证 Open/List 的数据文件双探测（Plan A1）：
-// ① Create 产出 v2 名后重开 Repository，Open/List 均命中（v2 探测）；
-// ② 手工造 <id>/current.jsonl 存量形态，Open/List 同样命中（兼容探测），且读路径不创建 v2 文件（不隐性迁移，改名归 A4）。
+// TestRepositoryOpenListDualProbe verifies v2 files and legacy current.jsonl remain discoverable.
 func TestRepositoryOpenListDualProbe(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -451,10 +437,7 @@ func TestRepositoryOpenListDualProbe(t *testing.T) {
 	}
 }
 
-// TestRepositoryCloseSessionReopen 验证 A2.1① 死实例修复：
-// CloseSession 关闭实例并逐出缓存；再次 Open 走 flock 慢路径拿到活的新实例
-// （锁已释放即可重开——session/load 重开需要的语义）；旧实例已 Close 不可写；
-// 对不在缓存中的 id 幂等返回 nil。
+// TestRepositoryCloseSessionReopen verifies eviction closes the Store and permits a fresh open.
 func TestRepositoryCloseSessionReopen(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -521,16 +504,10 @@ func TestRepositoryCloseSessionReopen(t *testing.T) {
 	}
 }
 
-// TestRepositoryCloseSessionEvictsAliasEntries 验证别名条目一并逐出：
-// 同一 *Store 挂在多个 id 下（Open 的同目录别名机制）时，CloseSession(任一 id)
-// 必须把全部别名条目逐出并只关闭一次——留任一条目都会让该 id 的 Open 命中已
-// 关闭实例，死实例问题换个 id 复发。
-//
-// 夹具说明（Plan A2：Store.Archive() 删除后的形态）：历史触发方「legacy 槽
-// 轮转换 id」已不存在，现可达的别名形态是存量「per-id 目录名 ≠ 文件内 metadata
-// id」（A4 一次性迁移前）。该形态经 Open 天然只会挂一个缓存键（另一 id 解析
-// 不到同一目录），因此别名条目由测试在包内直接播种——白盒构造与别名机制等价
-// 的缓存状态，逐出逻辑按实例指针清理的契约不依赖别名如何产生。
+// TestRepositoryCloseSessionEvictsAliasEntries verifies CloseSession evicts every cache
+// key for the same Store pointer and closes it once. The legacy fixture has a directory
+// name distinct from its metadata ID; the test seeds the otherwise unreachable alias
+// cache state directly, then checks eviction, idempotence, and a fresh reopen.
 func TestRepositoryCloseSessionEvictsAliasEntries(t *testing.T) {
 	root := t.TempDir()
 
@@ -603,14 +580,7 @@ func TestRepositoryCloseSessionEvictsAliasEntries(t *testing.T) {
 	}
 }
 
-// TestRepositoryPeekNeverResurrects 验证 Peek 的「只查不建」契约（Plan A4 加固，
-// storeFor 复活问题的 SDK 侧验收）：
-//   - 缓存命中返回同实例（指针相等，实例唯一不变量）；
-//   - 未命中返回 ok=false 且**不触碰文件系统**（对照：Open 未命中会走 Store.Open
-//     慢路径建实例并持 flock）；
-//   - repo.Close 清空缓存后 Peek 仍不复活——这正是 A3 审查抓到的泄漏根因：
-//     宿主 Stop 后 stale runtime 引用再取数，Open 会重建实例持 flock 到进程
-//     退出，Peek 把该路径收窄为诚实降级。
+// TestRepositoryPeekNeverResurrects verifies Peek never reopens a closed or missing Store.
 func TestRepositoryPeekNeverResurrects(t *testing.T) {
 	root := t.TempDir()
 	repo, err := OpenRepository(root)

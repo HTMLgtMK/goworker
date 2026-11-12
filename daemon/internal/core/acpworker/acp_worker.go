@@ -65,15 +65,10 @@ func (w *acpWorker) SetSession(sessionID, cwd string) {
 	w.setSession(sessionID, cwd)
 }
 
-// setSession 建会话并落地提交方声明的 cwd。cwd 经 SessionDeps.CWD 渗透到
-// Session 的 sandbox 配置副本（bash 的 cmd.Dir 与 read/write 的相对路径基准都
-// 取自 AllowedWorkDir）—— orchestrator 在 session/new 传的是 t.Worktree/t.Repo，
-// 于是工具就跑在该任务的 worktree 里，而不是 daemon 进程的 cwd。
-//
-// 这里不做 sandbox 边界校验（对照 agent 插件侧 SetSession）：cwd 来自
-// orchestrator 自己算出的任务 worktree，与 worker 同属一个信任域，不是远程
-// 不可信输入；套上 cfg.Sandbox.AllowedWorkDir 前缀校验反而会把合法 worktree
-// （位于 <repo>/.goworker/dispatch/ 下）误拒。
+// setSession creates a session using the cwd supplied by the trusted orchestrator.
+// The cwd becomes the sandbox work directory for commands and relative file access.
+// It is not checked against AllowedWorkDir: dispatch worktrees may be outside that
+// prefix, and the caller is within the worker's trust boundary.
 func (w *acpWorker) setSession(sessionID, cwd string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -178,9 +173,8 @@ func (w *acpWorker) Run(ctx context.Context, sessionID, prompt string, rep dispa
 		// 策略决定是自动放行还是转给订阅者）。决策失败一律拒绝，见 DecideViaACP。
 		Decide: model.DecideViaACP(ctx, rep, sessionID),
 	}
-	// stdio worker 无 SessionRuntime，Run 不记账（会话生命周期归调用方管理，
-	// 勘察修正 C）；记账留 P2 RunSupervisor。第二返回值 RunResult 此处仅丢弃，
-	// error 面与改造前一致。
+	// stdio worker sessions are caller-managed and have no SessionRuntime, so
+	// Run does not record run history here. Preserve the existing error behavior.
 	if _, err := session.Run(ctx, runtimeagent.RunRequest{Input: prompt}, cb); err != nil {
 		return "", err
 	}

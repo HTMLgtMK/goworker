@@ -16,18 +16,11 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 )
 
-// 本文件是 P5-9 设备工具切 CapabilityRegistry + proxy 的 daemon 集成测试(总方案
-// §8 的 daemon 接线,P5 显式可见变化 #1):经插件的真实 binder
-// (AgentPlugin.ClientToolSource)+ 真实 manager.Capabilities() 注册表 + 真实
-// deviceToolExecutor(x-device/call 适配)编排「绑定 → 断连(Unbind + dead
-// executor)→ 等待重绑 → 完成」与「超时 → 明确失败文本」。全部模拟 Provider
-// 与 fake caller,零真实 LLM;编排形态对齐 SDK 侧 TestToolBindingDisconnect
-// (ai-runtime/agent/capability_test.go:443)。
-//
-// HITL 注意:fake caller 声明 canonical "benign"(与 handler_test 的 capsReporter
-// payload 同约定)——归一后 metadata risk_level=benign + requires_permission=true,
-// normal 模式下 checkPolicyTool 直接放行(benign ≤ low,无 ForceHITL);声明 legacy
-// "never" 会归一成 "low" 落 checkSys 的 hitl 分支,把 run 卡进 waiting_input。
+// 本文件是 P5-9 设备工具切 CapabilityRegistry + proxy 的 daemon 集成测试：经真实
+// binder、Capabilities 注册表和 deviceToolExecutor 编排「绑定 → 断连 → 重绑 →
+// 完成」与「超时 → 明确失败」；Provider 与 caller 均为模拟实现，零真实 LLM。
+// fake caller 声明 canonical "benign"，归一后 normal 模式直接放行；若声明 legacy
+// "never" 会归一到 "low" 并落入 hitl 分支，把 run 卡进 waiting_input。
 
 // deviceToolName 是 fake caller 声明并归一后的注册工具名(与原始中继同名:
 // sys_ 前缀 + 客户端原名)。
@@ -146,14 +139,11 @@ func waitRunState(t *testing.T, h runtimeagent.RunHandle, want runtimeagent.RunS
 	}
 }
 
-// waitToolResultCollect 返回 EmitToken 回调与断连通知通道:首个本工具 tool_call
-// token 到达时执行 disconnect 并关闭 done;tool_result 文本收集进 toolResults。
-// 形态对齐 SDK 侧 waitToolCallUnbound。时序警示:ai-core 的 tool_call token 发送
-// 是执行 goroutine 到 streamTokens 消费 goroutine 的通道交接,交接完成即返回——
-// disconnect 的实际执行时刻相对工具 Execute 无保证(满载下消费面可晚于 Invoke
-// 被调度)。因此**需要严格先于 Execute 的编排(如断连)不得放进本钩子**,先验
-// 完成;钩子只承载无时序要求的通知/收集面(见
-// TestDeviceToolBindingRebindAfterDisconnect 的竞态修正注)。
+// waitToolResultCollect 返回 EmitToken 回调与断连通知通道：首个本工具 tool_call
+// token 到达时执行 disconnect 并关闭 done，tool_result 文本收集进 toolResults。
+// 注意 token 发送是执行 goroutine 到消费 goroutine 的通道交接，发送方交接后即
+// 返回，disconnect 相对 Execute 没有时序保证；严格先于 Execute 的编排不得放进
+// 本钩子，钩子只承载无时序要求的通知与收集。
 func waitToolResultCollect(disconnect func(), toolResults *[]string) (cb runtimeagent.RunCallbacks, done chan struct{}) {
 	done = make(chan struct{})
 	fired := false // 仅执行 goroutine 读写(EmitToken 单调用面)
@@ -237,22 +227,11 @@ func TestDeviceToolSourceProbeFailureCollapses(t *testing.T) {
 	}
 }
 
-// TestDeviceToolBindingRebindAfterDisconnect(P5 显式可见变化 #1 的 daemon 集成
-// 证明):绑定 conn-A → 断连(UnbindCapabilities + dead executor 陷阱,先于
-// StartRun 的确定性编排)→ run 执行设备工具时 lookup 必然 miss → run 迁移
-// RunWaitingCapability → 新连接 conn-B 显式重绑(经 binder 的 ClientToolSource
-// 探测+Bind)→ 工具在 conn-B 执行完成 → RunCompleted。dead executor 的
-// x-device/call 计数==0:等待重绑绝不把请求静默路由到已断开(或任何未显式
-// 重绑)的连接。
-//
-// 为什么断连先于 StartRun(而非 tool_call token 消费钩子):token 发送是 ai-core
-// 执行 goroutine 到 streamTokens 消费 goroutine 的通道交接(agent.go emitToken),
-// 交接完成执行面即继续跑中间件与 Execute,消费面何时被调度无保证——满载
-// -race 全量组合下 Invoke 可先命中绑定成功返回,run 直接 completed,
-// callCount==0 断言闪失败(goworker_no_agent 全量组合实测复现)。「在途 Invoke
-// 失败→即时 Invalidate→等待」路径由 SDK 侧单测钉死
-// (TestCapabilityInvokeFailureClassification「plain error invalidates and
-// waits」),本测试聚焦断连→等待→重绑→新连接执行的 daemon 集成面。
+// TestDeviceToolBindingRebindAfterDisconnect 验证设备工具重绑的 daemon 集成面：
+// 连接 A 断连（dead executor 陷阱）→ run 工具 lookup 落空并迁移到
+// RunWaitingCapability → 连接 B 重绑后工具完成。dead executor 的 call 计数必须
+// 为 0，证明请求未被静默路由到未重绑连接。断连必须先于 StartRun，因为 token
+// 钩子的消费调度无保证，满载 -race 下 Invoke 可能先命中绑定而误判断言。
 func TestDeviceToolBindingRebindAfterDisconnect(t *testing.T) {
 	p := newDeviceToolPlugin(t, 0, &scriptedToolProvider{msgs: []core.Message{
 		deviceToolCallRound("call-dev-1"),

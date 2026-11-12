@@ -1,7 +1,4 @@
 // Package mcp 提供 Model Context Protocol 客户端。
-//
-// 手写实现，但类型和接口形状对齐 mark3labs/mcp-go 的 protocol 包：
-// 换库时只替换内部实现，调用方（agent 集成层）不动。
 package mcp
 
 import "context"

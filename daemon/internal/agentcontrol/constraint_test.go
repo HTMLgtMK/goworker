@@ -9,13 +9,9 @@ import (
 	"testing"
 )
 
-// TestPackageImportConstraint(总方案 §三/§十「包依赖约束检查」):agentcontrol
-// 不得反向 import plugins/agent、core/service/acp、core/model——更一般地,不得
-// import 任何 daemon/internal 兄弟包(依赖方向锚定 ACP / AgentPlugin →
-// agentcontrol → ai-runtime → ai-core,goworker 自有依赖只允许 ai-* 前缀)。
-// 用 go/parser 断言本包全部 .go 文件(含测试文件)的 import 集合,比靠 Code
-// Review 记住规则可靠;与门禁的 go list -deps grep 双保险(那个覆盖传递闭包,
-// 这个覆盖「源码里写明」的直接依赖)。
+// TestPackageImportConstraint ensures agentcontrol imports neither ACP/service/model
+// packages nor any other daemon-internal package. It scans imports in all Go files,
+// including tests, to enforce the dependency direction at source level.
 func TestPackageImportConstraint(t *testing.T) {
 	// 显式点名 forbidden 三包(方案 §十:禁止 agentcontrol 反向 import
 	// plugins/agent 或 core/service/acp;core/model 的协议类型同样不得回流),

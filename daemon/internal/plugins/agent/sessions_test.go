@@ -19,10 +19,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// seedPluginArchiveFile 直接构造 dir/archive/<name>.jsonl 归档夹具（Plan A2：
-// Store.Archive() 删除后不再有「轮转出归档文件」的写路径）：一次性 store 造数，
-// 关闭后把其数据文件字节搬进归档目录（归档文件与会话数据文件同一 record 模型，
-// 直接构造等价且诚实）。
+// seedPluginArchiveFile 通过临时 store 生成归档记录，再写入 archive 目录作为测试夹具。
 func seedPluginArchiveFile(t *testing.T, dir, name string, seed func(st *session.Store)) {
 	t.Helper()
 	scratch := filepath.Join(t.TempDir(), "seed-slot")
@@ -48,12 +45,8 @@ func seedPluginArchiveFile(t *testing.T, dir, name string, seed func(st *session
 	}
 }
 
-// sessionFixture 用真实 Store 生成 current + archive 数据：current 留一条 user
-// 消息且 head 停在其上，archive/ 下直接构造 archives 条（每条一条 user 消息，
-// Store.Archive() 已随 Plan A 定案 #2/#9 删除，夹具改为直接落归档文件）。
-// 返回插件、挂载 store（= currentStore() 解析实例）与会话根目录。
-// P1-3 起按生产 repo 接线：先在种子句柄上造数（legacy 根槽布局），关闭释放
-// 文件锁后经 Repository 原地挂载，Session 绑定挂载实例（构造即水合）。
+// sessionFixture 用真实 Store 生成当前会话和归档夹具，返回插件、当前 store 与会话根目录。
+// 经 repository 接线挂载已播种的 legacy 根槽，构造时恢复会话视图。
 func sessionFixture(t *testing.T, archives int) (*AgentPlugin, *session.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -114,12 +107,8 @@ func touchSessionData(t *testing.T, dir, id string, at time.Time) {
 	}
 }
 
-// TestAgentPlugin_ListSessionsUnionScanSortsByUpdatedAt 验证 Plan A3 的清单并集
-// 重写：per-id 目录（v2 数据文件）与 legacy 根槽全部入列；updatedAt 降序统一
-// 排序，旧版「当前会话置顶且不参与排序」的特殊逻辑取消（plan A3——多会话下
-// current 只是普通条目）；title 取首条 user 消息；cwd 取 workspace 记录（A7
-// 设计点 5：非 current 会话从记录读，current 未声明为空）；三态 idle/active
-// 判定（定案 #3：current 便利指针持有即 active）。
+// TestAgentPlugin_ListSessionsUnionScanSortsByUpdatedAt 验证清单包含 per-id 和
+// legacy 会话、统一按更新时间排序，并正确读取 title、cwd 与三态状态。
 func TestAgentPlugin_ListSessionsUnionScanSortsByUpdatedAt(t *testing.T) {
 	p, st, dir := sessionFixture(t, 0)
 	currentID := st.SessionID()
@@ -309,15 +298,11 @@ func TestAgentPlugin_ReloadCurrentSessionRefreshesView(t *testing.T) {
 	}
 }
 
-// historyFixture 用真实 Store 构建多轮会话（每轮提交后打 checkpoint，模拟
-// ai-runtime/agent 的 Run 提交流程）：
-//
-//	轮1（ckpt）：user → assistant(2 个 tool_calls) → tool(c1) → tool(c2) → assistant 收尾
-//	轮2（ckpt）：user → assistant（空正文无 tool_calls）
-//	轮3（ckpt）：user → assistant 正文
-//	尾段（checkpoint 漏打）：user → 孤立 tool（配不到 tool_call）→ system（compact 摘要）
-//
-// 返回插件与挂载 store（= currentStore() 解析实例）。视图共 12 条消息、3 个 checkpoint。
+// historyFixture 用真实 Store 构建多轮会话，每轮提交后打 checkpoint。内容为：
+// 轮1 user → assistant(2 tool_calls) → tool(c1) → tool(c2) → assistant 收尾；
+// 轮2 user → assistant（空正文）；轮3 user → assistant 正文；尾段无 checkpoint
+// （user → 孤立 tool → system compact 摘要）。返回插件与挂载 store，视图共
+// 12 条消息、3 个 checkpoint。
 func historyFixture(t *testing.T) (*AgentPlugin, *session.Store) {
 	t.Helper()
 	dir := t.TempDir()
@@ -1039,15 +1024,11 @@ func seedLegacySlot(t *testing.T, dir string, seedFn func(st *session.Store)) st
 	return id
 }
 
-// wireLegacyStore 把 cfg.Session.Dir 下的 legacy 根槽（id = mountID）按生产
-// startSession 的装配形态接线进插件（P1-3 取数换轨后的测试基座）：
-//  1. OpenRepository + repo.Open(mountID) 原地挂载——实例进 open 缓存，即
-//     currentStore() 的解析对象；
-//  2. deps.Store 注入 + runtime id = store SessionID（生产 ④ 的同款规则）；
-//  3. Session 绑定挂载实例（构造即水合，与重启恢复同路径）。
-//
-// 返回的挂载实例与插件视图是同一对象：测试对它的 Commit 与生产同轨。
-// 仓库经 t.Cleanup 关闭（连带释放目录文件锁）。
+// wireLegacyStore 把 legacy 根槽（id = mountID）按生产 startSession 的装配形态
+// 接线进插件：OpenRepository 后 repo.Open(mountID) 原地挂载，结果进入 currentStore
+// 的解析缓存；deps.Store 注入该实例，runtime id 取 store SessionID；Session
+// 绑定挂载实例并完成水合。返回的实例与插件视图是同一对象，测试对它的 Commit
+// 与生产同轨；仓库经 t.Cleanup 关闭并释放文件锁。
 func wireLegacyStore(t *testing.T, cfg *runtimeconfig.Config, mountID string) (*AgentPlugin, *session.Store) {
 	t.Helper()
 	repo, err := session.OpenRepository(cfg.Session.Dir)

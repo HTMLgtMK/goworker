@@ -273,7 +273,9 @@ daemon **不经 agentCapabilities 通告 x-goworker 能力**（V1 决策，与 x
 - key 存在性即门控，value 当前不解析 —— `{"x-device":{"tools":true}}` 里的
   `tools` 字段是给未来留的形状，写了不亏。
 - 声明 `x-device` = 本客户端实现 `x-device/tools` / `x-device/call`
-  （设备能力注册表见「系统能力工具」一节）。
+  （设备能力注册表见「系统能力工具」一节）。发送 initialize **之前**必须完成
+  反向请求 handler 注册：服务端写出 initialize 响应后即可发起探测，客户端
+  应用层可能尚未处理该响应。
 - **不声明的后果（app-service 路径）**：agent 不发探测请求，设备工具静默为零
   —— 不报错、不降级提示，LLM 只是看不到任何 `sys_*` 工具。这是能力协商的
   预期行为（VS Code 等标准客户端就是这条路），但实现了 DeviceTools 的客户端
@@ -292,11 +294,11 @@ daemon **不经 agentCapabilities 通告 x-goworker 能力**（V1 决策，与 x
 
 **客户端迁移清单（旧 AAR → capability 门控版 AAR）**
 
-1. initialize params 补 `clientCapabilities: {"x-device": {"tools": true}}`
-   —— 唯一必改点。
-2. 保存 initialize 响应的 `agentCapabilities`，UI 按能力降级。
-3. 其余不动：`x-device/tools` / `x-device/call` 的应答逻辑、-32601 兜底、
-   权限对话框语义全部照旧。
+1. initialize params 补 `clientCapabilities: {"x-device": {"tools": true}}`。
+2. 在发送 initialize 前注册 `x-device/tools` / `x-device/call` handler，
+   不要等到 initialize 返回后才注册。
+3. 保存 initialize 响应的 `agentCapabilities`，UI 按能力降级；保留 -32601 兜底、
+   权限对话框语义。
 4. 新 AAR（app-service 路径）要求客户端声明 `clientCapabilities`（见上节），
    未声明时设备工具静默为零；Host 侧已强制启用 ACP service —— 显式注入连接时
    `frontend.acp.enabled` 开关无效，装配层无视该开关注册 service。
@@ -347,10 +349,10 @@ session store 落 JSONL，同一 configDir 重建 Host 后 `session/load` 可恢
 VS Code/ZCode 等标准客户端不认识 → 自动 method-not-found → 无设备工具，零兼容负担。
 
 ```
-每次 prompt 的工具收集时（app-service 路径，mobile Host 属于该路径；旧
-ServeACPWorker 是 session/new 后一次性探测）：agent ── x-device/tools（探测请求）──→ client
+initialize 响应写入 transport 后（app-service 路径）：
+                 agent ── x-device/tools（探测请求）──→ client
                  ← {tools: [{name, description, schema, risk_level}]}
-                 （method-not-found / 超时 / 非法条目 → 视为无能力，不注册工具）
+                 （method-not-found / 超时 → 无设备工具；非法条目跳过）
 
 LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下）→ 通过后：
                  agent ── x-device/call {name, arguments} ──→ client 执行
@@ -360,9 +362,12 @@ LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下�
 - **工具名强制 `sys_` 前缀**（worker 添加）：与 bash/mcp 命名空间隔离。
 - **能力门控（app-service 路径）**：门控规则与报文见「能力协商（initialize）」一节
   —— 客户端在 initialize 的 clientCapabilities 里声明 `x-device` 才会被探测。
-- **探测时机**：probe 在每次 prompt 的工具收集时进行（Session.Run 合并按请求
-  注入的 ToolSource），session/new 后不做一次性探测注册。旧 ServeACPWorker
-  路径（session/new 后一次性探测）仅剩 stdio worker（ZCode dispatcher）形态。
+- **探测与绑定**：app-service 在每条连接的 initialize 响应写出后探测一次并缓存
+  工具清单；`session/new`、`session/load`、`x-goworker/session/attach` 和
+  `x-goworker/run/start` 在 Session 确定后使用该清单绑定。探测失败时会话仍可用，
+  只是没有设备工具；设备清单变化需重连。连接关闭时清除该连接的绑定；detach
+  只移除订阅并按 mode 释放控制权，不解除仍存活连接的设备工具绑定。
+  旧 ServeACPWorker 在 session/new 后探测；兼容旧 binder 的后端仍可能每轮探测。
 - **metadata 声明**：客户端应发送 `risk_level: benign..reserved`；需要统一门控的工具还应发送 `requires_permission: true`。worker 为 gated 工具补充稳定的 `allow_always_key: sys_<name>`。
 - **兼容旧客户端**：`never → low`（直通）、`mode → unclassified`、`always → critical + permission_policy=always_hitl`；旧值只在 relay 边界转换，runtime 内部统一使用 benign-reserved。
 
@@ -376,9 +381,8 @@ LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下�
 - **断连等待（P5 行为变化，声明 x-device 的客户端必须知晓）**：设备工具调用
   时发现执行通道已断（连接退出/`x-device/call` 失败）→ 不再「立即把错误交给
   模型」，而是**等待重绑**（默认 45s）：
-  - 预算内同会话出现具备相同工具能力的新绑定（新连接 prompt 探测成功即重绑）
-    → 工具在新连接上执行完成；重绑后的调用照常走统一 HITL 门控（per-call
-    裁决，危险操作重绑后仍需确认）；
+  - 预算内新连接完成探测并绑定同一会话，且工具 schema 和权限策略兼容
+    → 工具在新连接上执行完成；后续调用照常走统一 HITL 门控；
   - **审批语义边界（P4 评审 issue6）**：统一 HITL 门控在每次工具调用前裁决
     （ai-core OnBeforeTool，一次调用一次审批）。**单次工具调用内的审批随重绑
     转移到新连接执行**——调用获批后连接断开、预算内重绑成功的，本次调用以
@@ -391,7 +395,9 @@ LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下�
     为普通工具超时而非下面的明确失败文案；
   - 预算耗尽 → 返回**明确失败文本**（`device tool sys_<name> unavailable:
     connection lost, waited Ns`）交给模型决定下一步，run 正常继续；
-  - **绝不把工具请求静默路由到其他连接**（含已断开的旧连接）；
+  - 同一 Session 有多个兼容绑定时，registry 当前按 connection ID 字典序选择；
+    它不保证优先选择原连接或当前控制连接。当前使用约定是一个 Session 只对应
+    一个设备，代码不强制该约定。
   - 等待期间 run 状态为 `waiting_capability`（x-goworker 的 run/get /
     session/events 可观测）。
 - **`capability_wait_timeout` 配置**：上述等待预算，秒为单位，`config.yaml`

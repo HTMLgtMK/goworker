@@ -4,29 +4,8 @@ import (
 	"log/slog"
 )
 
-// lifecycle.go 是多 session 运行时的生命周期半边(Plan A2,定案需求 #2):
-// 「runtime 生命周期 = 连接绑定引用」——任一连接绑定即活;最后解绑(断连/切换
-// /new)→ 关 store + 注销 manager;有未完 run 时延到 run 终态再关(定案需求 #8
-// 的「run 在飞仍算活」由 A3 消费,本文件只负责收口时点)。
-//
-// 引用的事实源:agentcontrol.BindingRegistry(Service 装配,bindings.go)记录
-// clientID → 绑定 sessionID。登记点与 SessionBinding.Set 成对(ACP handler 的
-// CreateSession/LoadSession 经 model.ConnectionBinder 断言面),摘除点有三处,
-// 全部汇入 tryReleaseSession 的归零判定:
-//   1. /new 收口(commands.go P5-5 块):摘发起方登记后评估旧会话;
-//   2. 断连(runcontrol.go ReleaseConnection):清登记后评估被解除的会话;
-//   3. 改绑(lifecycle.go BindConnectionSession):替换登记后评估被放弃的会话。
-//
-// 锁序:本文件不引入新锁面——suspendedReaps 台账自带小锁且是叶锁(只护 map,
-// 不回调);tryReleaseSession 依次取 agentcontrol registry.mu(已释放)、manager.mu
-// (Get/Remove,短临界区)、SessionRuntime.admissionMu(Retire 的 Run 提交线性化
-// 点,短暂)、rt.mu、repo.mu/store.mu(CloseSession),全为单向短临界区,与
-// withSession 的 gate、SessionLease.mu 无嵌套。admissionMu 与 manager.mu 不嵌套
-// (Retire 返回后 admissionMu 已释放才 Remove),与 reserveRun 的「m.mu 释放后
-// 再取 admissionMu」同向,无锁环。run 终态回调(onSessionRunDone)跑在 manager
-// execute goroutine 上(finalizeRun 触发点,ai-runtime/agent/runtime.go),此刻
-// 该 run 已终态、rt.active 已清、run.done 已关——manager.Close 的等待面已放行,
-// 回调内做 store 关闭的文件 I/O 不阻塞任何等待者。
+// 会话绑定与收口流程见 ../../../docs/README.md。
+// 生命周期操作由 lifecycleMu 串行化；Retire 与 Remove 不嵌套持锁。
 
 // markSuspendedRelease 登记一个「引用已归零但 run 在飞」的挂起收口。幂等。
 func (p *AgentPlugin) markSuspendedRelease(sessionID string) {
@@ -59,11 +38,9 @@ func (p *AgentPlugin) takeSuspendedRelease(sessionID string) bool {
 	return true
 }
 
-// isSuspendedRelease 报告会话是否处于挂起收口台账(只读取数面,Plan A3):清单
-// state=active 判定消费——挂起中(引用归零但 run 在飞)的会话 run 一旦终态即被
-// 收口注销,若 state 只看 rt.Active() 会读到「终态已清、台账未摘」的瞬间窗口
-// (onSessionRunDone 尚未执行),清单把一个即将消失的会话标成 idle 产生 UI 抖动
-// (定案需求 #8 的反面);台账判定让该会话在收口发生前恒为 active。
+// isSuspendedRelease reports a reference-zero session waiting for its active run to finish.
+// Listing treats it as active until terminal handling reaps it, avoiding an idle flicker
+// between run completion and the suspended-release recheck.
 func (p *AgentPlugin) isSuspendedRelease(sessionID string) bool {
 	p.suspendMu.Lock()
 	defer p.suspendMu.Unlock()
@@ -71,8 +48,8 @@ func (p *AgentPlugin) isSuspendedRelease(sessionID string) bool {
 	return ok
 }
 
-// onSessionRunDone 是 manager.WithRunDoneHook 注入的 run 终态通知(Plan A2,
-// A7 设计点 2 的完成通知面):仅唤醒挂起中的收口——重判在 tryReleaseSession 的
+// onSessionRunDone 是 manager.WithRunDoneHook 注入的 run 终态通知(完成
+// 通知面):仅唤醒挂起中的收口——重判在 tryReleaseSession 的
 // 收口执行点做(原子复查,见其注释),本回调只做闸门,不在 execute goroutine 上
 // 携带判定状态。
 func (p *AgentPlugin) onSessionRunDone(sessionID string) {
@@ -84,12 +61,8 @@ func (p *AgentPlugin) onSessionRunDone(sessionID string) {
 	p.tryReleaseSessionLocked(sessionID)
 }
 
-// BindConnectionSession 实现 model.ConnectionBinder(Plan A2 生命周期半边的
-// 登记面;ACP handler 在 SessionBinding.Set 点经 type-assert 调用,工厂内断言,
-// handler.go):登记 clientID → sessionID(改绑即替换),改绑时被放弃的会话失去
-// 本连接的引用 → 立即评估收口。登记动作本身零副作用(§6.2 四条纪律);评估是
-// 收口动作,只在引用真的变化时发生。control 未装配(测试直构插件)时跳过——
-// 与 tryReleaseSession 的 nil 容忍同款。
+// BindConnectionSession records the connection's selected session and rechecks its previous
+// session for release. It is serialized by lifecycleMu and is a no-op without control.
 func (p *AgentPlugin) BindConnectionSession(clientID, sessionID string) {
 	if p.control == nil {
 		return
@@ -99,6 +72,22 @@ func (p *AgentPlugin) BindConnectionSession(clientID, sessionID string) {
 	p.bindConnectionSessionLocked(clientID, sessionID)
 }
 
+// BindConnectionSessionGuarded linearizes a connection binding against disconnect.
+// allowBind must be a non-blocking state check and must not acquire lifecycle locks.
+func (p *AgentPlugin) BindConnectionSessionGuarded(clientID, sessionID string, allowBind func() bool) bool {
+	if p.control == nil {
+		return false
+	}
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if allowBind == nil || !allowBind() {
+		p.tryReleaseSessionLocked(sessionID)
+		return false
+	}
+	p.bindConnectionSessionLocked(clientID, sessionID)
+	return true
+}
+
 func (p *AgentPlugin) bindConnectionSessionLocked(clientID, sessionID string) {
 	prev := p.control.BindSession(clientID, sessionID)
 	if prev != "" && prev != sessionID {
@@ -106,44 +95,10 @@ func (p *AgentPlugin) bindConnectionSessionLocked(clientID, sessionID string) {
 	}
 }
 
-// tryReleaseSession 评估 sessionID 的引用并尝试收口(Plan A2 生命周期半边的
-// 唯一判定点,三处触发共用):
-//
-//	绑定集合空 && 无在飞 run → manager.Remove(id) + repo.CloseSession(id)
-//	有 run 在飞             → 挂起,run 终态通知(onSessionRunDone)再判
-//	绑定集合非空            → 保留(其他连接仍在用,旧会话可继续 prompt)
-//
-// 收口执行点的原子复查(挂起取消语义,Plan A2 实施注意点):绑定集合的读取
-// 就在执行点完成——挂起期间若有新绑定到达(session/load 重开把连接绑回该会话,
-// 经 BindConnectionSession 登记),run 终态通知触发的重判在这里读到非空集合,
-// 挂起收口即被取消,绝不关闭仍有引用的会话。判定与执行(Remove/CloseSession)
-// 之间不追求跨包的分布式原子——那段窗口的并发改绑落在「已判定收口」的会话上
-// 时,该连接的下次解析走既有诚实失败语义(悬空 Binding → ErrSessionNotFound,
-// PR2 契约),且 store 数据未被删除,重开路径(session/load → repo.Open)仍可
-// 恢复;宁取诚实失败,不为它把 manager/repo 锁与 agentcontrol 注册表锁互取
-// (锁序单向是硬边界,见文件头)。
-//
-// 收口次序:Retire 先于 Remove 先于 CloseSession——Retire 与 manager 的 Run
-// admission 共用 SessionRuntime.admissionMu,是「引用归零判定」与「Run 提交」
-// 的线性化点:Retire 成功后,已拿到 rt 指针但尚未占位的 StartRun 在 reserveRun
-// 处被拒(ErrSessionRetired),不存在「Manager 已注销、store 已关、run 却刚占位
-// 成功」的窗口;Remove 后对旧 id 的 StartRun/路由立即得 ErrSessionNotFound
-// (诚实拒绝)。Remove 与 Retire 是同一临界区内的顺序动作(Retire 返回 nil 时
-// active 已为空且不再可变),故不再需要旧的 Active() 二次复查与 cancel 补救。
-//
-// current 隐式引用守卫:p.current 指向的 runtime 恒有一个「无绑定调用方的
-// 便利引用」(CLI/stdio/测试回落 current 语义,plugin.go current 注释)——它
-// 不进 BindingRegistry(登记只服务 ACP 连接),但收口判定必须尊重,否则 CLI 的
-// 活跃会话会被 run 终态通知或断连评估误收口。按 runtime 指针判等而非 id:纯
-// 内存降级下新旧 runtime 同 id("current"),/new 收口要移除的正是同 id 的旧
-// 条目(指针不同)——旧条目移除后其 store 是否可关由下文的 current store id
-// 判定兜底(store 归 current 会话持有的同 id 重建窗口不关 store)。A3 收缩
-// current 语义时本守卫随之重审。
-//
-// 幂等:id 不在 manager(Get 为 nil)即已收口或从未注册,直接返回——三处触发
-// (含 /new 闭包里 UnbindSession 后的显式评估与挂起重判)重复到达安全。
-// control/repo 为 nil(测试直构插件,零值容忍同 inFlightTracker)时:无登记
-// 事实源按零绑定处理、无持久化跳过 store 收口。
+// tryReleaseSession evaluates release after unbinding or run completion. Bindings and current
+// references retain it; active runs suspend release until terminal notification, while a new
+// binding cancels release. Retire, Remove, CloseEvents, and CloseSession share admission with
+// run reservation so a retired runtime cannot receive a run as its store closes.
 func (p *AgentPlugin) tryReleaseSession(sessionID string) {
 	p.lifecycleMu.Lock()
 	defer p.lifecycleMu.Unlock()
@@ -170,27 +125,17 @@ func (p *AgentPlugin) tryReleaseSessionLocked(sessionID string) {
 		return
 	}
 	if err := rt.Retire(); err != nil {
-		// 有未完 run:Retire 返回 ErrRunActive,挂起等 run 终态通知再判(定案
-		// 需求 #8 的收口时点半边)。admissionMu 与 reserveRun 同一线性化点:
-		// Retire 成功后,任何已从 manager 拿到 rt 指针但尚未占位的 StartRun 都会
-		// 在 reserveRun 处被 ErrSessionRetired 拒绝,绝不会触碰随后关闭的
-		// hub/store。
+		// Active Retire means ErrRunActive, so suspend until the terminal-run notification.
+		// Retire and reserveRun share one admission point: after retirement, a caller that
+		// obtained the runtime before reserving fails with ErrSessionRetired and cannot reach
+		// the closing hub or store.
 		p.markSuspendedRelease(sessionID)
 		return
 	}
 	p.clearSuspendedRelease(sessionID)
 
 	p.manager.Remove(sessionID)
-	// 事件枢纽收口（A7 设计点 3）：订阅随 runtime 注销诚实断开——hub.Close 关
-	// 闭全部订阅通道，daemon 侧通知泵经「通道关闭 → 泵退出自清」收敛，订阅不
-	// 泄漏、客户端经事件流停止 + session/list 状态变化 + attach 的
-	// ErrSessionNotFound 可感知结束（不 panic、不静默悬挂）。重开路径
-	// （session/load → mountRuntime）构造新 runtime 与新 hub，EnsureHub 经
-	// journal.SeqRange 磁盘播种续接既有事件历史——Seq 不从零，重连按 afterSeq
-	// 续放。次序：先关 hub 再关 store——hub 桥接（RunJournalStore）不实现
-	// io.Closer，两步无交互，但 hub 若晚于 store 关闭，残余 Publish 会撞已关
-	// 句柄（warn 噪音）；此刻不可能有在飞 Publish（Retire 已排除在飞 run，本
-	// 路径只在终态后到达）。
+	// Close events before the store so no late publisher reaches a closed journal.
 	rt.CloseEvents()
 	// store 收口:同 id 重建窗口(纯内存 /new 的 Register 冲突、会话边界的同 id
 	// 重建——manager 里同 id 的旧条目是误路由隐患,上面已移除)下,该 id 可能仍

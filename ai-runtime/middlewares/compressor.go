@@ -14,20 +14,12 @@ type CompressReport struct {
 	Tokens     int // summarize 调用消耗（模型返回 total，缺省用估算）
 }
 
-// Compressor 通过 LLM 把过长的对话历史压成"滚动摘要"：
-// 保留最近 keepLast 条消息原文，只把更早的旧段发给模型要一段摘要，
-// 输出 [摘要] + 最近 N 条。
-//
-// 为什么不全量压成一条：ReAct 会话里工具结果、文件路径、最近结论是
-// 继续干活的关键上下文，压掉就断线了。滚动只牺牲最古老的记忆，
-// 而且压缩调用只读旧段，不会在压缩这一步把窗口撑爆。
+// Compressor 将较早的对话压成摘要，同时保留最近 keepLast 条原文。
 type Compressor struct {
 	provider core.Provider
 	keepLast int
-	// protectSystem 为 true 时，首位 system 消息（agent 系统提示）原样保留、不参与压缩。
-	// 自动压缩路径要开：ReAct 循环里 history[0] 是 buildMessages 注入的提示词，压掉模型就忘了怎么用工具。
-	// /compact 路径要关：p.conversation 从不含系统提示（plugin 存的是 messages[1:]），
-	// 首位可能是上次的摘要，必须允许被再次滚动，否则摘要会一条条累积。
+	// protectSystem 为 true 时保留所有前导 system 消息，避免压掉提示词或记忆块；
+	// 显式 compact 时可关闭，以便旧摘要参与下一轮压缩。
 	protectSystem bool
 	// onCompress 压缩成功后回调（可选），调用方用它把压缩记进 token 账本。
 	onCompress func(CompressReport)
@@ -44,9 +36,7 @@ func NewCompressor(provider core.Provider, keepLast int, protectSystem bool, onC
 // Compress 压缩 history。无可压缩内容（长度 <= keepLast 或找不到安全切点）时原样返回。
 func (c *Compressor) Compress(ctx context.Context, history []core.Message) ([]core.Message, error) {
 	keepHead := 0
-	// protectSystem 保护所有连续前导 system 消息（agent 提示词 + 注入的记忆块等），
-	// 不让他们被压进滚动摘要 —— 摘要没有 [记忆] 前缀，stripMemoryBlocks 剥不掉，
-	// 一旦进 STM 会被下次固化重新归档，形成自指污染。
+	// 保留前导 system 消息，避免提示词和注入的记忆进入摘要。
 	if c.protectSystem {
 		for keepHead < len(history) && history[keepHead].Role == "system" {
 			keepHead++
@@ -124,11 +114,7 @@ func (c *Compressor) summarize(ctx context.Context, old []core.Message) (string,
 	return strings.TrimSpace(resp.Choices[0].Message.Content), resp.Usage, nil
 }
 
-// summaryPrompt 构造压缩摘要的指令。
-//
-// TODO: 打磨这段提示词 —— 决定保留清单、输出格式和长度约束。
-// 当前版本是能用的基线，重点想清楚：摘要要喂给"继续干活的 agent"，
-// 而不是给人看，所以宁可信息密度高，不要追求行文流畅。
+// summaryPrompt 构造面向后续工作的压缩摘要指令。
 func summaryPrompt(old []core.Message) string {
 	return "Summarize the conversation below for a coding assistant that must continue the work.\n" +
 		"Preserve: decided facts and constraints, file paths, shell commands run and their key " +

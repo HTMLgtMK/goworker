@@ -8,11 +8,9 @@ import (
 	"time"
 )
 
-// 本文件是多会话执行内核的运行记账类型:AgentRun 记账一次会话执行
-// (总方案 docs/multi-session-runtime-plan.md 第三节)。P0 阶段仅骨架:
-// 记账接线(RecordRun)在 P0-3,后台运行与宿主生命周期 ctx 属 P2(RunSupervisor)。
+// 本文件定义运行记账类型。
 
-// RunState 是一次会话执行的生命周期状态(对齐总方案第三节枚举)。
+// RunState 是一次会话执行的生命周期状态。
 type RunState string
 
 const (
@@ -21,32 +19,23 @@ const (
 	RunCompleted RunState = "completed"
 	RunFailed    RunState = "failed"
 	RunCancelled RunState = "cancelled"
-	// RunWaiting(waiting_input)P4-1 定义,产生方 P4-2 审批等待(HITL 决策
-	// 挂起期间 Run 停留此态)。非终态:journal 恢复扫描(isTerminalRunState)
-	// 不视其为收尾,重启后照旧标 interrupted(总方案 §9;V1 审批在内存、
-	// 不跨重启,自动续跑不做)。
+	// RunWaiting(waiting_input)由审批等待产生(HITL 决策挂起期间 Run 停留
+	// 此态)。非终态:journal 恢复扫描(isTerminalRunState)不视其为收尾,重启后
+	// 照旧标 interrupted(V1 审批在内存、不跨重启,自动续跑不做)。
 	RunWaiting RunState = "waiting_input"
-	// RunWaitingCapability(waiting_capability)P4-4 定义,产生方 P4-4 能力代理
-	// 的等待重绑(supervisor 观察者注入的 onWait 闭包):客户端工具的绑定连接
-	// 断开后,Run 在等待具备相同工具能力的客户端显式重绑期间停留此态。与 HITL
-	// 的 waiting_input 在 run/get 观测面上可区分(总方案 §8 :673「waiting_input
-	// 或 waiting_capability」取后者)。非终态:journal 恢复扫描(isTerminalRun
-	// State,session/journal.go:143-150)不含它——卡在等待重绑的 run 重启后
-	// 照旧标 interrupted(V1 不做等待重绑的跨重启续跑)。
+	// Client-tool rebinding wait state. It is non-terminal and restores as interrupted.
 	RunWaitingCapability RunState = "waiting_capability"
 )
 
-// RunResult 是一次会话执行的结果快照。Persisted 语义见 P0-3「模型成功 ≠
-// 持久化成功」:Conversation Commit 失败时 State=RunFailed 且 Persisted=false,
-// 绝不记 RunCompleted。
+// RunResult 是一次会话执行的结果快照。仅模型成功且持久化成功才标记为
+// RunCompleted；持久化失败时 State 为 RunFailed、Persisted 为 false。
 type RunResult struct {
 	State     RunState
 	Err       error
 	Persisted bool
 }
 
-// AgentRun 记账一次会话执行:使用独立 RunID 而非 SessionID 代表一次执行,
-// 为后续事件回放、Trace、性能统计与取消指定 Run 留空间(总方案第三节)。
+// AgentRun 记录一次会话执行，以独立 RunID 标识，可用于查询、等待和取消。
 type AgentRun struct {
 	ID        string
 	SessionID string
@@ -57,8 +46,8 @@ type AgentRun struct {
 	done      chan struct{}
 	result    RunResult
 	// cancel 是后台 Run 的取消函数(mu 保护):StartRun 同步段在派生 runCtx 后
-	// 写入(P2-6 修正:先于 go execute,返回的句柄立即可取消),CancelRun(P2-6)
-	// 经 cancelFunc() 读取并调用。RecordRun 同步路径恒 nil——同步 Run 的取消
+	// 写入(先于 go execute,返回的句柄立即可取消),CancelRun 经 cancelFunc()
+	// 读取并调用。RecordRun 同步路径恒 nil——同步 Run 的取消
 	// 入口是调用方请求 ctx,不经 run 记账。
 	cancel context.CancelFunc
 }
@@ -106,10 +95,7 @@ func (run *AgentRun) snapshot() RunResult {
 	return res
 }
 
-// State 返回运行当前状态快照(P5-6 导出访问器):daemon 侧 RunControlSource 的
-// RunStatus 经 rt.Active() 命中 runID 后读取状态——snapshot() 未导出,daemon
-// 跨包不可达(runtime.go DeclareCWD 同款先例:plan 预留消费面,编译器指路后按
-// 包边界导出)。与 RunHandle.State() 同一快照面(run.mu 内读)。
+// State 返回当前运行状态快照。
 func (run *AgentRun) State() RunState {
 	return run.snapshot().State
 }
@@ -122,13 +108,8 @@ func (run *AgentRun) cancelFunc() context.CancelFunc {
 	return run.cancel
 }
 
-// Cancel 取消本次运行并报告取消是否已发出(Plan A2 生命周期半边的导出面):
-// 后台 StartRun 形态取消其 runCtx(execute 在 gate/执行入口按取消收敛,
-// finalizeRun 归一 cancelled);RecordRun 同步路径无 cancel,返回 false。与
-// manager.CancelRun 的差别:按 run 记账对象直接取消、不经 manager 注册表
-// 寻址——daemon 生命周期收口在 manager.Remove 之后防御性取消 queued run 时
-// (lifecycle.go tryReleaseSession),注册表已查无此 runtime,只能持 run 指针
-// 取消。幂等:重复取消只是关闭一个已取消的 ctx,无副作用。
+// Cancel invokes the run context's cancel function, if this is a cancellable background run.
+// It returns false for synchronous RecordRun entries and is safe to call repeatedly.
 func (run *AgentRun) Cancel() bool {
 	cancel := run.cancelFunc()
 	if cancel == nil {
@@ -149,9 +130,9 @@ func (run *AgentRun) finish(res RunResult) {
 
 // runSeq 是 RunID 的进程内自增序列,作 UnixNano 时间戳后的同刻消歧后缀:
 // 进程内 seq 保唯一(UnixNano 单调性不做强假设);跨重启同会话目录同 nano+同
-// seq 概率可忽略,且由 P2-2 RunJournal 建文件 O_EXCL 兜底——碰撞变成可观测
+// seq 概率可忽略,且由 RunJournal 建文件 O_EXCL 兜底——碰撞变成可观测
 // 错误(ErrRunExists)而非静默损坏。文件名字符序=创建序(nano 定宽至 2262 年),
-// P3-1 的跨文件 seq 拼接依赖此序。
+// 跨文件 seq 拼接依赖此序。
 var runSeq atomic.Uint64
 
 // newRunID 返回新的 run id(run-<unixnano>-<seq>,跨重启唯一)。

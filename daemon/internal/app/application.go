@@ -1,11 +1,5 @@
-// Package app 是 daemon 的装配层，三种运行形态共用一套配置/日志装配：
-//
-//   - CLI 壳（cmd/goworker）与 Android 壳（mobile）：New() 装配完整后端
-//     （配置→日志→Engine→插件→StartAll），壳只负责前端与退出策略；
-//   - ACP worker（RunACPWorker）：dispatcher spawn 的无人值守单任务进程。
-//     它不走 New() —— worker 不装 Engine/插件/内置命令，没有前端，只共享
-//     ProviderFactory 与配置/日志装配，以 stdio 直接服务 ACP 协议；
-//     每任务一进程，轻启动是硬要求。
+// Package app assembles the daemon backend shared by the CLI, Android host,
+// and ACP worker entry points.
 package app
 
 import (
@@ -22,8 +16,7 @@ import (
 	coreservice "github.com/tinguo/goworker/daemon/internal/core/service"
 )
 
-// Application 是装配完成的 agent 后端：Engine + 插件 + services + 配置 + 日志。
-// 字段供壳层取用（CLI 读 Config.Frontend.Stdin，mobile 读 Engine.Eval 等）。
+// Application is the fully assembled backend exposed to frontend hosts.
 type Application struct {
 	Config   *config.Config
 	Runtime  *runtimeconfig.Config
@@ -95,8 +88,7 @@ func loadConfigAndLogger() (*config.Config, *logger.Logger, error) {
 	return cfg, log, nil
 }
 
-// New 完成全部装配：配置 → 日志 → Engine → AgentPlugin → 内置命令 → StartAll → services.Start。
-// 出错返回 error，不 panic、不 os.Exit —— 退出策略归壳层（CLI 打印后 exit，mobile 转 Java 异常）。
+// New assembles the application and returns setup errors to the frontend host.
 func New(options ...Option) (*Application, error) {
 	appOptions := applicationOptions{}
 	for _, option := range options {
@@ -177,8 +169,7 @@ func New(options ...Option) (*Application, error) {
 	return a, nil
 }
 
-// Stop 释放资源：先停 services（收口新连接与活跃 prompt），再停插件、关日志。
-// 对应原 main 的 defer 链，壳层在所有退出路径调用。
+// Stop shuts down services, plugins, and logging, in that order.
 func (a *Application) Stop() {
 	if a == nil {
 		return

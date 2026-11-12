@@ -13,39 +13,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 )
 
-// 本文件是 P3-2/P3-3 的 EventHub 验收测试。P3-2 写侧(plan P3-2「新增测试」):
-//   - TestEventHubSeqMonotonicAcrossRuns:BeginRun 切换后 seq 连续不重复
-//     (跨 Run 游标,P3-0 契约表第 1 行);
-//   - TestKeyEventDurableFirst:stub journal AppendEvent 注错 → Publish 返回
-//     err 且无订阅者收到(durable-first 失败不广播);成功路径以 stub 里的
-//     顺序钩子断言 journal 先于广播(plan 原文),并用 gate 阻塞把「落盘未
-//     完成 ⇒ 不广播」变成可轮询的确定断言;
-//   - TestDeltaMergeWindow:50ms 窗内 100 条 text.delta → journal 恰 1 条
-//     批次记录(Seq=最后一条、FromSeq=第一条,payload 为 DeltaBatch JSON,
-//     per-part seq+payload 按序保留),订阅者仍逐条收到 100 条
-//     (实时不合并,P3-0 契约表第 3 行)。
-//
-// 修复验收(CR6/CR3-I1):
-//   - TestSubscribeReplayExpandsDeltaBatch(CR3-I1):回放把合并批次展开为
-//     原始 per-seq 事件,实时与回放形状彻底一致(wire 无 FromSeq/批量语义,
-//     SessionEvent 已无该字段——编译期钉死);
-//   - TestReplayResumeInsideInterleavedDeltaBatch(CR3-I1 核心交错实例):
-//     游标落在合并批次 seq 区间内部时,断点恢复不重复、不丢失;
-//   - TestEventHubReplayIntegrity(I4):完整性三态——空历史/纯内存 → Complete、
-//     播种自非空 journal → Unknown、key 落盘失败/合并 flush 失败 → Incomplete
-//     且粘滞永不复位(含「失败后成功发布不翻回」与 Unknown → Incomplete 单向);
-//   - TestNewEventHubPropagatesSeqRangeError(第三轮评审 I3):SeqRange 播种
-//     注错 → NewEventHub 返回 (nil, err) 显式上抛,绝不创建「看似健康」的 hub
-//     (旧形态把读取失败当空历史:complete 且 seq 从 1 重起,与旧记录冲突)。
-//
-// P3-3 读侧(plan P3-3「新增测试」):
-//   - TestAttachReplayNoGap(总方案第十一节 → 本步):Replay+Live 原子切换的
-//     无缺口无重复压测(-race);
-//   - TestSubscribeCursorExpired / TestSubscribeAfterClose /
-//     TestSubscribeCtxCancelCleansUp:窗口校验、关停拒绝、断线清理。
-//
-// P3-2 时代的订阅注册经 addTestSub(同包白盒)直接进 subs 表;P3-3 的
-// Subscribe 落地后这些测试照旧成立(addTestSub 的 watermark=0 不触发水位过滤)。
+// 本文件验证 EventHub 的序号、持久化、回放、交接与订阅者行为。
 
 // 编译期断言:测试桩满足 EventJournal 消费面。
 var _ EventJournal = (*stubEventJournal)(nil)
@@ -62,18 +30,9 @@ func mustNewEventHub(t *testing.T, sessionID string, j EventJournal) *EventHub {
 	return hub
 }
 
-// stubEventJournal 是 EventJournal 的内存测试桩:成功追加的记录按序收进 recs;
-// appendErr 非 nil 时注入 AppendEvent 持续失败(记录不收);failFirst > 0 时
-// 接下来 N 次 AppendEvent 注错后自愈(粘滞性验收用——验证「失败后成功发布不
-// 翻回」,需要失败与成功在同一个 stub 上先后发生);seqRangeErr 非 nil 时注入
-// SeqRange 播种失败(I3:NewEventHub 显式拒绝创建,TestNewEventHubPropagatesSeqRangeError)。
-// 另带两个顺序断言装置:
-//   - order(顺序钩子,plan「以 stub 里的顺序钩子断言」):非 nil 时每次成功
-//     追加向共享顺序日志记 "journal:<type>",与订阅者读侧记的 "sub:<type>"
-//     同池比对——durable-first ⇒ journal 条目恒先于 sub 条目;
-//   - gate/entered:gate 非 nil 时 AppendEvent 在记下 entered 后阻塞直至 gate
-//     关闭,把「落盘进行中」变成测试可轮询的确定状态(而非依赖调度运气)。
-//     gate/entered 构造期赋值只读,无并发写。
+// stubEventJournal 是 EventJournal 内存桩，可注入追加/播种失败并保存成功记录。
+// failFirst 支持先失败后恢复；order 检查持久化先于广播，gate/entered 则确定性地
+// 暂停追加并通知测试进入阻塞态。
 type stubEventJournal struct {
 	mu          sync.Mutex
 	recs        []session.EventRecord
@@ -441,16 +400,9 @@ func TestDeltaMergeWindow(t *testing.T) {
 	}
 }
 
-// TestSubscribeReplayExpandsDeltaBatch(CR3-I1 修复验收):回放把合并批次展开
-// 为原始 per-seq 事件——实时与回放形状彻底一致:
-//   - 回放侧:3 条 text.delta 的合并批次 [1..3] → 3 条逐事件(seq 1/2/3),
-//     随后的 tool_call(seq 4)单条记录原样产出;
-//   - 实时侧:live 投递逐事件,与回放同形状(wire 无 FromSeq/范围声明——
-//     SessionEvent 已无该字段,编译期即钉死);
-//   - 游标以逐事件 Seq 推进,无批量语义。
-//
-// 订阅晚于全部发布:无并发发布面,回放快照确定;订阅后另发一条 delta 验证
-// live 侧粒度,收尾关闭由 defer 的 hub.Close 承担(pump 随 Close 退出)。
+// TestSubscribeReplayExpandsDeltaBatch 验证回放将合并记录展开为逐 Seq 事件，
+// 与 live 形状一致且游标逐事件推进。订阅发生在发布完成后以固定回放快照，
+// 随后再发布一条 delta 单独验证 live 粒度。
 func TestSubscribeReplayExpandsDeltaBatch(t *testing.T) {
 	jr := &stubEventJournal{}
 	hub := mustNewEventHub(t, "batch-expand", jr)
@@ -496,21 +448,9 @@ func TestSubscribeReplayExpandsDeltaBatch(t *testing.T) {
 	requireNoEvent(t, ch)
 }
 
-// TestReplayResumeInsideInterleavedDeltaBatch(CR3-I1 核心验收,评审 §三 I1 的
-// 101-104 交错实例):key 事件落在合并窗 seq 区间内部时,游标停在批次中间的
-// 断点恢复必须不重复、不丢失:
-//
-//	101 text.delta "A" ┐
-//	102 tool_call      │ 102 逐条落盘(key);101/103/104 合并为批次记录
-//	103 text.delta "B" │ [FromSeq=101..Seq=104](批次只含 text 的 3 个 part)
-//	104 text.delta "C" ┘
-//
-// 各 afterSeq 的期望恢复面(逐事件、精确到 seq):
-//   - afterSeq=100:101"A" 102 103"B" 104"C"(全量:批次展开 + key 单条);
-//   - afterSeq=101:102 103"B" 104"C"(101 不重复);
-//   - afterSeq=102:103"B" 104"C"(核心断言:批次头部被跳过——"A" 不重复、
-//     "B"/"C" 不丢失,评审指出的重复/丢失场景);
-//   - afterSeq=103:104"C"。
+// TestReplayResumeInsideInterleavedDeltaBatch 验证 key 事件打断 delta 合并后，
+// 游标落在批次区间内部仍能逐条恢复，不重复也不遗漏。用 101/103/104 三条 delta
+// 与 seq 102 的 tool_call 构造交错批次，并检查 afterSeq=100..103 的恢复结果。
 func TestReplayResumeInsideInterleavedDeltaBatch(t *testing.T) {
 	// buildHub 构造交错流并收口(EndRun flush 批次);预置历史 seq=100(key 事件,
 	// 模拟上游游标,使交错流落在 101-104)。每次调用全新 stub + 全新 hub,
@@ -632,14 +572,9 @@ func TestReplayResumeInsideInterleavedDeltaBatch(t *testing.T) {
 	}
 }
 
-// TestEventHubReplayIntegrity(I4 修复验收):回放完整性三态的播种与粘滞置位——
-//   - 播种:全新空 journal / 纯内存 hub → Complete(本进程观察面即全部);
-//     播种自非空 journal(既有历史)→ Unknown(跨进程纪元完整性不可验证,
-//     诚实优先,绝不把不可验证的历史报告为完整);
-//   - 置位:stub journal 注错 → key 落盘失败 → Incomplete;注错自愈后的成功
-//     发布不翻回(粘滞,永不复位);合并 delta flush 失败同样置位;
-//   - 方向单调:Unknown 播种后遇失败 → Incomplete 一去不返;成功发布不改变
-//     任何三态(只有失败路径是写点)。
+// TestEventHubReplayIntegrity 验证完整性从 Complete/Unknown 单调转为 Incomplete：
+// 空历史及纯内存 hub 为 Complete，非空历史为 Unknown；落盘或 flush 失败置 Incomplete，
+// 后续成功发布不恢复状态。
 func TestEventHubReplayIntegrity(t *testing.T) {
 	t.Run("FreshEmptyJournalComplete", func(t *testing.T) {
 		hub := mustNewEventHub(t, "fresh-journal", &stubEventJournal{})
@@ -750,12 +685,8 @@ func TestEventHubReplayIntegrity(t *testing.T) {
 	})
 }
 
-// TestNewEventHubPropagatesSeqRangeError(第三轮评审 I3 修复验收):SeqRange
-// 播种注错(Journal 读取失败)→ NewEventHub 返回 (nil, err) 显式上抛——
-//   - 错误链包裹底层原因(errors.Is 可判);
-//   - hub 恒为 nil:绝不创建「看似健康」的 hub(旧形态把读取失败降级为空历史:
-//     replayIntegrity 报 complete 且 seq 从 1 重起,与既有记录冲突);
-//   - 失败构造零副作用:同一 stub 恢复后可正常构造,空历史诚实报 Complete。
+// TestNewEventHubPropagatesSeqRangeError 验证播种读取失败会原样向上返回错误且不创建 hub，
+// 避免把既有历史误当空历史并从 Seq 1 重启；恢复 journal 后应可正常构造。
 func TestNewEventHubPropagatesSeqRangeError(t *testing.T) {
 	cause := errors.New("runs dir unreadable")
 	jr := &stubEventJournal{seqRangeErr: cause}
@@ -782,22 +713,11 @@ func TestNewEventHubPropagatesSeqRangeError(t *testing.T) {
 	}
 }
 
-// ── P3-3:Subscribe Replay+Live 原子切换(防 Race A/B)+ ErrCursorExpired ────
+// P3-3 验收 Subscribe 的 Replay/Live 原子切换及游标过期处理。
 
-// TestAttachReplayNoGap(总方案第十一节 → P3-3):单 hub,N 轮
-// BeginRun/Publish(混合 key+delta,含合并窗)/EndRun;M 个订阅者在随机时刻以
-// 随机 fromSeq(含 0、含注册时 latest)Subscribe,各收集到 Close;断言每个
-// 订阅者收到的 seq 严格覆盖 (fromSeq, finalLatest] 无缺口无重复。
-//
-// 记账口径(CR3-I1 起):回放已把合并批次展开为原始 per-seq 事件,实时与回放
-// 同形状——收到的每个 SessionEvent 恰计入其自身 Seq,不再按合并记录范围展开
-// (展开记账在批次时代反而可能掩盖批次内部的缺段:收到批次末 seq 即误认为
-// 整窗已覆盖)。「无重复」由收到流严格递增独立钉死。
-//
-// 时序收口:Close 前先轮询等全部订阅者抵达 finalLatest(10s 上界)——Close
-// 断开订阅者,提前 Close 会截断在途投递使覆盖断言失真;fromSeq==finalLatest
-// 的订阅者期望空覆盖,轮询按此豁免。随机源按 goroutine 独立播种(固定种子,
-// 失败可复现,且 rand.Rand 非并发安全)。
+// TestAttachReplayNoGap 随机交错多个订阅者的 Subscribe 与发布，断言每条流
+// 精确覆盖 (fromSeq, finalLatest]。回放批次先展开为逐事件，因此按 SessionEvent.Seq
+// 记账；关闭前等待所有订阅者到达终点，避免 Close 截断在途投递。随机源独立固定种子。
 func TestAttachReplayNoGap(t *testing.T) {
 	jr := &stubEventJournal{}
 	hub := mustNewEventHub(t, "replay-nogap", jr)
@@ -1143,19 +1063,9 @@ func TestSubscribeCtxCancelCleansUp(t *testing.T) {
 	}
 }
 
-// ── DE1-I1/I2:回放批次损坏/旧格式的诚实降级 ────────────────────────────────
-//
-// 三条验收(评审 DE1-I1/I2):
-//   - TestReplaySkipsCorruptBatchMarksIncomplete:损坏批次(两种解析都失败)
-//     被跳过、后续合法事件照收(单条损坏不炸整个 attach),replayIntegrity
-//     置 Incomplete——缺口显式暴露,不假装完整;
-//   - TestReplayLegacyMergedPayloadFallback:旧格式字符串批次(本功能发布前
-//     的开发数据形态)回退为区间末单事件,内容保留但同样置 Incomplete;
-//   - TestReplayRejectsMalformedBatchStructure:合法 JSON 但批次结构语义错误
-//     (seq 非严格递增等四种违反)视同解码失败——跳过 + Incomplete。
-//
-// 损坏/旧格式记录均经 jr.AppendEvent 直接预置(绕过 Publish 的编码路径,构造
-// 存储面的损坏形态);Subscribe 全程在 mu 内同步展开,返回后三态已定,无需轮询。
+// 回放容错验收：损坏批次跳过并置 Incomplete，后续事件仍可收；旧字符串批次以末 Seq
+// 单事件回放但标记 Incomplete；结构无效的合法 JSON 批次同样跳过并标记 Incomplete。
+// 测试直接写入 journal 构造损坏数据；Subscribe 在锁内同步回放，返回时完整性状态已确定。
 
 // TestReplaySkipsCorruptBatchMarksIncomplete(DE1-I1 验收):损坏批次 [1..3]
 // + 合法后续事件 seq 4 → 批次被跳过(无 1..3 的任何投递)、后续事件照收,
@@ -1241,16 +1151,9 @@ func TestReplayLegacyMergedPayloadFallback(t *testing.T) {
 	}
 }
 
-// TestReplayRejectsMalformedBatchStructure(DE1-I1 验收):合法 JSON(DeltaBatch
-// 可解码)但批次结构语义错误 → 视同解码失败:跳过该记录、后续事件照收、
-// replayIntegrity 置 Incomplete——「合法 JSON 但 seq 边界错乱」的数据不得进入
-// Replay。四种结构违反各一个子测试:
-//   - SeqNotStrictlyIncreasing(评审点名的形态:3 之后出现 2);
-//   - EmptyEvents(空批次,区间声明必然失真);
-//   - FirstSeqMismatch(首 part.Seq != FromSeq);
-//   - LastSeqMismatch(末 part.Seq != Seq)。
-//
-// part payload 内容与断言无关(整条记录被跳过,永不展开),取最短 JSON。
+// TestReplayRejectsMalformedBatchStructure 检验可解码但结构非法的批次会被整体跳过，
+// 后续事件仍回放且完整性转为 Incomplete。覆盖 Seq 非递增、空批次及首尾 Seq 不匹配；
+// part payload 无关，因为非法记录不会展开。
 func TestReplayRejectsMalformedBatchStructure(t *testing.T) {
 	malformed := []struct {
 		name    string
@@ -1300,21 +1203,9 @@ func TestReplayRejectsMalformedBatchStructure(t *testing.T) {
 
 // ── DE1-M1:Replay/Live 跨边界并发交接 ───────────────────────────────────────
 
-// TestReplayLiveHandoffWhilePublishing(DE1-M1 验收,评审场景「Replay 正在读取
-// Seq 101~110 → 另一 goroutine Publish Seq 111 → Replay 结束,切换 Live」):
-// journal 预置批次事件(text 窗被 key 事件打断的合并批次,物理序 ≠ seq 序)→
-// Subscribe(afterSeq=0) 注册完成即返回 → 屏障放行另一 goroutine **立即连续**
-// Publish 新事件(无 time.Sleep 对齐)——回放投递进行中实时发布已开始,订户
-// 收集至静默(发布收口、最终 seq 送达)后 Close 收口。
-//
-// 断言收到流 Seq 严格递增、恰好覆盖 (0, finalLatest] 每号一次——无重复、无
-// 遗漏、无越界:Replay→Live 交接(回放快照止于注册点 latest、watermark 只投
-// 其后、pump 先回放后 live)在发布并发下不丢不重。
-//
-// 容量论证(并发下仍无 flakes):实时发布总数 liveN < subscriberBuffer(256)
-// ——即便 pump 全程滞留回放阶段、sub.live 无人排空,fan-out 直投也不满缓冲,
-// 慢订户断开路径(fanOutLocked 的 delete+close)绝不触发,覆盖断言纯粹检验
-// 交接语义本身。
+// TestReplayLiveHandoffWhilePublishing 验证回放进行时并发 Publish 的无缝交接。
+// Subscribe 注册后立即放行连续发布，不靠 Sleep 对齐；断言收到的 Seq 严格递增且
+// 精确覆盖回放快照之后的实时区间。liveN 小于订阅缓冲容量，避免慢订户断开干扰交接断言。
 func TestReplayLiveHandoffWhilePublishing(t *testing.T) {
 	jr := &stubEventJournal{}
 	hub := mustNewEventHub(t, "replay-live-handoff", jr)

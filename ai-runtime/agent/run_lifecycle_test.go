@@ -14,17 +14,7 @@ import (
 	"github.com/tinguo/goworker/ai-sandbox"
 )
 
-// 本文件是 P0-3 的 Run 生命周期验收测试（总方案第十一节 → 本步）：
-//   - TestConcurrentSessions：manager 注册的两个 runtime 并行执行互不阻塞，
-//     各 fake store 只收到自己的提交；
-//   - TestSameSessionBusy：同一 runtime 第二个 Run 在 gate 上排队、第一个完成后
-//     执行，两轮提交串行、历史无覆盖；
-//   - TestCommitFailureNotCompleted：Commit/Compact 失败注入 → RunFailed+Persisted=false，
-//     绝不出现 RunCompleted（「模型成功 ≠ 持久化成功」的硬门槛）。
-//
-// 并行性用「双方 provider 都已开工」的屏障断言代替计时测量：若存在跨 runtime 的
-// 全局串行，B 的 provider 永远不会在 A 释放前开工，waitStarted 超时即失败——
-// 比耗时近似更确定，也不引入 flaky 时钟。
+// 本文件验证 Run 生命周期、跨 runtime 并发和持久化失败语义。
 
 // 编译期钉死接口契约：*session.Store 天然满足 ConversationStore（plugin 传参零改动）。
 var (
@@ -32,9 +22,7 @@ var (
 	_ ConversationStore = (*session.Store)(nil)
 )
 
-// fakeConversationStore 是 ConversationStore 的测试桩：view/commits 记内存，
-// commitErr/compactErr 注入持久化失败。语义对齐 *session.Store：Commit 追加进
-// view，ActiveView 返回快照。
+// fakeConversationStore 是支持持久化错误注入的测试存储。
 type fakeConversationStore struct {
 	mu           sync.Mutex
 	view         []core.Message
@@ -200,10 +188,7 @@ func assertSingleCommit(t *testing.T, st *fakeConversationStore, wantUser, wantA
 	}
 }
 
-// TestConcurrentSessions：manager 注册 A/B 两个 runtime，各自独立
-// SessionDeps（fake store + gatedProvider）并行 RecordRun。断言：
-// 双方 provider 同时处于运行中（互不阻塞）、各自 store 只收自己的提交、
-// 双双 RunCompleted+Persisted=true。
+// TestConcurrentSessions 验证不同 runtime 可并发运行且存储互相隔离。
 func TestConcurrentSessions(t *testing.T) {
 	mgr := NewSessionManager()
 
@@ -273,8 +258,7 @@ func TestConcurrentSessions(t *testing.T) {
 	}
 }
 
-// TestSameSessionBusy：同一 runtime 第二个 Run 在 gate 上排队，第一个完成后执行；
-// 两轮提交串行、历史无覆盖（两次 Commit 内容完整、view 累积 4 条）。
+// TestSameSessionBusy 验证同一 runtime 的运行经 gate 串行执行。
 func TestSameSessionBusy(t *testing.T) {
 	st := &fakeConversationStore{}
 	started1 := make(chan struct{})
@@ -337,10 +321,7 @@ func TestSameSessionBusy(t *testing.T) {
 	}
 }
 
-// TestCommitFailureNotCompleted：持久化失败注入 → RunFailed+Persisted=false，
-// 绝不出现 RunCompleted。Commit 失败走普通提交路径；Compact 失败走「运行中
-// 自动压缩触发 DetectCompact」的压缩提交路径（fake store 预置带 id 历史 +
-// 小窗口配置，使压缩中间件在本轮内真实触发）。
+// TestCommitFailureNotCompleted 验证存储失败不会记为成功。
 func TestCommitFailureNotCompleted(t *testing.T) {
 	t.Run("commit failure", func(t *testing.T) {
 		commitErr := errors.New("disk full")

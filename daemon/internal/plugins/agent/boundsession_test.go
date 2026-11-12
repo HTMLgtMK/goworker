@@ -18,26 +18,11 @@ import (
 	acpservice "github.com/tinguo/goworker/daemon/internal/core/service/acp"
 )
 
-// boundsession_test.go 是 Plan A2b1(会话面多会话化)的 handler×plugin 集成测试:
-// 真实 FrontendHandler(标准 ACP 方法面)+ 真实 AgentPlugin(SessionSource/
-// BoundSessionSource/ConnectionBinder 全能力)——session/new 真新建、session/load
-// 的 reload/重开/共享绑定/归档只读,四条验收场景(任务书测试要求):
-//
-//	① 两连接各 CreateSession → 各自绑定不同新会话,prompt 各自路由、历史互不串扰;
-//	② LoadSession 重开:/new 式收口(A2a CloseSession 逐出)后的会话 → 拿活实例、
-//	   历史重放、prompt 路由到重开会话;
-//	③ 多连接共享会话:A 绑 X,B load 同一 X → 双绑定,prompt 双方都可路由;
-//	④ archived 会话 load → 只读重放、binding 不动。
-//
-// evaluate 以 handleAgent 顶替 Engine.Eval 的 fallback 语义(标准 ACP prompt 的
-// 文本即 /agent 输入,Engine 对未匹配输入转 fallback handler——生产同型);零
-// 真实 LLM(fixedProvider)。
-//
-// 断言视角:FrontendHandler 的 binding/connectionID 是包内私有字段,跨包测试
-// 一律从插件侧观测——绑定事实源是 agentcontrol.BindingRegistry
-// (control.SessionBindings),注册事实源是 manager(创建/收口前后做集合差),
-// 路由与历史事实源是会话本体与 SessionHistory。这比反射/导出测试钩子更贴近
-// 生产消费面(handler 与插件本就经这三个面协作)。
+// boundsession_test.go 是 Plan A2b1 的 handler×plugin 集成测试，覆盖四条场景：
+// ① 两连接各自新建会话后 prompt 独立路由；② LoadSession 重开收口后的会话并
+// 重放历史；③ 多连接共享会话双向路由；④ archived 会话 load 只读、binding 不动。
+// 测试使用真实 handler/plugin 与 fixedProvider，零真实 LLM；断言从插件侧观测
+// 绑定、注册与历史，不依赖 handler 包内私有字段。
 
 // acpRecorder 是 aiacp.Reporter 的最小收集实现(acp 包 handler_test.go 的
 // recordingReporter 同款形态;测试文件不可跨包引用,这里自带一份)。
@@ -98,7 +83,12 @@ func newACPStack(t *testing.T, pv core.Provider) (*AgentPlugin, func() *acpStack
 	}
 	factory := acpservice.NewFrontendHandlerFactory(evaluate, nil, p, acpservice.NewSessionGate())
 	return p, func() *acpStack {
-		return &acpStack{handler: factory().(*acpservice.FrontendHandler), rep: &acpRecorder{}, p: p}
+		handler := factory().(*acpservice.FrontendHandler)
+		rep := &acpRecorder{}
+		// Direct handler tests have no wire initialize request; declare the same
+		// no-device ready state that a capability-free initialize would produce.
+		handler.InitializeReady(context.Background(), rep)
+		return &acpStack{handler: handler, rep: rep, p: p}
 	}
 }
 
@@ -490,12 +480,11 @@ func (s *acpStack) promptAsync(t *testing.T, sessionID, input string) <-chan err
 	return done
 }
 
-// TestACPCrossSessionPromptsRunInParallel(任务书验收①):两连接各绑不同会话,
-// 连接 1 的 prompt 阻塞在 provider(真实链路:handleAgent → manager.StartRun →
-// Session.Run → provider.Chat,即「工具执行慢」的形态),连接 2 的 prompt 在其
-// 阻塞期间正常完成——跨 session 并行。拆除 prompt 全局门禁(A2b2)之前,B 会在
-// handler.Prompt 的 gate.acquire 排队到 A 释放,不可能先完成;拆除后 B 的执行
-// 全程持有自己会话的 runtime gate(withSession → AcquireRun),与 A 的 gate 无嵌套。
+// TestACPCrossSessionPromptsRunInParallel(任务书验收①)验证跨会话并行：连接 1 的
+// prompt 阻塞在 provider（handleAgent → manager.StartRun → Session.Run →
+// provider.Chat），连接 2 的 prompt 在此期间正常完成。拆除 prompt 全局门禁前，
+// 连接 2 会排队在 handler.Prompt 的 gate.acquire 上；拆除后每个会话持有各自的
+// runtime gate（withSession → AcquireRun），两者互不阻塞。
 func TestACPCrossSessionPromptsRunInParallel(t *testing.T) {
 	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
 	p, newStack := newACPStack(t, fixedProvider{content: "ack"})
@@ -588,15 +577,10 @@ func TestACPCreateSessionImmediateWhilePromptInFlight(t *testing.T) {
 	}
 }
 
-// TestACPManagementOpsConcurrentCreateSerializes(任务书验收③,配合注释论证):
-// 两条连接**并发** session/new。管理操作在全局门禁上互斥(coordinator.go 的
-// 容量 1 channel;临界区只含注册表/repo 突变,无 I/O 无 LLM 调用),互斥的实现
-// 是**非阻塞 busy 拒绝**(tryAcquire,满即 sessionBusyError)而非排队——并发
-// 竞争下败者收到瞬态 busy、按客户端契约重试(测试内建模:busy 重试收敛),
-// 成功者携全序突变落地。断言:并发下两者最终都成功、绑定不同新会话、注册表
-// 恰好新增两条(突变全序,无竞态损坏)。「互斥本身」的确定性断言由 handler 层
-// 持有门禁时的 busy 拒绝承担(handler_test.go TestManagementGateSerializesManagementOps);
-// 本测试补真插件链路下并发管理操作的正确性面。
+// TestACPManagementOpsConcurrentCreateSerializes(任务书验收③)验证两条连接并发
+// session/new：管理操作在容量 1 的全局门禁上互斥，满时以非阻塞 busy 拒绝而非
+// 排队，测试按客户端契约重试。断言两者最终都成功、绑定不同新会话、注册表恰好
+// 新增两条，证明并发突变全序且无竞态损坏；门禁确定性由 handler 层测试覆盖。
 func TestACPManagementOpsConcurrentCreateSerializes(t *testing.T) {
 	p, newStack := newACPStack(t, fixedProvider{content: "ack"})
 	conn1, conn2 := newStack(), newStack()

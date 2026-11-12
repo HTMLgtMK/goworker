@@ -186,6 +186,141 @@ func TestNewFrontendHandlerFactoryPerConnection(t *testing.T) {
 	}
 }
 
+type lifecycleRaceSessionSource struct {
+	fakeSessionSource
+	createStarted chan struct{}
+	loadStarted   chan struct{}
+	finishCreate  chan struct{}
+	finishLoad    chan struct{}
+	muBindings    sync.Mutex
+	bindings      map[string]string
+	cleanupCount  int
+}
+
+func (f *lifecycleRaceSessionSource) CreateBoundSession(string) (string, error) {
+	close(f.createStarted)
+	<-f.finishCreate
+	return "runtime-session", nil
+}
+
+func (f *lifecycleRaceSessionSource) LoadBoundSession(string, string) error {
+	close(f.loadStarted)
+	<-f.finishLoad
+	return nil
+}
+
+func (f *lifecycleRaceSessionSource) SessionHistory(string) ([]model.SessionUpdate, error) {
+	return nil, nil
+}
+
+func (f *lifecycleRaceSessionSource) SessionArchived(string) bool         { return false }
+func (f *lifecycleRaceSessionSource) ArchiveSession(string, string) error { return nil }
+
+func (f *lifecycleRaceSessionSource) LoadBoundSessionForConnection(string, string, string) ([]model.SessionUpdate, error) {
+	close(f.loadStarted)
+	<-f.finishLoad
+	return nil, nil
+}
+
+func (f *lifecycleRaceSessionSource) LoadBoundSessionForConnectionGuarded(_, _, connectionID string, allowBind func() bool) ([]model.SessionUpdate, bool, error) {
+	close(f.loadStarted)
+	<-f.finishLoad
+	if !allowBind() {
+		f.muBindings.Lock()
+		f.cleanupCount++
+		f.muBindings.Unlock()
+		return nil, false, nil
+	}
+	f.BindConnectionSession(connectionID, "runtime-session")
+	return nil, true, nil
+}
+
+func (f *lifecycleRaceSessionSource) BindConnectionSession(connectionID, sessionID string) {
+	f.muBindings.Lock()
+	defer f.muBindings.Unlock()
+	if f.bindings == nil {
+		f.bindings = make(map[string]string)
+	}
+	f.bindings[connectionID] = sessionID
+}
+
+func (f *lifecycleRaceSessionSource) BindConnectionSessionGuarded(connectionID, sessionID string, allowBind func() bool) bool {
+	if !allowBind() {
+		f.muBindings.Lock()
+		f.cleanupCount++
+		f.muBindings.Unlock()
+		return false
+	}
+	f.BindConnectionSession(connectionID, sessionID)
+	return true
+}
+
+func (f *lifecycleRaceSessionSource) ReleaseConnection(connectionID string) {
+	f.muBindings.Lock()
+	defer f.muBindings.Unlock()
+	delete(f.bindings, connectionID)
+}
+
+func (f *lifecycleRaceSessionSource) binding(connectionID string) string {
+	f.muBindings.Lock()
+	defer f.muBindings.Unlock()
+	return f.bindings[connectionID]
+}
+
+func (f *lifecycleRaceSessionSource) cleanupCalls() int {
+	f.muBindings.Lock()
+	defer f.muBindings.Unlock()
+	return f.cleanupCount
+}
+
+func TestCreateSessionCloseWinsBeforeLifecycleRegistration(t *testing.T) {
+	source := &lifecycleRaceSessionSource{
+		createStarted: make(chan struct{}), finishCreate: make(chan struct{}),
+		loadStarted: make(chan struct{}), finishLoad: make(chan struct{}),
+	}
+	handler := &FrontendHandler{sessions: source, multi: source, binder: source, gate: NewSessionGate(), connectionID: "conn"}
+	result := make(chan error, 1)
+	go func() {
+		result <- handler.CreateSession(context.Background(), "transport", protocol.NewSessionRequest{}, &recordingReporter{})
+	}()
+	<-source.createStarted
+	handler.Close()
+	close(source.finishCreate)
+	if err := <-result; !errors.Is(err, protocol.ErrClosed) {
+		t.Fatalf("CreateSession after Close = %v, want protocol.ErrClosed", err)
+	}
+	if got := source.binding("conn"); got != "" {
+		t.Fatalf("connection binding after Close = %q, want none", got)
+	}
+	if got := source.cleanupCalls(); got != 1 {
+		t.Fatalf("guarded cleanup calls = %d, want 1", got)
+	}
+}
+
+func TestLoadSessionCloseWinsBeforeLifecycleRegistration(t *testing.T) {
+	source := &lifecycleRaceSessionSource{
+		createStarted: make(chan struct{}), finishCreate: make(chan struct{}),
+		loadStarted: make(chan struct{}), finishLoad: make(chan struct{}),
+	}
+	handler := &FrontendHandler{sessions: source, multi: source, binder: source, gate: NewSessionGate(), connectionID: "conn"}
+	result := make(chan error, 1)
+	go func() {
+		result <- handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "runtime-session"}, &recordingReporter{})
+	}()
+	<-source.loadStarted
+	handler.Close()
+	close(source.finishLoad)
+	if err := <-result; !errors.Is(err, protocol.ErrClosed) {
+		t.Fatalf("LoadSession after Close = %v, want protocol.ErrClosed", err)
+	}
+	if got := source.binding("conn"); got != "" {
+		t.Fatalf("connection binding after Close = %q, want none", got)
+	}
+	if got := source.cleanupCalls(); got != 1 {
+		t.Fatalf("guarded cleanup calls = %d, want 1", got)
+	}
+}
+
 func TestCreateSessionPushesCommands(t *testing.T) {
 	reporter := &recordingReporter{}
 	handler := &FrontendHandler{
@@ -194,6 +329,7 @@ func TestCreateSessionPushesCommands(t *testing.T) {
 		},
 		gate: NewSessionGate(),
 	}
+	handler.InitializeReady(context.Background(), reporter)
 	if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -423,12 +559,9 @@ func (b *binderSessionSource) consulted() (string, model.DeviceCaller) {
 	return b.lastConn, b.lastCall
 }
 
-// TestPromptInjectsDeviceToolSourceWhenCapable：对端声明 x-device 且提供 Call
-// 通道时，Prompt 注入惰性工具源。P5-9 两个后端形态：
-//   - sessions 实现 model.ClientToolBinder → 走能力代理面（handler 的
-//     connectionID 与 reporter 的 Call 通道转发给 binder，工具源即 binder 产出）；
-//   - 未实现（纯 SessionSource 测试桩/无 sessions）→ 回落原始 relay 路径
-//     （调用即 probe，工具带 sys_ 前缀）——测试桩兼容语义。
+// TestPromptInjectsDeviceToolSourceWhenCapable covers both backends: ClientToolBinder
+// supplies a connection-scoped lazy source when available; otherwise the handler falls back
+// to the legacy relay. Both require x-device capability and a reporter Call channel.
 func TestPromptInjectsDeviceToolSourceWhenCapable(t *testing.T) {
 	reporter := &capsReporter{caps: decodeCaps(t, `{"x-device": {"tools": true}}`)}
 
@@ -455,6 +588,7 @@ func TestPromptInjectsDeviceToolSourceWhenCapable(t *testing.T) {
 			gate:         NewSessionGate(),
 			connectionID: "conn-test",
 		}
+		handler.InitializeReady(context.Background(), reporter)
 		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
@@ -491,6 +625,7 @@ func TestPromptInjectsDeviceToolSourceWhenCapable(t *testing.T) {
 			},
 			gate: NewSessionGate(),
 		}
+		handler.InitializeReady(context.Background(), reporter)
 		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
@@ -761,12 +896,9 @@ func waitPrompt(t *testing.T, h *FrontendHandler, sessionID string, reporter aia
 	return done
 }
 
-// TestPromptInFlightDoesNotBlockCreateSession（A2b2 语义翻转，取代评审 P1 场景 1
-// 的 busy 断言）：A 的 prompt 在飞时 B 的 session/new 立即成功——prompt 已退出
-// 全局门禁（执行互斥下沉 per-runtime gate，插件 withSession 的 AcquireRun），
-// 管理操作不再被在飞 prompt 阻塞（plan A2「busy 语义改善：new/load 不再被在飞
-// prompt 阻塞」）。B 的 new 不触碰 A 的会话：真新建只 Create 新 store + 注册新
-// runtime（A2b1 语义），在飞执行不受影响。
+// TestPromptInFlightDoesNotBlockCreateSession verifies session management uses a separate
+// gate from prompt execution: creating B succeeds while A's prompt is blocked, without
+// changing A's runtime.
 func TestPromptInFlightDoesNotBlockCreateSession(t *testing.T) {
 	sessions := &fakeSessionSource{}
 	reporter := &recordingReporter{}
@@ -847,11 +979,9 @@ func TestPromptInFlightDoesNotBlockLoadCurrent(t *testing.T) {
 	}
 }
 
-// TestPromptsRunConcurrentlyAcrossConnections（A2b2 语义翻转，取代原「门禁对
-// prompt 互斥」的串行断言）：prompt 退出全局门禁后跨连接并行——A 的 prompt
-// 阻塞在 evaluate 时 B 的 prompt 照常启动（旧版在此排队于门禁）。同一 session
-// 的执行互斥由 per-runtime gate（插件 withSession 的 AcquireRun）承担，本测试
-// 的 fake evaluate 不经过插件链，验证的是 handler 层不再有全局串行点。
+// TestPromptsRunConcurrentlyAcrossConnections verifies prompts on different connections are
+// not serialized by the management gate. Same-session execution remains serialized by the
+// plugin's per-runtime gate; this fake tests only the handler layer.
 func TestPromptsRunConcurrentlyAcrossConnections(t *testing.T) {
 	reporter := &recordingReporter{}
 	aEval, bEval := newBlockedEval(), newBlockedEval()
@@ -882,18 +1012,13 @@ func TestPromptsRunConcurrentlyAcrossConnections(t *testing.T) {
 	}
 }
 
-// TestPromptCancelWhileQueued 已随全局门禁的 prompt 排队面一并删除（A2b2）：
-// 其验证的「连接断开时排队 prompt 立即以错误退出」原是 SessionGate.acquire 的
-// ctx 取消语义——acquire 随 prompt 退出门禁而退役（coordinator.go），断连不
-// 悬挂改由请求 ctx 传入 evaluate 链、经 SDK 的 AgentRun 取消语义承担（与 xgw
-// 后台 run 的 ctx 取消同源）；ai-acp 的请求 goroutine（dispatchRequest）在
-// handler 返回后自然收敛，无门禁可悬挂。
+// Prompt queuing was removed from SessionGate: execution now uses per-runtime gates, and
+// request cancellation flows through evaluate to AgentRun. The former queued-prompt test is
+// obsolete; dispatchRequest exits when the handler returns.
 
-// TestManagementGateSerializesManagementOps（A2b2 管理互斥面的确定性断言）：
-// 全局门禁被另一管理操作占住（tryAcquire 模拟）时，session/new 收到 -32000
-// busy——管理操作互斥的实现是非阻塞 busy 拒绝（tryAcquire，coordinator.go），
-// 绝不排队；释放后重试成功。这是并发管理操作 busy 语义的 gate 级验证（真插件
-// 链路的并发正确性面在 plugins/agent 的 TestACPManagementOpsConcurrentCreateSerializes）。
+// TestManagementGateSerializesManagementOps verifies a held management gate returns busy
+// instead of queueing session/new; retry succeeds after release. Concurrent plugin-level
+// serialization is covered by the integration suite.
 func TestManagementGateSerializesManagementOps(t *testing.T) {
 	sessions := &fakeSessionSource{}
 	reporter := &recordingReporter{}

@@ -13,27 +13,8 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 )
 
-// stop_test.go 是 PR5 Stop 收口（总方案 §十测试矩阵「Plugin Stop:不遗留失控
-// goroutine、连接订阅或 Store 句柄」；P4 报备「P5 再接线」）的插件侧验收。
-//
-// TestPluginStopClosesManager：在飞 Run → 插件 Stop →
-//   - run 收敛取消终态（journal 末条 cancelled，取消不是失败，P2-1 归一）；
-//   - manager 停机（注册表清空 + Register/StartRun 一律 ErrManagerClosed）；
-//   - 事件订阅随 hub 收口关闭（订阅通道关闭可观测，无失控订阅面）；
-//   - Stop 返回后可再入（幂等：第二次 Stop 不 panic、不悬挂）。
-//
-// Store 句柄释放面（flock 已释放）在 daemon 根 e2e 以包外视角断言
-// （e2e_plugin_stop_test.go：session.Open 同目录重开成功 ⇒ 锁已释放）；
-// 本包内 currentStore 经 repo 缓存取数，锁释放不构成可观测差异。
-//
-// TestStopWaitsForInFlightMaintenance 是 S1（第四轮评审）的插件侧验收：
-// Stop 的等待面除 manager 的 AgentRun 外，还必须覆盖 withSession 维护闭包
-// （/new /compact 等经 Session Gate 但不在 Manager 活跃集的执行面）——
-// store.Close 不得早于在飞维护操作完成。
-//
-// goroutine 收敛不直接用 runtime.NumGoroutine 断言（并行测试下基线不可靠）：
-// 在飞 Run 的执行 goroutine 以「journal 终态 + active 清空」收敛为证，订阅
-// goroutine 以「订阅通道关闭」为证——两者正是失控 goroutine 的全部来源面。
+// stop_test.go 验证插件停止时 run、维护请求、后台固化、事件订阅和 store 均正确收口。
+// goroutine 收敛以 run 终态/active 清空和订阅通道关闭断言，不依赖不稳定的 goroutine 数。
 
 // TestPluginStopClosesManager:在途 run → Stop → run 终态、manager closed。
 func TestPluginStopClosesManager(t *testing.T) {
@@ -333,17 +314,11 @@ func TestStopDrainsMaintenanceWaitingBehindRunGate(t *testing.T) {
 	}
 }
 
-// TestStopWaitsForInFlightMaintenance(S1 验收,第四轮评审):withSession 维护闭包
-// (/compact 等命令的执行面)持有 store 操作期间触发 Stop → store.Close 不早于
-// 维护操作完成。确定性交错(生产可达面:CLI stdin 信号路径在 Eval 在飞时即可
-// 进入 appl.Stop → Engine.StopAll → Plugin.Stop,Engine 层无排空屏障):
-//  1. 请求在 withSession 入口登记后，闭包在 gate 内挂起(close(entered) 钩子);
-//  2. Stop 并发启动(此刻起 inFlight admission closed,新维护回合被拒绝);
-//  3. 放行闭包 → 闭包对 store 真实 Commit——若 Stop 先于闭包关掉 store,
-//     Commit 以错误可观测(Store 关闭后 appendRecord 落在已关句柄上);
-//  4. Stop 返回后断言:闭包内部的生产操作已完成(happens-before 经
-//     inFlight.wait 的 WaitGroup 建立:闭包完成 → exit/Done → wait 返回
-//     → Stop 返回 → stopped 关闭),store 写成功,且重启文件视图可见写入。
+// TestStopWaitsForInFlightMaintenance 验证 S1：维护闭包持有 store 操作期间触发
+// Stop，store.Close 不得早于操作完成。确定性交错：闭包在 gate 内挂起 → Stop
+// 并发启动并关闭 inFlight admission → 放行闭包并真实 Commit（若 store 已关会
+// 报错）→ Stop 返回时闭包已完成（happens-before 由 inFlight.wait 建立），
+// store 写成功且重启后可见。
 func TestStopWaitsForInFlightMaintenance(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "maint-stop"})
 	sid := p.CurrentSessionID()
@@ -432,13 +407,10 @@ func TestStopWaitsForInFlightMaintenance(t *testing.T) {
 	}
 }
 
-// TestStopWaitsForBackgroundFinalizers（A2b2 的 Stop 等待面验收，对齐
-// TestStopWaitsForInFlightMaintenance 的白盒形态）：/new 的 CheckpointSync 已
-// 挪出命令回合异步执行（commands.go，spawn 即登记 bgFinalizers）——Stop 必须
-// 在 memory 收尾（memory.Client.Close）之前等待全部后台固化完成，否则停机会
-// 打断固化、丢记忆（固化 goroutine 持有的 deps.Memory 在 Close 后调用）。
-// 直接断言「Stop 返回前 bgFinalizers 已排空」：以一个慢收尾 goroutine 模拟
-// 固化时长，Stop 返回时它必须已完成。
+// TestStopWaitsForBackgroundFinalizers 验证 A2b2 的 Stop 等待面：/new 的
+// CheckpointSync 已异步执行并在 spawn 时登记 bgFinalizers，Stop 必须在
+// memory.Client.Close 之前等待全部后台固化完成，否则会打断固化并丢失记忆。
+// 测试用一个慢收尾 goroutine 模拟固化时长，直接断言 Stop 返回时它已完成。
 func TestStopWaitsForBackgroundFinalizers(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "x"})
 

@@ -19,10 +19,8 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/app/config"
 )
 
-// TestE2E_SessionPersistFullChain 端到端验证会话持久化完整链路：
-// /agent 两轮 → jsonl 落盘 + 自动 checkpoint → 重启恢复 → rewind。
-// mock LLM 返回固定回复，Memory 关闭以专注会话链路。（/new 自动归档已随
-// Plan A 定案 #2/#9 移除：/new 纯新建，归档为显式命令、A3 提供。）
+// TestE2E_SessionPersistFullChain verifies persistence, recovery, and rewind
+// across two runs using a deterministic mock provider.
 func TestE2E_SessionPersistFullChain(t *testing.T) {
 	// mock LLM：返回固定 assistant 回复
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -66,7 +64,7 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 
 	jsonl := filepath.Join(cfg.Session.Dir, "current.jsonl")
 
-	// 1. 第一轮 /agent
+	// First run writes messages and an automatic checkpoint.
 	var out strings.Builder
 	if _, err := s.Run(context.Background(), agent.RunRequest{Input: "question one"}, e2eRunCallbacks(&out)); err != nil {
 		t.Fatalf("Run 1: %v", err)

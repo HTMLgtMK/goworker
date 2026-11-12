@@ -8,9 +8,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 )
 
-// 本文件测试 /rewind 依赖的 store 层回溯行为。
-// 因 p.store 字段由并行 agent (D) 负责落地，handler 级集成测试在 D 落字段后再补。
-// 当前聚焦：SetHead → ActiveView 正确性、多轮 rewind、compact 恢复原文、分叉后提交。
+// 本文件验证 store 的回溯、压缩恢复与分叉提交行为。
 
 // openTestStore 打开临时目录下的 store 并注册 cleanup。
 func openTestStore(t *testing.T) *session.Store {

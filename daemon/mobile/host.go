@@ -1,13 +1,6 @@
-// Package mobile 是 Android（gobind）入口壳：进程内嵌入 app.Application 后端的管道桥。
-//
-// 架构：Kotlin 侧实现 ACP Client（JSON-RPC over 换行分隔帧），经本包与 Go 侧
-// app.Application 通信 —— ACP 经 WithACPConnection 走进程内管道，后端是完整
-// 的 Engine + 插件 + services 装配（内置命令、会话持久化与 VS Code 端的
-// app-service 路径同源）。本包只桥接字节流，不解释协议：JSON-RPC 编解码、
-// session 生命周期、HITL 对话框交互全部在 Kotlin ACP 客户端完成。协议细节见 PROTOCOL.md。
-//
-// gobind 边界约束：仅 string/[]byte/error/可绑定接口（无 map/func 字段/变参）；
-// 一切导出方法带 recover 壳 —— Go panic 会 abort 整个 App 进程。
+// Package mobile bridges Android's gobind ACP client to app.Application over pipes.
+// Kotlin owns protocol handling and session/UI behavior; this package forwards bytes.
+// Exported APIs must stay gobind-compatible, and recover panics at the boundary.
 package mobile
 
 import (
@@ -128,19 +121,10 @@ func (h *Host) rollbackStart(toWorkerR *io.PipeReader, toWorkerW *io.PipeWriter,
 	}
 }
 
-// Start 装配并启动后端：io.Pipe 桥 + app.New(WithACPConnection) 同步装配
-// （配置 → Engine → 插件 → StartAll → services.Start），之后 Kotlin 即可经
-// Write 发送 ACP 请求（首条约定为 initialize）。acp service 的 Start 只调
-// listener factory 后台 accept，不会卡在协议握手。
-//
-// 生命周期状态机：new → starting → running → closed。昂贵的 app.New 装配在
-// 状态锁之外执行 —— Close 与装配并行时不必等装配跑完（Android 后台初始化
-// 期间组件销毁要能立刻收口）。OnClose 恰一次的契约随交织而异：
-//   - Start 成功后 Close：appl.Stop → pump EOF → OnClose 一次；
-//   - Close 撞上装配中：Start 装配完成后的 closed 检查接手善后并上报一次
-//     （pump 尚不存在，没人翻译 EOF）；若装配因收口而失败，失败路径同样补报；
-//   - Start 从未跑起来（未调 / 被拒 / 装配自身失败）：不上报 OnClose ——
-//     历史契约，此时 Kotlin 从未收到过任何后端输出。
+// Start builds the pipe-backed ACP service. app.New runs outside the state lock so
+// Close can finish during assembly; the completion path then stops the new app and
+// reports OnClose. After a successful start, OnClose is delivered once on shutdown;
+// a start that never succeeded does not report it.
 func (h *Host) Start() (err error) {
 	var (
 		toWorkerR   *io.PipeReader
@@ -253,19 +237,10 @@ func (h *Host) Write(chunk []byte) (err error) {
 	return nil
 }
 
-// Close 停止后端并释放资源。幂等。OnClose 恰一次的契约随生命周期交织而异
-// （详见 Start）：
-//   - Start 成功后 Close：关 clientW（EOF → server 读循环退出）→ appl.Stop()
-//     （services → engine → log）→ pump 读到 EOF → OnClose 一次。Stop 会等
-//     活跃 prompt 取消完成，可能阻塞，这是有意的收口语义。
-//   - Start 从未成功（未调 / 被拒 / 装配自身失败）：不上报 OnClose —— 历史
-//     契约，Kotlin 从未收到过后端输出；无 pump 可等，直接收口返回。
-//   - Close 撞上装配中：pump 尚不存在，OnClose 由 Start 装配完成后的 closed
-//     检查（或装配失败路径）补报，本方法只负责关端点、置 closed。
-//
-// 锁纪律：Close 只拿 mu、刻意不碰 writeMu —— 因此无论 Write 卡在管道上
-// 还是排在 I/O 锁后，都拦不住 Close 关端点解救它们（这也是拆锁的意义）。
-// appl 必须在锁内快照：装配并行时 Start 正在锁外阶段三写它，锁外裸读是 race。
+// Close stops the backend and releases resources. It is idempotent. A successful
+// Start waits for app shutdown and the output pump to report OnClose; Close during
+// assembly leaves reporting to Start's completion path. Close never takes writeMu:
+// closing the pipe must unblock a blocked Write. Snapshot appl under mu to avoid a race.
 func (h *Host) Close() {
 	defer func() {
 		if r := recover(); r != nil {

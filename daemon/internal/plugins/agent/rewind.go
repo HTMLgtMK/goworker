@@ -34,8 +34,8 @@ func (p *AgentPlugin) handleRewind(ctx *model.Context) error {
 }
 
 func (p *AgentPlugin) handleRewindLocked(ctx *model.Context) error {
-	// P1-3 起取数经 store 解析链（runtime → repo 实例唯一缓存），
-	// 与命令互斥同源；PR2 起经 binding 形态 currentStoreIn(命令回合注入的
+	// 取数经 store 解析链（runtime → repo 实例唯一缓存），
+	// 与命令互斥同源；经 binding 形态 currentStoreIn(命令回合注入的
 	// runtime,无绑定直接调用回落 current);nil 降级文案与旧版一致。
 	st := p.currentStoreIn(ctx.Ctx)
 	if st == nil {
@@ -95,7 +95,7 @@ func (p *AgentPlugin) doRewind(ctx *model.Context, arg string) error {
 		return nil
 	}
 
-	// 执行回溯：移动 head → 刷新 session。写面前同源拒 archived（定案需求 #1，
+	// 执行回溯：移动 head → 刷新 session。写面前同源拒 archived（
 	// 与 handleCompact/handleAgent 的 store 执法同一数据源）——/rewind 无参的
 	// 检查点列表是只读观察面，保留对 archived 会话可用。
 	if st := p.currentStoreIn(ctx.Ctx); st.Archived() {

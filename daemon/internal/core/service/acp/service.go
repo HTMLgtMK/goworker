@@ -15,10 +15,8 @@ import (
 // session state never leaks across peers.
 type HandlerFactory func() aiacp.SessionHandler
 
-// connectionCloser 是 handler 的可选连接退出钩子(daemon 侧扩展约定,ai-acp 无
-// 此接口):accept 在 server 退出后调用,承载断连收口语义——FrontendHandler.Close
-// 释放 control lease(P5-7),P5-8/P5-9 追加订阅泵清理与能力解绑。编译期断言
-// 钉住 FrontendHandler 的钩子实现,防止签名漂移后静默失去收口语义。
+// connectionCloser 是 handler 的可选连接退出钩子。accept 在 server 退出后调用，
+// 用于释放连接持有的资源。
 type connectionCloser interface {
 	Close()
 }

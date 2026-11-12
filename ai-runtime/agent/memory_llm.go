@@ -43,14 +43,9 @@ func toCoreMessages(messages []memory.Message) []core.Message {
 	return out
 }
 
-// toMemoryMessages 把 core.Message 转成 memory.Message，只保留纯文本的
-// user/assistant/system 消息。
-//
-// 过滤 tool 消息与带 tool_calls 的 assistant 消息，两个理由：
-//  1. 固化是提炼任务/事实，tool 原始输出与工具调用声明是噪音，纯文本对话
-//     （user 意图 + assistant 行动/结论）信息量足够，还省 token；
-//  2. 残缺的 tool 结构（memory.Message 不携带 tool_call_id）会踩 OpenAI 的
-//     严格校验 —— 400 "missing field tool_call_id"。主动过滤掉比补全字段干净。
+// toMemoryMessages keeps only plain user/assistant/system text. Tool messages and
+// tool_calls are dropped as noise and because incomplete call structures fail strict
+// provider validation.
 func toMemoryMessages(messages []core.Message) []memory.Message {
 	out := make([]memory.Message, 0, len(messages))
 	for _, message := range messages {

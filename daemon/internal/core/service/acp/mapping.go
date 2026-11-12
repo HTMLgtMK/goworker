@@ -10,11 +10,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// ---- daemon domain → ACP wire 映射 ----
-//
-// 这些函数把 daemon domain 类型（model.SessionSummary / SessionUpdate /
-// SessionModeState / core.Token / model.Command）映射为 ACP wire DTO，是
-// FrontendHandler 的序列化层。
+// Domain-to-wire mapping for ACP session summaries, updates, modes, tokens, and commands.
 
 // SessionInfoFromDomain 把 daemon 会话摘要映射为 wire SessionInfo。domain 的
 // Active 是业务标记，不进 wire DTO（ACP SessionInfo 保持纯协议语义）；三态

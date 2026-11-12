@@ -118,9 +118,7 @@ type SessionInfo struct {
 	Cwd       string `json:"cwd"`
 	Title     string `json:"title,omitempty"`
 	UpdatedAt string `json:"updatedAt,omitempty"` // RFC3339
-	// State 是会话三态（Plan A3/定案需求 #3）：active（有连接绑定或 run 在飞）、
-	// idle（无引用无在飞）、archived（终态标记，只读保留、不可逆）。omitempty
-	// 保持旧客户端兼容：不理解该字段的实现按无字段组收下（A1 未知字段结论）。
+	// State 是可选的会话状态：active、idle 或只读终态 archived。
 	State string `json:"state,omitempty"`
 }
 
@@ -293,15 +291,9 @@ type PermissionOption struct {
 	Kind     string `json:"kind,omitempty"` // allow_once / allow_always / reject_once / reject_always
 }
 
-// PermissionResponse 是 session/request_permission 的应答。
-// ACP 规范里 outcome 是**嵌套**的判别联合（jsonrpc.ts / schema 的
-// RequestPermissionOutcome），线上形状是：
-//
-//	{"outcome":{"outcome":"selected","optionId":"allow_once"}}
-//	{"outcome":{"outcome":"cancelled"}}
-//
-// 不是扁平的 {"optionId":...} —— 后者对端 schema 校验不过，会当成取消/拒绝，
-// 表现成"用户明明点了允许，agent 那边收到的还是 reject"。
+// PermissionResponse 是 session/request_permission 的应答。ACP schema 要求 outcome
+// 使用嵌套判别联合，例如 {"outcome":{"outcome":"selected","optionId":"allow_once"}}
+// 或 {"outcome":{"outcome":"cancelled"}}；扁平结构会校验失败并导致允许被当作拒绝。
 type PermissionResponse struct {
 	Outcome PermissionOutcome `json:"outcome"`
 }
