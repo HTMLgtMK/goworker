@@ -72,6 +72,22 @@ func (p *AgentPlugin) BindConnectionSession(clientID, sessionID string) {
 	p.bindConnectionSessionLocked(clientID, sessionID)
 }
 
+// BindConnectionSessionGuarded linearizes a connection binding against disconnect.
+// allowBind must be a non-blocking state check and must not acquire lifecycle locks.
+func (p *AgentPlugin) BindConnectionSessionGuarded(clientID, sessionID string, allowBind func() bool) bool {
+	if p.control == nil {
+		return false
+	}
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if allowBind == nil || !allowBind() {
+		p.tryReleaseSessionLocked(sessionID)
+		return false
+	}
+	p.bindConnectionSessionLocked(clientID, sessionID)
+	return true
+}
+
 func (p *AgentPlugin) bindConnectionSessionLocked(clientID, sessionID string) {
 	prev := p.control.BindSession(clientID, sessionID)
 	if prev != "" && prev != sessionID {

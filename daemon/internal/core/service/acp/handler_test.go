@@ -186,6 +186,141 @@ func TestNewFrontendHandlerFactoryPerConnection(t *testing.T) {
 	}
 }
 
+type lifecycleRaceSessionSource struct {
+	fakeSessionSource
+	createStarted chan struct{}
+	loadStarted   chan struct{}
+	finishCreate  chan struct{}
+	finishLoad    chan struct{}
+	muBindings    sync.Mutex
+	bindings      map[string]string
+	cleanupCount  int
+}
+
+func (f *lifecycleRaceSessionSource) CreateBoundSession(string) (string, error) {
+	close(f.createStarted)
+	<-f.finishCreate
+	return "runtime-session", nil
+}
+
+func (f *lifecycleRaceSessionSource) LoadBoundSession(string, string) error {
+	close(f.loadStarted)
+	<-f.finishLoad
+	return nil
+}
+
+func (f *lifecycleRaceSessionSource) SessionHistory(string) ([]model.SessionUpdate, error) {
+	return nil, nil
+}
+
+func (f *lifecycleRaceSessionSource) SessionArchived(string) bool         { return false }
+func (f *lifecycleRaceSessionSource) ArchiveSession(string, string) error { return nil }
+
+func (f *lifecycleRaceSessionSource) LoadBoundSessionForConnection(string, string, string) ([]model.SessionUpdate, error) {
+	close(f.loadStarted)
+	<-f.finishLoad
+	return nil, nil
+}
+
+func (f *lifecycleRaceSessionSource) LoadBoundSessionForConnectionGuarded(_, _, connectionID string, allowBind func() bool) ([]model.SessionUpdate, bool, error) {
+	close(f.loadStarted)
+	<-f.finishLoad
+	if !allowBind() {
+		f.muBindings.Lock()
+		f.cleanupCount++
+		f.muBindings.Unlock()
+		return nil, false, nil
+	}
+	f.BindConnectionSession(connectionID, "runtime-session")
+	return nil, true, nil
+}
+
+func (f *lifecycleRaceSessionSource) BindConnectionSession(connectionID, sessionID string) {
+	f.muBindings.Lock()
+	defer f.muBindings.Unlock()
+	if f.bindings == nil {
+		f.bindings = make(map[string]string)
+	}
+	f.bindings[connectionID] = sessionID
+}
+
+func (f *lifecycleRaceSessionSource) BindConnectionSessionGuarded(connectionID, sessionID string, allowBind func() bool) bool {
+	if !allowBind() {
+		f.muBindings.Lock()
+		f.cleanupCount++
+		f.muBindings.Unlock()
+		return false
+	}
+	f.BindConnectionSession(connectionID, sessionID)
+	return true
+}
+
+func (f *lifecycleRaceSessionSource) ReleaseConnection(connectionID string) {
+	f.muBindings.Lock()
+	defer f.muBindings.Unlock()
+	delete(f.bindings, connectionID)
+}
+
+func (f *lifecycleRaceSessionSource) binding(connectionID string) string {
+	f.muBindings.Lock()
+	defer f.muBindings.Unlock()
+	return f.bindings[connectionID]
+}
+
+func (f *lifecycleRaceSessionSource) cleanupCalls() int {
+	f.muBindings.Lock()
+	defer f.muBindings.Unlock()
+	return f.cleanupCount
+}
+
+func TestCreateSessionCloseWinsBeforeLifecycleRegistration(t *testing.T) {
+	source := &lifecycleRaceSessionSource{
+		createStarted: make(chan struct{}), finishCreate: make(chan struct{}),
+		loadStarted: make(chan struct{}), finishLoad: make(chan struct{}),
+	}
+	handler := &FrontendHandler{sessions: source, multi: source, binder: source, gate: NewSessionGate(), connectionID: "conn"}
+	result := make(chan error, 1)
+	go func() {
+		result <- handler.CreateSession(context.Background(), "transport", protocol.NewSessionRequest{}, &recordingReporter{})
+	}()
+	<-source.createStarted
+	handler.Close()
+	close(source.finishCreate)
+	if err := <-result; !errors.Is(err, protocol.ErrClosed) {
+		t.Fatalf("CreateSession after Close = %v, want protocol.ErrClosed", err)
+	}
+	if got := source.binding("conn"); got != "" {
+		t.Fatalf("connection binding after Close = %q, want none", got)
+	}
+	if got := source.cleanupCalls(); got != 1 {
+		t.Fatalf("guarded cleanup calls = %d, want 1", got)
+	}
+}
+
+func TestLoadSessionCloseWinsBeforeLifecycleRegistration(t *testing.T) {
+	source := &lifecycleRaceSessionSource{
+		createStarted: make(chan struct{}), finishCreate: make(chan struct{}),
+		loadStarted: make(chan struct{}), finishLoad: make(chan struct{}),
+	}
+	handler := &FrontendHandler{sessions: source, multi: source, binder: source, gate: NewSessionGate(), connectionID: "conn"}
+	result := make(chan error, 1)
+	go func() {
+		result <- handler.LoadSession(context.Background(), protocol.LoadSessionRequest{SessionID: "runtime-session"}, &recordingReporter{})
+	}()
+	<-source.loadStarted
+	handler.Close()
+	close(source.finishLoad)
+	if err := <-result; !errors.Is(err, protocol.ErrClosed) {
+		t.Fatalf("LoadSession after Close = %v, want protocol.ErrClosed", err)
+	}
+	if got := source.binding("conn"); got != "" {
+		t.Fatalf("connection binding after Close = %q, want none", got)
+	}
+	if got := source.cleanupCalls(); got != 1 {
+		t.Fatalf("guarded cleanup calls = %d, want 1", got)
+	}
+}
+
 func TestCreateSessionPushesCommands(t *testing.T) {
 	reporter := &recordingReporter{}
 	handler := &FrontendHandler{
@@ -194,6 +329,7 @@ func TestCreateSessionPushesCommands(t *testing.T) {
 		},
 		gate: NewSessionGate(),
 	}
+	handler.InitializeReady(context.Background(), reporter)
 	if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -452,6 +588,7 @@ func TestPromptInjectsDeviceToolSourceWhenCapable(t *testing.T) {
 			gate:         NewSessionGate(),
 			connectionID: "conn-test",
 		}
+		handler.InitializeReady(context.Background(), reporter)
 		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
@@ -488,6 +625,7 @@ func TestPromptInjectsDeviceToolSourceWhenCapable(t *testing.T) {
 			},
 			gate: NewSessionGate(),
 		}
+		handler.InitializeReady(context.Background(), reporter)
 		if err := handler.CreateSession(context.Background(), "s1", protocol.NewSessionRequest{}, reporter); err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}

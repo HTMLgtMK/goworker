@@ -177,8 +177,15 @@ func SpecDeviceTools(caller DeviceCaller) ([]runtimeagent.ClientToolSpec, error)
 	if len(descriptors) == 0 {
 		return nil, fmt.Errorf("device tool probe failed or declared no tools (capability collapsed)")
 	}
+	return DeviceToolSpecs(descriptors), nil
+}
+
+// DeviceToolSpecs converts a validated descriptor snapshot into SDK capability
+// specs without another reverse call.
+func DeviceToolSpecs(descriptors []DeviceToolDescriptor) []runtimeagent.ClientToolSpec {
 	specs := make([]runtimeagent.ClientToolSpec, 0, len(descriptors))
 	for _, d := range descriptors {
+		d = normalizeDeviceToolDescriptor(d)
 		specs = append(specs, runtimeagent.ClientToolSpec{
 			Name:        sysToolPrefix + d.Name,
 			Description: d.Description,
@@ -186,7 +193,7 @@ func SpecDeviceTools(caller DeviceCaller) ([]runtimeagent.ClientToolSpec, error)
 			Metadata:    clientToolMetadata(d),
 		})
 	}
-	return specs, nil
+	return specs
 }
 
 // probeDeviceTools 带默认超时的探测（SetSessionServer 用，无现成 ctx）。

@@ -23,19 +23,439 @@ import (
 // fakeClientExecutor 是 ClientToolExecutor 的测试桩:记录调用次数,返回预置
 // 结果。各绑定用独立实例,靠指针相等断言 Lookup 返回的正是登记的执行通道。
 type fakeClientExecutor struct {
+	mu     sync.Mutex
 	calls  int
 	result string
 	err    error
 }
 
 func (f *fakeClientExecutor) Invoke(ctx context.Context, toolName string, argsJSON []byte) (string, error) {
+	f.mu.Lock()
 	f.calls++
+	f.mu.Unlock()
 	return f.result, f.err
 }
 
-// TestCapabilityRegistryBindLookupRoundtrip:Bind 新建 → refreshed=false,
-// Lookup 按登记的 ToolNames/executor 返回;未登记的会话/工具一律 false——
-// Lookup 只按 Bind 登记返回,不存在隐式路由面(总方案 §8 :650)。
+// TestCapabilityRegistryBindConnectionLifecycle:连接绑定不依赖 TTL,跨时间仍有效;
+// UnbindConnection 是唯一连接生命周期收口,调用后 Lookup 不再命中。
+func TestCapabilityRegistryBindConnectionLifecycle(t *testing.T) {
+	r := NewCapabilityRegistry()
+	exec := &fakeClientExecutor{result: "connection-live"}
+
+	if refreshed := r.BindConnection("sess-connection", "conn-A", []string{"sys_x"}, exec); refreshed {
+		t.Fatal("first BindConnection must report refreshed=false")
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got, ok := r.Lookup("sess-connection", "sys_x"); !ok || got != exec {
+		t.Fatalf("connection binding expired without disconnect: Lookup = (%v, %v)", got, ok)
+	}
+
+	r.UnbindConnection("conn-A")
+	if _, ok := r.Lookup("sess-connection", "sys_x"); ok {
+		t.Fatal("connection binding must be unavailable after UnbindConnection")
+	}
+}
+
+func TestCapabilityRegistryBindConnectionWakesWaiter(t *testing.T) {
+	r := NewCapabilityRegistry()
+	tools := NewClientToolProxy(r, "sess-wait", []ClientToolSpec{{Name: "sys_x", Schema: "{}"}}, time.Second)
+	waitState := make(chan bool, 2)
+	ctx := withCapabilityWaitObserver(context.Background(), func(waiting bool) {
+		waitState <- waiting
+	})
+	result := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		got, err := tools[0].Execute(ctx, map[string]any{})
+		result <- got
+		errCh <- err
+	}()
+
+	select {
+	case waiting := <-waitState:
+		if !waiting {
+			t.Fatal("first wait notification must enter waiting state")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tool did not enter waiting state")
+	}
+
+	exec := &fakeClientExecutor{result: "rebound"}
+	if refreshed := r.BindConnection("sess-wait", "conn-A", []string{"sys_x"}, exec); refreshed {
+		t.Fatal("first BindConnection must report refreshed=false")
+	}
+	select {
+	case got := <-result:
+		if got != "rebound" {
+			t.Fatalf("Execute result = %q, want rebound", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("BindConnection did not wake the waiting tool")
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+	if exec.calls != 1 {
+		t.Fatalf("executor invoked %d times, want 1", exec.calls)
+	}
+	select {
+	case waiting := <-waitState:
+		if waiting {
+			t.Fatal("waiter must leave waiting state after successful rebind")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter did not report leaving waiting state")
+	}
+}
+
+// TestSpecAwareProxyMatchesFrozenSchemaAndPolicy verifies that a proxy created for an older
+// Run cannot invoke a connection advertising a changed schema/policy, while a proxy created
+// for the newer Run can. Description and internal/non-policy metadata are not compatibility keys.
+func TestSpecAwareProxyMatchesFrozenSchemaAndPolicy(t *testing.T) {
+	r := NewCapabilityRegistry()
+	oldSpec := ClientToolSpec{
+		Name:        "sys_camera",
+		Description: "old description",
+		Schema:      `{"type":"object","properties":{"resolution":{"type":"string"}}}`,
+		Metadata: map[string]string{
+			"risk_level":               "normal",
+			"requires_permission":      "false",
+			"goworker.capability_wait": "caller-value-is-not-policy",
+			"display_hint":             "old",
+		},
+	}
+	newSpec := ClientToolSpec{
+		Name:        oldSpec.Name,
+		Description: "new description",
+		Schema:      `{"type":"object","properties":{"resolution":{"type":"string"},"flash":{"type":"boolean"}}}`,
+		Metadata:    map[string]string{"risk_level": "critical", "requires_permission": "true"},
+	}
+	newExec := &fakeClientExecutor{result: "new-contract"}
+	if r.BindConnectionSpecs("sess-spec", "conn-A", []ClientToolSpec{newSpec}, newExec) {
+		t.Fatal("first spec binding must report refreshed=false")
+	}
+
+	oldProxy := NewSpecAwareClientToolProxy(r, "sess-spec", []ClientToolSpec{oldSpec}, 40*time.Millisecond)
+	got, err := oldProxy[0].Execute(context.Background(), map[string]any{})
+	if err != nil || !strings.Contains(got, "unavailable") {
+		t.Fatalf("old proxy result = (%q, %v), want compatibility wait timeout", got, err)
+	}
+	if newExec.calls != 0 {
+		t.Fatalf("new-contract executor invoked %d times by old proxy, want 0", newExec.calls)
+	}
+
+	newProxy := NewSpecAwareClientToolProxy(r, "sess-spec", []ClientToolSpec{newSpec}, time.Second)
+	if got, err := newProxy[0].Execute(context.Background(), map[string]any{}); err != nil || got != "new-contract" {
+		t.Fatalf("new proxy result = (%q, %v), want new-contract", got, err)
+	}
+
+	// Register the old contract using equivalent JSON formatting and a changed description.
+	oldExec := &fakeClientExecutor{result: "old-contract"}
+	oldAdvertised := oldSpec
+	oldAdvertised.Description = "description does not participate"
+	oldAdvertised.Schema = ` { "properties" : { "resolution" : { "type" : "string" } }, "type" : "object" } `
+	oldAdvertised.Metadata = map[string]string{
+		"risk_level":               "normal",
+		"requires_permission":      "false",
+		"goworker.capability_wait": "different-internal-value",
+		"display_hint":             "new-non-policy-value",
+	}
+	if r.BindConnectionSpecs("sess-spec", "conn-B", []ClientToolSpec{oldAdvertised}, oldExec) {
+		t.Fatal("first conn-B binding must report refreshed=false")
+	}
+	if got, err := oldProxy[0].Execute(context.Background(), map[string]any{}); err != nil || got != "old-contract" {
+		t.Fatalf("old proxy must match canonical schema and policy despite description change: (%q, %v)", got, err)
+	}
+}
+
+func TestSpecAwareProxyDistinguishesLargeSchemaIntegers(t *testing.T) {
+	const expectedSchema = `{"type":"object","properties":{"x":{"const":9007199254740992}}}`
+	const advertisedSchema = `{"type":"object","properties":{"x":{"const":9007199254740993}}}`
+
+	r := NewCapabilityRegistry()
+	exec := &fakeClientExecutor{result: "must-not-run"}
+	r.BindConnectionSpecs("sess-large-integer", "conn-A", []ClientToolSpec{{Name: "sys_x", Schema: advertisedSchema}}, exec)
+	proxy := NewSpecAwareClientToolProxy(r, "sess-large-integer", []ClientToolSpec{{Name: "sys_x", Schema: expectedSchema}}, 25*time.Millisecond)
+
+	got, err := proxy[0].Execute(context.Background(), map[string]any{})
+	if err != nil || !strings.Contains(got, "unavailable") {
+		t.Fatalf("proxy result = (%q, %v), want compatibility timeout for distinct integers above 2^53", got, err)
+	}
+	if exec.calls != 0 {
+		t.Fatalf("incompatible executor invoked %d times, want 0", exec.calls)
+	}
+}
+
+func TestSpecAwareProxyFingerprintPreservesSchemaFallbackAndParameters(t *testing.T) {
+	r := NewCapabilityRegistry()
+	fallbackExec := &fakeClientExecutor{result: "fallback-matched"}
+	r.BindConnectionSpecs("sess-schema-fallback", "conn-fallback", []ClientToolSpec{{Name: "sys_fallback", Schema: `{} trailing`}}, fallbackExec)
+	validLargeSchema := `{"type":"object","properties":{"x":{"const":9007199254740993}}}`
+	largeExec := &fakeClientExecutor{result: "valid-schema-matched"}
+	r.BindConnectionSpecs("sess-schema-fallback", "conn-large", []ClientToolSpec{{Name: "sys_large", Schema: validLargeSchema}}, largeExec)
+
+	proxy := NewSpecAwareClientToolProxy(r, "sess-schema-fallback", []ClientToolSpec{
+		{Name: "sys_fallback", Schema: `{"type":"object"}`},
+		{Name: "sys_large", Schema: validLargeSchema},
+	}, time.Second)
+	if got, err := proxy[0].Execute(context.Background(), map[string]any{}); err != nil || got != "fallback-matched" {
+		t.Fatalf("trailing-invalid schema fallback result = (%q, %v), want fallback-matched", got, err)
+	}
+	if got, err := proxy[1].Execute(context.Background(), map[string]any{}); err != nil || got != "valid-schema-matched" {
+		t.Fatalf("valid large-number schema result = (%q, %v), want valid-schema-matched", got, err)
+	}
+
+	parameters := proxy[1].Parameters["properties"].(map[string]any)["x"].(map[string]any)
+	if value, ok := parameters["const"].(float64); !ok || value != float64(9007199254740993) {
+		t.Fatalf("core.Tool.Parameters const = (%T) %v, want existing float64 decoding behavior", parameters["const"], parameters["const"])
+	}
+	fallbackParameters := proxy[0].Parameters
+	if len(fallbackParameters) != 1 || fallbackParameters["type"] != "object" {
+		t.Fatalf("trailing-invalid schema Parameters = %v, want object fallback", fallbackParameters)
+	}
+}
+
+func TestSpecAwareProxyRejectsSchemaOrPolicyDriftIndependently(t *testing.T) {
+	base := ClientToolSpec{
+		Name:     "sys_x",
+		Schema:   `{"type":"object","properties":{"x":{"type":"string"}}}`,
+		Metadata: map[string]string{"risk_level": "normal", "requires_permission": "false"},
+	}
+	alwaysHITL := base
+	alwaysHITL.Metadata = map[string]string{"risk_level": "normal", "requires_permission": "false", "permission_policy": "always_hitl"}
+	tests := []struct {
+		name       string
+		expected   ClientToolSpec
+		advertised ClientToolSpec
+	}{
+		{
+			name:     "schema drift",
+			expected: base,
+			advertised: ClientToolSpec{
+				Name: base.Name, Schema: `{"type":"object","properties":{"y":{"type":"string"}}}`,
+				Metadata: map[string]string{"risk_level": "normal", "requires_permission": "false"},
+			},
+		},
+		{
+			name:       "risk policy drift",
+			expected:   base,
+			advertised: ClientToolSpec{Name: base.Name, Schema: base.Schema, Metadata: map[string]string{"risk_level": "critical", "requires_permission": "false"}},
+		},
+		{
+			name:       "permission policy added",
+			expected:   base,
+			advertised: alwaysHITL,
+		},
+		{
+			name:       "permission policy removed",
+			expected:   alwaysHITL,
+			advertised: base,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := NewCapabilityRegistry()
+			exec := &fakeClientExecutor{result: "must-not-run"}
+			r.BindConnectionSpecs("sess-drift", "conn-A", []ClientToolSpec{tt.advertised}, exec)
+			proxy := NewSpecAwareClientToolProxy(r, "sess-drift", []ClientToolSpec{tt.expected}, 25*time.Millisecond)
+			got, err := proxy[0].Execute(context.Background(), map[string]any{})
+			if err != nil || !strings.Contains(got, "unavailable") {
+				t.Fatalf("proxy result = (%q, %v), want compatibility timeout", got, err)
+			}
+			if exec.calls != 0 {
+				t.Fatalf("incompatible executor invoked %d times, want 0", exec.calls)
+			}
+		})
+	}
+}
+
+func TestLegacyProxyRejectsMismatchedSpecAwareBinding(t *testing.T) {
+	r := NewCapabilityRegistry()
+	oldSpec := ClientToolSpec{
+		Name:     "sys_mode_off",
+		Schema:   `{"type":"object"}`,
+		Metadata: map[string]string{"risk_level": "never"},
+	}
+	newConnectionSpec := ClientToolSpec{
+		Name:        oldSpec.Name,
+		Description: "forces HITL even in mode off",
+		Schema:      oldSpec.Schema,
+		Metadata: map[string]string{
+			"risk_level":        "never",
+			"permission_policy": "always_hitl",
+		},
+	}
+	legacyExec := &fakeClientExecutor{result: "must-not-fallback-to-unverified-legacy"}
+	r.BindConnection("sess-legacy-proxy", "conn-legacy", []string{oldSpec.Name}, legacyExec)
+	newExec := &fakeClientExecutor{result: "must-not-run-with-old-policy"}
+	r.BindConnectionSpecs("sess-legacy-proxy", "conn-new", []ClientToolSpec{newConnectionSpec}, newExec)
+
+	// The pre-existing proxy API must freeze the old Run's policy and refuse a new
+	// spec-aware connection whose always_hitl behavior is not present in that Run.
+	// A same-name legacy binding cannot bypass the incompatible verified candidate.
+	oldProxy := NewClientToolProxy(r, "sess-legacy-proxy", []ClientToolSpec{oldSpec}, 25*time.Millisecond)
+	got, err := oldProxy[0].Execute(context.Background(), map[string]any{})
+	if err != nil || !strings.Contains(got, "unavailable") {
+		t.Fatalf("old proxy result = (%q, %v), want timeout for mismatched always_hitl registration", got, err)
+	}
+	if newExec.calls != 0 {
+		t.Fatalf("new always_hitl executor invoked %d times by old proxy, want 0", newExec.calls)
+	}
+	if legacyExec.calls != 0 {
+		t.Fatalf("unverified legacy executor invoked %d times despite incompatible verified registration, want 0", legacyExec.calls)
+	}
+}
+
+func TestSpecAwareProxyFreezesMetadataAndSharesSchemaFallback(t *testing.T) {
+	r := NewCapabilityRegistry()
+	registered := ClientToolSpec{
+		Name:     "sys_x",
+		Schema:   `{not-json`,
+		Metadata: map[string]string{"risk_level": "normal"},
+	}
+	exec := &fakeClientExecutor{result: "fallback-matched"}
+	if r.BindConnectionSpecs("sess-frozen", "conn-A", []ClientToolSpec{registered}, exec) {
+		t.Fatal("first binding must report refreshed=false")
+	}
+	registered.Metadata["risk_level"] = "critical"
+
+	proxySpec := ClientToolSpec{
+		Name:     "sys_x",
+		Schema:   `{"type":"object"}`,
+		Metadata: map[string]string{"risk_level": "normal"},
+	}
+	proxy := NewSpecAwareClientToolProxy(r, "sess-frozen", []ClientToolSpec{proxySpec}, time.Second)
+	proxySpec.Metadata["risk_level"] = "critical"
+	proxySpec.Schema = `{"type":"array"}`
+
+	if got, err := proxy[0].Execute(context.Background(), map[string]any{}); err != nil || got != "fallback-matched" {
+		t.Fatalf("proxy did not preserve its snapshotted contract: (%q, %v)", got, err)
+	}
+}
+
+func TestSpecAwareProxyRejectsLegacyUnverifiedBinding(t *testing.T) {
+	r := NewCapabilityRegistry()
+	legacyExec := &fakeClientExecutor{result: "unverified"}
+	r.BindConnection("sess-legacy", "conn-A", []string{"sys_x"}, legacyExec)
+	proxy := NewSpecAwareClientToolProxy(r, "sess-legacy", []ClientToolSpec{{Name: "sys_x", Schema: `{"type":"object"}`}}, 30*time.Millisecond)
+
+	got, err := proxy[0].Execute(context.Background(), map[string]any{})
+	if err != nil || !strings.Contains(got, "unavailable") {
+		t.Fatalf("strict proxy result = (%q, %v), want timeout for unverified legacy binding", got, err)
+	}
+	if legacyExec.calls != 0 {
+		t.Fatalf("legacy executor invoked %d times by strict proxy, want 0", legacyExec.calls)
+	}
+}
+
+func TestSpecAwareWaitersAllWakeAndCleanUp(t *testing.T) {
+	r := NewCapabilityRegistry()
+	const waiterCount = 4
+	spec := ClientToolSpec{Name: "sys_x", Schema: `{ "type" : "object" }`}
+	proxy := NewSpecAwareClientToolProxy(r, "sess-many-waiters", []ClientToolSpec{spec}, 2*time.Second)
+	ready := make(chan struct{}, waiterCount)
+	results := make(chan string, waiterCount)
+	for i := 0; i < waiterCount; i++ {
+		go func() {
+			ctx := withCapabilityWaitObserver(context.Background(), func(waiting bool) {
+				if waiting {
+					ready <- struct{}{}
+				}
+			})
+			got, err := proxy[0].Execute(ctx, map[string]any{})
+			if err != nil {
+				results <- "error: " + err.Error()
+				return
+			}
+			results <- got
+		}()
+	}
+	for i := 0; i < waiterCount; i++ {
+		select {
+		case <-ready:
+		case <-time.After(time.Second):
+			t.Fatal("not all concurrent calls entered capability wait")
+		}
+	}
+
+	exec := &fakeClientExecutor{result: "woken"}
+	if r.BindConnectionSpecs("sess-many-waiters", "conn-A", []ClientToolSpec{spec}, exec) {
+		t.Fatal("first spec binding must report refreshed=false")
+	}
+	for i := 0; i < waiterCount; i++ {
+		select {
+		case got := <-results:
+			if got != "woken" {
+				t.Fatalf("waiter result = %q, want woken", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("waiter %d was not woken by binding", i)
+		}
+	}
+	if exec.calls != waiterCount {
+		t.Fatalf("executor invoked %d times, want %d", exec.calls, waiterCount)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.waiters[capabilityWaitKey("sess-many-waiters", "sys_x")]; ok {
+		t.Fatal("completed Execute calls left waiter registrations behind")
+	}
+}
+
+type blockingClientExecutor struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (e *blockingClientExecutor) Invoke(context.Context, string, []byte) (string, error) {
+	close(e.started)
+	<-e.release
+	return "stale failure", errors.New("old channel failed")
+}
+
+func TestSpecAwareInvokeFailureDoesNotInvalidateReplacement(t *testing.T) {
+	r := NewCapabilityRegistry()
+	spec := ClientToolSpec{Name: "sys_x", Schema: `{"type":"object"}`}
+	stale := &blockingClientExecutor{started: make(chan struct{}), release: make(chan struct{})}
+	if r.BindConnectionSpecs("sess-rebind", "conn-A", []ClientToolSpec{spec}, stale) {
+		t.Fatal("first binding must report refreshed=false")
+	}
+	proxy := NewSpecAwareClientToolProxy(r, "sess-rebind", []ClientToolSpec{spec}, time.Second)
+	result := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		got, err := proxy[0].Execute(context.Background(), map[string]any{})
+		result <- got
+		errCh <- err
+	}()
+	select {
+	case <-stale.started:
+	case <-time.After(time.Second):
+		t.Fatal("stale executor was not invoked")
+	}
+
+	replacement := &fakeClientExecutor{result: "replacement"}
+	if !r.BindConnectionSpecs("sess-rebind", "conn-A", []ClientToolSpec{spec}, replacement) {
+		t.Fatal("replacement binding must report refreshed=true")
+	}
+	close(stale.release)
+	select {
+	case got := <-result:
+		if got != "replacement" {
+			t.Fatalf("Execute result = %q, want replacement after stale failure", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement binding was removed by stale Invoke failure")
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+	if replacement.calls != 1 {
+		t.Fatalf("replacement executor invoked %d times, want 1", replacement.calls)
+	}
+}
+
+// TestCapabilityRegistryBindLookupRoundtrip verifies the legacy TTL Bind lookup contract.
 func TestCapabilityRegistryBindLookupRoundtrip(t *testing.T) {
 	r := NewCapabilityRegistry()
 	execA := &fakeClientExecutor{result: "from-A"}

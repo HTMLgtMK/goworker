@@ -70,6 +70,16 @@ type Handler func(ctx context.Context, params json.RawMessage) (any, error)
 // Notifier 处理对端 notification。
 type Notifier func(params json.RawMessage)
 
+// PostWriteHook 是 handler 返回值的选择性实现：响应成功写出后、请求
+// goroutine 收尾前同步调用。它是唯一的"写完成"事件面——dispatch 循环是
+// 唯一知道响应是否落线的地方。契约：仅在写出成功且非错误响应时触发；
+// 在 dispatch goroutine 上运行，重活须自行起 goroutine；实现内 panic 由
+// dispatch 就地 recover 记日志——响应已落线，不得再写任何响应（同 ID 双
+// 响应是协议错误）。
+type PostWriteHook interface {
+	AfterResponseWritten(ctx context.Context)
+}
+
 // ConnOptions 配置一条 JSON-RPC 连接。
 type ConnOptions struct {
 	// MaxMessageBytes 是 JSON payload 的最大字节数，不包含末尾换行符。
@@ -302,6 +312,7 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 		c.mu.Unlock()
 
 		var response Response
+		var postWriteHook PostWriteHook
 		response.JSONRPC = JSONRPCVersion
 		response.ID = id
 		if h == nil {
@@ -316,6 +327,9 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 					response.Error = &RPCError{Code: CodeInternalError, Message: err.Error()}
 				}
 			} else {
+				if pw, ok := result.(PostWriteHook); ok {
+					postWriteHook = pw
+				}
 				data, marshalErr := json.Marshal(result)
 				if marshalErr != nil {
 					response.Error = &RPCError{Code: CodeInternalError, Message: "marshal result: " + marshalErr.Error()}
@@ -324,7 +338,16 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 				}
 			}
 		}
-		_ = c.write(response)
+		if err := c.write(response); err == nil && response.Error == nil && postWriteHook != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("acp: post-write hook panic", "method", method, "panic", r, "stack", string(debug.Stack()))
+					}
+				}()
+				postWriteHook.AfterResponseWritten(ctx)
+			}()
+		}
 	}()
 }
 

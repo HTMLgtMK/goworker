@@ -83,7 +83,12 @@ func newACPStack(t *testing.T, pv core.Provider) (*AgentPlugin, func() *acpStack
 	}
 	factory := acpservice.NewFrontendHandlerFactory(evaluate, nil, p, acpservice.NewSessionGate())
 	return p, func() *acpStack {
-		return &acpStack{handler: factory().(*acpservice.FrontendHandler), rep: &acpRecorder{}, p: p}
+		handler := factory().(*acpservice.FrontendHandler)
+		rep := &acpRecorder{}
+		// Direct handler tests have no wire initialize request; declare the same
+		// no-device ready state that a capability-free initialize would produce.
+		handler.InitializeReady(context.Background(), rep)
+		return &acpStack{handler: handler, rep: rep, p: p}
 	}
 }
 

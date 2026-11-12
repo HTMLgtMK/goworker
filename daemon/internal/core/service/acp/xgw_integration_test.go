@@ -449,6 +449,26 @@ func (f *xgwLiveControl) ClientToolSource(connectionID string, caller model.Devi
 	}
 }
 
+// BindClientToolSpecs consumes the initialize-time contract without probing again.
+func (f *xgwLiveControl) BindClientToolSpecs(sessionID, connectionID string, specs []runtimeagent.ClientToolSpec, caller model.DeviceCaller) bool {
+	if len(specs) == 0 || caller == nil || sessionID != f.sid {
+		return false
+	}
+	return f.m.Capabilities().BindConnectionSpecs(sessionID, connectionID, specs, xgwDeviceExecutor{caller: caller})
+}
+
+// ClientToolSourceForSpecs reuses the negotiated schema and waits for compatible rebinding.
+func (f *xgwLiveControl) ClientToolSourceForSpecs(sessionID string, specs []runtimeagent.ClientToolSpec) func(context.Context) []core.Tool {
+	if sessionID != f.sid || len(specs) == 0 {
+		return nil
+	}
+	reg := f.m.Capabilities()
+	wait := f.CapabilityWaitTimeout()
+	return func(context.Context) []core.Tool {
+		return runtimeagent.NewSpecAwareClientToolProxy(reg, sessionID, specs, wait)
+	}
+}
+
 // startRunCount 供幂等断言(真实新起跑次数)。
 func (f *xgwLiveControl) startRunCount() int {
 	f.reqMu.Lock()
@@ -1284,8 +1304,6 @@ func TestXGWIntegrationDeviceToolBinderProbeAndDisconnectUnbind(t *testing.T) {
 	}
 	l := newXGWLiveStack(t, evaluate, src)
 	t.Cleanup(l.handler.Close)
-	l.liveInitializeWithDeviceCaps(t)
-
 	// 客户端义务:x-device/tools 应答声明清单;x-device/call 计数并回放结果
 	// (协议级 fake caller —— caller 即 ai-acp Server 的 client-ward Call 通道)。
 	var callMu sync.Mutex
@@ -1299,6 +1317,7 @@ func TestXGWIntegrationDeviceToolBinderProbeAndDisconnectUnbind(t *testing.T) {
 		callMu.Unlock()
 		return json.RawMessage(`{"result":"from-A"}`), nil
 	})
+	l.liveInitializeWithDeviceCaps(t)
 
 	sid := l.liveNewSession(t)
 	type promptResult struct {

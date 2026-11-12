@@ -8,8 +8,10 @@ import (
 	"sync"
 
 	aiacp "github.com/tinguo/goworker/ai-acp"
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
+	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
 // xgw.go implements FrontendHandler's x-goworker methods and connection cleanup.
@@ -77,7 +79,7 @@ func registerXGWMethods(server *aiacp.Server, handler aiacp.SessionHandler) {
 // xgwRunStart validates the request ID and delegates lease fencing, submission, and
 // idempotency to RunControlSource. StartRun is intentionally detached from the request context:
 // disconnecting the caller does not cancel an accepted background run.
-func (h *FrontendHandler) xgwRunStart(_ context.Context, params json.RawMessage) (any, error) {
+func (h *FrontendHandler) xgwRunStart(ctx context.Context, params json.RawMessage) (any, error) {
 	if h.runs == nil {
 		return nil, xgwNotAvailableError(XMethodRunStart)
 	}
@@ -88,7 +90,17 @@ func (h *FrontendHandler) xgwRunStart(_ context.Context, params json.RawMessage)
 	if req.RequestID == "" {
 		return nil, xgwError("%s: requestId is required (idempotency key)", XMethodRunStart)
 	}
-	runID, state, err := h.runs.StartRun(req.SessionID, h.connectionID, req.Input, req.RequestID)
+	if !h.waitDeviceTools(ctx) {
+		return nil, protocol.ErrClosed
+	}
+	h.bindDeviceTools(req.SessionID)
+	var runID, state string
+	var err error
+	if runs, ok := h.runs.(model.NegotiatedRunControlSource); ok {
+		runID, state, err = runs.StartRunWithTools(req.SessionID, h.connectionID, req.Input, req.RequestID, h.deviceToolSource(req.SessionID))
+	} else {
+		runID, state, err = h.runs.StartRun(req.SessionID, h.connectionID, req.Input, req.RequestID)
+	}
 	if err != nil {
 		return nil, xgwError("%s: %v", XMethodRunStart, err)
 	}
@@ -198,7 +210,7 @@ func (h *FrontendHandler) xgwApprovalRespond(_ context.Context, params json.RawM
 // xgwSessionAttach prepares a subscription outside h.mu, then commits it under the lock.
 // Control-mode subscription replacement and lease acquisition commit atomically; Close uses
 // the same lock. Brief overlap may deliver duplicate sequence ranges, so clients deduplicate by seq.
-func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMessage) (any, error) {
+func (h *FrontendHandler) xgwSessionAttach(ctx context.Context, params json.RawMessage) (any, error) {
 	if h.runs == nil {
 		return nil, xgwNotAvailableError(XMethodSessionAttach)
 	}
@@ -212,6 +224,9 @@ func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMes
 	mode, err := xgwAttachMode(req.Mode)
 	if err != nil {
 		return nil, err
+	}
+	if !h.waitDeviceTools(ctx) {
+		return nil, protocol.ErrClosed
 	}
 
 	// Prepare the subscription before changing existing subscription or lease state.
@@ -241,6 +256,7 @@ func (h *FrontendHandler) xgwSessionAttach(_ context.Context, params json.RawMes
 		_ = res.Subscription.Close()
 		return nil, xgwError("%s: connection closed", XMethodSessionAttach)
 	}
+	h.bindDeviceToolsLocked(req.SessionID)
 	if h.subs == nil {
 		h.subs = make(map[string]*xgwSubscription)
 	}
@@ -352,9 +368,20 @@ func (h *FrontendHandler) xgwSessionDetach(_ context.Context, params json.RawMes
 func (h *FrontendHandler) Close() {
 	h.mu.Lock()
 	h.closed = true
+	h.closedForBinding.Store(true)
+	probeCancel := h.deviceProbeCancel
+	h.deviceProbeCancel = nil
+	h.toolsReadyOnce.Do(func() {
+		if h.toolsReady != nil {
+			close(h.toolsReady)
+		}
+	})
 	subs := h.subs
 	h.subs = nil
 	h.mu.Unlock()
+	if probeCancel != nil {
+		probeCancel()
+	}
 	for _, sub := range subs {
 		sub.stop()
 	}

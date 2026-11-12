@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
@@ -67,7 +69,17 @@ type FrontendHandler struct {
 	// 段一律拒绝——Close 返回之后不会再发生新的订阅提交或 control lease 获取
 	// (不复活订阅与 lease;Close/Attach 竞态:attach 的提交段与
 	// Close 的「closed 置位 + 清表」同以 h.mu 串行,二者必有一个全序)。
-	closed bool
+	closed           bool
+	closedForBinding atomic.Bool
+
+	// Device tools are negotiated once, after initialize has been written. The
+	// descriptor snapshot is immutable after toolsReady closes.
+	toolsReady        chan struct{}
+	toolsReadyOnce    sync.Once
+	initializeOnce    sync.Once
+	deviceCaller      model.DeviceCaller
+	deviceDescriptors []acpworker.DeviceToolDescriptor
+	deviceProbeCancel context.CancelFunc
 
 	// preCommitHook 仅供测试，在订阅准备完成、提交锁获取前注入 Close/detach
 	// 竞态。生产环境保持 nil；测试须在无并发 attach 时设置或清除。
@@ -103,6 +115,7 @@ func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Comma
 			sessions:     sessions,
 			gate:         gate,
 			connectionID: newConnectionID(),
+			toolsReady:   make(chan struct{}),
 		}
 		if sessions != nil {
 			// RunControlSource deliberately excludes host-only synchronous methods, so ACP
@@ -125,21 +138,136 @@ func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Comma
 	}
 }
 
-// remember 记入可 prompt 集合并登记为本连接的活动声明；rememberReadOnly 记入
+// InitializeReady negotiates x-device/tools exactly once after initialize's
+// response has reached the transport. No authentication is implied by this state.
+func (h *FrontendHandler) InitializeReady(ctx context.Context, reporter aiacp.Reporter) {
+	h.initializeOnce.Do(func() { h.initializeDeviceTools(ctx, reporter) })
+}
+
+func (h *FrontendHandler) initializeDeviceTools(ctx context.Context, reporter aiacp.Reporter) {
+	probeCtx, cancelProbe := context.WithCancel(ctx)
+	h.mu.Lock()
+	if h.closed {
+		h.toolsReadyOnce.Do(func() {
+			if h.toolsReady != nil {
+				close(h.toolsReady)
+			}
+		})
+		h.mu.Unlock()
+		cancelProbe()
+		return
+	}
+	h.deviceProbeCancel = cancelProbe
+	h.mu.Unlock()
+	defer cancelProbe()
+
+	capable, ok := reporter.(interface {
+		ClientCapabilities() protocol.ClientCapabilities
+	})
+	caller, callerOK := reporter.(model.DeviceCaller)
+	var descriptors []acpworker.DeviceToolDescriptor
+	if ok && callerOK && capable.ClientCapabilities().Has(acpworker.CapabilityDeviceTools) {
+		probeCtx, cancel := context.WithTimeout(probeCtx, acpworker.ProbeTimeout)
+		descriptors = acpworker.ProbeDeviceTools(probeCtx, caller)
+		cancel()
+	}
+
+	h.mu.Lock()
+	h.deviceProbeCancel = nil
+	if !h.closed && len(descriptors) != 0 {
+		h.deviceCaller = caller
+		h.deviceDescriptors = append([]acpworker.DeviceToolDescriptor(nil), descriptors...)
+	}
+	h.toolsReadyOnce.Do(func() {
+		if h.toolsReady != nil {
+			close(h.toolsReady)
+		}
+	})
+	h.mu.Unlock()
+}
+
+func (h *FrontendHandler) waitDeviceTools(ctx context.Context) bool {
+	h.mu.Lock()
+	ready := h.toolsReady
+	h.mu.Unlock()
+	if ready != nil {
+		timer := time.NewTimer(acpworker.ProbeTimeout)
+		defer timer.Stop()
+		select {
+		case <-ready:
+		case <-timer.C:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	h.mu.Lock()
+	closed := h.closed
+	h.mu.Unlock()
+	return !closed
+}
+
+func (h *FrontendHandler) bindDeviceTools(sessionID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.bindDeviceToolsLocked(sessionID)
+}
+
+func (h *FrontendHandler) bindDeviceToolsLocked(sessionID string) {
+	if sessionID == "" || h.closed || len(h.deviceDescriptors) == 0 || h.deviceCaller == nil {
+		return
+	}
+	binder, ok := h.sessions.(model.NegotiatedClientToolBinder)
+	if !ok {
+		return
+	}
+	binder.BindClientToolSpecs(sessionID, h.connectionID, acpworker.DeviceToolSpecs(h.deviceDescriptors), h.deviceCaller)
+}
+
 // 只读集合。归档会话只读：load 成功记入只读集合，prompt 该 id 诚实报错而非掩盖
 // 成未知会话。活动声明归连接(h.active)——superseded 守卫据此只拦本连接
 // 自己的过期声明。
 func (h *FrontendHandler) remember(sessionID string) {
 	h.mu.Lock()
+	h.rememberLocked(sessionID)
+	h.mu.Unlock()
+}
+
+func (h *FrontendHandler) rememberLocked(sessionID string) {
 	if h.promptable == nil {
 		h.promptable = map[string]struct{}{}
 	}
 	h.promptable[sessionID] = struct{}{}
-	// 同一会话只能归属一个集合：若先以归档身份 load 进只读集合、后又被恢复为
-	// 当前会话再 load，不清掉旧标记会让 Prompt 永远误判 read-only（评审 MEDIUM-2）。
 	delete(h.readOnly, sessionID)
 	h.active = sessionID
-	h.mu.Unlock()
+}
+
+// commitSessionSelection updates connection-local routing state, then commits the
+// lifecycle reference through the source's disconnect-aware serialization point.
+func (h *FrontendHandler) commitSessionSelection(transportID, runtimeID string, bindLifecycle bool) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		if bindLifecycle && runtimeID != "" {
+			if binder, ok := h.sessions.(model.GuardedConnectionBinder); ok {
+				binder.BindConnectionSessionGuarded(h.connectionID, runtimeID, func() bool { return false })
+			}
+		}
+		return false
+	}
+	h.rememberLocked(transportID)
+	h.binding.Set(runtimeID)
+	if !bindLifecycle || runtimeID == "" || h.binder == nil {
+		return true
+	}
+	if binder, ok := h.sessions.(model.GuardedConnectionBinder); ok {
+		return binder.BindConnectionSessionGuarded(h.connectionID, runtimeID, func() bool {
+			return !h.closedForBinding.Load()
+		})
+	}
+	// Legacy binders have no atomic guard. Keep h.mu through their registration so
+	// Close either runs afterwards and releases the reference or wins before us.
+	h.binder.BindConnectionSession(h.connectionID, runtimeID)
+	return true
 }
 
 func (h *FrontendHandler) rememberReadOnly(sessionID string) {
@@ -174,7 +302,10 @@ func sessionBusyError() *protocol.RPCError {
 // a persistent session and updates this connection's Binding and lifecycle registration.
 // That branch leaves the global current session unchanged; without it, the existing
 // single-session fallback remains in effect.
-func (h *FrontendHandler) CreateSession(_ context.Context, sessionID string, req protocol.NewSessionRequest, reporter aiacp.Reporter) error {
+func (h *FrontendHandler) CreateSession(ctx context.Context, sessionID string, req protocol.NewSessionRequest, reporter aiacp.Reporter) error {
+	if !h.waitDeviceTools(ctx) {
+		return protocol.ErrClosed
+	}
 	// 真新建突变 manager 注册表与 repo（管理面共享状态），prompt 在飞时诚实报
 	// busy 而非排队：客户端取消在飞 prompt 或稍后重试即可。SessionGate 本步
 	// 不动（管理操作互斥；本使用点语义不变）。
@@ -198,20 +329,12 @@ func (h *FrontendHandler) CreateSession(_ context.Context, sessionID string, req
 	// 门禁绝不能被一个卡死的客户端攥住，否则全 daemon 的 prompt 都堵在这。
 	h.gate.release()
 
-	// Record the active ID and promptable membership only after declaration succeeds. Failed
-	// creation must not leave a routable-looking ID that falls back to another session; this
-	// state is connection-local and protected by h.mu.
-	h.remember(sessionID)
-	// Binding 是连接私有状态，门禁外 Set 即可（不影响任何共享会话状态,
-	// 也不影响其他连接）。无多会话能力的后端 boundTo 为空 = Binding 保持空 =
-	// 回落 current 语义（降级形态，与纯内存降级同形）。
-	h.binding.Set(boundTo)
-	// Set 处成对登记(clientID → boundTo,改绑即替换——本连接此前绑定的会话
-	// 在此失去引用,由实现侧评估收口)。boundTo 为空(降级后端,无稳定 id)
-	// 不登记,与 Binding 保持空一致。
-	if h.binder != nil && boundTo != "" {
-		h.binder.BindConnectionSession(h.connectionID, boundTo)
+	// Commit connection-local routing and lifecycle registration together with Close.
+	// If disconnect won, the guarded binder releases the newly created runtime.
+	if !h.commitSessionSelection(sessionID, boundTo, true) {
+		return protocol.ErrClosed
 	}
+	h.bindDeviceTools(boundTo)
 
 	if h.commands != nil {
 		if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
@@ -221,32 +344,39 @@ func (h *FrontendHandler) CreateSession(_ context.Context, sessionID string, req
 	return nil
 }
 
-// deviceToolSource enables lazy tools only when initialize declared x-device and the reporter
-// provides reverse calls. A ClientToolBinder supplies connection-scoped proxies that wait for
-// rebinding after disconnect; without it, the handler uses the legacy relay. Capability gating
-// applies to both paths, so clients without x-device see no change.
-func (h *FrontendHandler) deviceToolSource(reporter aiacp.Reporter) func(ctx context.Context) []core.Tool {
-	capable, ok := reporter.(interface {
-		ClientCapabilities() protocol.ClientCapabilities
-	})
-	if !ok {
+// deviceRuntimeSessionID resolves the runtime selected by this ACP connection.
+// Transport session IDs are not necessarily runtime IDs in the persistent-session path.
+func (h *FrontendHandler) deviceRuntimeSessionID() string {
+	if sessionID := h.binding.Get(); sessionID != "" {
+		return sessionID
+	}
+	if h.sessions != nil {
+		return h.sessions.CurrentSessionID()
+	}
+	return ""
+}
+
+// deviceToolSource reuses the initialize-time snapshot. Prompt execution must not
+// reverse-probe the client again; rebinding is session-scoped and schema-aware.
+func (h *FrontendHandler) deviceToolSource(sessionID string) func(ctx context.Context) []core.Tool {
+	h.mu.Lock()
+	caller := h.deviceCaller
+	descriptors := append([]acpworker.DeviceToolDescriptor(nil), h.deviceDescriptors...)
+	h.mu.Unlock()
+	if caller == nil || len(descriptors) == 0 {
 		return nil
 	}
-	caller, ok := reporter.(acpworker.DeviceCaller)
-	if !ok {
-		return nil
+	specs := acpworker.DeviceToolSpecs(descriptors)
+	if binder, ok := h.sessions.(model.NegotiatedClientToolBinder); ok {
+		return binder.ClientToolSourceForSpecs(sessionID, specs)
 	}
-	if !capable.ClientCapabilities().Has(acpworker.CapabilityDeviceTools) {
-		return nil
-	}
-	// type-assert 对 nil 接口安全（zero, false）：sessions 为 nil 直接落回落路径。
+	// Legacy binders only supply ClientToolBinder; keep their proxy/rebind path so
+	// third-party backends do not silently fall through to the raw per-connection relay.
 	if binder, ok := h.sessions.(model.ClientToolBinder); ok {
 		return binder.ClientToolSource(h.connectionID, caller)
 	}
-	return func(ctx context.Context) []core.Tool {
-		pctx, cancel := context.WithTimeout(ctx, acpworker.ProbeTimeout)
-		defer cancel()
-		return acpworker.RelayDeviceTools(caller, acpworker.ProbeDeviceTools(pctx, caller))
+	return func(context.Context) []core.Tool {
+		return acpworker.RelayDeviceTools(caller, descriptors)
 	}
 }
 
@@ -314,7 +444,7 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 			// of this connection. Assigning nil directly is safe: Session.Run and
 			// the plugin both treat a nil ToolSource as "no device tools".
 			// 优先 binder 能力代理面（断连等待重绑），装配点不变。
-			ToolSource: h.deviceToolSource(reporter),
+			ToolSource: h.deviceToolSource(h.deviceRuntimeSessionID()),
 		},
 		Values: make(map[string]any),
 	}
@@ -332,7 +462,10 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 // sessions, reopen persisted sessions, replay archived sessions read-only, and report unknown
 // IDs as the existing -32000 error. Reopening and archive probing are serialized with session
 // management; backends without BoundSessionSource retain the single-session fallback.
-func (h *FrontendHandler) LoadSession(_ context.Context, req protocol.LoadSessionRequest, reporter aiacp.Reporter) error {
+func (h *FrontendHandler) LoadSession(ctx context.Context, req protocol.LoadSessionRequest, reporter aiacp.Reporter) error {
+	if !h.waitDeviceTools(ctx) {
+		return protocol.ErrClosed
+	}
 	if h.sessions == nil {
 		return &protocol.RPCError{Code: -32000, Message: "acp frontend: session load not supported"}
 	}
@@ -363,14 +496,27 @@ func (h *FrontendHandler) LoadSession(_ context.Context, req protocol.LoadSessio
 			return sessionBusyError()
 		}
 		var (
-			history       []model.SessionUpdate
-			loadErr       error
-			historyErr    error
-			boundByLoader bool
+			history         []model.SessionUpdate
+			loadErr         error
+			historyErr      error
+			boundByLoader   bool
+			bindingRejected bool
 		)
-		if loader, ok := h.multi.(model.BoundSessionLoader); ok {
-			history, loadErr = loader.LoadBoundSessionForConnection(req.SessionID, req.Cwd, h.connectionID)
-			boundByLoader = loadErr == nil
+		if loader, ok := h.multi.(model.GuardedBoundSessionLoader); ok {
+			history, boundByLoader, loadErr = loader.LoadBoundSessionForConnectionGuarded(
+				req.SessionID, req.Cwd, h.connectionID,
+				func() bool { return !h.closedForBinding.Load() },
+			)
+			bindingRejected = loadErr == nil && !boundByLoader
+		} else if loader, ok := h.multi.(model.BoundSessionLoader); ok {
+			h.mu.Lock()
+			if h.closed {
+				bindingRejected = true
+			} else {
+				history, loadErr = loader.LoadBoundSessionForConnection(req.SessionID, req.Cwd, h.connectionID)
+				boundByLoader = loadErr == nil
+			}
+			h.mu.Unlock()
 		} else {
 			loadErr = h.multi.LoadBoundSession(req.SessionID, req.Cwd)
 			if loadErr == nil {
@@ -387,17 +533,18 @@ func (h *FrontendHandler) LoadSession(_ context.Context, req protocol.LoadSessio
 			}
 			return fmt.Errorf("acp frontend: load session %q: %w", req.SessionID, loadErr)
 		}
+		if bindingRejected {
+			return protocol.ErrClosed
+		}
 		if historyErr != nil {
 			return fmt.Errorf("acp frontend: load session %q history: %w", req.SessionID, historyErr)
 		}
-
-		h.remember(req.SessionID)
-		// Binding 指向本连接刚加载的会话(连接私有状态,门禁外 Set;
-		// 重选不删除原会话、不取消其后台 Run、不动 control lease、不影响其他连接)。
-		h.binding.Set(req.SessionID)
-		if !boundByLoader && h.binder != nil {
-			h.binder.BindConnectionSession(h.connectionID, req.SessionID)
+		// Guarded loaders commit the source reference atomically with lifecycle cleanup;
+		// this commits routing state and covers compatible legacy loaders.
+		if !h.commitSessionSelection(req.SessionID, req.SessionID, !boundByLoader) {
+			return protocol.ErrClosed
 		}
+		h.bindDeviceTools(req.SessionID)
 		if h.commands != nil {
 			if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
 				reporter.Update(req.SessionID, body)
@@ -425,16 +572,11 @@ func (h *FrontendHandler) LoadSession(_ context.Context, req protocol.LoadSessio
 		}
 		history := h.sessions.CurrentSessionHistory()
 		h.gate.release()
-
-		h.remember(req.SessionID)
-		// Binding 指向本连接刚加载的会话(连接私有状态,门禁外 Set;
-		// 重选不删除原会话、不取消其后台 Run、不动 control lease、不影响其他连接)。
-		h.binding.Set(req.SessionID)
-		// Set 处成对登记(与 CreateSession 同款;改绑即替换,session/load 重开把
-		// 引用落回重开的会话)。
-		if h.binder != nil {
-			h.binder.BindConnectionSession(h.connectionID, req.SessionID)
+		if !h.commitSessionSelection(req.SessionID, req.SessionID, true) {
+			return protocol.ErrClosed
 		}
+		h.bindDeviceTools(req.SessionID)
+
 		if h.commands != nil {
 			if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
 				reporter.Update(req.SessionID, body)

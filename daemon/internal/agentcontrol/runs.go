@@ -1,8 +1,10 @@
 package agentcontrol
 
 import (
+	"context"
 	"fmt"
 
+	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 )
 
@@ -36,6 +38,12 @@ func (s *Service) ensureRegistered(rt *runtimeagent.SessionRuntime) {
 // 重试输入不一致返回 ErrRequestConflict，只有首次提交的 cb 生效。
 // 新提交返回接受时状态；幂等命中返回已有 Run 的当前状态。
 func (s *Service) StartRun(sessionID, clientID, input, requestID string, cb runtimeagent.RunCallbacks) (string, string, error) {
+	return s.StartRunWithTools(sessionID, clientID, input, requestID, cb, nil)
+}
+
+// StartRunWithTools submits a background run with an immutable per-submission tool source.
+// The source is captured by the idempotency leader's closure; retries never replace it.
+func (s *Service) StartRunWithTools(sessionID, clientID, input, requestID string, cb runtimeagent.RunCallbacks, toolSource func(context.Context) []core.Tool) (string, string, error) {
 	rt := s.route(sessionID)
 	if rt == nil {
 		return "", "", sessionNotFoundErr(sessionID)
@@ -49,7 +57,7 @@ func (s *Service) StartRun(sessionID, clientID, input, requestID string, cb runt
 	err := s.leases.WithControl(sessionID, clientID, func() error {
 		h, fresh, submitErr := s.requests.Submit(key, input, func() (runtimeagent.RunHandle, error) {
 			s.ensureRegistered(rt)
-			return s.sessions.StartRun(rt.ID, runtimeagent.RunRequest{Input: input}, cb)
+			return s.sessions.StartRun(rt.ID, runtimeagent.RunRequest{Input: input, ToolSource: toolSource}, cb)
 		})
 		if submitErr == nil {
 			// Fresh submissions return the deterministic submit state; a fast provider may

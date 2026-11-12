@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/tinguo/goworker/ai-core/core"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 )
@@ -172,6 +173,21 @@ type ClientToolBinder interface {
 	ClientToolSource(connectionID string, caller DeviceCaller) func(ctx context.Context) []core.Tool
 }
 
+// NegotiatedClientToolBinder consumes the initialize-time descriptor snapshot.
+// Its source must not probe again; execution resolves a schema/policy-compatible
+// connection binding so reconnects can resume a waiting tool call safely.
+type NegotiatedClientToolBinder interface {
+	BindClientToolSpecs(sessionID, connectionID string, specs []runtimeagent.ClientToolSpec, caller DeviceCaller) bool
+	ClientToolSourceForSpecs(sessionID string, specs []runtimeagent.ClientToolSpec) func(ctx context.Context) []core.Tool
+}
+
+// NegotiatedRunControlSource submits an idempotent background run with the
+// connection's initialize-time device-tool snapshot. Implementations must capture
+// the source only in the first submission closure; retries reuse the existing run.
+type NegotiatedRunControlSource interface {
+	StartRunWithTools(sessionID, connectionID, input, requestID string, toolSource func(context.Context) []core.Tool) (runID, state string, err error)
+}
+
 // ErrSessionUnknown is the protocol-neutral missing-session sentinel used by session/load
 // to preserve the existing -32000 unknown-session wire error. ACP cannot import ai-runtime/agent,
 // so implementations wrap this and any execution-layer sentinel for their respective consumers.
@@ -210,6 +226,12 @@ type BoundSessionLoader interface {
 	LoadBoundSessionForConnection(sessionID, cwd, connectionID string) ([]SessionUpdate, error)
 }
 
+// GuardedBoundSessionLoader binds only if the connection is still open at the
+// loader's lifecycle commit point. The guard must be short and must not do I/O.
+type GuardedBoundSessionLoader interface {
+	LoadBoundSessionForConnectionGuarded(sessionID, cwd, connectionID string, allowBind func() bool) ([]SessionUpdate, bool, error)
+}
+
 // ConnectionBinder optionally records connection-to-session bindings for lifecycle reference
 // counting and active-state reporting. SessionBinding remains the routing source; registration
 // itself has no side effects. Implementations evaluate cleanup after rebinding, but must not
@@ -219,4 +241,10 @@ type ConnectionBinder interface {
 	// sessionID = 解除绑定）。connectionID 与 RunControlSource 的连接句柄同源
 	// （handler 工厂生成的 connectionID），断连收口经 ReleaseConnection 清账。
 	BindConnectionSession(connectionID, sessionID string)
+}
+
+// GuardedConnectionBinder commits a session reference only while the connection
+// remains open. allowBind must be a fast state check with no lifecycle lock acquisition.
+type GuardedConnectionBinder interface {
+	BindConnectionSessionGuarded(connectionID, sessionID string, allowBind func() bool) bool
 }

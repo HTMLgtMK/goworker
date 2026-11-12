@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -98,12 +100,70 @@ type ClientToolSpec struct {
 	Metadata    map[string]string // 策略元数据原样透传
 }
 
+var clientToolPolicyMetadataKeys = [...]string{
+	"risk_level",
+	"requires_permission",
+	"allow_always_key",
+	"permission_policy",
+}
+
+// normalizeClientToolSchema mirrors the proxy's schema parsing and invalid-schema fallback.
+// encoding/json sorts object keys, so the encoded representation is a stable identity.
+func normalizeClientToolSchema(raw string) (map[string]any, string) {
+	var schema map[string]any
+	if err := json.Unmarshal([]byte(raw), &schema); err != nil || schema == nil {
+		schema = map[string]any{"type": "object"}
+	}
+	encoded, _ := json.Marshal(schema) // values came from JSON and are always marshalable.
+	return schema, string(encoded)
+}
+
+// clientToolSchemaFingerprint decodes only the compatibility identity with UseNumber,
+// preserving integers that float64 cannot distinguish without changing tool Parameters.
+// Invalid or trailing input retains normalizeClientToolSchema's object fallback semantics.
+func clientToolSchemaFingerprint(raw string) string {
+	const fallback = `{"type":"object"}`
+
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var schema map[string]any
+	if err := decoder.Decode(&schema); err != nil || schema == nil {
+		return fallback
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return fallback
+	}
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		return fallback
+	}
+	return string(encoded)
+}
+
+// clientToolSpecKey freezes schema and policy only. Descriptions and internal proxy metadata
+// are deliberately excluded: neither affects the tool contract enforced by the agent runtime.
+func clientToolSpecKey(spec ClientToolSpec) string {
+	schema := clientToolSchemaFingerprint(spec.Schema)
+	policy := make(map[string]string, len(clientToolPolicyMetadataKeys))
+	for _, key := range clientToolPolicyMetadataKeys {
+		if value, ok := spec.Metadata[key]; ok {
+			policy[key] = value
+		}
+	}
+	encodedPolicy, _ := json.Marshal(policy)
+	return schema + "\x00" + string(encodedPolicy)
+}
+
 // capabilityBinding 是 registry 内部条目:导出值形态(ToolCapabilityBinding)
 // + 执行通道。exec 不进导出结构——ToolCapabilityBinding 是导出的绑定快照,
 // 执行通道是实现细节。
 type capabilityBinding struct {
 	ToolCapabilityBinding
 	exec ClientToolExecutor
+	// specKeys is nil for legacy Bind APIs, whose tool names carry no verified
+	// schema/policy contract. Non-nil entries map names to accepted spec identities.
+	specKeys map[string]map[string]struct{}
 }
 
 // CapabilityRegistry 是能力绑定的进程内注册表:sessionID → connectionID →
@@ -112,18 +172,17 @@ type capabilityBinding struct {
 type CapabilityRegistry struct {
 	mu       sync.Mutex
 	bindings map[string]map[string]*capabilityBinding
-	// waiters 是重绑就绪通知的注册表:(sessionID,toolName) → 容量 1
-	// 的 chan。等待侧(proxy Execute)在判定无绑定之前经 waitChan 注册,Bind
-	// 成功时对已注册的 chan 非阻塞投递(满则丢弃——通知只是唤醒,事实源是
-	// bindings 表);Execute 出口经 dropWaitChan 撤销,无泄漏。
-	waiters map[string]chan struct{}
+	// waiters 是 (sessionID,toolName) → 独立通知 chan 集合。每个 Execute
+	// 单独登记，Bind 对全体广播；容量 1 只用于合并重复唤醒，不会让并发等待者
+	// 互相抢掉通知。Execute 出口移除自己的 chan，无泄漏。
+	waiters map[string]map[chan struct{}]struct{}
 }
 
 // NewCapabilityRegistry 创建空注册表。
 func NewCapabilityRegistry() *CapabilityRegistry {
 	return &CapabilityRegistry{
 		bindings: make(map[string]map[string]*capabilityBinding),
-		waiters:  make(map[string]chan struct{}),
+		waiters:  make(map[string]map[chan struct{}]struct{}),
 	}
 }
 
@@ -136,19 +195,53 @@ func capabilityWaitKey(sessionID, toolName string) string {
 // Bind registers or replaces a connection's tool set and TTL. Tool names are copied;
 // nil executors are rejected, and rebinding the same pair is an idempotent refresh.
 func (r *CapabilityRegistry) Bind(sessionID, connectionID string, toolNames []string, ttl time.Duration, exec ClientToolExecutor) (refreshed bool) {
+	return r.bind(sessionID, connectionID, toolNames, time.Now().Add(ttl), exec)
+}
+
+// BindConnection registers a connection-scoped name-only binding with no time-based expiry.
+// It does not attest to a schema or policy contract; use BindConnectionSpecs for that.
+func (r *CapabilityRegistry) BindConnection(sessionID, connectionID string, toolNames []string, exec ClientToolExecutor) (refreshed bool) {
+	return r.bind(sessionID, connectionID, toolNames, time.Time{}, exec)
+}
+
+func (r *CapabilityRegistry) bind(sessionID, connectionID string, toolNames []string, expiresAt time.Time, exec ClientToolExecutor) (refreshed bool) {
+	return r.bindWithSpecs(sessionID, connectionID, toolNames, expiresAt, nil, exec)
+}
+
+// BindConnectionSpecs registers a connection's fully described client tools without a TTL.
+// Schema and policy metadata are snapshotted and normalized; description is intentionally
+// excluded from compatibility. Duplicate names retain every advertised spec identity.
+func (r *CapabilityRegistry) BindConnectionSpecs(sessionID, connectionID string, specs []ClientToolSpec, exec ClientToolExecutor) (refreshed bool) {
 	if exec == nil {
 		return false
 	}
-	names := make([]string, len(toolNames))
-	copy(names, toolNames)
+	names := make([]string, 0, len(specs))
+	specKeys := make(map[string]map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		key := clientToolSpecKey(spec)
+		if _, exists := specKeys[spec.Name]; !exists {
+			names = append(names, spec.Name)
+			specKeys[spec.Name] = make(map[string]struct{})
+		}
+		specKeys[spec.Name][key] = struct{}{}
+	}
+	return r.bindWithSpecs(sessionID, connectionID, names, time.Time{}, specKeys, exec)
+}
+
+func (r *CapabilityRegistry) bindWithSpecs(sessionID, connectionID string, toolNames []string, expiresAt time.Time, specKeys map[string]map[string]struct{}, exec ClientToolExecutor) (refreshed bool) {
+	if exec == nil {
+		return false
+	}
+	names := append([]string(nil), toolNames...)
 	binding := &capabilityBinding{
 		ToolCapabilityBinding: ToolCapabilityBinding{
 			SessionID:    sessionID,
 			ConnectionID: connectionID,
 			ToolNames:    names,
-			ExpiresAt:    time.Now().Add(ttl),
+			ExpiresAt:    expiresAt,
 		},
-		exec: exec,
+		exec:     exec,
+		specKeys: specKeys,
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -159,11 +252,8 @@ func (r *CapabilityRegistry) Bind(sessionID, connectionID string, toolNames []st
 	}
 	_, refreshed = conns[connectionID]
 	conns[connectionID] = binding
-	// Bind 成功即对等待者非阻塞投递就绪信号:新声明/刷新的每个工具名
-	// 各投一次。容量 1 满则丢弃——旧信号未消费说明等待者尚未回到 select,其
-	// 醒来后按 bindings 现状重查,不会错过本次(或更新一次的)Bind。
 	for _, name := range names {
-		if ch, ok := r.waiters[capabilityWaitKey(sessionID, name)]; ok {
+		for ch := range r.waiters[capabilityWaitKey(sessionID, name)] {
 			select {
 			case ch <- struct{}{}:
 			default:
@@ -204,6 +294,20 @@ func (r *CapabilityRegistry) Invalidate(sessionID, connectionID string) {
 	}
 }
 
+// invalidateIfCurrent prevents a stale Invoke failure from deleting a newer registration.
+func (r *CapabilityRegistry) invalidateIfCurrent(sessionID, connectionID string, expected *capabilityBinding) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	conns, ok := r.bindings[sessionID]
+	if !ok || conns[connectionID] != expected {
+		return
+	}
+	delete(conns, connectionID)
+	if len(conns) == 0 {
+		delete(r.bindings, sessionID)
+	}
+}
+
 // Lookup returns an unexpired binding that explicitly advertises toolName. Expired
 // bindings are removed lazily; duplicate matches use connectionID lexical order.
 func (r *CapabilityRegistry) Lookup(sessionID, toolName string) (ClientToolExecutor, bool) {
@@ -216,11 +320,20 @@ func (r *CapabilityRegistry) Lookup(sessionID, toolName string) (ClientToolExecu
 // 而非盲删。判定语义与 Lookup 完全一致(过期读时逐出、确定性字典序选择、
 // 无隐式路由),导出面保持既有形状不变。
 func (r *CapabilityRegistry) lookupResolved(sessionID, toolName string) (ClientToolExecutor, string, bool) {
+	exec, connectionID, _, ok := r.lookupResolvedBinding(sessionID, toolName, nil, true)
+	return exec, connectionID, ok
+}
+
+// lookupResolvedBinding returns the selected binding pointer as a generation token. An old
+// Invoke failure may invalidate only that exact instance, never a replacement under same IDs.
+// With a frozen spec, verified registrations take precedence: an incompatible verified entry
+// blocks legacy name-only fallback, while purely legacy registries retain their old behavior.
+func (r *CapabilityRegistry) lookupResolvedBinding(sessionID, toolName string, expectedSpecKey *string, allowLegacy bool) (ClientToolExecutor, string, *capabilityBinding, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	conns, ok := r.bindings[sessionID]
 	if !ok {
-		return nil, "", false
+		return nil, "", nil, false
 	}
 	ids := make([]string, 0, len(conns))
 	for id := range conns {
@@ -229,72 +342,108 @@ func (r *CapabilityRegistry) lookupResolved(sessionID, toolName string) (ClientT
 	sort.Strings(ids)
 
 	now := time.Now()
+	var legacy *capabilityBinding
+	hasVerifiedCandidate := false
 	for _, id := range ids {
 		binding := conns[id]
-		if !binding.ExpiresAt.After(now) {
-			// 过期:视同无绑定,读时逐出(含空会话桶回收)。ids 是快照切片,
-			// 迭代中删 map 安全。
+		if !binding.ExpiresAt.IsZero() && !binding.ExpiresAt.After(now) {
 			delete(conns, id)
 			if len(conns) == 0 {
 				delete(r.bindings, sessionID)
 			}
 			continue
 		}
-		for _, name := range binding.ToolNames {
-			if name == toolName {
-				return binding.exec, binding.ConnectionID, true
+		if expectedSpecKey == nil {
+			for _, name := range binding.ToolNames {
+				if name == toolName {
+					return binding.exec, binding.ConnectionID, binding, true
+				}
 			}
+			continue
+		}
+		if binding.specKeys == nil {
+			if allowLegacy && legacy == nil {
+				for _, name := range binding.ToolNames {
+					if name == toolName {
+						legacy = binding
+						break
+					}
+				}
+			}
+			continue // Legacy bindings cannot satisfy a strict proxy.
+		}
+		keys, advertisesName := binding.specKeys[toolName]
+		if !advertisesName {
+			continue
+		}
+		hasVerifiedCandidate = true
+		if _, ok := keys[*expectedSpecKey]; ok {
+			return binding.exec, binding.ConnectionID, binding, true
 		}
 	}
-	return nil, "", false
+	if allowLegacy && !hasVerifiedCandidate && legacy != nil {
+		return legacy.exec, legacy.ConnectionID, legacy, true
+	}
+	return nil, "", nil, false
 }
 
-// waitChan 返回 (sessionID,toolName) 的重绑就绪通知 chan,不存在则创建(容量
-// 1)。等待侧(proxy Execute)在判定无绑定**之前**注册——Bind 落在注册之后的
-// 任何时刻都必然非阻塞投递,「判定无绑定」与「select 挂起」之间的窗口不漏
-// 唤醒。chan 的生命周期归等待侧:Execute 出口经 dropWaitChan 撤销(进程内
-// 存量,无泄漏;V1 无后台清扫)。
+// waitChan registers a private (sessionID,toolName) notification channel before lookup.
+// Bind broadcasts while holding the same mutex, so no rebind can be lost between the
+// unbound check and select. The Execute owner removes its channel on every exit.
 func (r *CapabilityRegistry) waitChan(sessionID, toolName string) chan struct{} {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := capabilityWaitKey(sessionID, toolName)
-	ch, ok := r.waiters[key]
+	waiters, ok := r.waiters[key]
 	if !ok {
-		ch = make(chan struct{}, 1)
-		r.waiters[key] = ch
+		waiters = make(map[chan struct{}]struct{})
+		r.waiters[key] = waiters
 	}
+	ch := make(chan struct{}, 1)
+	waiters[ch] = struct{}{}
 	return ch
 }
 
-// dropWaitChan 撤销等待侧注册:仅当当前登记的正是本 chan 才删(防误删后来者
-// 的重注册);不存在时幂等空操作。
+// dropWaitChan removes only this caller's subscription; concurrent waiters remain registered.
 func (r *CapabilityRegistry) dropWaitChan(sessionID, toolName string, ch chan struct{}) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := capabilityWaitKey(sessionID, toolName)
-	if cur, ok := r.waiters[key]; ok && cur == ch {
+	waiters, ok := r.waiters[key]
+	if !ok {
+		return
+	}
+	delete(waiters, ch)
+	if len(waiters) == 0 {
 		delete(r.waiters, key)
 	}
 }
 
-// NewClientToolProxy 为每个声明创建稳定的 core.Tool，执行时动态解析绑定。
-// Schema 无效时回退 object；Metadata 拷贝透传并附内部标记，等待预算归一化。
+// NewClientToolProxy preserves name-only fallback for purely legacy registrations. When a
+// spec-aware registration advertises the same tool name, the frozen proxy spec is matched
+// exactly and an incompatible verified binding blocks legacy fallback.
 func NewClientToolProxy(reg *CapabilityRegistry, sessionID string, specs []ClientToolSpec, waitTimeout time.Duration) []core.Tool {
+	return newClientToolProxy(reg, sessionID, specs, waitTimeout, false)
+}
+
+// NewSpecAwareClientToolProxy creates proxies that resolve only explicitly registered,
+// schema-and-policy-compatible connection bindings. Specs are snapshotted at construction.
+func NewSpecAwareClientToolProxy(reg *CapabilityRegistry, sessionID string, specs []ClientToolSpec, waitTimeout time.Duration) []core.Tool {
+	return newClientToolProxy(reg, sessionID, specs, waitTimeout, true)
+}
+
+func newClientToolProxy(reg *CapabilityRegistry, sessionID string, specs []ClientToolSpec, waitTimeout time.Duration, specAware bool) []core.Tool {
 	wait := resolveCapabilityWait(waitTimeout)
 	tools := make([]core.Tool, 0, len(specs))
 	for _, spec := range specs {
-		var schema map[string]any
-		if err := json.Unmarshal([]byte(spec.Schema), &schema); err != nil || schema == nil {
-			// 非法 schema 整体兜底,不放大为构造失败(探测面「方向必须是收缩
-			// 不是放行」的镜像:坏声明只降级该工具的参数面,不注册不了了之)。
-			schema = map[string]any{"type": "object"}
-		}
-
+		spec := spec // Freeze scalar fields and compatibility identity for this Run.
+		schema, _ := normalizeClientToolSchema(spec.Schema)
 		metadata := make(map[string]string, len(spec.Metadata)+1)
 		for k, v := range spec.Metadata {
 			metadata[k] = v
 		}
 		metadata[capabilityWaitMetaKey] = "true"
+		specKey := clientToolSpecKey(spec)
 
 		tools = append(tools, core.Tool{
 			Name:        spec.Name,
@@ -304,15 +453,13 @@ func NewClientToolProxy(reg *CapabilityRegistry, sessionID string, specs []Clien
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
 				onWait := capabilityWaitObserver(ctx)
 				if onWait == nil {
-					// 未注入(RecordRun 同步路径直用代理):等待照常发生(安全
-					// 超时兜底),仅 RunState 不迁移——空观察者即「仅执行面」。
 					onWait = func(bool) {}
 				}
 				argsJSON, err := json.Marshal(args)
 				if err != nil {
 					return "", fmt.Errorf("capability tool %s: encode args: %w", spec.Name, err)
 				}
-				return executeCapabilityTool(ctx, reg, sessionID, spec.Name, argsJSON, wait, onWait)
+				return executeCapabilityToolForSpec(ctx, reg, sessionID, spec.Name, argsJSON, wait, onWait, &specKey, !specAware)
 			},
 		})
 	}
@@ -322,6 +469,10 @@ func NewClientToolProxy(reg *CapabilityRegistry, sessionID string, specs []Clien
 // executeCapabilityTool 先解析并调用当前绑定；无绑定或普通调用失败时等待重绑。
 // 就绪通知仅用于唤醒，之后必须重查绑定；等待总预算不重置，超时/取消返回失败文本。
 func executeCapabilityTool(ctx context.Context, reg *CapabilityRegistry, sessionID, toolName string, argsJSON []byte, wait time.Duration, onWait capabilityWaitFunc) (string, error) {
+	return executeCapabilityToolForSpec(ctx, reg, sessionID, toolName, argsJSON, wait, onWait, nil, true)
+}
+
+func executeCapabilityToolForSpec(ctx context.Context, reg *CapabilityRegistry, sessionID, toolName string, argsJSON []byte, wait time.Duration, onWait capabilityWaitFunc, specKey *string, allowLegacy bool) (string, error) {
 	// 就绪通知先注册后判定:Bind 落在「判定无绑定」与「select 挂起」之间的
 	// 窗口也必然投递(非阻塞、容量 1),不漏唤醒。
 	notify := reg.waitChan(sessionID, toolName)
@@ -347,7 +498,7 @@ func executeCapabilityTool(ctx context.Context, reg *CapabilityRegistry, session
 	}()
 
 	for {
-		exec, connID, ok := reg.lookupResolved(sessionID, toolName)
+		exec, connID, binding, ok := reg.lookupResolvedBinding(sessionID, toolName, specKey, allowLegacy)
 		if ok {
 			// 绑定在(直接命中 / 等待中重绑成功):先收敛等待态再执行
 			// (「→ onWait(false) → 重绑成功则 Invoke」)。
@@ -364,7 +515,7 @@ func executeCapabilityTool(ctx context.Context, reg *CapabilityRegistry, session
 			}
 			// Invoke 失败 = 通道事实不可用:即时失效「该绑定」,转入等待——
 			// 绝不静默吞掉失败后路由到其他连接。
-			reg.Invalidate(sessionID, connID)
+			reg.invalidateIfCurrent(sessionID, connID, binding)
 		}
 		if !waiting {
 			waiting = true

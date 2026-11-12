@@ -22,6 +22,7 @@ import (
 // RunControlSource 编译期断言:AgentPlugin 满足可选能力接口,handler
 // 以 type-assert 获取(SessionSource 先例,capability.go:61-78)。
 var _ model.RunControlSource = (*AgentPlugin)(nil)
+var _ model.NegotiatedRunControlSource = (*AgentPlugin)(nil)
 
 // InternalRunner 编译期断言：AgentPlugin 实现受限的同步宿主入口。该接口只隔离静态方法集，
 // 不构成运行时授权边界；协议控制仍由 Service 的 lease fencing 保护。
@@ -102,7 +103,13 @@ func (p *AgentPlugin) runJournalStore() *session.RunJournalStore {
 // StartRun submits a background run after routing the session. The Service performs
 // lease fencing and per-(session, request) idempotency before committing to the manager.
 func (p *AgentPlugin) StartRun(sessionID, connectionID, input, requestID string) (string, string, error) {
-	runID, state, err := p.control.StartRun(sessionID, connectionID, input, requestID, runtimeagent.RunCallbacks{})
+	return p.StartRunWithTools(sessionID, connectionID, input, requestID, nil)
+}
+
+// StartRunWithTools freezes the negotiated device-tool source into the initial run
+// submission. The idempotency registry ignores sources on replays by construction.
+func (p *AgentPlugin) StartRunWithTools(sessionID, connectionID, input, requestID string, toolSource func(context.Context) []core.Tool) (string, string, error) {
+	runID, state, err := p.control.StartRunWithTools(sessionID, connectionID, input, requestID, runtimeagent.RunCallbacks{}, toolSource)
 	if errors.Is(err, runtimeagent.ErrSessionArchived) {
 		return "", "", fmt.Errorf("agent: session %q is archived and read-only", sessionID)
 	}
@@ -259,11 +266,43 @@ func (p *AgentPlugin) CapabilityWaitTimeout() time.Duration {
 // ClientToolBinder is the device-tool capability surface wired by the daemon. The stdio
 // worker path keeps its own relay and does not use this proxy.
 
-// deviceToolExecutor 把 SDK 的 ClientToolExecutor 收窄面适配到 x-device/call:
-// Execute 收到的 toolName 是注册名(sys_ 前缀,与原始中继的 core.Tool.Name 同
-// 名),CallDeviceTool 统一剥前缀转发客户端原名(wire 形状单一事实源,
-// sys_relay.go CallDeviceTool)。Invoke 失败由代理 Execute 即时 Invalidate 该
-// 绑定并进入等待重绑,绝不静默路由到其他连接。
+// BindClientToolSpecs registers the immutable initialize-time descriptor contract for a
+// specific runtime session and connection. Registry matching rejects schema or policy drift.
+func (p *AgentPlugin) BindClientToolSpecs(sessionID, connectionID string, specs []runtimeagent.ClientToolSpec, caller model.DeviceCaller) bool {
+	if len(specs) == 0 || caller == nil {
+		return false
+	}
+	return p.manager.Capabilities().BindConnectionSpecs(sessionID, connectionID, specs, deviceToolExecutor{caller: caller})
+}
+
+// ClientToolSourceForSpecs builds proxies from the cached declaration snapshot without probing.
+func (p *AgentPlugin) ClientToolSourceForSpecs(sessionID string, specs []runtimeagent.ClientToolSpec) func(context.Context) []core.Tool {
+	if len(specs) == 0 {
+		return nil
+	}
+	frozen := cloneRuntimeClientToolSpecs(specs)
+	wait := p.CapabilityWaitTimeout()
+	reg := p.manager.Capabilities()
+	return func(context.Context) []core.Tool {
+		return runtimeagent.NewSpecAwareClientToolProxy(reg, sessionID, frozen, wait)
+	}
+}
+
+func cloneRuntimeClientToolSpecs(specs []runtimeagent.ClientToolSpec) []runtimeagent.ClientToolSpec {
+	cloned := make([]runtimeagent.ClientToolSpec, len(specs))
+	for i, spec := range specs {
+		cloned[i] = spec
+		if spec.Metadata != nil {
+			cloned[i].Metadata = make(map[string]string, len(spec.Metadata))
+			for key, value := range spec.Metadata {
+				cloned[i].Metadata[key] = value
+			}
+		}
+	}
+	return cloned
+}
+
+// deviceToolExecutor adapts the SDK executor to x-device/call.
 type deviceToolExecutor struct {
 	caller model.DeviceCaller
 }

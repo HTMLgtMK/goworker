@@ -106,21 +106,38 @@ func (p *AgentPlugin) LoadBoundSession(sessionID, cwd string) error {
 }
 
 func (p *AgentPlugin) LoadBoundSessionForConnection(sessionID, cwd, connectionID string) ([]model.SessionUpdate, error) {
+	updates, committed, err := p.LoadBoundSessionForConnectionGuarded(sessionID, cwd, connectionID, func() bool { return true })
+	if err != nil {
+		return nil, err
+	}
+	if !committed {
+		return nil, fmt.Errorf("agent: connection binding was not committed")
+	}
+	return updates, nil
+}
+
+// LoadBoundSessionForConnectionGuarded keeps load, history, and connection reference
+// registration under lifecycleMu, but rejects the registration if disconnect won first.
+func (p *AgentPlugin) LoadBoundSessionForConnectionGuarded(sessionID, cwd, connectionID string, allowBind func() bool) ([]model.SessionUpdate, bool, error) {
 	p.lifecycleMu.Lock()
 	defer p.lifecycleMu.Unlock()
 
 	if err := p.LoadBoundSession(sessionID, cwd); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	history, err := p.SessionHistory(sessionID)
 	if err != nil {
 		p.tryReleaseSessionLocked(sessionID)
-		return nil, err
+		return nil, false, err
+	}
+	if allowBind == nil || !allowBind() {
+		p.tryReleaseSessionLocked(sessionID)
+		return history, false, nil
 	}
 	if p.control != nil {
 		p.bindConnectionSessionLocked(connectionID, sessionID)
 	}
-	return history, nil
+	return history, true, nil
 }
 
 // SessionHistory replays a registered session's full history before session/load. It reads
