@@ -10,8 +10,8 @@ import (
 	"github.com/tinguo/goworker/ai-acp/protocol"
 )
 
-// TestServerStoresClientCapabilities 验证 initialize 协商的 clientCapabilities
-// 在 server 侧可读：未 initialize 时 Has 一律 false，initialize 后按声明可见。
+// TestInitializeReadyRunsAfterResponseWrite checks that the ready hook issues a reverse call.
+// Frame ordering is checked independently by TestInitializeResponseFramePrecedesReverseRequest.
 func TestInitializeReadyRunsAfterResponseWrite(t *testing.T) {
 	serverEnd, clientEnd := net.Pipe()
 	handler := &initializeReadyHandler{ready: make(chan struct{})}
@@ -28,7 +28,7 @@ func TestInitializeReadyRunsAfterResponseWrite(t *testing.T) {
 		select {
 		case <-handler.ready:
 		default:
-			t.Error("reverse call arrived before initialize response was delivered")
+			t.Error("reverse call arrived before the ready hook")
 		}
 		close(called)
 		return map[string]any{"tools": []any{}}, nil

@@ -26,9 +26,9 @@ type SessionHandler interface {
 	Prompt(ctx context.Context, sessionID string, prompt []protocol.ContentBlock, reporter Reporter) (string, error)
 }
 
-// InitializeReady is an optional connection hook. It runs only after the
-// successful initialize response has been written, so reverse calls cannot race
-// the client's initialize request handling.
+// InitializeReady runs after the successful initialize response is written to the
+// transport. Clients must register reverse request handlers before initialize;
+// a completed write does not mean the client has processed the response.
 type InitializeReady interface {
 	InitializeReady(ctx context.Context, reporter Reporter)
 }

@@ -157,6 +157,13 @@ func (h *FrontendHandler) initializeDeviceTools(ctx context.Context, reporter ai
 		cancelProbe()
 		return
 	}
+	select {
+	case <-h.toolsReady:
+		h.mu.Unlock()
+		cancelProbe()
+		return
+	default:
+	}
 	h.deviceProbeCancel = cancelProbe
 	h.mu.Unlock()
 	defer cancelProbe()
@@ -174,6 +181,12 @@ func (h *FrontendHandler) initializeDeviceTools(ctx context.Context, reporter ai
 
 	h.mu.Lock()
 	h.deviceProbeCancel = nil
+	select {
+	case <-h.toolsReady:
+		h.mu.Unlock()
+		return
+	default:
+	}
 	if !h.closed && len(descriptors) != 0 {
 		h.deviceCaller = caller
 		h.deviceDescriptors = append([]acpworker.DeviceToolDescriptor(nil), descriptors...)
@@ -196,6 +209,16 @@ func (h *FrontendHandler) waitDeviceTools(ctx context.Context) bool {
 		select {
 		case <-ready:
 		case <-timer.C:
+			h.mu.Lock()
+			var cancelProbe context.CancelFunc
+			h.toolsReadyOnce.Do(func() {
+				cancelProbe = h.deviceProbeCancel
+				close(ready)
+			})
+			h.mu.Unlock()
+			if cancelProbe != nil {
+				cancelProbe()
+			}
 		case <-ctx.Done():
 			return false
 		}
