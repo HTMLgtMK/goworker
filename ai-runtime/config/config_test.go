@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -318,5 +319,289 @@ func TestParseCompactKeepAndMaxIterations(t *testing.T) {
 		if _, err := fn("abc"); err == nil {
 			t.Errorf("%s: abc should error", name)
 		}
+	}
+}
+
+func TestDefaultConfig(t *testing.T) {
+	cfg := Default()
+	if cfg == nil {
+		t.Fatal("Default() returned nil")
+	}
+	wantMemory := MemoryConfig{
+		Enabled: true, TaskKeep: 50, TaskInjectN: 3, LtmInjectTopK: 8, LtmExtract: true,
+		InjectBudgetRatio: 0.15, UserMaxChars: 1500, AgentsMaxChars: 4096,
+	}
+	if cfg.Memory != wantMemory {
+		t.Errorf("Memory = %#v, want %#v", cfg.Memory, wantMemory)
+	}
+	if cfg.Session != (SessionConfig{Enabled: true, MaxConcurrentRuns: 4, MaxPendingRuns: 16, CapabilityWaitTimeout: 45}) {
+		t.Errorf("Session = %#v", cfg.Session)
+	}
+	if cfg.Sandbox.Mode != "normal" {
+		t.Errorf("Sandbox.Mode = %q, want normal", cfg.Sandbox.Mode)
+	}
+}
+
+func TestDispatchConfigValidate(t *testing.T) {
+	worker := WorkerConfig{Name: "worker-a", Command: "worker"}
+	validWorkers := []WorkerConfig{worker, {Name: "worker-b", Command: "other"}}
+	tests := []struct {
+		name    string
+		config  DispatchConfig
+		wantErr string
+	}{
+		{name: "disabled empty is valid"},
+		{name: "valid disabled configuration", config: DispatchConfig{Workers: []WorkerConfig{worker}}},
+		{name: "valid enabled configuration", config: DispatchConfig{
+			Enabled: true, Workers: validWorkers, DefaultWorker: "worker-a", MaxParallel: 2,
+			Routes: []RouteConfig{{Keywords: []string{"bug"}, Worker: "worker-b"}},
+		}},
+		{name: "empty worker name", config: DispatchConfig{Workers: []WorkerConfig{{Command: "worker"}}}, wantErr: "name is required"},
+		{name: "duplicate worker name", config: DispatchConfig{Workers: []WorkerConfig{worker, worker}}, wantErr: "duplicate name"},
+		{name: "empty worker command", config: DispatchConfig{Workers: []WorkerConfig{{Name: "worker-a"}}}, wantErr: "command is required"},
+		{name: "unknown default worker", config: DispatchConfig{Workers: []WorkerConfig{worker}, DefaultWorker: "missing"}, wantErr: "is not in workers"},
+		{name: "negative max parallel", config: DispatchConfig{MaxParallel: -1}, wantErr: "must be >= 0"},
+		{name: "invalid permission policy", config: DispatchConfig{Workers: []WorkerConfig{{Name: "worker-a", Command: "worker", OnPermission: "prompt"}}}, wantErr: "invalid on_permission"},
+		{name: "route without keywords", config: DispatchConfig{Workers: []WorkerConfig{worker}, Routes: []RouteConfig{{Worker: "worker-a"}}}, wantErr: "keywords is required"},
+		{name: "route references unknown worker", config: DispatchConfig{Workers: []WorkerConfig{worker}, Routes: []RouteConfig{{Keywords: []string{"bug"}, Worker: "missing"}}}, wantErr: "worker \"missing\" is not in workers"},
+		{name: "enabled without workers", config: DispatchConfig{Enabled: true}, wantErr: "requires at least one worker"},
+		{name: "enabled without default worker", config: DispatchConfig{Enabled: true, Workers: []WorkerConfig{worker}}, wantErr: "default_worker is required"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDispatchConfigResolveDefaultWorker(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		config  DispatchConfig
+		want    string
+		wantErr bool
+	}{
+		{name: "explicit default", config: DispatchConfig{DefaultWorker: "chosen", Workers: []WorkerConfig{{Name: "first"}}}, want: "chosen"},
+		{name: "first worker fallback", config: DispatchConfig{Workers: []WorkerConfig{{Name: "first"}, {Name: "second"}}}, want: "first"},
+		{name: "no workers", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.config.ResolveDefaultWorker()
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "no workers") {
+					t.Fatalf("ResolveDefaultWorker() = %q, %v; want no-workers error", got, err)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("ResolveDefaultWorker() = %q, %v; want %q", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestDispatchConfigMatchWorker(t *testing.T) {
+	cfg := DispatchConfig{Routes: []RouteConfig{
+		{Keywords: []string{"", "panic"}, Worker: "first"},
+		{Keywords: []string{"PANIC", "crash"}, Worker: "second"},
+	}}
+	for _, tt := range []struct {
+		prompt string
+		want   string
+		match  bool
+	}{
+		{prompt: "PANIC in production", want: "first", match: true},
+		{prompt: "please CRASH", want: "second", match: true},
+		{prompt: "ordinary request", match: false},
+	} {
+		got, ok := cfg.MatchWorker(tt.prompt)
+		if got != tt.want || ok != tt.match {
+			t.Errorf("MatchWorker(%q) = %q, %v; want %q, %v", tt.prompt, got, ok, tt.want, tt.match)
+		}
+	}
+}
+
+func TestDispatchConfigWorker(t *testing.T) {
+	cfg := DispatchConfig{Workers: []WorkerConfig{{Name: "one", Command: "cmd"}}}
+	if got, ok := cfg.Worker("one"); !ok || got.Command != "cmd" {
+		t.Fatalf("Worker(one) = %#v, %v", got, ok)
+	}
+	if got, ok := cfg.Worker("missing"); ok || got.Name != "" || got.Command != "" {
+		t.Fatalf("Worker(missing) = %#v, %v; want zero value, false", got, ok)
+	}
+}
+
+func TestLLMConfigValidateFailures(t *testing.T) {
+	base := DefaultLLM()
+	anthropic := LLMConfig{
+		Current: CurrentConfig{Provider: "anthropic", Model: "claude"},
+		Providers: map[string]ProviderConfig{"anthropic": {
+			Type: ProviderTypeAnthropic, Endpoint: "https://api.example.com", APIKey: "key",
+			AuthType: AnthropicAuthAPIKey, Models: map[string]ModelConfig{"claude": {ContextWindow: 1000, MaxTokens: 100}},
+		}},
+		CompressAt: 0.8, CompactKeep: 10, MaxIterations: 5,
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*LLMConfig)
+		wantErr string
+	}{
+		{name: "compress below zero", mutate: func(c *LLMConfig) { c.CompressAt = -0.1 }, wantErr: "invalid compress_at"},
+		{name: "compress above one", mutate: func(c *LLMConfig) { c.CompressAt = 1.1 }, wantErr: "invalid compress_at"},
+		{name: "compress NaN", mutate: func(c *LLMConfig) { c.CompressAt = math.NaN() }, wantErr: "invalid compress_at"},
+		{name: "compact keep must be positive", mutate: func(c *LLMConfig) { c.CompactKeep = 0 }, wantErr: "compact_keep must be positive"},
+		{name: "iterations must be positive", mutate: func(c *LLMConfig) { c.MaxIterations = 0 }, wantErr: "max_iterations must be positive"},
+		{name: "invalid provider name", mutate: func(c *LLMConfig) { c.Providers["bad.name"] = c.Providers["openai"] }, wantErr: "invalid provider name"},
+		{name: "endpoint required", mutate: func(c *LLMConfig) { p := c.Providers["openai"]; p.Endpoint = ""; c.Providers["openai"] = p }, wantErr: "endpoint is required"},
+		{name: "endpoint must be absolute uri", mutate: func(c *LLMConfig) {
+			p := c.Providers["openai"]
+			p.Endpoint = "localhost:8000/v1"
+			c.Providers["openai"] = p
+		}, wantErr: "endpoint is invalid"},
+		{name: "unsupported provider type", mutate: func(c *LLMConfig) { p := c.Providers["openai"]; p.Type = "other"; c.Providers["openai"] = p }, wantErr: "unsupported type"},
+		{name: "openai rejects auth type", mutate: func(c *LLMConfig) {
+			p := c.Providers["openai"]
+			p.AuthType = AnthropicAuthAPIKey
+			c.Providers["openai"] = p
+		}, wantErr: "Anthropic-only fields"},
+		{name: "anthropic needs api key", mutate: func(c *LLMConfig) {
+			p := c.Providers["openai"]
+			p.Type = ProviderTypeAnthropic
+			p.APIKey = ""
+			p.AuthType = AnthropicAuthAPIKey
+			p.Models["gpt-4o"] = ModelConfig{ContextWindow: 1000, MaxTokens: 100}
+			c.Providers["openai"] = p
+		}, wantErr: "api_key is required"},
+		{name: "anthropic auth type required", mutate: func(c *LLMConfig) {
+			p := c.Providers["openai"]
+			p.Type = ProviderTypeAnthropic
+			p.APIKey = "key"
+			p.AuthType = "invalid"
+			p.Models["gpt-4o"] = ModelConfig{ContextWindow: 1000, MaxTokens: 100}
+			c.Providers["openai"] = p
+		}, wantErr: "auth_type is invalid"},
+		{name: "provider must have model", mutate: func(c *LLMConfig) {
+			p := c.Providers["openai"]
+			c.Providers["empty"] = ProviderConfig{Type: ProviderTypeOpenAI, Endpoint: "https://api.example.com", Models: map[string]ModelConfig{}}
+			c.Providers["openai"] = p
+		}, wantErr: "must define at least one model"},
+		{name: "model id required", mutate: func(c *LLMConfig) {
+			p := c.Providers["openai"]
+			p.Models[""] = ModelConfig{ContextWindow: 1, Thinking: ProviderThinkingConfig{RequestMode: ThinkingRequestAuto, Effort: ThinkingEffortLow}}
+			c.Providers["openai"] = p
+		}, wantErr: "empty model id"},
+		{name: "context window positive", mutate: func(c *LLMConfig) {
+			p := c.Providers["openai"]
+			m := p.Models["gpt-4o"]
+			m.ContextWindow = -1
+			p.Models["gpt-4o"] = m
+			c.Providers["openai"] = p
+		}, wantErr: "context_window must be positive"},
+		{name: "openai rejects max tokens", mutate: func(c *LLMConfig) {
+			p := c.Providers["openai"]
+			m := p.Models["gpt-4o"]
+			m.MaxTokens = 1
+			p.Models["gpt-4o"] = m
+			c.Providers["openai"] = p
+		}, wantErr: "Anthropic-only fields"},
+		{name: "openai request mode enum", mutate: func(c *LLMConfig) {
+			p := c.Providers["openai"]
+			m := p.Models["gpt-4o"]
+			m.Thinking.RequestMode = "invalid"
+			p.Models["gpt-4o"] = m
+			c.Providers["openai"] = p
+		}, wantErr: "thinking request_mode"},
+		{name: "openai effort enum", mutate: func(c *LLMConfig) {
+			p := c.Providers["openai"]
+			m := p.Models["gpt-4o"]
+			m.Thinking.Effort = "invalid"
+			p.Models["gpt-4o"] = m
+			c.Providers["openai"] = p
+		}, wantErr: "thinking effort"},
+		{name: "anthropic max tokens positive", mutate: func(c *LLMConfig) {
+			*c = anthropic.Clone()
+			p := c.Providers["anthropic"]
+			m := p.Models["claude"]
+			m.MaxTokens = 0
+			p.Models["claude"] = m
+			c.Providers["anthropic"] = p
+		}, wantErr: "max_tokens must be positive"},
+		{name: "anthropic rejects thinking fields", mutate: func(c *LLMConfig) {
+			*c = anthropic.Clone()
+			p := c.Providers["anthropic"]
+			m := p.Models["claude"]
+			m.Thinking.Effort = ThinkingEffortHigh
+			p.Models["claude"] = m
+			c.Providers["anthropic"] = p
+		}, wantErr: "OpenAI-only thinking fields"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base.Clone()
+			tt.mutate(&cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLLMConfigValidateProviderModelIndependently(t *testing.T) {
+	cfg := DefaultLLM()
+	cfg.Current.Model = "missing"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), `model "missing" does not exist`) {
+		t.Fatalf("Validate() = %v, want missing-current-model error", err)
+	}
+
+	cfg = DefaultLLM()
+	cfg.Providers["extra"] = ProviderConfig{
+		Type: ProviderTypeAnthropic, Endpoint: "https://api.example.com", APIKey: "key", AuthType: AnthropicAuthBearer,
+		Models: map[string]ModelConfig{"model": {ContextWindow: 10, MaxTokens: 0}},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "max_tokens must be positive") {
+		t.Fatalf("Validate() = %v, want invalid non-current provider model", err)
+	}
+}
+
+func TestValidateProviderRequiresOpenAIRequestMode(t *testing.T) {
+	provider := ProviderConfig{Type: ProviderTypeOpenAI, Endpoint: "https://api.example.com"}
+	model := ModelConfig{ContextWindow: 10, Thinking: ProviderThinkingConfig{Effort: ThinkingEffortLow}}
+	if err := validateProvider("openai", provider, "model", model); err == nil || !strings.Contains(err.Error(), "thinking request_mode is required") {
+		t.Fatalf("validateProvider() = %v, want missing request mode error", err)
+	}
+}
+
+func TestLLMConfigYAMLProviderReplacementAndDecodeErrors(t *testing.T) {
+	cfg := DefaultLLM()
+	if err := yaml.Unmarshal([]byte("compress_at: 0.5"), &cfg); err != nil {
+		t.Fatalf("Unmarshal partial config: %v", err)
+	}
+	if _, ok := cfg.Providers["openai"]; !ok {
+		t.Fatal("omitted providers should preserve existing provider registry")
+	}
+	if err := yaml.Unmarshal([]byte("providers: {}"), &cfg); err != nil {
+		t.Fatalf("Unmarshal empty provider registry: %v", err)
+	}
+	if len(cfg.Providers) != 0 {
+		t.Fatalf("explicit empty provider registry = %#v, want empty", cfg.Providers)
+	}
+	if err := yaml.Unmarshal([]byte("current: [not, a, mapping]"), &cfg); err == nil {
+		t.Fatal("malformed current value should return decode error")
+	}
+}
+
+func TestParseContextWindowRejectsValuesThatRoundToZero(t *testing.T) {
+	if got, err := ParseContextWindow("0.0000001k"); err == nil || got != 0 {
+		t.Fatalf("ParseContextWindow(tiny) = %d, %v; want zero and error", got, err)
 	}
 }

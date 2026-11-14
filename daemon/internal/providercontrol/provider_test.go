@@ -295,6 +295,146 @@ func TestSetCurrentRejectsUnknownProviderModelAndStaleRevision(t *testing.T) {
 	}
 }
 
+type controlledBackend struct {
+	config   *runtimeconfig.Config
+	revision string
+	update   func(string, func(*runtimeconfig.Config) error) (*runtimeconfig.Config, string, error)
+}
+
+func (b *controlledBackend) ConfigSnapshotWithRevision() (*runtimeconfig.Config, string) {
+	return b.config, b.revision
+}
+
+func (b *controlledBackend) UpdateConfigAtRevision(expected string, mutate func(*runtimeconfig.Config) error) (*runtimeconfig.Config, string, error) {
+	if b.update != nil {
+		return b.update(expected, mutate)
+	}
+	return nil, "", ErrUnavailable
+}
+
+func TestReadOperationsRejectUnavailableSnapshots(t *testing.T) {
+	config, _ := newMemoryBackend().ConfigSnapshotWithRevision()
+	tests := []struct {
+		name    string
+		service *Service
+	}{
+		{name: "nil service"},
+		{name: "nil backend", service: New(nil)},
+		{name: "nil config", service: New(&controlledBackend{revision: "epoch-1"})},
+		{name: "empty revision", service: New(&controlledBackend{config: config})},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := tt.service.List(); !errors.Is(err, ErrUnavailable) {
+				t.Errorf("List() error = %v, want ErrUnavailable", err)
+			}
+			if _, _, err := tt.service.Detail("openai"); !errors.Is(err, ErrUnavailable) {
+				t.Errorf("Detail() error = %v, want ErrUnavailable", err)
+			}
+			if _, err := tt.service.Current(); !errors.Is(err, ErrUnavailable) {
+				t.Errorf("Current() error = %v, want ErrUnavailable", err)
+			}
+		})
+	}
+}
+
+func TestMutationBoundariesAndBackendFailures(t *testing.T) {
+	service := New(newMemoryBackend())
+	if _, _, err := service.Upsert(UpsertRequest{Name: "openai"}); !errors.Is(err, ErrInvalid) {
+		t.Errorf("Upsert without revision = %v, want ErrInvalid", err)
+	}
+	if _, _, err := service.Upsert(UpsertRequest{
+		Revision: "epoch-1",
+		Name:     "openai",
+		Endpoint: "https://api.example.test/v1",
+		Models:   map[string]Model{"": {}},
+	}); !errors.Is(err, ErrInvalid) {
+		t.Errorf("Upsert with empty model ID = %v, want ErrInvalid", err)
+	}
+	if _, err := service.Remove("", "epoch-1"); !errors.Is(err, ErrInvalid) {
+		t.Errorf("Remove without name = %v, want ErrInvalid", err)
+	}
+	if _, err := service.Remove("missing", "epoch-1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Remove missing provider = %v, want ErrNotFound", err)
+	}
+	if _, err := service.SetCurrent("", Current{Provider: "openai", Model: "gpt-4o"}); !errors.Is(err, ErrInvalid) {
+		t.Errorf("SetCurrent without revision = %v, want ErrInvalid", err)
+	}
+	if _, err := service.SetCurrent("epoch-1", Current{Provider: "openai"}); !errors.Is(err, ErrInvalid) {
+		t.Errorf("SetCurrent without model = %v, want ErrInvalid", err)
+	}
+
+	backendError := errors.New("backend persistence failed")
+	failingBackend := &controlledBackend{update: func(string, func(*runtimeconfig.Config) error) (*runtimeconfig.Config, string, error) {
+		return nil, "", backendError
+	}}
+	request := UpsertRequest{
+		Revision: "epoch-1",
+		Name:     "openai",
+		Type:     string(runtimeconfig.ProviderTypeOpenAI),
+		Endpoint: "https://api.example.test/v1",
+		Models:   map[string]Model{"gpt-4o": {ContextWindow: 1000}},
+	}
+	if _, _, err := New(failingBackend).Upsert(request); !errors.Is(err, backendError) {
+		t.Errorf("Upsert backend error = %v, want wrapped backend error", err)
+	}
+	if _, err := New(failingBackend).SetCurrent("epoch-1", Current{Provider: "openai", Model: "gpt-4o"}); !errors.Is(err, backendError) {
+		t.Errorf("SetCurrent backend error = %v, want wrapped backend error", err)
+	}
+
+	emptyResultBackend := &controlledBackend{update: func(_ string, mutate func(*runtimeconfig.Config) error) (*runtimeconfig.Config, string, error) {
+		candidate, _ := newMemoryBackend().ConfigSnapshotWithRevision()
+		if err := mutate(candidate); err != nil {
+			return nil, "", err
+		}
+		return nil, "epoch-2", nil
+	}}
+	if _, _, err := New(emptyResultBackend).Upsert(request); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("Upsert with nil backend result = %v, want ErrUnavailable", err)
+	}
+	if _, err := New(emptyResultBackend).SetCurrent("epoch-1", Current{Provider: "openai", Model: "gpt-4o"}); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("SetCurrent with nil backend result = %v, want ErrUnavailable", err)
+	}
+}
+
+func TestResolveSecretRejectsInvalidActions(t *testing.T) {
+	tests := []struct {
+		name     string
+		action   string
+		supplied string
+		wantErr  bool
+	}{
+		{name: "replacement without value", action: "replace", wantErr: true},
+		{name: "clear with supplied value", action: "clear", supplied: "secret", wantErr: true},
+		{name: "unknown action", action: "rotate", wantErr: true},
+		{name: "keep existing key", action: "keep"},
+		{name: "keep absent key", action: "keep"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			old, exists := "old-secret", true
+			if tt.name == "keep absent key" {
+				old, exists = "", false
+			}
+			got, err := resolveSecret(old, exists, tt.action, tt.supplied)
+			if tt.wantErr {
+				if !errors.Is(err, ErrInvalid) {
+					t.Fatalf("resolveSecret() error = %v, want ErrInvalid", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveSecret() error = %v", err)
+			}
+			if got != old {
+				t.Errorf("resolveSecret() = %q, want existing value %q", got, old)
+			}
+		})
+	}
+}
+
 func TestModelNameRoundTripsThroughUpsertAndViews(t *testing.T) {
 	backend := newMemoryBackend()
 	service := New(backend)
