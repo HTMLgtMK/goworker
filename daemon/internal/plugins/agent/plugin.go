@@ -30,6 +30,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
+	"github.com/tinguo/goworker/daemon/internal/providercontrol"
 )
 
 // defaultHTTPTimeout 是 HTTP 客户端总超时。检查点/压缩是非流式全量调用，
@@ -76,6 +77,7 @@ type AgentPlugin struct {
 	// 提供当前会话路由和 journal。锁序为 lease.mu → registry.mu → manager，
 	// 跨层路径的 h.mu → session lease 也保持单向。
 	control *agentcontrol.Service
+	providerControl *providercontrol.Service
 
 	// inFlight tracks external maintenance requests, which may be queued at a session gate.
 	// Stop closes admission, closes the manager, waits for these requests, and then releases
@@ -230,8 +232,29 @@ func (p *AgentPlugin) storeFor(rt *runtimeagent.SessionRuntime) *session.Store {
 
 func (p *AgentPlugin) Name() string { return "agent" }
 
+// hubConfigBackend 把 model.Hub 的配置函数字段适配成 providercontrol.Backend：
+// Hub 用函数字段注入而非方法，接口断言天然不命中，这里显式转发。
+type hubConfigBackend struct{ hub *model.Hub }
+
+func (b hubConfigBackend) ConfigSnapshotWithRevision() (*runtimeconfig.Config, string) {
+	return b.hub.ConfigSnapshotWithRevision()
+}
+
+func (b hubConfigBackend) UpdateConfigAtRevision(expected string, mutate func(*runtimeconfig.Config) error) (*runtimeconfig.Config, string, error) {
+	return b.hub.UpdateConfigAtRevision(expected, mutate)
+}
+
+// ProviderControl exposes the daemon-wide revisioned provider registry to ACP composition.
+func (p *AgentPlugin) ProviderControl() *providercontrol.Service {
+	if p == nil {
+		return nil
+	}
+	return p.providerControl
+}
+
 func (p *AgentPlugin) Init(h *model.Hub) error {
 	p.hub = h
+	p.providerControl = providercontrol.New(hubConfigBackend{hub: h})
 	p.mcpClients = make(map[string]mcp.Client)
 
 	// Init 中途失败要回收已连接的 MCP 进程 —— Engine.Register 在 Init 报错时不会调用 Stop。
@@ -421,21 +444,31 @@ func (p *AgentPlugin) persistAllowRule(rule sandbox.AllowRule) error {
 		MaxRisk: rule.MaxRisk.String(),
 		Effects: rule.Effects.Names(),
 	}
-	for _, existing := range p.cfg.Sandbox.AllowRules {
-		if existing.Match == candidate.Match && existing.MaxRisk == candidate.MaxRisk && strings.Join(existing.Effects, ",") == strings.Join(candidate.Effects, ",") {
-			return nil
+	if p.hub == nil || p.hub.UpdateConfig == nil {
+		return fmt.Errorf("allow_always: config updates are unavailable")
+	}
+	// 快照预检：重复规则的常见路径直接短路，免去一次全量配置落盘。mutate 内的
+	// 重新检查仍是权威判定（预检与提交间的竞态最多多一次 no-op 提交）。
+	if snapshot := p.configSnapshot(); snapshot != nil {
+		for _, existing := range snapshot.Sandbox.AllowRules {
+			if existing.Match == candidate.Match && existing.MaxRisk == candidate.MaxRisk && strings.Join(existing.Effects, ",") == strings.Join(candidate.Effects, ",") {
+				return nil
+			}
 		}
 	}
-
-	previous := append([]sandbox.AllowRuleConfig(nil), p.cfg.Sandbox.AllowRules...)
-	p.cfg.Sandbox.AllowRules = append(p.cfg.Sandbox.AllowRules, candidate)
-	if p.hub == nil || p.hub.SaveConfig == nil {
-		p.cfg.Sandbox.AllowRules = previous
-		return fmt.Errorf("allow_always: config persistence is unavailable")
-	}
-	if err := p.hub.SaveConfig(p.cfg); err != nil {
-		p.cfg.Sandbox.AllowRules = previous
-		return fmt.Errorf("allow_always: save config: %w", err)
+	if _, err := p.hub.UpdateConfig(func(cfg *runtimeconfig.Config) error {
+		if cfg == nil {
+			return fmt.Errorf("allow_always: runtime config is unavailable")
+		}
+		for _, existing := range cfg.Sandbox.AllowRules {
+			if existing.Match == candidate.Match && existing.MaxRisk == candidate.MaxRisk && strings.Join(existing.Effects, ",") == strings.Join(candidate.Effects, ",") {
+				return nil
+			}
+		}
+		cfg.Sandbox.AllowRules = append(cfg.Sandbox.AllowRules, candidate)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("allow_always: update config: %w", err)
 	}
 	return nil
 }
@@ -452,21 +485,30 @@ func (p *AgentPlugin) persistToolAllowRule(rule sandbox.ToolAllowRule) error {
 		MaxRisk: rule.MaxRisk.String(),
 		Desc:    rule.Desc,
 	}
-	for _, existing := range p.cfg.Sandbox.ToolAllowRules {
-		if existing.Key == candidate.Key && existing.MaxRisk == candidate.MaxRisk && existing.Desc == candidate.Desc {
-			return nil
+	if p.hub == nil || p.hub.UpdateConfig == nil {
+		return fmt.Errorf("allow_always: config updates are unavailable")
+	}
+	// 快照预检同 persistAllowRule：重复直接短路，mutate 内仍权威去重。
+	if snapshot := p.configSnapshot(); snapshot != nil {
+		for _, existing := range snapshot.Sandbox.ToolAllowRules {
+			if existing.Key == candidate.Key && existing.MaxRisk == candidate.MaxRisk && existing.Desc == candidate.Desc {
+				return nil
+			}
 		}
 	}
-
-	previous := append([]sandbox.ToolAllowRuleConfig(nil), p.cfg.Sandbox.ToolAllowRules...)
-	p.cfg.Sandbox.ToolAllowRules = append(p.cfg.Sandbox.ToolAllowRules, candidate)
-	if p.hub == nil || p.hub.SaveConfig == nil {
-		p.cfg.Sandbox.ToolAllowRules = previous
-		return fmt.Errorf("allow_always: config persistence is unavailable")
-	}
-	if err := p.hub.SaveConfig(p.cfg); err != nil {
-		p.cfg.Sandbox.ToolAllowRules = previous
-		return fmt.Errorf("allow_always: save config: %w", err)
+	if _, err := p.hub.UpdateConfig(func(cfg *runtimeconfig.Config) error {
+		if cfg == nil {
+			return fmt.Errorf("allow_always: runtime config is unavailable")
+		}
+		for _, existing := range cfg.Sandbox.ToolAllowRules {
+			if existing.Key == candidate.Key && existing.MaxRisk == candidate.MaxRisk && existing.Desc == candidate.Desc {
+				return nil
+			}
+		}
+		cfg.Sandbox.ToolAllowRules = append(cfg.Sandbox.ToolAllowRules, candidate)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("allow_always: update config: %w", err)
 	}
 	return nil
 }
@@ -539,7 +581,13 @@ func (p *AgentPlugin) startSession() {
 	modelProvider := acpworker.ProviderFactory(client)
 
 	p.deps = runtimeagent.SessionDeps{
-		Config:               p.cfg,
+		Config: p.cfg,
+		ConfigSnapshot: func() *runtimeconfig.Config {
+			if p.hub != nil && p.hub.ConfigSnapshot != nil {
+				return p.hub.ConfigSnapshot()
+			}
+			return p.cfg
+		},
 		AuditDir:             p.paths.AuditDir,
 		Memory:               p.memory,
 		CollectTools:         p.collectTools,

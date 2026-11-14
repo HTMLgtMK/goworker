@@ -92,3 +92,57 @@ func TestServerStoresClientCapabilities(t *testing.T) {
 		t.Fatal("server did not store clientCapabilities.x-device from initialize")
 	}
 }
+
+type testAgentCapability struct{}
+
+func (testAgentCapability) Key() string { return "x-test" }
+
+func (testAgentCapability) MarshalJSON() ([]byte, error) {
+	return []byte(`{"enabled":true}`), nil
+}
+
+func TestServerInjectsTypedAgentCapability(t *testing.T) {
+	serverEnd, clientEnd := net.Pipe()
+	server := ServeConn(serverEnd, &lifecycleHandler{}, WithAgentCapability(testAgentCapability{}))
+	t.Cleanup(func() { _ = server.Close() })
+	client, err := NewClient("test-agent", clientEnd, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	response, err := client.Initialize(context.Background())
+	if err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	capability, ok := response.AgentCapabilities.Get("x-test")
+	if !ok {
+		t.Fatal("initialize response does not advertise the injected capability")
+	}
+	wire, err := json.Marshal(capability)
+	if err != nil {
+		t.Fatalf("marshal injected capability: %v", err)
+	}
+	if string(wire) != `{"enabled":true}` {
+		t.Fatalf("injected capability wire = %s, want {\"enabled\":true}", wire)
+	}
+}
+
+func TestServerKeepsInitializeWireWithoutInjectedCapabilities(t *testing.T) {
+	serverEnd, clientEnd := net.Pipe()
+	server := ServeConn(serverEnd, &lifecycleHandler{})
+	t.Cleanup(func() { _ = server.Close() })
+	client, err := NewClient("test-agent", clientEnd, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	response, err := client.Initialize(context.Background())
+	if err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if response.AgentCapabilities.Has("x-test") {
+		t.Fatal("default server unexpectedly advertises an application capability")
+	}
+}

@@ -152,26 +152,25 @@ relocate the whole directory — skills, logs and audit logs derive from it.
 
 ```yaml
 llm:
-  default_provider: openai
+  current: {provider: openai, model: gpt-4o}
   compress_at: 0.8
   providers:
     openai:
       type: openai
       endpoint: https://api.openai.com/v1
-      model: gpt-4o
       api_key: sk-xxx
-      context_window: 128000
-      thinking:
-        request_mode: auto    # auto | enable_thinking | reasoning_effort — required
-        effort: medium        # low | medium | high
+      models:
+        gpt-4o:
+          context_window: 128000
+          thinking:
+            request_mode: auto    # auto | enable_thinking | reasoning_effort
+            effort: medium        # low | medium | high
 ```
 
-⚠️ A provider entry you define in `config.yaml` **replaces** the built-in
-default wholesale — defaults are not merged in, so you have to spell out every
-required field yourself. `thinking.request_mode` is one of them: leave it out
-and the whole config is rejected at startup (the process exits with
-`配置无效`, logging the reason above it). Easiest route is to let `/model set`
-write the file for you.
+When `providers` is present it replaces the built-in registry. OpenAI model
+context window and thinking settings have defaults; Anthropic models require
+`context_window` and `max_tokens`. Older single-model LLM formats are rejected;
+use `current` and `models` as shown above.
 
 (This sample is pinned by a test — `TestReadmeSampleConfigParses` — so it can't
 drift away from what the loader actually accepts.)

@@ -28,109 +28,69 @@ func TestDefault_IncludesLog(t *testing.T) {
 	}
 }
 
-func TestLoad_NamedProvidersAndLegacyMigration(t *testing.T) {
-	dir := t.TempDir()
-
-	namedPath := filepath.Join(dir, "named.yaml")
-	if err := os.WriteFile(namedPath, []byte(`
-llm:
-  default_provider: cc-switch
+func TestLoad_NamedProvidersAndRejectLegacy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := `llm:
+  current: {provider: cc-switch, model: claude-sonnet-4-6}
   providers:
     cc-switch:
       type: anthropic
       endpoint: http://127.0.0.1:15721
-      model: claude-sonnet-4-6
       api_key: PROXY_MANAGED
       auth_type: bearer
-      max_tokens: 8192
-      context_window: 1048576
-  compress_at: 0.8
-  compact_keep: 10
-  max_iterations: 15
-  thinking:
-    show: true
-`), 0o600); err != nil {
+      models:
+        claude-sonnet-4-6: {max_tokens: 8192, context_window: 1048576}
+`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 		t.Fatal(err)
 	}
-	named := Load(namedPath)
-	name, provider, err := named.LLM.ResolveDefault()
-	if err != nil || name != "cc-switch" || provider.Type != runtimeconfig.ProviderTypeAnthropic {
-		t.Fatalf("named provider = %q %#v, %v", name, provider, err)
+	cfg := Load(path)
+	if cfg == nil {
+		t.Fatal("Load failed")
 	}
-	if strings.Contains(named.Display(), "PROXY_MANAGED") {
-		t.Fatal("Display leaked provider api key")
+	provider, model, err := cfg.LLM.ResolveCurrent()
+	if err != nil || provider.Type != runtimeconfig.ProviderTypeAnthropic || model.MaxTokens != 8192 || len(cfg.LLM.Providers) != 1 {
+		t.Fatalf("provider = %#v model = %#v, %v", provider, model, err)
 	}
-
-	legacyPath := filepath.Join(dir, "legacy.yaml")
-	if err := os.WriteFile(legacyPath, []byte(`
-llm:
-  endpoint: http://localhost:8000/v1
-  model: legacy
-  api_key: local-key
-  context_window: 32768
-  thinking:
-    show: false
-    request_mode: reasoning_effort
-    effort: high
-`), 0o600); err != nil {
+	if strings.Contains(cfg.Display(), "PROXY_MANAGED") {
+		t.Fatal("Display leaked api key")
+	}
+	if err := os.WriteFile(path, []byte("llm:\n  model: legacy\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	legacy := Load(legacyPath)
-	legacyProvider := legacy.LLM.Providers["openai"]
-	if legacy.LLM.DefaultProvider != "openai" || legacyProvider.Model != "legacy" || legacyProvider.Thinking.Effort != runtimeconfig.ThinkingEffortHigh || legacy.LLM.Thinking.Show {
-		t.Fatalf("legacy migration = %#v", legacy.LLM)
+	if Load(path) != nil {
+		t.Fatal("legacy config must be rejected")
 	}
 }
 
 func TestLoad_OpenAIProviderUsesDefaultsForOmittedFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte(`
-llm:
-  default_provider: openai
-  providers:
-    openai:
-      type: openai
-      endpoint: http://localhost:8000/v1
-      model: gpt-4o
-  compress_at: 0.8
-  compact_keep: 10
-  max_iterations: 15
-`), 0o600); err != nil {
+	data := "llm:\n  current: {provider: openai, model: gpt-4o}\n  providers:\n    openai:\n      type: openai\n      endpoint: http://localhost:8000/v1\n      models: {gpt-4o: {}}\n"
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 		t.Fatal(err)
 	}
-
 	cfg := Load(path)
 	if cfg == nil {
-		t.Fatal("Load returned nil for provider with omitted optional defaults")
+		t.Fatal("Load failed")
 	}
-	provider := cfg.LLM.Providers["openai"]
-	if provider.ContextWindow != 256000 {
-		t.Errorf("context_window = %d, want 256000", provider.ContextWindow)
-	}
-	if provider.Thinking.RequestMode != runtimeconfig.ThinkingRequestAuto {
-		t.Errorf("thinking.request_mode = %q, want auto", provider.Thinking.RequestMode)
-	}
-	if provider.Thinking.Effort != runtimeconfig.ThinkingEffortMedium {
-		t.Errorf("thinking.effort = %q, want medium", provider.Thinking.Effort)
+	model := cfg.LLM.Providers["openai"].Models["gpt-4o"]
+	if model.ContextWindow != 256000 || model.Thinking.RequestMode != runtimeconfig.ThinkingRequestAuto || model.Thinking.Effort != runtimeconfig.ThinkingEffortMedium {
+		t.Fatalf("model defaults = %#v", model)
 	}
 }
 
 func TestSetField_ProviderPaths(t *testing.T) {
 	cfg := Default()
-	if err := cfg.SetField("llm.default_provider", "openai"); err != nil {
-		t.Fatalf("SetField default_provider: %v", err)
+	provider := cfg.LLM.Providers["openai"]
+	provider.Models["gpt-4.1"] = runtimeconfig.ModelConfig{}
+	cfg.LLM.Providers["openai"] = provider
+	for _, setting := range [][2]string{{"llm.current.provider", "openai"}, {"llm.current.model", "gpt-4.1"}, {"llm.providers.openai.models.gpt-4.1.context_window", "64k"}} {
+		if err := cfg.SetField(setting[0], setting[1]); err != nil {
+			t.Fatalf("SetField %s: %v", setting[0], err)
+		}
 	}
-	if err := cfg.SetField("llm.providers.openai.model", "gpt-test"); err != nil {
-		t.Fatalf("SetField provider model: %v", err)
-	}
-	if got := cfg.LLM.Providers["openai"].Model; got != "gpt-test" {
-		t.Errorf("provider model = %q", got)
-	}
-	if err := cfg.SetField("llm.providers.openai.context_window", "64k"); err != nil {
-		t.Fatalf("SetField context window: %v", err)
-	}
-	if got := cfg.LLM.Providers["openai"].ContextWindow; got != 65536 {
-		t.Errorf("context window = %d", got)
+	if cfg.LLM.Current.Model != "gpt-4.1" || cfg.LLM.Providers["openai"].Models["gpt-4.1"].ContextWindow != 65536 {
+		t.Fatalf("config = %#v", cfg.LLM)
 	}
 }
 
@@ -186,7 +146,7 @@ log:
 func TestLoad_MissingLogKeepsDefault(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
-	os.WriteFile(path, []byte("llm:\n  model: gpt-4o\n"), 0644)
+	os.WriteFile(path, []byte("llm:\n  current: {provider: openai, model: gpt-4o}\n"), 0644)
 
 	cfg := Load(path)
 	if cfg.Log.Level != "info" {
@@ -235,11 +195,11 @@ func TestSetField_Thinking(t *testing.T) {
 		check      func(*Config) bool
 	}{
 		{"llm.thinking.show", "false", func(c *Config) bool { return !c.LLM.Thinking.Show }},
-		{"llm.providers.openai.thinking.request_mode", "enable_thinking", func(c *Config) bool {
-			return c.LLM.Providers["openai"].Thinking.RequestMode == runtimeconfig.ThinkingRequestEnable
+		{"llm.providers.openai.models.gpt-4o.thinking.request_mode", "enable_thinking", func(c *Config) bool {
+			return c.LLM.Providers["openai"].Models["gpt-4o"].Thinking.RequestMode == runtimeconfig.ThinkingRequestEnable
 		}},
-		{"llm.providers.openai.thinking.effort", "high", func(c *Config) bool {
-			return c.LLM.Providers["openai"].Thinking.Effort == runtimeconfig.ThinkingEffortHigh
+		{"llm.providers.openai.models.gpt-4o.thinking.effort", "high", func(c *Config) bool {
+			return c.LLM.Providers["openai"].Models["gpt-4o"].Thinking.Effort == runtimeconfig.ThinkingEffortHigh
 		}},
 	}
 	for _, tt := range tests {
@@ -253,30 +213,26 @@ func TestSetField_Thinking(t *testing.T) {
 }
 
 func TestThinkingYAMLRoundtripAndMissingDefaults(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
+	path := filepath.Join(t.TempDir(), "config.yaml")
 	cfg := Default()
 	cfg.LLM.Thinking.Show = false
 	provider := cfg.LLM.Providers["openai"]
-	provider.Thinking.RequestMode = runtimeconfig.ThinkingRequestEffort
-	provider.Thinking.Effort = runtimeconfig.ThinkingEffortHigh
+	model := provider.Models["gpt-4o"]
+	model.ContextWindow = 12345
+	model.Thinking.RequestMode = runtimeconfig.ThinkingRequestEffort
+	model.Thinking.Effort = runtimeconfig.ThinkingEffortHigh
+	provider.Models["gpt-4o"] = model
 	cfg.LLM.Providers["openai"] = provider
 	if err := Save(cfg, path); err != nil {
-		t.Fatalf("Save: %v", err)
+		t.Fatal(err)
 	}
 	loaded := Load(path)
-	if loaded.LLM.Thinking != cfg.LLM.Thinking || loaded.LLM.Providers["openai"].Thinking != provider.Thinking {
-		t.Errorf("loaded thinking = %#v/%#v, want %#v/%#v", loaded.LLM.Thinking, loaded.LLM.Providers["openai"].Thinking, cfg.LLM.Thinking, provider.Thinking)
+	if loaded == nil {
+		t.Fatal("Load failed")
 	}
-
-	legacyPath := filepath.Join(dir, "legacy.yaml")
-	if err := os.WriteFile(legacyPath, []byte("llm:\n  model: legacy\n"), 0o600); err != nil {
-		t.Fatalf("write legacy config: %v", err)
-	}
-	legacy := Load(legacyPath)
-	want := runtimeconfig.DefaultLLM()
-	if legacy.LLM.Thinking != want.Thinking || legacy.LLM.Providers["openai"].Thinking != want.Providers["openai"].Thinking {
-		t.Errorf("legacy thinking = %#v/%#v, want defaults %#v/%#v", legacy.LLM.Thinking, legacy.LLM.Providers["openai"].Thinking, want.Thinking, want.Providers["openai"].Thinking)
+	_, got, err := loaded.LLM.ResolveCurrent()
+	if err != nil || got != model || loaded.LLM.Thinking != cfg.LLM.Thinking {
+		t.Fatalf("roundtrip model = %#v, %v", got, err)
 	}
 }
 
@@ -285,8 +241,8 @@ func TestSetField_ThinkingRejectsBadValuesWithoutMutation(t *testing.T) {
 		key, value string
 	}{
 		{"llm.thinking.show", "sometimes"},
-		{"llm.providers.openai.thinking.request_mode", "guess"},
-		{"llm.providers.openai.thinking.effort", "extreme"},
+		{"llm.providers.openai.models.gpt-4o.thinking.request_mode", "guess"},
+		{"llm.providers.openai.models.gpt-4o.thinking.effort", "extreme"},
 	} {
 		cfg := Default()
 		before := cfg.LLM.Thinking
@@ -461,7 +417,7 @@ memory:
 func TestLoad_MissingMemoryKeepsDefault(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
-	os.WriteFile(path, []byte("llm:\n  model: gpt-4o\n"), 0644)
+	os.WriteFile(path, []byte("llm:\n  current: {provider: openai, model: gpt-4o}\n"), 0644)
 
 	cfg := Load(path)
 	if !cfg.Memory.Enabled {

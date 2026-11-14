@@ -4,78 +4,203 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestDefaultLLMRegistry(t *testing.T) {
 	llm := DefaultLLM()
-	name, provider, err := llm.ResolveDefault()
+	provider, model, err := llm.ResolveCurrent()
 	if err != nil {
-		t.Fatalf("ResolveDefault: %v", err)
+		t.Fatal(err)
 	}
-	if name != "openai" {
-		t.Errorf("default provider = %q, want openai", name)
-	}
-	if provider.Type != ProviderTypeOpenAI || provider.Endpoint != "http://localhost:8000/v1" || provider.Model != "gpt-4o" || provider.ContextWindow != 256000 {
-		t.Errorf("default provider = %#v", provider)
-	}
-	if !llm.Thinking.Show {
-		t.Error("thinking should be shown by default")
-	}
-	if provider.Thinking.RequestMode != ThinkingRequestAuto || provider.Thinking.Effort != ThinkingEffortMedium {
-		t.Errorf("provider thinking = %#v", provider.Thinking)
+	if llm.Current != (CurrentConfig{Provider: "openai", Model: "gpt-4o"}) || provider.Type != ProviderTypeOpenAI || provider.Endpoint != "http://localhost:8000/v1" || model.ContextWindow != 256000 || model.Thinking.RequestMode != ThinkingRequestAuto || model.Thinking.Effort != ThinkingEffortMedium || !llm.Thinking.Show {
+		t.Fatalf("unexpected defaults: %#v %#v", provider, model)
 	}
 }
 
 func TestLLMConfigDefaultsOmittedOpenAIFields(t *testing.T) {
 	llm := DefaultLLM()
-	llm.Providers["openai"] = ProviderConfig{
-		Type:     ProviderTypeOpenAI,
-		Endpoint: "http://localhost:8000/v1",
-		Model:    "gpt-4o",
-	}
-
+	p := llm.Providers["openai"]
+	p.Models["gpt-4o"] = ModelConfig{}
+	llm.Providers["openai"] = p
 	if err := llm.Validate(); err != nil {
-		t.Fatalf("Validate: %v", err)
+		t.Fatal(err)
 	}
-	_, provider, err := llm.ResolveDefault()
-	if err != nil {
-		t.Fatalf("ResolveDefault: %v", err)
-	}
-	if provider.ContextWindow != 256000 || provider.Thinking.RequestMode != ThinkingRequestAuto || provider.Thinking.Effort != ThinkingEffortMedium {
-		t.Errorf("resolved provider defaults = %#v", provider)
+	_, model, err := llm.ResolveCurrent()
+	if err != nil || model.ContextWindow != 256000 || model.Thinking.RequestMode != ThinkingRequestAuto || model.Thinking.Effort != ThinkingEffortMedium {
+		t.Fatalf("resolved defaults = %#v, %v", model, err)
 	}
 }
 
 func TestLLMConfigResolveValidateAndClone(t *testing.T) {
 	llm := DefaultLLM()
 	if err := llm.Validate(); err != nil {
-		t.Fatalf("Validate: %v", err)
+		t.Fatal(err)
 	}
-
-	for name, cfg := range map[string]LLMConfig{
-		"missing default": {DefaultProvider: "missing", Providers: llm.Providers, CompressAt: llm.CompressAt, CompactKeep: llm.CompactKeep, MaxIterations: llm.MaxIterations, Thinking: llm.Thinking},
-		"unknown type":    {DefaultProvider: "bad", Providers: map[string]ProviderConfig{"bad": {Type: "wat", Endpoint: "http://localhost", Model: "x", ContextWindow: 1}}, CompressAt: 0.8, CompactKeep: 1, MaxIterations: 1},
-		"invalid name":    {DefaultProvider: "bad.name", Providers: map[string]ProviderConfig{"bad.name": llm.Providers["openai"]}, CompressAt: 0.8, CompactKeep: 1, MaxIterations: 1},
-		"anthropic auth":  {DefaultProvider: "anthropic", Providers: map[string]ProviderConfig{"anthropic": {Type: ProviderTypeAnthropic, Endpoint: "http://localhost", Model: "claude", APIKey: "key", ContextWindow: 1, MaxTokens: 1}}, CompressAt: 0.8, CompactKeep: 1, MaxIterations: 1},
+	for name, mutate := range map[string]func(*LLMConfig){
+		"missing provider": func(c *LLMConfig) { c.Current.Provider = "missing" },
+		"missing model":    func(c *LLMConfig) { c.Current.Model = "missing" },
+		"unknown type":     func(c *LLMConfig) { p := c.Providers["openai"]; p.Type = "wat"; c.Providers["openai"] = p },
+		"invalid name":     func(c *LLMConfig) { c.Providers["bad.name"] = c.Providers["openai"] },
+		"anthropic auth": func(c *LLMConfig) {
+			p := c.Providers["openai"]
+			p.Type = ProviderTypeAnthropic
+			p.APIKey = "key"
+			c.Providers["openai"] = p
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
+			cfg := llm.Clone()
+			mutate(&cfg)
 			if err := cfg.Validate(); err == nil {
-				t.Fatal("Validate should reject invalid registry")
+				t.Fatal("expected validation error")
 			}
 		})
 	}
-
 	clone := llm.Clone()
-	clone.Providers["openai"] = ProviderConfig{Model: "changed"}
+	clone.Providers["openai"] = ProviderConfig{}
 	if reflect.DeepEqual(clone.Providers, llm.Providers) {
-		t.Fatal("Clone shares provider map with original")
+		t.Fatal("Clone shares provider map")
 	}
 }
 
-func TestLLMConfigResolveDefaultErrorsAreActionable(t *testing.T) {
-	_, _, err := (LLMConfig{}).ResolveDefault()
-	if err == nil || !strings.Contains(err.Error(), "default provider") {
-		t.Fatalf("ResolveDefault error = %v", err)
+func TestLLMConfigResolveCurrentErrorsAreActionable(t *testing.T) {
+	_, _, err := (LLMConfig{}).ResolveCurrent()
+	if err == nil || !strings.Contains(err.Error(), "provider") {
+		t.Fatalf("ResolveCurrent error = %v", err)
+	}
+}
+
+func TestLLMConfigUnmarshalNewModelDomain(t *testing.T) {
+	data := []byte(`
+current:
+  provider: openai
+  model: gpt-4.1
+providers:
+  openai:
+    type: openai
+    endpoint: https://api.example.com/v1
+    api_key: secret
+    models:
+      gpt-4.1:
+        context_window: 1048576
+        thinking:
+          request_mode: reasoning_effort
+          effort: high
+      o3:
+        context_window: 200000
+        thinking:
+          request_mode: enable_thinking
+          effort: medium
+  anthropic:
+    type: anthropic
+    endpoint: https://api.anthropic.com
+    api_key: secret
+    auth_type: x-api-key
+    models:
+      claude-sonnet:
+        context_window: 200000
+        max_tokens: 8192
+`)
+
+	llm := DefaultLLM()
+	if err := yaml.Unmarshal(data, &llm); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got, want := llm.Current, (CurrentConfig{Provider: "openai", Model: "gpt-4.1"}); got != want {
+		t.Fatalf("current = %#v, want %#v", got, want)
+	}
+	openai := llm.Providers["openai"]
+	if openai.Endpoint != "https://api.example.com/v1" || openai.APIKey != "secret" {
+		t.Fatalf("openai connection config = %#v", openai)
+	}
+	if got := openai.Models["gpt-4.1"]; got.ContextWindow != 1048576 || got.Thinking.Effort != ThinkingEffortHigh {
+		t.Fatalf("selected model config = %#v", got)
+	}
+	if got := llm.Providers["anthropic"].Models["claude-sonnet"]; got.ContextWindow != 200000 || got.MaxTokens != 8192 {
+		t.Fatalf("anthropic model config = %#v", got)
+	}
+	if err := llm.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	_, selected, err := llm.ResolveCurrent()
+	if err != nil || selected.ContextWindow != 1048576 {
+		t.Fatalf("resolved model = %#v, %v", selected, err)
+	}
+}
+
+func TestRejectLegacyLLMFields(t *testing.T) {
+	for _, field := range []string{"endpoint: https://example.com", "model: old", "api_key: secret", "context_window: 1000", "default_provider: openai"} {
+		t.Run(field, func(t *testing.T) {
+			cfg := DefaultLLM()
+			if err := yaml.Unmarshal([]byte(field), &cfg); err == nil {
+				t.Fatalf("legacy field %q must be rejected", field)
+			}
+		})
+	}
+	for _, field := range []string{"model: old", "context_window: 1000", "thinking: {effort: high}", "max_tokens: 100"} {
+		t.Run("provider/"+field, func(t *testing.T) {
+			cfg := DefaultLLM()
+			data := "providers:\n  openai:\n    " + field + "\n"
+			if err := yaml.Unmarshal([]byte(data), &cfg); err == nil {
+				t.Fatalf("legacy provider field %q must be rejected", field)
+			}
+		})
+	}
+}
+
+func TestCanonicalModelChangesSurviveResolution(t *testing.T) {
+	llm := DefaultLLM()
+	provider := llm.Providers[llm.Current.Provider]
+	model := provider.Models[llm.Current.Model]
+	model.ContextWindow = 12345
+	model.Thinking.Effort = ThinkingEffortHigh
+	provider.Models[llm.Current.Model] = model
+	llm.Providers[llm.Current.Provider] = provider
+	_, resolved, err := llm.ResolveCurrent()
+	if err != nil || resolved.ContextWindow != 12345 || resolved.Thinking.Effort != ThinkingEffortHigh {
+		t.Fatalf("resolved model = %#v, %v", resolved, err)
+	}
+}
+
+func TestLLMConfigUnmarshalRejectsMixedModelFormats(t *testing.T) {
+	for _, data := range []string{
+		"current: {provider: openai, model: new-model}\nproviders:\n  openai:\n    type: openai\n    endpoint: https://example.com\n    model: old-model",
+		"current: {provider: openai, model: new-model}\nproviders:\n  openai:\n    type: openai\n    endpoint: https://example.com\n    models: {new-model: {context_window: 1000}}\ndefault_provider: openai",
+		"default_provider: openai\nproviders:\n  openai:\n    type: openai\n    endpoint: https://example.com\n    models: {new-model: {context_window: 1000}}",
+	} {
+		var llm LLMConfig
+		if err := yaml.Unmarshal([]byte(data), &llm); err == nil {
+			t.Errorf("Unmarshal mixed formats should fail for:\n%s", data)
+		}
+	}
+}
+
+func TestLLMConfigCloneDeepCopiesModelRegistry(t *testing.T) {
+	llm := LLMConfig{
+		Current: CurrentConfig{Provider: "openai", Model: "gpt-4.1"},
+		Providers: map[string]ProviderConfig{
+			"openai": {Models: map[string]ModelConfig{"gpt-4.1": {ContextWindow: 1000}}},
+		},
+	}
+	clone := llm.Clone()
+	provider := clone.Providers["openai"]
+	provider.Models["gpt-4.1"] = ModelConfig{ContextWindow: 2000}
+	clone.Providers["openai"] = provider
+	if llm.Providers["openai"].Models["gpt-4.1"].ContextWindow != 1000 {
+		t.Fatal("Clone shares nested model map with original")
+	}
+}
+
+func TestLLMConfigResolveCurrentReturnsModelAttributes(t *testing.T) {
+	llm := DefaultLLM()
+	provider, model, err := llm.ResolveCurrent()
+	if err != nil {
+		t.Fatalf("ResolveCurrent: %v", err)
+	}
+	if provider.Endpoint != "http://localhost:8000/v1" || model.ContextWindow != defaultContextWindow {
+		t.Fatalf("resolved provider/model = %#v / %#v", provider, model)
 	}
 }
 

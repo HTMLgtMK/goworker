@@ -366,9 +366,11 @@ func TestCommitFailureNotCompleted(t *testing.T) {
 		// 小窗口 + 低阈值 + 小 keepLast：首轮模型调用前压缩中间件必然触发，
 		// 使 Run 的提交块走 DetectCompact → Store.Compact 失败注入点。
 		cfg := runtimeconfig.Default()
-		prov := cfg.LLM.Providers[cfg.LLM.DefaultProvider]
-		prov.ContextWindow = 100
-		cfg.LLM.Providers[cfg.LLM.DefaultProvider] = prov
+		prov := cfg.LLM.Providers[cfg.LLM.Current.Provider]
+		modelCfg := prov.Models[cfg.LLM.Current.Model]
+		modelCfg.ContextWindow = 100
+		prov.Models[cfg.LLM.Current.Model] = modelCfg
+		cfg.LLM.Providers[cfg.LLM.Current.Provider] = prov
 		cfg.LLM.CompressAt = 0.1
 		cfg.LLM.CompactKeep = 2
 

@@ -28,6 +28,9 @@ func (s *Session) checkpoint(ctx context.Context, conv []core.Message, cfg *runt
 	if s.deps.Memory == nil || len(conv) == 0 {
 		return nil, nil
 	}
+	if cfg == nil {
+		return nil, fmt.Errorf("agent: runtime configuration is unavailable")
+	}
 	// 记忆档案的 CWD 优先取会话工作目录（任务发生在 client 声明的目录里）；
 	// 未声明时回退进程 cwd（与旧行为一致）。
 	cwd := s.cwd()
@@ -63,7 +66,8 @@ func (s *Session) CheckpointSync(ctx context.Context, conv []core.Message, cb Ru
 	publishStage(cb, "固化旧会话记忆")
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
-	sum, err := s.checkpoint(ctx, conv, s.deps.Config)
+	// 配置在调用边界取一次快照，固化期间不受全局更新影响。
+	sum, err := s.checkpoint(ctx, conv, s.configSnapshot())
 	if err != nil {
 		if cb.Write != nil {
 			cb.Write(fmt.Sprintf("⚠ Consolidation failed (history kept only in STM, lost on exit): %v\n", err))
@@ -84,14 +88,21 @@ func (s *Session) CheckpointSync(ctx context.Context, conv []core.Message, cb Ru
 
 // Consolidate 增量固化：有 store 时只喂游标之后未固化的消息，无 store 回退全量。
 func (s *Session) Consolidate(ctx context.Context) (*memory.AppliedSummary, error) {
+	return s.consolidate(ctx, s.configSnapshot())
+}
+
+func (s *Session) consolidate(ctx context.Context, cfg *runtimeconfig.Config) (*memory.AppliedSummary, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("agent: runtime configuration is unavailable")
+	}
 	if s.deps.Store == nil {
-		return s.checkpoint(ctx, s.Conversation(), s.deps.Config) // 回退全量
+		return s.checkpoint(ctx, s.Conversation(), cfg) // 回退全量
 	}
 	pending := s.deps.Store.PendingAfterCursor()
 	if len(pending) == 0 || len(toMemoryMessages(pending)) == 0 {
 		return nil, nil
 	}
-	sum, err := s.checkpoint(ctx, pending, s.deps.Config)
+	sum, err := s.checkpoint(ctx, pending, cfg)
 	if err != nil {
 		return nil, err
 	}

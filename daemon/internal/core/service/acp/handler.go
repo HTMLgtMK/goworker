@@ -54,10 +54,11 @@ type FrontendHandler struct {
 	// 降级同型。
 	runs model.RunControlSource
 	// events 是 x-goworker 订阅泵的下行通知面:registerXGWMethods 注入本
-	// 连接的 *aiacp.Server(内嵌 *Peer,Notify 导出;注册先于 server.Start,无
-	// 并发面,happens-before 经 Start 的 goroutine 创建成立)。nil = 未注册
-	// (不经 wire 的直调形态):attach 诚实报错,泵无从建立。
+	// 连接的 *aiacp.Server。nil = 无 RunControlSource，订阅方法不会注册。
 	events xgwEventSink
+	// xgwRegistry is the per-connection source of truth for registered extension
+	// methods and notifications; capability discovery snapshots the same registry.
+	xgwRegistry *xgwRegistry
 
 	// subs 保存本连接每个会话的当前订阅。替换、detach 和 Close 都在 h.mu 下
 	// 更新表；泵退出按句柄身份清理，避免旧泵删除新订阅。

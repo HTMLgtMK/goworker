@@ -18,14 +18,9 @@ func TestSaveConfig_RollsBackOnWriteFailure(t *testing.T) {
 	candidate := *runtimeCfg
 	candidate.LLM = runtimeCfg.LLM.Clone()
 	candidate.LLM.Providers["openai"] = runtimeconfig.ProviderConfig{
-		Type:          runtimeconfig.ProviderTypeOpenAI,
-		Endpoint:      "http://localhost:8000/v1",
-		Model:         "changed",
-		ContextWindow: 128000,
-		Thinking: runtimeconfig.ProviderThinkingConfig{
-			RequestMode: runtimeconfig.ThinkingRequestAuto,
-			Effort:      runtimeconfig.ThinkingEffortMedium,
-		},
+		Type:     runtimeconfig.ProviderTypeOpenAI,
+		Endpoint: "http://localhost:8000/v1",
+		Models:   map[string]runtimeconfig.ModelConfig{"changed": {ContextWindow: 128000}},
 	}
 
 	beforeRuntime := *runtimeCfg

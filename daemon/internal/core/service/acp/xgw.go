@@ -12,6 +12,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
+	xgwprotocol "github.com/tinguo/goworker/daemon/xgoworker/protocol"
 )
 
 // xgw.go implements FrontendHandler's x-goworker methods and connection cleanup.
@@ -57,24 +58,109 @@ func (s *xgwSubscription) stop() {
 	})
 }
 
+// xgwRegistry is built before Server.Start. Registered RPC methods and outgoing
+// notifications are the single source used by x-goworker/capabilities.
+type xgwRegistry struct {
+	mu            sync.RWMutex
+	methods       []string
+	notifications []string
+	seenMethods   map[string]struct{}
+	seenNotifs    map[string]struct{}
+}
+
+func newXGWRegistry() *xgwRegistry {
+	return &xgwRegistry{
+		methods:       make([]string, 0),
+		notifications: make([]string, 0),
+		seenMethods:   make(map[string]struct{}),
+		seenNotifs:    make(map[string]struct{}),
+	}
+}
+
+func (h *FrontendHandler) registerXGWMethod(
+	server *aiacp.Server,
+	method string,
+	handler func(context.Context, json.RawMessage) (any, error),
+) {
+	if server == nil || h.xgwRegistry == nil || method == "" || handler == nil {
+		panic("acp: invalid x-goworker method registration")
+	}
+	registry := h.xgwRegistry
+	registry.mu.Lock()
+	if _, duplicate := registry.seenMethods[method]; duplicate {
+		registry.mu.Unlock()
+		panic("acp: duplicate x-goworker method registration: " + method)
+	}
+	registry.seenMethods[method] = struct{}{}
+	registry.methods = append(registry.methods, method)
+	registry.mu.Unlock()
+	server.Handle(method, handler)
+}
+
+func (h *FrontendHandler) registerXGWNotification(notification string) {
+	if h.xgwRegistry == nil || notification == "" {
+		panic("acp: invalid x-goworker notification registration")
+	}
+	registry := h.xgwRegistry
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if _, duplicate := registry.seenNotifs[notification]; duplicate {
+		panic("acp: duplicate x-goworker notification registration: " + notification)
+	}
+	registry.seenNotifs[notification] = struct{}{}
+	registry.notifications = append(registry.notifications, notification)
+}
+
+func (h *FrontendHandler) xgwCapabilities(context.Context, json.RawMessage) (any, error) {
+	registry := h.xgwRegistry
+	if registry == nil {
+		return xgwprotocol.CapabilitiesResult{
+			Methods:       []string{},
+			Notifications: []string{},
+		}, nil
+	}
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	return xgwprotocol.CapabilitiesResult{
+		Methods:       append([]string{}, registry.methods...),
+		Notifications: append([]string{}, registry.notifications...),
+	}, nil
+}
+
 // registerXGWMethods installs daemon extensions before server.Start, only on
-// FrontendHandler instances; other handlers retain method-not-found fallback. It also injects
-// the server as the event notification sink without coupling the pump to ai-acp types.
+// FrontendHandler instances; other handlers retain method-not-found fallback. Each
+// method is registered only when its backend interface exists.
 func registerXGWMethods(server *aiacp.Server, handler aiacp.SessionHandler) {
 	fh, ok := handler.(*FrontendHandler)
 	if !ok {
 		return
 	}
-	fh.events = server
-	server.Handle(XMethodRunStart, fh.xgwRunStart)
-	server.Handle(XMethodRunGet, fh.xgwRunGet)
-	server.Handle(XMethodRunCancel, fh.xgwRunCancel)
-	server.Handle(XMethodApprovalRespond, fh.xgwApprovalRespond)
-	server.Handle(XMethodSessionAttach, fh.xgwSessionAttach)
-	server.Handle(XMethodSessionDetach, fh.xgwSessionDetach)
-	server.Handle(XMethodSessionArchive, fh.xgwSessionArchive)
-	server.Handle(XMethodSessionModes, fh.xgwSessionModes)
+	fh.xgwRegistry = newXGWRegistry()
+	fh.registerXGWMethod(server, XMethodCapabilities, fh.xgwCapabilities)
+
+	if fh.runs != nil {
+		fh.events = server
+		fh.registerXGWMethod(server, XMethodRunStart, fh.xgwRunStart)
+		fh.registerXGWMethod(server, XMethodRunGet, fh.xgwRunGet)
+		fh.registerXGWMethod(server, XMethodRunCancel, fh.xgwRunCancel)
+		fh.registerXGWMethod(server, XMethodApprovalRespond, fh.xgwApprovalRespond)
+		fh.registerXGWMethod(server, XMethodSessionAttach, fh.xgwSessionAttach)
+		fh.registerXGWMethod(server, XMethodSessionDetach, fh.xgwSessionDetach)
+		fh.registerXGWNotification(serverNotificationSessionEvents)
+	}
+	if fh.multi != nil {
+		fh.registerXGWMethod(server, XMethodSessionArchive, fh.xgwSessionArchive)
+	}
+	if fh.sessions != nil {
+		fh.registerXGWMethod(server, XMethodSessionModes, fh.xgwSessionModes)
+	}
+	registerXGWProviderMethods(server, fh)
 }
+
+const serverNotificationSessionEvents = XMethodSessionEvents
+
+// xgw.go implements FrontendHandler's x-goworker methods and connection cleanup.
+// Public wire names and types live in daemon/xgoworker/protocol.
 
 // xgwRunStart validates the request ID and delegates lease fencing, submission, and
 // idempotency to RunControlSource. StartRun is intentionally detached from the request context:

@@ -1,10 +1,34 @@
 llm:
-    # LLM API 端点
-    endpoint: http://localhost:8000/v1
-    # 模型名称
-    model: gpt-4o
-    # API Key（留空表示不需要认证）
-    api_key: ""
+    # 当前选择：provider + model 必须指向 providers 中已注册的条目
+    current:
+        provider: openai
+        model: gpt-4o
+
+    # Provider 注册表：连接/认证配置 + 各自的模型目录。
+    # 模型属性（context_window / thinking / max_tokens）按模型挂在 models 下。
+    providers:
+        openai:
+            type: openai
+            endpoint: http://localhost:8000/v1
+            # API Key（留空表示不需要认证）
+            api_key: ""
+            models:
+                gpt-4o:
+                    # 展示名（可选；客户端可在缺省时显示模型 ID）
+                    display_name: GPT-4o
+                    context_window: 256000
+                    thinking:
+                        request_mode: auto   # auto | enable_thinking | reasoning_effort
+                        effort: medium        # low | medium | high
+
+    # 全局策略
+    # compress_at: 0.8        # 上下文压缩触发比例
+    # compact_keep: 10        # 压缩保留的最近消息数
+    # max_iterations: 15      # 单轮工具调用迭代上限
+    # thinking:
+    #     show: true          # 是否展示思考过程
+
+    # 旧版单模型配置不再支持，请使用 current + models。
 
 sandbox:
     # 沙箱模式：off | normal | auto | strict | readonly

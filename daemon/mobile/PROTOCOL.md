@@ -97,6 +97,7 @@ run 生命周期）以持久化游标暴露给任意连接——断线重连不�
 
 | 方法 | 方向 | 入参 | 响应 | control lease |
 |---|---|---|---|---|
+| `x-goworker/capabilities` | 请求 | `{}` | `{methods: [...], notifications: [...]}` | 不需要（只读发现面） |
 | `x-goworker/run/start` | 请求 | `{sessionId, input, requestId}` | `{runId, state}` | **必须持有** |
 | `x-goworker/run/get` | 请求 | `{sessionId, runId}` | `{state, result?, latestSeq, replayIntegrity}` | 不需要（只读观察面） |
 | `x-goworker/run/cancel` | 请求 | `{sessionId, runId}` | `{accepted}` | **必须持有** |
@@ -104,6 +105,13 @@ run 生命周期）以持久化游标暴露给任意连接——断线重连不�
 | `x-goworker/session/detach` | 请求 | `{sessionId, mode?}` | `{detached}` | `mode:"control"` 归还（仅持有者本人有效） |
 | `x-goworker/session/archive` | 请求 | `{sessionId}` | `{archived}` | **必须持有**（声明的 `sessionId` 的 lease） |
 | `x-goworker/approval/respond` | 请求 | `{sessionId, requestId, decision}` | `{accepted}` | **必须持有**（声明的 `sessionId` 的 lease） |
+| `x-goworker/session/modes` | 请求 | `{}` | `{currentModeId, availableModes}` | 不需要（只读展示面） |
+| `x-goworker/providers` | 请求 | `{}` | `{revision, current, providers}` | 不需要（全局配置只读面） |
+| `x-goworker/provider/detail` | 请求 | `{name}` | `{revision, current, provider}` | 不需要 |
+| `x-goworker/provider/current/get` | 请求 | `{}` | `{revision, current}` | 不需要（读当前选择） |
+| `x-goworker/provider/current/set` | 请求 | `{revision, provider, model}` | `{revision, current}` | 不需要（切换选择；revision 乐观并发，见下） |
+| `x-goworker/provider/upsert` | 请求 | `{revision, name, type, endpoint, authType?, secretAction, apiKey?, models, current?}` | `{revision, current, provider}` | 不需要（revision 乐观并发，见下） |
+| `x-goworker/provider/remove` | 请求 | `{revision, name}` | `{revision}` | 不需要（同上） |
 | `x-goworker/session/events` | **服务端通知** | `SessionEvent`（原样 JSON，蛇形键；逐事件投递） | — | attach 建立订阅后下行；observe/control 均可收 |
 
 - **`state` 取值**：`queued` / `running` / `waiting_input`（HITL 等审批）/
@@ -245,13 +253,42 @@ per-seq 事件后逐条下行，与实时流形状完全一致。
 ← {"jsonrpc":"2.0","id":3,"result":{"accepted":true}}
 ```
 
-### 能力通告与降级
+- **`x-goworker/session/modes`（Plan B 任务3）**：数据源 cfg.LLM providers
+  （`currentModeId` = current provider），纯展示面，无门禁。
+- **Provider 管理面（revision 乐观并发）**：`providers`/`provider/detail` 返回
+  全局 Provider 注册表与 `current {provider, model}`；模型属性
+  （`name`（可选展示名；客户端可在缺省时显示模型 ID）/`contextWindow`/`thinking`/`maxTokens`）
+挂在每个 model 条目下，models 的 JSON key 是模型 ID（身份）。
+  **模型切换走 `provider/current/set`**（高频操作，不扛整个 upsert）：带读取时的
+  `revision` 切换到已注册的 `{provider, model}`，同一事务内校验模型归属。
+  写操作（current/set、upsert、remove）必须携带读取时的 `revision`，
+  版本不匹配返回 -32000（文案含 revision/conflict），不执行变更。约束：不允许
+  删除 current provider、不允许空 `models`、`current.model` 必须属于对应
+  provider——切换与删除在同一笔提交中原子完成。`secretAction` 三态：
+  `keep`（保留现有 key，不可携带 apiKey）/ `replace`（必携新 key）/ `clear`
+  （清除）；**明文 key 永不出现在任何响应中**（仅 `hasApiKey` 状态位）。API
+  key 写入即时持久化，运行中 Run 使用启动时的配置快照不受影响，下一轮 Run 生效。
 
-daemon **不经 agentCapabilities 通告 x-goworker 能力**（V1 决策，与 x-device
-的方法面同策略）：客户端按 JSON-RPC 标准行为降级——收到
-`-32601 method not found` 即视为对端无此扩展（老 daemon / stdio worker 形态）。
-实现 x-goworker 的客户端：先试 attach，吃 -32601 就回退纯标准面（prompt 阻塞
-语义 + session/update 流），不要假设方法一定存在。
+### 能力通告与降级（两阶段发现）
+
+**initialize 通告 + ready 后动态发现**，与 x-device 的"声明后探测"同型：
+
+1. **握手通告**：daemon 在 initialize 响应的 `agentCapabilities` 中声明
+   `x-goworker: {version: 1}`（发现协议版本）。未声明即视为对端无此扩展
+   （老 daemon / stdio worker 形态），客户端不要假设方法存在。
+2. **动态发现**：initialize 响应收到后调用 `x-goworker/capabilities`，daemon
+   返回**本连接实际可用**的方法与通知清单——清单来自连接级注册表，与真实
+   注册同源：后端接口缺失的方法不注册、不列出（如无 RunControlSource 时无
+   run/* 方法，无 ProviderControl 时无 provider 方法）。客户端按发现结果启用
+   功能，发现清单不构成授权——lease/revision 校验仍在每次操作时执行。
+3. **降级路径**：initialize 未声明 x-goworker 时，旧客户端可保留试探性 attach
+   （吃 `-32601` 即回退纯标准面：prompt 阻塞语义 + session/update 流）；
+   新实现以握手通告为准，不做方法级试探。
+
+`version: 1` 定义发现协议本身的兼容性；方法清单向后兼容地增删，未知方法由
+客户端忽略，不因增方法升版本。已知方法目录的唯一事实源是
+`daemon/xgoworker/protocol`（gomobile 侧 `mobile.XGWorkerMethod*` 导出同一
+目录），**本地目录 ≠ 当前端支持**——运行时可用性以发现响应为准。
 
 ## 能力协商（initialize）
 
@@ -264,7 +301,7 @@ daemon **不经 agentCapabilities 通告 x-goworker 能力**（V1 决策，与 x
    }}
 ← {"jsonrpc":"2.0","id":1,"result":{
      "protocolVersion":1,
-     "agentCapabilities":{"loadSession":true}
+     "agentCapabilities":{"loadSession":true,"x-goworker":{"version":1}}
    }}
 ```
 

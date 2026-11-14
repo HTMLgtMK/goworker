@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -27,24 +28,52 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
-// testHub 构造一个最小可用的 model.Hub，只暴露测试需要的字段。
+// testHub 构造一个最小可用的 model.Hub。UpdateConfig 模拟 engine 的事务语义：
+// mutate 作用于深拷贝候选，经 SaveConfig 提交（失败不落、原配置不变）——测试
+// 通过覆写 SaveConfig 制造持久化失败。saved 记录每次成功提交的候选。
 func testHub(cfg *runtimeconfig.Config) (*model.Hub, *[]*runtimeconfig.Config) {
 	var saved []*runtimeconfig.Config
-	hub := &model.Hub{
-		Config: cfg,
-		SaveConfig: func(c any) error {
-			rc, ok := c.(*runtimeconfig.Config)
-			if !ok {
-				return errors.New("unexpected config type")
-			}
-			next := *rc
-			next.LLM = rc.LLM.Clone()
-			*cfg = next
-			saved = append(saved, rc)
-			return nil
-		},
-		Tools: func() []model.Tool { return nil }, // collectTools 依赖，缺了会 nil 函数 panic
+	clone := func() *runtimeconfig.Config {
+		next := *cfg
+		next.LLM = cfg.LLM.Clone()
+		next.Sandbox.DeniedPatterns = append([]string(nil), cfg.Sandbox.DeniedPatterns...)
+		next.Sandbox.RiskyPatterns = append([]sandbox.RiskPatternConfig(nil), cfg.Sandbox.RiskyPatterns...)
+		next.Sandbox.SafeCommands = append([]string(nil), cfg.Sandbox.SafeCommands...)
+		next.Sandbox.AllowRules = append([]sandbox.AllowRuleConfig(nil), cfg.Sandbox.AllowRules...)
+		next.Sandbox.ToolAllowRules = append([]sandbox.ToolAllowRuleConfig(nil), cfg.Sandbox.ToolAllowRules...)
+		return &next
 	}
+	hub := &model.Hub{}
+	hub.Config = cfg
+	hub.SaveConfig = func(c any) error {
+		rc, ok := c.(*runtimeconfig.Config)
+		if !ok {
+			return errors.New("unexpected config type")
+		}
+		*cfg = *rc
+		saved = append(saved, rc)
+		return nil
+	}
+	hub.ConfigSnapshot = clone
+	hub.ConfigSnapshotWithRevision = func() (*runtimeconfig.Config, string) { return clone(), "test-rev-1" }
+	hub.UpdateConfig = func(mutate func(*runtimeconfig.Config) error) (*runtimeconfig.Config, error) {
+		next := clone()
+		if err := mutate(next); err != nil {
+			return nil, err
+		}
+		if err := hub.SaveConfig(next); err != nil {
+			return nil, err
+		}
+		return next, nil
+	}
+	hub.UpdateConfigAtRevision = func(_ string, mutate func(*runtimeconfig.Config) error) (*runtimeconfig.Config, string, error) {
+		next, err := hub.UpdateConfig(mutate)
+		if err != nil {
+			return nil, "test-rev-1", err
+		}
+		return next, "test-rev-1", nil
+	}
+	hub.Tools = func() []model.Tool { return nil } // collectTools 依赖，缺了会 nil 函数 panic
 	return hub, &saved
 }
 
@@ -186,11 +215,11 @@ func newAgentPlugin(hub *model.Hub) *AgentPlugin {
 		Memory:       p.memory,
 		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
 		NewProvider: func(cfg *runtimeconfig.Config) (core.Provider, error) {
-			_, provider, err := cfg.LLM.ResolveDefault()
+			provider, _, err := cfg.LLM.ResolveCurrent()
 			if err != nil {
 				return nil, err
 			}
-			return runtimeopenai.NewProvider("mock", provider.Endpoint, provider.APIKey, provider.Model, &http.Client{}), nil
+			return runtimeopenai.NewProvider("mock", provider.Endpoint, provider.APIKey, cfg.LLM.Current.Model, &http.Client{}), nil
 		},
 		PersistAllowRule: p.persistAllowRule,
 	}
@@ -301,15 +330,16 @@ func TestHandleModel_SetProviderAndGlobalKeys(t *testing.T) {
 			t.Errorf("handleModel(%s) output = %q, want success", setting, buf.String())
 		}
 	}
-	provider := cfg.LLM.Providers[cfg.LLM.DefaultProvider]
+	provider := cfg.LLM.Providers[cfg.LLM.Current.Provider]
+	model := provider.Models[cfg.LLM.Current.Model]
 	if cfg.LLM.CompressAt != 0.9 || cfg.LLM.CompactKeep != 25 || cfg.LLM.Thinking.Show {
 		t.Errorf("global LLM config = %+v", cfg.LLM)
 	}
-	if provider.Thinking.RequestMode != runtimeconfig.ThinkingRequestEffort {
-		t.Errorf("RequestMode = %q, want reasoning_effort", provider.Thinking.RequestMode)
+	if model.Thinking.RequestMode != runtimeconfig.ThinkingRequestEffort {
+		t.Errorf("RequestMode = %q, want reasoning_effort", model.Thinking.RequestMode)
 	}
-	if provider.Thinking.Effort != runtimeconfig.ThinkingEffortHigh {
-		t.Errorf("Effort = %q, want high", provider.Thinking.Effort)
+	if model.Thinking.Effort != runtimeconfig.ThinkingEffortHigh {
+		t.Errorf("Effort = %q, want high", model.Thinking.Effort)
 	}
 	if len(*saved) != 5 {
 		t.Errorf("SaveConfig called %d times, want 5", len(*saved))
@@ -318,14 +348,16 @@ func TestHandleModel_SetProviderAndGlobalKeys(t *testing.T) {
 
 func TestHandleModel_ListUseAndFailedSaveRollback(t *testing.T) {
 	cfg := runtimeconfig.Default()
+	// 新 schema 种子：模型属性挂在 Models map，Current 记录全局选择。
 	cfg.LLM.Providers["cc-switch"] = runtimeconfig.ProviderConfig{
-		Type:          runtimeconfig.ProviderTypeAnthropic,
-		Endpoint:      "http://127.0.0.1:15721",
-		Model:         "claude-sonnet-4-6",
-		APIKey:        "PROXY_MANAGED",
-		AuthType:      runtimeconfig.AnthropicAuthBearer,
-		MaxTokens:     8192,
-		ContextWindow: 1048576,
+		Type:     runtimeconfig.ProviderTypeAnthropic,
+		Endpoint: "http://127.0.0.1:15721",
+		APIKey:   "PROXY_MANAGED",
+		AuthType: runtimeconfig.AnthropicAuthBearer,
+		Models: map[string]runtimeconfig.ModelConfig{
+			"claude-sonnet-4-6": {ContextWindow: 1048576, MaxTokens: 8192},
+			"claude-opus-4-8":   {ContextWindow: 1048576, MaxTokens: 8192},
+		},
 	}
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
@@ -342,17 +374,17 @@ func TestHandleModel_ListUseAndFailedSaveRollback(t *testing.T) {
 	if err := p.handleModel(ctx); err != nil {
 		t.Fatalf("handleModel(use): %v", err)
 	}
-	if cfg.LLM.DefaultProvider != "cc-switch" || !strings.Contains(out.String(), "已切换") {
-		t.Errorf("use output = %q, default = %q", out.String(), cfg.LLM.DefaultProvider)
+	if cfg.LLM.Current.Provider != "cc-switch" || !strings.Contains(out.String(), "已切换") {
+		t.Errorf("use output = %q, current = %+v", out.String(), cfg.LLM.Current)
 	}
 
-	originalModel := cfg.LLM.Providers["cc-switch"].Model
+	originalModel := cfg.LLM.Current.Model
 	p.hub.SaveConfig = func(any) error { return errors.New("disk full") }
-	ctx, out = newContext("set", "model=changed")
+	ctx, out = newContext("set", "model=claude-opus-4-8")
 	if err := p.handleModel(ctx); err != nil {
 		t.Fatalf("handleModel(set): %v", err)
 	}
-	if cfg.LLM.Providers["cc-switch"].Model != originalModel || !strings.Contains(out.String(), "保存失败") {
+	if cfg.LLM.Current.Model != originalModel || !strings.Contains(out.String(), "保存失败") {
 		t.Errorf("failed save mutated live config or missed error: %q", out.String())
 	}
 }
@@ -388,7 +420,7 @@ func TestHandleModel_ThinkingHelpStatusAndValidation(t *testing.T) {
 		"thinking_effort=extreme",
 	} {
 		beforeGlobal := cfg.LLM.Thinking
-		beforeProvider := cfg.LLM.Providers[cfg.LLM.DefaultProvider]
+		beforeProvider := cfg.LLM.Providers[cfg.LLM.Current.Provider]
 		ctx, out := newContext("set", setting)
 		if err := p.handleModel(ctx); err != nil {
 			t.Fatalf("handleModel(%s): %v", setting, err)
@@ -396,7 +428,8 @@ func TestHandleModel_ThinkingHelpStatusAndValidation(t *testing.T) {
 		if !strings.Contains(out.String(), "✘") {
 			t.Errorf("handleModel(%s) output = %q, want rejection", setting, out.String())
 		}
-		if cfg.LLM.Thinking != beforeGlobal || cfg.LLM.Providers[cfg.LLM.DefaultProvider] != beforeProvider {
+		// ProviderConfig 含 Models map，不可直接 == 比较（编译期拒绝），用 DeepEqual。
+		if cfg.LLM.Thinking != beforeGlobal || !reflect.DeepEqual(cfg.LLM.Providers[cfg.LLM.Current.Provider], beforeProvider) {
 			t.Errorf("handleModel(%s) mutated config after rejection", setting)
 		}
 	}
@@ -913,9 +946,9 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	defer srv.Close()
 
 	cfg := runtimeconfig.Default()
-	provider := cfg.LLM.Providers[cfg.LLM.DefaultProvider]
+	provider := cfg.LLM.Providers[cfg.LLM.Current.Provider]
 	provider.Endpoint = srv.URL
-	cfg.LLM.Providers[cfg.LLM.DefaultProvider] = provider
+	cfg.LLM.Providers[cfg.LLM.Current.Provider] = provider
 	cfg.Session.Enabled = false // 避免 handleNew 走真实 store 路径，污染用户会话目录
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
@@ -1075,9 +1108,9 @@ func TestHandleNew_LtmExtractDisabledSkipsFacts(t *testing.T) {
 	defer srv.Close()
 
 	cfg := runtimeconfig.Default()
-	provider := cfg.LLM.Providers[cfg.LLM.DefaultProvider]
+	provider := cfg.LLM.Providers[cfg.LLM.Current.Provider]
 	provider.Endpoint = srv.URL
-	cfg.LLM.Providers[cfg.LLM.DefaultProvider] = provider
+	cfg.LLM.Providers[cfg.LLM.Current.Provider] = provider
 	cfg.Memory.LtmExtract = false
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)

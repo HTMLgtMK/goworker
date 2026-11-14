@@ -13,19 +13,22 @@ import (
 
 const defaultContextWindow = 256000
 
-// DefaultLLM 返回默认 LLM 注册表（不含 APIKey）。
+// DefaultLLM 返回默认 LLM 配置（不含 APIKey）。
 func DefaultLLM() LLMConfig {
 	return LLMConfig{
-		DefaultProvider: "openai",
+		Current: CurrentConfig{Provider: "openai", Model: "gpt-4o"},
 		Providers: map[string]ProviderConfig{
 			"openai": {
-				Type:          ProviderTypeOpenAI,
-				Endpoint:      "http://localhost:8000/v1",
-				Model:         "gpt-4o",
-				ContextWindow: defaultContextWindow,
-				Thinking: ProviderThinkingConfig{
-					RequestMode: ThinkingRequestAuto,
-					Effort:      ThinkingEffortMedium,
+				Type:     ProviderTypeOpenAI,
+				Endpoint: "http://localhost:8000/v1",
+				Models: map[string]ModelConfig{
+					"gpt-4o": {
+						ContextWindow: defaultContextWindow,
+						Thinking: ProviderThinkingConfig{
+							RequestMode: ThinkingRequestAuto,
+							Effort:      ThinkingEffortMedium,
+						},
+					},
 				},
 			},
 		},
@@ -36,59 +39,68 @@ func DefaultLLM() LLMConfig {
 	}
 }
 
-// WithDefaults 返回补齐 Provider 缺省值的配置副本。
+// WithDefaults 返回补齐模型缺省值的配置副本。
 func (c LLMConfig) WithDefaults() LLMConfig {
 	clone := c.Clone()
 	for name, provider := range clone.Providers {
-		if provider.Type == ProviderTypeOpenAI {
-			if provider.ContextWindow == 0 {
-				provider.ContextWindow = defaultContextWindow
+		for modelID, model := range provider.Models {
+			if provider.Type == ProviderTypeOpenAI {
+				if model.ContextWindow == 0 {
+					model.ContextWindow = defaultContextWindow
+				}
+				if model.Thinking.RequestMode == "" {
+					model.Thinking.RequestMode = ThinkingRequestAuto
+				}
+				if model.Thinking.Effort == "" {
+					model.Thinking.Effort = ThinkingEffortMedium
+				}
 			}
-			if provider.Thinking.RequestMode == "" {
-				provider.Thinking.RequestMode = ThinkingRequestAuto
-			}
-			if provider.Thinking.Effort == "" {
-				provider.Thinking.Effort = ThinkingEffortMedium
-			}
+			provider.Models[modelID] = model
 		}
 		clone.Providers[name] = provider
 	}
 	return clone
 }
 
-// Clone 返回不共享 Provider map 的 LLM 配置副本。
+// Clone 返回不共享 Provider 或 Model map 的 LLM 配置副本。
 func (c LLMConfig) Clone() LLMConfig {
 	clone := c
 	clone.Providers = make(map[string]ProviderConfig, len(c.Providers))
 	for name, provider := range c.Providers {
+		provider.Models = make(map[string]ModelConfig, len(provider.Models))
+		for modelID, model := range c.Providers[name].Models {
+			provider.Models[modelID] = model
+		}
 		clone.Providers[name] = provider
 	}
 	return clone
 }
 
-// ResolveDefault 返回当前默认 Provider 的稳定名称和配置。
-func (c LLMConfig) ResolveDefault() (string, ProviderConfig, error) {
-	return c.WithDefaults().resolveDefault()
-}
-
-func (c LLMConfig) resolveDefault() (string, ProviderConfig, error) {
-	if c.DefaultProvider == "" {
-		return "", ProviderConfig{}, fmt.Errorf("default provider is not configured")
+// ResolveCurrent 返回当前选择对应的 Provider 连接配置和模型属性。
+func (c LLMConfig) ResolveCurrent() (ProviderConfig, ModelConfig, error) {
+	c = c.WithDefaults()
+	name := c.Current.Provider
+	if name == "" {
+		return ProviderConfig{}, ModelConfig{}, fmt.Errorf("current provider is not configured")
 	}
-	provider, ok := c.Providers[c.DefaultProvider]
+	provider, ok := c.Providers[name]
 	if !ok {
-		return "", ProviderConfig{}, fmt.Errorf("default provider %q does not exist", c.DefaultProvider)
+		return ProviderConfig{}, ModelConfig{}, fmt.Errorf("current provider %q does not exist", name)
 	}
-	if err := validateProvider(c.DefaultProvider, provider); err != nil {
-		return "", ProviderConfig{}, err
+	model, ok := provider.Models[c.Current.Model]
+	if !ok {
+		return ProviderConfig{}, ModelConfig{}, fmt.Errorf("provider %q model %q does not exist", name, c.Current.Model)
 	}
-	return c.DefaultProvider, provider, nil
+	if err := validateProvider(name, provider, c.Current.Model, model); err != nil {
+		return ProviderConfig{}, ModelConfig{}, err
+	}
+	return provider, model, nil
 }
 
-// Validate 确保全局策略和每个命名 Provider 在请求前可用。
+// Validate 确保全局策略、Provider 连接及注册的所有模型在请求前有效。
 func (c LLMConfig) Validate() error {
 	c = c.WithDefaults()
-	if _, _, err := c.resolveDefault(); err != nil {
+	if _, _, err := c.ResolveCurrent(); err != nil {
 		return err
 	}
 	if c.CompressAt < 0 || c.CompressAt > 1 || math.IsNaN(c.CompressAt) {
@@ -101,14 +113,63 @@ func (c LLMConfig) Validate() error {
 		return fmt.Errorf("max_iterations must be positive")
 	}
 	for name, provider := range c.Providers {
-		if err := validateProvider(name, provider); err != nil {
+		if !validProviderName(name) {
+			return fmt.Errorf("invalid provider name %q", name)
+		}
+		if err := validateProviderConnection(name, provider); err != nil {
 			return err
+		}
+		if len(provider.Models) == 0 {
+			return fmt.Errorf("provider %q must define at least one model", name)
+		}
+		for modelID, model := range provider.Models {
+			if modelID == "" {
+				return fmt.Errorf("provider %q has an empty model id", name)
+			}
+			if err := validateProvider(name, provider, modelID, model); err != nil {
+				return fmt.Errorf("provider %q model %q: %w", name, modelID, err)
+			}
 		}
 	}
 	return nil
 }
 
-func validateProvider(name string, provider ProviderConfig) error {
+func validateProvider(name string, provider ProviderConfig, modelID string, model ModelConfig) error {
+	if err := validateProviderConnection(name, provider); err != nil {
+		return err
+	}
+	if modelID == "" {
+		return fmt.Errorf("provider %q model is required", name)
+	}
+	if model.ContextWindow <= 0 {
+		return fmt.Errorf("provider %q model %q context_window must be positive", name, modelID)
+	}
+	switch provider.Type {
+	case ProviderTypeOpenAI:
+		if model.MaxTokens != 0 || provider.AuthType != "" {
+			return fmt.Errorf("openai provider %q has Anthropic-only fields", name)
+		}
+		if model.Thinking.RequestMode == "" {
+			return fmt.Errorf("openai provider %q thinking request_mode is required", name)
+		}
+		if _, err := ParseThinkingRequestMode(string(model.Thinking.RequestMode)); err != nil {
+			return fmt.Errorf("openai provider %q: %w", name, err)
+		}
+		if _, err := ParseThinkingEffort(string(model.Thinking.Effort)); err != nil {
+			return fmt.Errorf("openai provider %q: %w", name, err)
+		}
+	case ProviderTypeAnthropic:
+		if model.MaxTokens <= 0 {
+			return fmt.Errorf("anthropic provider %q max_tokens must be positive", name)
+		}
+		if model.Thinking.RequestMode != "" || model.Thinking.Effort != "" {
+			return fmt.Errorf("anthropic provider %q has OpenAI-only thinking fields", name)
+		}
+	}
+	return nil
+}
+
+func validateProviderConnection(name string, provider ProviderConfig) error {
 	if !validProviderName(name) {
 		return fmt.Errorf("invalid provider name %q", name)
 	}
@@ -119,40 +180,19 @@ func validateProvider(name string, provider ProviderConfig) error {
 	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
 		return fmt.Errorf("provider %q endpoint is invalid", name)
 	}
-	if provider.Model == "" {
-		return fmt.Errorf("provider %q model is required", name)
-	}
-	if provider.ContextWindow <= 0 {
-		return fmt.Errorf("provider %q context_window must be positive", name)
-	}
 	switch provider.Type {
 	case ProviderTypeOpenAI:
-		if provider.AuthType != "" || provider.MaxTokens != 0 {
+		if provider.AuthType != "" {
 			return fmt.Errorf("openai provider %q has Anthropic-only fields", name)
-		}
-		if provider.Thinking.RequestMode == "" {
-			return fmt.Errorf("openai provider %q thinking request_mode is required", name)
-		}
-		if _, err := ParseThinkingRequestMode(string(provider.Thinking.RequestMode)); err != nil {
-			return fmt.Errorf("openai provider %q: %w", name, err)
-		}
-		if _, err := ParseThinkingEffort(string(provider.Thinking.Effort)); err != nil {
-			return fmt.Errorf("openai provider %q: %w", name, err)
 		}
 	case ProviderTypeAnthropic:
 		if provider.APIKey == "" {
 			return fmt.Errorf("anthropic provider %q api_key is required", name)
 		}
-		if provider.MaxTokens <= 0 {
-			return fmt.Errorf("anthropic provider %q max_tokens must be positive", name)
-		}
 		switch provider.AuthType {
 		case AnthropicAuthBearer, AnthropicAuthAPIKey:
 		default:
 			return fmt.Errorf("anthropic provider %q auth_type is invalid", name)
-		}
-		if provider.Thinking.RequestMode != "" || provider.Thinking.Effort != "" {
-			return fmt.Errorf("anthropic provider %q has OpenAI-only thinking fields", name)
 		}
 	default:
 		return fmt.Errorf("provider %q has unsupported type %q", name, provider.Type)

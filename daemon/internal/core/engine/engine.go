@@ -1,12 +1,18 @@
 package engine
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/logger"
+	"github.com/tinguo/goworker/ai-sandbox"
 	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
@@ -20,8 +26,13 @@ import (
 //   - 中间件链
 //   - 事件广播
 type Engine struct {
+	configMu        sync.Mutex
 	config          *config.Config
-	runtimeCfg      *runtimeconfig.Config
+	runtimeCfg      *runtimeconfig.Config // legacy construction-time pointer; never mutated after construction
+	runtimeState    atomic.Pointer[runtimeconfig.Config]
+	configPath      string
+	configEpoch     string
+	configRevision  uint64
 	log             *logger.Logger
 	plugins         map[string]model.Plugin
 	pluginOrder     []string
@@ -38,36 +49,122 @@ type Engine struct {
 
 // NewEngine 创建一个引擎并关联全局配置与日志器。
 // l 为 nil 时回落到 stderr logger，避免调用方误传 nil 导致内部 panic。
+var ErrConfigRevisionConflict = model.ErrConfigRevisionConflict
+
+func newConfigEpoch() string {
+	var epoch [16]byte
+	if _, err := rand.Read(epoch[:]); err != nil {
+		// rand.Read is expected to succeed on supported hosts; the fallback still makes
+		// accidental cross-process revision reuse vanishingly unlikely.
+		return fmt.Sprintf("%x-%d", time.Now().UnixNano(), configEpochFallback.Add(1))
+	}
+	return hex.EncodeToString(epoch[:])
+}
+
+var configEpochFallback atomic.Uint64
+
 func NewEngine(cfg *config.Config, runtimeCfg *runtimeconfig.Config, l *logger.Logger) *Engine {
 	if l == nil {
 		l, _ = logger.Setup(logger.Default()) // 空 File 配置必然成功
 	}
+	if cfg == nil {
+		cfg = config.Default()
+	}
 	if runtimeCfg == nil {
 		runtimeCfg = cfg.ToRuntime()
 	}
-	return &Engine{
-		config:       cfg,
-		runtimeCfg:   runtimeCfg,
-		log:          l,
-		plugins:      make(map[string]model.Plugin),
-		pluginOrder:  make([]string, 0),
-		started:      make(map[string]bool),
-		stopped:      make(map[string]bool),
-		commands:     make(map[string]model.Command),
-		tools:        make(map[string]model.Tool),
-		interceptors: make([]model.PluginInterceptor, 0),
-		listeners:    make([]func(model.Event), 0),
-		capabilities: make(map[string]any),
+	initialRuntime := cloneRuntimeConfig(runtimeCfg)
+	e := &Engine{
+		config:         cloneDaemonConfig(cfg),
+		runtimeCfg:     runtimeCfg,
+		configPath:     config.DefaultPath(),
+		configEpoch:    newConfigEpoch(),
+		configRevision: 1,
+		log:            l,
+		plugins:        make(map[string]model.Plugin),
+		pluginOrder:    make([]string, 0),
+		started:        make(map[string]bool),
+		stopped:        make(map[string]bool),
+		commands:       make(map[string]model.Command),
+		tools:          make(map[string]model.Tool),
+		interceptors:   make([]model.PluginInterceptor, 0),
+		listeners:      make([]func(model.Event), 0),
+		capabilities:   make(map[string]any),
 	}
+	e.runtimeState.Store(initialRuntime)
+	return e
 }
 
-// Config 返回全局配置。
-func (e *Engine) Config() *config.Config { return e.config }
+// Config returns a detached copy of the latest daemon configuration.
+func (e *Engine) Config() *config.Config {
+	e.configMu.Lock()
+	defer e.configMu.Unlock()
+	return cloneDaemonConfig(e.config)
+}
 
-// SaveConfig 持久化配置到 YAML 文件并同步内存。
-// cfg 是插件注入的 ai-runtime 配置（model.Hub.Config 已 any 化）。
+// ConfigSnapshot returns a detached copy of the current runtime configuration.
+func (e *Engine) ConfigSnapshot() *runtimeconfig.Config {
+	return cloneRuntimeConfig(e.runtimeState.Load())
+}
+
+// ConfigSnapshotWithRevision returns one detached config snapshot and an opaque generation.
+func (e *Engine) ConfigSnapshotWithRevision() (*runtimeconfig.Config, string) {
+	e.configMu.Lock()
+	defer e.configMu.Unlock()
+	return cloneRuntimeConfig(e.runtimeState.Load()), e.currentConfigRevision()
+}
+
+func (e *Engine) currentConfigRevision() string {
+	return fmt.Sprintf("%s-%d", e.configEpoch, e.configRevision)
+}
+
+// SaveConfig persists a replacement runtime configuration for compatibility.
+// New callers should use UpdateConfig to avoid overwriting concurrent changes.
 func (e *Engine) SaveConfig(cfg any) error {
 	return e.saveConfig(cfg, config.Save)
+}
+
+// UpdateConfig serializes a mutation against the latest config, persists it, and only
+// publishes the candidate after the write succeeds. Mutators execute once under configMu.
+func (e *Engine) UpdateConfig(mutate func(*runtimeconfig.Config) error) (*runtimeconfig.Config, error) {
+	if mutate == nil {
+		return nil, fmt.Errorf("UpdateConfig: mutator is nil")
+	}
+	candidate, _, err := e.updateConfigAtRevision("", mutate, config.Save)
+	return candidate, err
+}
+
+// UpdateConfigAtRevision is UpdateConfig with optimistic concurrency control. A zero
+// expected revision disables the check; stale revisions fail without running the mutator.
+func (e *Engine) UpdateConfigAtRevision(expected string, mutate func(*runtimeconfig.Config) error) (*runtimeconfig.Config, string, error) {
+	if mutate == nil {
+		return nil, "", fmt.Errorf("UpdateConfig: mutator is nil")
+	}
+	candidate, revision, err := e.updateConfigAtRevision(expected, mutate, config.Save)
+	return candidate, revision, err
+}
+
+func (e *Engine) updateConfigAtRevision(expected string, mutate func(*runtimeconfig.Config) error, save func(*config.Config, string) error) (*runtimeconfig.Config, string, error) {
+	e.configMu.Lock()
+	defer e.configMu.Unlock()
+	currentRevision := e.currentConfigRevision()
+	if expected != "" && expected != currentRevision {
+		return nil, currentRevision, fmt.Errorf("%w: expected %q, current %q", ErrConfigRevisionConflict, expected, currentRevision)
+	}
+	candidateRuntime := cloneRuntimeConfig(e.runtimeState.Load())
+	if err := mutate(candidateRuntime); err != nil {
+		return nil, currentRevision, err
+	}
+	if err := candidateRuntime.LLM.Validate(); err != nil {
+		return nil, currentRevision, fmt.Errorf("UpdateConfig: invalid LLM configuration: %w", err)
+	}
+	candidateDaemon := cloneDaemonConfig(e.config)
+	candidateDaemon.ApplyRuntime(candidateRuntime)
+	if err := save(candidateDaemon, e.configPath); err != nil {
+		return nil, currentRevision, err
+	}
+	e.publishConfig(candidateDaemon, candidateRuntime)
+	return cloneRuntimeConfig(candidateRuntime), e.currentConfigRevision(), nil
 }
 
 func (e *Engine) saveConfig(cfg any, save func(*config.Config, string) error) error {
@@ -75,25 +172,118 @@ func (e *Engine) saveConfig(cfg any, save func(*config.Config, string) error) er
 	if !ok {
 		return fmt.Errorf("SaveConfig: unexpected config type %T", cfg)
 	}
-	candidateRuntime := *rc
-	candidateRuntime.LLM = rc.LLM.Clone()
+	e.configMu.Lock()
+	defer e.configMu.Unlock()
+	candidateRuntime := cloneRuntimeConfig(rc)
 	if err := candidateRuntime.LLM.Validate(); err != nil {
 		return fmt.Errorf("SaveConfig: invalid LLM configuration: %w", err)
 	}
-	candidateDaemon := *e.config
-	candidateDaemon.LLM = e.config.LLM.Clone()
-	candidateDaemon.ApplyRuntime(&candidateRuntime)
-	if err := save(&candidateDaemon, config.DefaultPath()); err != nil {
+	candidateDaemon := cloneDaemonConfig(e.config)
+	candidateDaemon.ApplyRuntime(candidateRuntime)
+	if err := save(candidateDaemon, e.configPath); err != nil {
 		return err
 	}
-	// TODO(竞态): 这里对共享的 *runtimeconfig.Config 做整体结构体拷贝，
-	// LLM.Providers 的 map 头不是原子写的 —— /model use 与 dispatcher 的
-	// worker 解析 / ACP service 的 SessionModes 并发时可能读到撕裂的 map 头
-	// （评审 I5）。根治需要把运行时配置改成不可变快照 + atomic.Pointer 发布，
-	// 并让插件经 holder 读取；在那之前避免在任务运行中并发执行 /model use。
-	*e.runtimeCfg = candidateRuntime
-	*e.config = candidateDaemon
+	e.publishConfig(candidateDaemon, candidateRuntime)
 	return nil
+}
+
+func (e *Engine) publishConfig(daemonCfg *config.Config, runtimeCfg *runtimeconfig.Config) {
+	e.config = cloneDaemonConfig(daemonCfg)
+	e.runtimeState.Store(cloneRuntimeConfig(runtimeCfg))
+	e.configRevision++
+}
+
+// UpdateDaemonConfig serializes changes made through daemon-only configuration paths.
+func (e *Engine) UpdateDaemonConfig(mutate func(*config.Config) error) error {
+	if mutate == nil {
+		return fmt.Errorf("UpdateDaemonConfig: mutator is nil")
+	}
+	e.configMu.Lock()
+	defer e.configMu.Unlock()
+	candidateDaemon := cloneDaemonConfig(e.config)
+	if err := mutate(candidateDaemon); err != nil {
+		return err
+	}
+	candidateRuntime := cloneRuntimeConfig(candidateDaemon.ToRuntime())
+	if err := candidateRuntime.LLM.Validate(); err != nil {
+		return fmt.Errorf("UpdateDaemonConfig: invalid LLM configuration: %w", err)
+	}
+	candidateDaemon.ApplyRuntime(candidateRuntime)
+	if err := saveConfigPath(candidateDaemon, e.configPath); err != nil {
+		return err
+	}
+	e.publishConfig(candidateDaemon, candidateRuntime)
+	return nil
+}
+
+func saveConfigPath(cfg *config.Config, path string) error { return config.Save(cfg, path) }
+
+func cloneRuntimeConfig(src *runtimeconfig.Config) *runtimeconfig.Config {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	clone.LLM = src.LLM.Clone()
+	clone.Sandbox.DeniedPatterns = append([]string(nil), src.Sandbox.DeniedPatterns...)
+	clone.Sandbox.RiskyPatterns = append(src.Sandbox.RiskyPatterns[:0:0], src.Sandbox.RiskyPatterns...)
+	clone.Sandbox.SafeCommands = append([]string(nil), src.Sandbox.SafeCommands...)
+	clone.Sandbox.AllowRules = cloneSandboxAllowRules(src.Sandbox.AllowRules)
+	clone.Sandbox.ToolAllowRules = append(src.Sandbox.ToolAllowRules[:0:0], src.Sandbox.ToolAllowRules...)
+	clone.MCP.Servers = append(src.MCP.Servers[:0:0], src.MCP.Servers...)
+	for i := range clone.MCP.Servers {
+		clone.MCP.Servers[i].Args = append([]string(nil), src.MCP.Servers[i].Args...)
+	}
+	clone.Dispatch.Workers = append(src.Dispatch.Workers[:0:0], src.Dispatch.Workers...)
+	for i := range clone.Dispatch.Workers {
+		clone.Dispatch.Workers[i].Args = append([]string(nil), src.Dispatch.Workers[i].Args...)
+	}
+	clone.Dispatch.Routes = append(src.Dispatch.Routes[:0:0], src.Dispatch.Routes...)
+	for i := range clone.Dispatch.Routes {
+		clone.Dispatch.Routes[i].Keywords = append([]string(nil), src.Dispatch.Routes[i].Keywords...)
+	}
+	return &clone
+}
+
+func cloneSandboxAllowRules(rules []sandbox.AllowRuleConfig) []sandbox.AllowRuleConfig {
+	clone := append(rules[:0:0], rules...)
+	for i := range clone {
+		clone[i].Effects = append([]string(nil), rules[i].Effects...)
+	}
+	return clone
+}
+
+func cloneDaemonAllowRules(rules []config.AllowRuleConfig) []config.AllowRuleConfig {
+	clone := append(rules[:0:0], rules...)
+	for i := range clone {
+		clone[i].Effects = append([]string(nil), rules[i].Effects...)
+	}
+	return clone
+}
+
+func cloneDaemonConfig(src *config.Config) *config.Config {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	clone.LLM = src.LLM.Clone()
+	clone.Sandbox.DeniedPatterns = append([]string(nil), src.Sandbox.DeniedPatterns...)
+	clone.Sandbox.RiskyPatterns = append(src.Sandbox.RiskyPatterns[:0:0], src.Sandbox.RiskyPatterns...)
+	clone.Sandbox.SafeCommands = append([]string(nil), src.Sandbox.SafeCommands...)
+	clone.Sandbox.AllowRules = cloneDaemonAllowRules(src.Sandbox.AllowRules)
+	clone.Sandbox.ToolAllowRules = append(src.Sandbox.ToolAllowRules[:0:0], src.Sandbox.ToolAllowRules...)
+	clone.MCP.Servers = append(src.MCP.Servers[:0:0], src.MCP.Servers...)
+	for i := range clone.MCP.Servers {
+		clone.MCP.Servers[i].Args = append([]string(nil), src.MCP.Servers[i].Args...)
+	}
+	clone.Dispatch.Workers = append(src.Dispatch.Workers[:0:0], src.Dispatch.Workers...)
+	for i := range clone.Dispatch.Workers {
+		clone.Dispatch.Workers[i].Args = append([]string(nil), src.Dispatch.Workers[i].Args...)
+	}
+	clone.Dispatch.Routes = append(src.Dispatch.Routes[:0:0], src.Dispatch.Routes...)
+	for i := range clone.Dispatch.Routes {
+		clone.Dispatch.Routes[i].Keywords = append([]string(nil), src.Dispatch.Routes[i].Keywords...)
+	}
+	return &clone
 }
 
 // SetFallbackHandler 设置未匹配命令的兜底处理器。
@@ -191,8 +381,12 @@ func (e *Engine) pluginHub() *model.Hub {
 		Eval: func(ctx *model.Context, input string) error {
 			return e.Eval(ctx, input)
 		},
-		Config:     e.runtimeCfg,
-		SaveConfig: e.SaveConfig,
+		Config:                     e.ConfigSnapshot(),
+		ConfigSnapshot:             e.ConfigSnapshot,
+		ConfigSnapshotWithRevision: e.ConfigSnapshotWithRevision,
+		UpdateConfig:               e.UpdateConfig,
+		UpdateConfigAtRevision:     e.UpdateConfigAtRevision,
+		SaveConfig:                 e.SaveConfig,
 		SetFallbackHandler: func(fn func(ctx *model.Context) error) {
 			e.SetFallbackHandler(fn)
 		},

@@ -18,6 +18,8 @@ import (
 
 type RunRequest struct {
 	Input string
+	// Config is captured when a run is accepted; callers normally leave it nil.
+	Config *runtimeconfig.Config
 	// ToolSource 是本轮请求的连接级工具源（nil = 无）。
 	// 惰性调用：probe 发生在 Session.Run 收集工具的时机。
 	ToolSource func(ctx context.Context) []core.Tool
@@ -75,7 +77,8 @@ type RunStateJournal interface {
 // SessionDeps 是会话构造输入包：插件级资源 + 本会话参数，Init 组装后每次 NewSession 复用。
 // 其余字段跨会话不变。可变资源（instructions）的装载在 plugin 层，这里只收最终值。
 type SessionDeps struct {
-	Config               *runtimeconfig.Config                                  // 运行配置（含 Sandbox 段）
+	Config               *runtimeconfig.Config                                  // Initial runtime configuration.
+	ConfigSnapshot       func() *runtimeconfig.Config                           // Current global config; called once for each accepted run.
 	AuditDir             string                                                 // sandbox 审计落盘目录
 	CWD                  string                                                 // 会话工作目录（client 经 wire 声明、宿主校验后注入）；空 = 未声明，工具回退 cfg.AllowedWorkDir
 	Memory               *memory.Client                                         // nil = 禁用

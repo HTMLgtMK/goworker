@@ -36,11 +36,11 @@ func TestReadmeSampleConfigParses(t *testing.T) {
 	if !ok {
 		t.Fatalf("provider openai 未解析出来: %v", cfg.LLM.Providers)
 	}
-	if p.Endpoint == "" || p.Model == "" {
+	if p.Endpoint == "" || cfg.LLM.Current.Model == "" {
 		t.Errorf("endpoint/model 未解析: %+v", p)
 	}
-	if cfg.LLM.DefaultProvider != "openai" {
-		t.Errorf("default_provider = %q", cfg.LLM.DefaultProvider)
+	if cfg.LLM.Current.Provider != "openai" {
+		t.Errorf("default_provider = %q", cfg.LLM.Current.Provider)
 	}
 }
 

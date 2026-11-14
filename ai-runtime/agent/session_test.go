@@ -270,7 +270,7 @@ func TestSessionStreamTokens_ForwardsEmptyToolResult(t *testing.T) {
 	close(tokens)
 
 	var emitted []core.Token
-	s.streamTokens(RunCallbacks{EmitToken: func(token core.Token) {
+	s.streamTokens(s.deps.Config, RunCallbacks{EmitToken: func(token core.Token) {
 		emitted = append(emitted, token)
 	}}, context.Background(), tokens, make(chan hitl.Decision, 1))
 

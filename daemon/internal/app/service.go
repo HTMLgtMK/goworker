@@ -13,6 +13,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 	acpservice "github.com/tinguo/goworker/daemon/internal/core/service/acp"
+	xgwprotocol "github.com/tinguo/goworker/daemon/xgoworker/protocol"
 )
 
 type serviceRegistration struct {
@@ -117,6 +118,7 @@ func newACPService(options acpServiceOptions) (*acpservice.Service, error) {
 	// 了这两个接口，auto-discovery 会让 initialize 通告 loadSession，客户端随即
 	// 协商一个调用必然失败的能力。
 	var serverOptions []aiacp.ServerOption
+	serverOptions = append(serverOptions, aiacp.WithAgentCapability(xgwprotocol.XGWorkerCapability{}))
 	if options.sessions == nil {
 		serverOptions = append(serverOptions,
 			aiacp.WithSessionLoader(nil),
