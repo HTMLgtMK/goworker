@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	appconfig "github.com/tinguo/goworker/daemon/internal/app/config"
 )
 
 var (
@@ -60,17 +61,19 @@ type Snapshot struct {
 }
 
 // UpsertRequest is the validated user intent for creating or replacing one provider.
+// EndpointAction is keep or replace; omitted values use legacy endpoint round-trip behavior.
 // SecretAction is keep, replace, or clear. APIKey is never included in any response.
 type UpsertRequest struct {
-	Revision     string
-	Name         string
-	Type         string
-	Endpoint     string
-	AuthType     string
-	SecretAction string
-	APIKey       string
-	Models       map[string]Model
-	Current      *Current
+	Revision       string
+	Name           string
+	Type           string
+	Endpoint       string
+	EndpointAction string
+	AuthType       string
+	SecretAction   string
+	APIKey         string
+	Models         map[string]Model
+	Current        *Current
 }
 
 // Service exposes revisioned CRUD operations over the runtime configuration.
@@ -119,8 +122,18 @@ func (s *Service) Upsert(req UpsertRequest) (Snapshot, ProviderView, error) {
 	if req.Revision == "" {
 		return Snapshot{}, ProviderView{}, fmt.Errorf("%w: revision is required", ErrInvalid)
 	}
-	if strings.TrimSpace(req.Name) != req.Name || req.Name == "" || validateEndpoint(req.Endpoint) != nil {
-		return Snapshot{}, ProviderView{}, fmt.Errorf("%w: provider name or endpoint is invalid", ErrInvalid)
+	if strings.TrimSpace(req.Name) != req.Name || req.Name == "" {
+		return Snapshot{}, ProviderView{}, fmt.Errorf("%w: provider name is invalid", ErrInvalid)
+	}
+	switch req.EndpointAction {
+	case "", "replace":
+		if validateEndpoint(req.Endpoint) != nil {
+			return Snapshot{}, ProviderView{}, fmt.Errorf("%w: provider endpoint is invalid", ErrInvalid)
+		}
+	case "keep":
+		// Endpoint is intentionally ignored; an existing provider is required below.
+	default:
+		return Snapshot{}, ProviderView{}, fmt.Errorf("%w: unknown endpoint action", ErrInvalid)
 	}
 	if len(req.Models) == 0 {
 		return Snapshot{}, ProviderView{}, fmt.Errorf("%w: provider must define at least one model", ErrInvalid)
@@ -151,9 +164,20 @@ func (s *Service) Upsert(req UpsertRequest) (Snapshot, ProviderView, error) {
 		if err != nil {
 			return err
 		}
+		endpoint := req.Endpoint
+		if req.EndpointAction == "keep" {
+			if !exists {
+				return fmt.Errorf("%w: cannot keep endpoint for a new provider", ErrInvalid)
+			}
+			endpoint = previous.Endpoint
+		}
+		if req.EndpointAction == "" && exists && endpoint == safeEndpoint(previous.Endpoint) {
+			// An unchanged redacted value preserves the configured path.
+			endpoint = previous.Endpoint
+		}
 		candidate.Providers[req.Name] = runtimeconfig.ProviderConfig{
 			Type:     runtimeconfig.ProviderType(req.Type),
-			Endpoint: req.Endpoint,
+			Endpoint: endpoint,
 			APIKey:   apiKey,
 			AuthType: runtimeconfig.AnthropicAuthType(req.AuthType),
 			Models:   models,
@@ -343,17 +367,8 @@ func validateEndpoint(raw string) error {
 	return nil
 }
 
-// safeEndpoint strips URL fields commonly used for credentials while retaining the configured
-// base path (for example /proxy/openai/v1). New provider updates reject userinfo, query and fragment.
+// safeEndpoint uses the same redaction contract as config display. In particular, URL paths
+// are opaque and may contain reverse-proxy credentials, so none are returned to clients.
 func safeEndpoint(raw string) string {
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return ""
-	}
-	parsed.User = nil
-	parsed.RawQuery = ""
-	parsed.ForceQuery = false
-	parsed.Fragment = ""
-	parsed.RawFragment = ""
-	return parsed.String()
+	return appconfig.RedactEndpoint(raw)
 }

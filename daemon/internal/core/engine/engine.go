@@ -26,25 +26,37 @@ import (
 //   - 中间件链
 //   - 事件广播
 type Engine struct {
-	configMu        sync.Mutex
-	config          *config.Config
-	runtimeCfg      *runtimeconfig.Config // legacy construction-time pointer; never mutated after construction
-	runtimeState    atomic.Pointer[runtimeconfig.Config]
-	configPath      string
-	configEpoch     string
-	configRevision  uint64
-	log             *logger.Logger
-	plugins         map[string]model.Plugin
-	pluginOrder     []string
-	started         map[string]bool
-	stopped         map[string]bool
-	stopRequested   bool
-	commands        map[string]model.Command
-	tools           map[string]model.Tool
-	interceptors    []model.PluginInterceptor
-	listeners       []func(model.Event)
-	capabilities    map[string]any
-	fallbackHandler func(ctx *model.Context) error // 未匹配命令的兜底处理器
+	configMu              sync.Mutex
+	config                *config.Config
+	runtimeCfg            *runtimeconfig.Config // legacy construction-time pointer; never mutated after construction
+	runtimeState          atomic.Pointer[runtimeconfig.Config]
+	runtimeConfigOverride func(*runtimeconfig.Config) error
+	configPath            string
+	configEpoch           string
+	configRevision        uint64
+	log                   *logger.Logger
+	plugins               map[string]model.Plugin
+	pluginOrder           []string
+	started               map[string]bool
+	stopped               map[string]bool
+	stopRequested         bool
+	commands              map[string]model.Command
+	tools                 map[string]model.Tool
+	interceptors          []model.PluginInterceptor
+	listeners             []func(model.Event)
+	capabilities          map[string]any
+	fallbackHandler       func(ctx *model.Context) error // 未匹配命令的兜底处理器
+}
+
+type EngineOption func(*Engine)
+
+// WithRuntimeConfigOverride reapplies host-owned overrides before runtime updates
+// are published. Callers must prepare the initial runtime config themselves.
+// The daemon config remains the persistent source of truth.
+func WithRuntimeConfigOverride(override func(*runtimeconfig.Config) error) EngineOption {
+	return func(e *Engine) {
+		e.runtimeConfigOverride = override
+	}
 }
 
 // NewEngine 创建一个引擎并关联全局配置与日志器。
@@ -63,7 +75,7 @@ func newConfigEpoch() string {
 
 var configEpochFallback atomic.Uint64
 
-func NewEngine(cfg *config.Config, runtimeCfg *runtimeconfig.Config, l *logger.Logger) *Engine {
+func NewEngine(cfg *config.Config, runtimeCfg *runtimeconfig.Config, l *logger.Logger, options ...EngineOption) *Engine {
 	if l == nil {
 		l, _ = logger.Setup(logger.Default()) // 空 File 配置必然成功
 	}
@@ -90,6 +102,11 @@ func NewEngine(cfg *config.Config, runtimeCfg *runtimeconfig.Config, l *logger.L
 		interceptors:   make([]model.PluginInterceptor, 0),
 		listeners:      make([]func(model.Event), 0),
 		capabilities:   make(map[string]any),
+	}
+	for _, option := range options {
+		if option != nil {
+			option(e)
+		}
 	}
 	e.runtimeState.Store(initialRuntime)
 	return e
@@ -119,6 +136,8 @@ func (e *Engine) currentConfigRevision() string {
 }
 
 // SaveConfig persists a replacement runtime configuration for compatibility.
+// Under a runtime override, its snapshot cannot express whether Sandbox.Mode changed
+// intentionally, so mode updates must use UpdateConfig instead.
 // New callers should use UpdateConfig to avoid overwriting concurrent changes.
 func (e *Engine) SaveConfig(cfg any) error {
 	return e.saveConfig(cfg, config.Save)
@@ -151,15 +170,20 @@ func (e *Engine) updateConfigAtRevision(expected string, mutate func(*runtimecon
 	if expected != "" && expected != currentRevision {
 		return nil, currentRevision, fmt.Errorf("%w: expected %q, current %q", ErrConfigRevisionConflict, expected, currentRevision)
 	}
-	candidateRuntime := cloneRuntimeConfig(e.runtimeState.Load())
+	// Runtime overrides are effective-only. Mutators operate on the persisted base so
+	// an unchanged overridden value remains distinguishable from an explicit update.
+	candidateRuntime := cloneRuntimeConfig(e.config.ToRuntime())
 	if err := mutate(candidateRuntime); err != nil {
 		return nil, currentRevision, err
+	}
+	candidateDaemon := e.daemonConfigForRuntimeUpdate(candidateRuntime)
+	candidateRuntime = candidateDaemon.ToRuntime()
+	if err := e.applyRuntimeConfigOverride(candidateRuntime); err != nil {
+		return nil, currentRevision, fmt.Errorf("UpdateConfig: apply runtime override: %w", err)
 	}
 	if err := candidateRuntime.LLM.Validate(); err != nil {
 		return nil, currentRevision, fmt.Errorf("UpdateConfig: invalid LLM configuration: %w", err)
 	}
-	candidateDaemon := cloneDaemonConfig(e.config)
-	candidateDaemon.ApplyRuntime(candidateRuntime)
 	if err := save(candidateDaemon, e.configPath); err != nil {
 		return nil, currentRevision, err
 	}
@@ -175,11 +199,19 @@ func (e *Engine) saveConfig(cfg any, save func(*config.Config, string) error) er
 	e.configMu.Lock()
 	defer e.configMu.Unlock()
 	candidateRuntime := cloneRuntimeConfig(rc)
+	// With an override, a replacement snapshot cannot distinguish an explicit mode
+	// update from the effective value returned by ConfigSnapshot.
+	if e.runtimeConfigOverride != nil {
+		candidateRuntime.Sandbox.Mode = e.config.Sandbox.Mode
+	}
+	candidateDaemon := e.daemonConfigForRuntimeUpdate(candidateRuntime)
+	candidateRuntime = candidateDaemon.ToRuntime()
+	if err := e.applyRuntimeConfigOverride(candidateRuntime); err != nil {
+		return fmt.Errorf("SaveConfig: apply runtime override: %w", err)
+	}
 	if err := candidateRuntime.LLM.Validate(); err != nil {
 		return fmt.Errorf("SaveConfig: invalid LLM configuration: %w", err)
 	}
-	candidateDaemon := cloneDaemonConfig(e.config)
-	candidateDaemon.ApplyRuntime(candidateRuntime)
 	if err := save(candidateDaemon, e.configPath); err != nil {
 		return err
 	}
@@ -205,15 +237,34 @@ func (e *Engine) UpdateDaemonConfig(mutate func(*config.Config) error) error {
 		return err
 	}
 	candidateRuntime := cloneRuntimeConfig(candidateDaemon.ToRuntime())
+	if err := e.applyRuntimeConfigOverride(candidateRuntime); err != nil {
+		return fmt.Errorf("UpdateDaemonConfig: apply runtime override: %w", err)
+	}
 	if err := candidateRuntime.LLM.Validate(); err != nil {
 		return fmt.Errorf("UpdateDaemonConfig: invalid LLM configuration: %w", err)
 	}
-	candidateDaemon.ApplyRuntime(candidateRuntime)
 	if err := saveConfigPath(candidateDaemon, e.configPath); err != nil {
 		return err
 	}
 	e.publishConfig(candidateDaemon, candidateRuntime)
 	return nil
+}
+
+func (e *Engine) daemonConfigForRuntimeUpdate(candidate *runtimeconfig.Config) *config.Config {
+	candidateDaemon := cloneDaemonConfig(e.config)
+	candidateDaemon.ApplyRuntime(candidate)
+	if candidate.Sandbox.Mode == e.config.Sandbox.Mode {
+		// The runtime override is applied after persistence and never enters the file.
+		candidateDaemon.Sandbox.Mode = e.config.Sandbox.Mode
+	}
+	return candidateDaemon
+}
+
+func (e *Engine) applyRuntimeConfigOverride(cfg *runtimeconfig.Config) error {
+	if e.runtimeConfigOverride == nil {
+		return nil
+	}
+	return e.runtimeConfigOverride(cfg)
 }
 
 func saveConfigPath(cfg *config.Config, path string) error { return config.Save(cfg, path) }
@@ -477,6 +528,11 @@ func (e *Engine) Eval(ctx *model.Context, input string) error {
 	}
 
 	ctx.Args = parts[1:]
+	if cmd.Authorize != nil {
+		if err := cmd.Authorize(ctx); err != nil {
+			return err
+		}
+	}
 
 	// 洋葱模型：从最后一个 interceptor 开始往前层层包裹。
 	// 执行时从最外层往里剥，每个 interceptor 调 next() 进入下一层，

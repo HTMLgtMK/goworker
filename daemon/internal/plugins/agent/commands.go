@@ -17,6 +17,7 @@ import (
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
+	appconfig "github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -495,7 +496,7 @@ func (p *AgentPlugin) showConfig(ctx *model.Context) {
 		keyDisplay = "***"
 	}
 	ctx.Writer(fmt.Sprintf("Provider:       %s (%s)\n", cfg.LLM.Current.Provider, provider.Type))
-	ctx.Writer(fmt.Sprintf("Endpoint:       %s\n", provider.Endpoint))
+	ctx.Writer(fmt.Sprintf("Endpoint:       %s\n", appconfig.RedactEndpoint(provider.Endpoint)))
 	ctx.Writer(fmt.Sprintf("Model:          %s\n", cfg.LLM.Current.Model))
 	ctx.Writer(fmt.Sprintf("API Key:        %s\n", keyDisplay))
 	ctx.Writer(fmt.Sprintf("Context Window: %d\n", modelConfig.ContextWindow))
@@ -511,6 +512,9 @@ func (p *AgentPlugin) showConfig(ctx *model.Context) {
 }
 
 func selectedContextWindow(cfg *runtimeconfig.Config) int {
+	if cfg == nil {
+		return 0
+	}
 	_, modelConfig, err := cfg.LLM.ResolveCurrent()
 	if err != nil {
 		return 0
@@ -531,6 +535,7 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 			return nil
 		}
 		calls, comps, total := s.UsageSnapshot()
+		currentWindow := selectedContextWindow(p.configSnapshot())
 		if len(calls) == 0 && len(comps) == 0 {
 			runContext.Writer("(no agent calls yet — run /agent first)\n")
 			return nil
@@ -558,7 +563,7 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 			runContext.Writer(totalLine + "\n")
 
 			// context usage uses "last prompt / window" — the final ReAct request already holds all history.
-			if w := selectedContextWindow(p.cfg); w > 0 && total.LastPromptTokens > 0 {
+			if w := total.LastPromptContextWindow; w > 0 && total.LastPromptTokens > 0 {
 				pct := float64(total.LastPromptTokens) / float64(w) * 100
 				runContext.Writer(fmt.Sprintf("  context: %.2f%% (last in %s / window %s)\n",
 					pct, runtimeagent.Humanize(total.LastPromptTokens), runtimeagent.Humanize(w)))
@@ -582,7 +587,7 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 		if convLen := len(conv); convLen > 0 {
 			convEst := core.EstimateTokens(conv)
 			line := fmt.Sprintf("  history: %s est (%d msgs)", runtimeagent.Humanize(convEst), convLen)
-			if w := selectedContextWindow(p.cfg); w > 0 {
+			if w := currentWindow; w > 0 {
 				line += fmt.Sprintf(", %.2f%% of window", float64(convEst)/float64(w)*100)
 			}
 			runContext.Writer(line + "\n")

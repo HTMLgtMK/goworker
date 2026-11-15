@@ -72,18 +72,22 @@ type ProviderGetResult struct {
 }
 
 // ProviderUpsertParams creates or replaces provider metadata and model settings.
-// SecretAction is "keep", "replace", or "clear"; secret values are accepted only
-// on input and are never included in a response.
+// EndpointAction is "keep" or "replace"; omitted values retain legacy behavior where an
+// endpoint equal to the redacted current value preserves the stored endpoint. Use "replace"
+// to explicitly set a real endpoint path that happens to equal the redaction marker.
+// SecretAction is "keep", "replace", or "clear"; secret values are accepted only on input
+// and are never included in a response.
 type ProviderUpsertParams struct {
-	Revision     string                   `json:"revision"`
-	Name         string                   `json:"name"`
-	Type         string                   `json:"type"`
-	Endpoint     string                   `json:"endpoint"`
-	AuthType     string                   `json:"authType,omitempty"`
-	SecretAction string                   `json:"secretAction"`
-	APIKey       string                   `json:"apiKey,omitempty"`
-	Models       map[string]ProviderModel `json:"models"`
-	Current      *ProviderCurrent         `json:"current,omitempty"`
+	Revision       string                   `json:"revision"`
+	Name           string                   `json:"name"`
+	Type           string                   `json:"type"`
+	Endpoint       string                   `json:"endpoint"`
+	EndpointAction string                   `json:"endpointAction,omitempty"`
+	AuthType       string                   `json:"authType,omitempty"`
+	SecretAction   string                   `json:"secretAction"`
+	APIKey         string                   `json:"apiKey,omitempty"`
+	Models         map[string]ProviderModel `json:"models"`
+	Current        *ProviderCurrent         `json:"current,omitempty"`
 }
 
 // ProviderUpsertResult returns the committed revision and sanitized provider view.

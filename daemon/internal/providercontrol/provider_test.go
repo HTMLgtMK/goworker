@@ -65,8 +65,8 @@ func TestListAndDetailNeverExposeSecretsOrEndpointCredentials(t *testing.T) {
 	if len(list.Providers) != 1 || !list.Providers[0].HasAPIKey {
 		t.Fatalf("provider list did not return safe key presence: %#v", list.Providers)
 	}
-	if got := list.Providers[0].Endpoint; got != "https://example.test/v1" {
-		t.Fatalf("endpoint was not sanitized: %q", got)
+	if got := list.Providers[0].Endpoint; got != "https://example.test/%5Bredacted%5D" {
+		t.Fatalf("endpoint path was not redacted: %q", got)
 	}
 	if strings.Contains(list.Providers[0].Endpoint, "user") || strings.Contains(list.Providers[0].Endpoint, "token") {
 		t.Fatalf("endpoint leaked credentials: %q", list.Providers[0].Endpoint)
@@ -141,6 +141,77 @@ func TestUpsertKeepsOrReplacesSecretAndCanChangeCurrentAtomically(t *testing.T) 
 	}
 	if strings.Contains(result.Endpoint, "new-secret") {
 		t.Fatal("response leaked secret")
+	}
+}
+
+func TestUpsertRoundTripsRedactedEndpointWithoutLosingHiddenPath(t *testing.T) {
+	backend := newMemoryBackend()
+	cfg, _ := backend.ConfigSnapshotWithRevision()
+	provider := cfg.LLM.Providers["openai"]
+	provider.Endpoint = "https://proxy.example.test/private-token/v1"
+	cfg.LLM.Providers["openai"] = provider
+	backend.cfg = cfg
+	service := New(backend)
+
+	list, err := service.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	redactedEndpoint := list.Providers[0].Endpoint
+	if strings.Contains(redactedEndpoint, "private-token") {
+		t.Fatalf("provider view exposed endpoint path: %q", redactedEndpoint)
+	}
+	request := UpsertRequest{
+		Revision: "epoch-1", Name: "openai", Type: string(runtimeconfig.ProviderTypeOpenAI),
+		Endpoint: redactedEndpoint, SecretAction: "keep",
+		Models: map[string]Model{
+			"gpt-4o": {ContextWindow: 128000, RequestMode: string(runtimeconfig.ThinkingRequestAuto), Effort: string(runtimeconfig.ThinkingEffortMedium)},
+		},
+	}
+	if _, _, err := service.Upsert(request); err != nil {
+		t.Fatalf("upsert unchanged redacted endpoint: %v", err)
+	}
+	stored, _ := backend.ConfigSnapshotWithRevision()
+	if got := stored.LLM.Providers["openai"].Endpoint; got != "https://proxy.example.test/private-token/v1" {
+		t.Fatalf("round-trip changed hidden endpoint: %q", got)
+	}
+
+	request.Revision = "epoch-1-next"
+	request.Endpoint = redactedEndpoint
+	request.EndpointAction = "replace"
+	if _, _, err := service.Upsert(request); err != nil {
+		t.Fatalf("upsert explicit endpoint replacement with redacted-looking path: %v", err)
+	}
+	stored, _ = backend.ConfigSnapshotWithRevision()
+	if got := stored.LLM.Providers["openai"].Endpoint; got != request.Endpoint {
+		t.Fatalf("explicit endpoint replacement = %q, want %q", got, request.Endpoint)
+	}
+}
+
+func TestUpsertEndpointActionKeepPreservesStoredEndpoint(t *testing.T) {
+	backend := newMemoryBackend()
+	cfg, _ := backend.ConfigSnapshotWithRevision()
+	provider := cfg.LLM.Providers["openai"]
+	provider.Endpoint = "https://proxy.example.test/private-token/v1"
+	cfg.LLM.Providers["openai"] = provider
+	backend.cfg = cfg
+
+	_, _, err := New(backend).Upsert(UpsertRequest{
+		Revision:       "epoch-1",
+		Name:           "openai",
+		Type:           string(runtimeconfig.ProviderTypeOpenAI),
+		EndpointAction: "keep",
+		SecretAction:   "keep",
+		Models: map[string]Model{
+			"gpt-4o": {ContextWindow: 128000, RequestMode: string(runtimeconfig.ThinkingRequestAuto), Effort: string(runtimeconfig.ThinkingEffortMedium)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("upsert with endpointAction keep: %v", err)
+	}
+	stored, _ := backend.ConfigSnapshotWithRevision()
+	if got := stored.LLM.Providers["openai"].Endpoint; got != provider.Endpoint {
+		t.Fatalf("keep action changed endpoint to %q, want %q", got, provider.Endpoint)
 	}
 }
 

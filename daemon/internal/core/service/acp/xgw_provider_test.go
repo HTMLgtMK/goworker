@@ -4,13 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	aiacp "github.com/tinguo/goworker/ai-acp"
+	"github.com/tinguo/goworker/ai-acp/protocol"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	appconfig "github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/engine"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
+	agentservice "github.com/tinguo/goworker/daemon/internal/plugins/agent"
 	"github.com/tinguo/goworker/daemon/internal/providercontrol"
 	xgwprotocol "github.com/tinguo/goworker/daemon/xgoworker/protocol"
 )
@@ -57,7 +62,7 @@ func newProviderControlHandler() (*FrontendHandler, *acpProviderBackend) {
 	}
 	service := providercontrol.New(backend)
 	source := &providerControlSessionSource{fakeSessionSource: &fakeSessionSource{}, service: service}
-	return &FrontendHandler{sessions: source}, backend
+	return &FrontendHandler{sessions: source, providerWriteAllowed: true}, backend
 }
 
 func TestXGWProviderHandlersCRUDAndCurrentSelection(t *testing.T) {
@@ -126,7 +131,7 @@ func TestXGWProviderHandlersCRUDAndCurrentSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := gotValue.(xgwprotocol.ProviderGetResult)
-	if got.Provider.Endpoint != "https://api.example.test/v1" || got.Provider.Models["gpt-4o-mini"].ContextWindow != 128000 {
+	if got.Provider.Endpoint != "https://api.example.test/%5Bredacted%5D" || got.Provider.Models["gpt-4o-mini"].ContextWindow != 128000 {
 		t.Fatalf("detail did not reflect sanitized committed config: %#v", got)
 	}
 
@@ -139,10 +144,13 @@ func TestXGWProviderHandlersCRUDAndCurrentSelection(t *testing.T) {
 func TestXGWProviderRealEngineRevisionConflict(t *testing.T) {
 	cfg := appconfig.Default()
 	backend := engine.NewEngine(cfg, cfg.ToRuntime(), nil)
-	h := &FrontendHandler{sessions: &providerControlSessionSource{
-		fakeSessionSource: &fakeSessionSource{},
-		service:           providercontrol.New(backend),
-	}}
+	h := &FrontendHandler{
+		sessions: &providerControlSessionSource{
+			fakeSessionSource: &fakeSessionSource{},
+			service:           providercontrol.New(backend),
+		},
+		providerWriteAllowed: true,
+	}
 	params := mustProviderJSON(t, xgwprotocol.ProviderCurrentSetParams{
 		Revision: "stale", Provider: "openai", Model: "gpt-4o",
 	})
@@ -237,6 +245,240 @@ func TestXGWProviderCurrentGetAndSet(t *testing.T) {
 	})); err == nil {
 		t.Fatal("missing provider/model should be rejected")
 	}
+}
+
+func TestUnauthorizedACPPromptCannotChangeDaemonProviderConfig(t *testing.T) {
+	t.Setenv("GOWORKER_CONFIG_DIR", t.TempDir())
+	cfg := appconfig.Default()
+	cfg.Memory.Enabled = false
+	cfg.Session.Enabled = true
+	cfg.Session.Dir = filepath.Join(t.TempDir(), "sessions")
+	e := engine.NewEngine(cfg, cfg.ToRuntime(), nil)
+	if err := e.Register(agentservice.NewPlugin(cfg.ToRuntime(), runtimeconfig.Paths{ConfigDir: t.TempDir()})); err != nil {
+		t.Fatalf("register agent plugin: %v", err)
+	}
+	e.RegisterBuiltinCommands()
+	t.Cleanup(e.StopAll)
+	source, ok := e.Capability(model.SessionSourceCapability)
+	if !ok {
+		t.Fatal("agent plugin did not register session source")
+	}
+	sessions, ok := source.(model.SessionSource)
+	if !ok {
+		t.Fatalf("session capability has type %T", source)
+	}
+
+	newClient := func(allowed bool) (*aiacp.Client, string) {
+		t.Helper()
+		serverConn, clientConn := net.Pipe()
+		handler := NewFrontendHandlerFactory(e.Eval, e.Commands, sessions, NewSessionGate(), func(string) bool { return allowed })().(*FrontendHandler)
+		server, err := aiacp.NewServer(serverConn, handler)
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		server.Start()
+		t.Cleanup(func() { _ = server.Close() })
+		client, err := aiacp.NewClient("command-auth-test", clientConn, nil)
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+		if _, err := client.Initialize(context.Background()); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+		sessionID, err := client.NewSession(context.Background(), t.TempDir())
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		return client, sessionID
+	}
+	prompt := func(client *aiacp.Client, sessionID, input string) error {
+		t.Helper()
+		_, err := client.Prompt(context.Background(), sessionID, []protocol.ContentBlock{{Type: "text", Text: input}})
+		return err
+	}
+
+	before := e.ConfigSnapshot().LLM.Providers["openai"].Endpoint
+	unauthorized, unauthorizedSession := newClient(false)
+	for _, input := range []string{
+		"/model set endpoint=https://attacker.example/changed",
+		"/model use openai",
+		"/config set llm.providers.openai.endpoint=https://attacker.example/changed",
+		"/cfg set llm.providers.openai.endpoint=https://attacker.example/changed",
+	} {
+		if err := prompt(unauthorized, unauthorizedSession, input); err == nil {
+			t.Errorf("unauthorized ACP prompt %q unexpectedly succeeded", input)
+		}
+		if got := e.ConfigSnapshot().LLM.Providers["openai"].Endpoint; got != before {
+			t.Fatalf("unauthorized ACP prompt %q changed endpoint from %q to %q", input, before, got)
+		}
+	}
+	// The session was created/bound on this connection, but a session binding is not a grant.
+	if err := prompt(unauthorized, unauthorizedSession, "/model"); err != nil {
+		t.Fatalf("unauthorized ACP model read: %v", err)
+	}
+	if err := prompt(unauthorized, unauthorizedSession, "/config"); err != nil {
+		t.Fatalf("unauthorized ACP config read: %v", err)
+	}
+
+	authorized, authorizedSession := newClient(true)
+	if err := prompt(authorized, authorizedSession, "/model set endpoint=https://trusted.example/new-route"); err != nil {
+		t.Fatalf("authorized /model set: %v", err)
+	}
+	if got := e.ConfigSnapshot().LLM.Providers["openai"].Endpoint; got != "https://trusted.example/new-route" {
+		t.Fatalf("authorized /model set endpoint = %q", got)
+	}
+	if err := prompt(authorized, authorizedSession, "/config set llm.providers.openai.endpoint=https://trusted.example/config-route"); err != nil {
+		t.Fatalf("authorized /config set: %v", err)
+	}
+	if got := e.ConfigSnapshot().LLM.Providers["openai"].Endpoint; got != "https://trusted.example/config-route" {
+		t.Fatalf("authorized /config set endpoint = %q", got)
+	}
+}
+
+func TestProviderWriteAuthorizationIsConnectionScopedAndDiscoverable(t *testing.T) {
+	t.Run("unknown connection is denied", func(t *testing.T) {
+		stack, backend := newProviderWireStack(t, nil)
+		if _, err := stack.client.Initialize(context.Background()); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+		methods := providerWireMethods(t, stack.client)
+		for _, method := range []string{
+			xgwprotocol.ProviderMethodList,
+			xgwprotocol.ProviderMethodDetail,
+			xgwprotocol.ProviderMethodCurrentGet,
+		} {
+			if !strings.Contains(strings.Join(methods, "|"), method) {
+				t.Errorf("authorized read method %q missing from discovery: %v", method, methods)
+			}
+		}
+		for _, method := range []string{
+			xgwprotocol.ProviderMethodCurrentSet,
+			xgwprotocol.ProviderMethodUpsert,
+			xgwprotocol.ProviderMethodRemove,
+		} {
+			if strings.Contains(strings.Join(methods, "|"), method) {
+				t.Errorf("unauthorized write method %q advertised: %v", method, methods)
+			}
+			var result json.RawMessage
+			if err := stack.client.Call(context.Background(), method, map[string]any{}, &result); err == nil {
+				t.Errorf("unauthorized method %q unexpectedly succeeded", method)
+			}
+		}
+		if backend.revision != "epoch-1" {
+			t.Fatalf("unauthorized calls mutated provider config; revision = %q", backend.revision)
+		}
+
+		// Registration is not the only guard: direct in-process dispatch of each
+		// mutator must still fail closed on an unprivileged handler.
+		for _, invoke := range []func() error{
+			func() error {
+				_, err := stack.handler.xgwProviderCurrentSet(context.Background(), mustProviderJSON(t, xgwprotocol.ProviderCurrentSetParams{Revision: "epoch-1", Provider: "openai", Model: "gpt-4o"}))
+				return err
+			},
+			func() error {
+				_, err := stack.handler.xgwProviderUpsert(context.Background(), mustProviderJSON(t, xgwprotocol.ProviderUpsertParams{Revision: "epoch-1"}))
+				return err
+			},
+			func() error {
+				_, err := stack.handler.xgwProviderRemove(context.Background(), mustProviderJSON(t, xgwprotocol.ProviderRemoveParams{Revision: "epoch-1", Name: "openai"}))
+				return err
+			},
+		} {
+			if err := invoke(); err == nil || !strings.Contains(err.Error(), "not authorized") {
+				t.Errorf("direct unauthorized handler call error = %v, want authorization denial", err)
+			}
+		}
+		if backend.revision != "epoch-1" {
+			t.Fatalf("direct unauthorized calls mutated provider config; revision = %q", backend.revision)
+		}
+	})
+
+	t.Run("explicitly authorized connection can mutate", func(t *testing.T) {
+		var authorizedConnection string
+		stack, backend := newProviderWireStack(t, func(connectionID string) bool {
+			authorizedConnection = connectionID
+			return connectionID != ""
+		})
+		if _, err := stack.client.Initialize(context.Background()); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+		if authorizedConnection == "" || authorizedConnection != stack.handler.connectionID {
+			t.Fatalf("authorizer connection ID = %q, handler ID = %q", authorizedConnection, stack.handler.connectionID)
+		}
+		methods := providerWireMethods(t, stack.client)
+		for _, method := range []string{
+			xgwprotocol.ProviderMethodCurrentSet,
+			xgwprotocol.ProviderMethodUpsert,
+			xgwprotocol.ProviderMethodRemove,
+		} {
+			if !strings.Contains(strings.Join(methods, "|"), method) {
+				t.Fatalf("authorized write method %q missing from discovery: %v", method, methods)
+			}
+		}
+
+		var setResult xgwprotocol.ProviderCurrentSetResult
+		if err := stack.client.Call(context.Background(), xgwprotocol.ProviderMethodCurrentSet,
+			xgwprotocol.ProviderCurrentSetParams{Revision: backend.revision, Provider: "openai", Model: "gpt-4o"}, &setResult); err != nil {
+			t.Fatalf("authorized current/set: %v", err)
+		}
+		var upsertResult xgwprotocol.ProviderUpsertResult
+		if err := stack.client.Call(context.Background(), xgwprotocol.ProviderMethodUpsert,
+			xgwprotocol.ProviderUpsertParams{
+				Revision: backend.revision, Name: "secondary", Type: "openai",
+				Endpoint: "https://api.example.test/v1", SecretAction: "keep",
+				Models: map[string]xgwprotocol.ProviderModel{
+					"model": {ContextWindow: 4096, Thinking: xgwprotocol.ProviderThinkingConfig{RequestMode: "auto", Effort: "medium"}},
+				},
+			}, &upsertResult); err != nil {
+			t.Fatalf("authorized provider/upsert: %v", err)
+		}
+		var removeResult xgwprotocol.ProviderRemoveResult
+		if err := stack.client.Call(context.Background(), xgwprotocol.ProviderMethodRemove,
+			xgwprotocol.ProviderRemoveParams{Revision: backend.revision, Name: "secondary"}, &removeResult); err != nil {
+			t.Fatalf("authorized provider/remove: %v", err)
+		}
+		if backend.revision == "epoch-1" {
+			t.Fatalf("expected authorized mutations to commit, revision=%q", backend.revision)
+		}
+		if _, exists := backend.cfg.LLM.Providers["secondary"]; exists {
+			t.Fatal("provider/remove left the secondary provider in the registry")
+		}
+	})
+}
+
+type providerWireStack struct {
+	client  *aiacp.Client
+	handler *FrontendHandler
+}
+
+func newProviderWireStack(t *testing.T, authorizer ProviderWriteAuthorizer) (*providerWireStack, *acpProviderBackend) {
+	t.Helper()
+	base, backend := newProviderControlHandler()
+	serverConn, clientConn := net.Pipe()
+	handler := NewFrontendHandlerFactory(nil, nil, base.sessions, NewSessionGate(), authorizer)().(*FrontendHandler)
+	server, err := aiacp.NewServer(serverConn, handler, aiacp.WithAgentCapability(xgwprotocol.XGWorkerCapability{}))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	registerXGWMethods(server, handler)
+	server.Start()
+	t.Cleanup(func() { _ = server.Close() })
+	client, err := aiacp.NewClient("provider-auth-test", clientConn, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	return &providerWireStack{client: client, handler: handler}, backend
+}
+
+func providerWireMethods(t *testing.T, client *aiacp.Client) []string {
+	t.Helper()
+	var result xgwprotocol.CapabilitiesResult
+	if err := client.Call(context.Background(), xgwprotocol.MethodCapabilities, nil, &result); err != nil {
+		t.Fatalf("x-goworker/capabilities: %v", err)
+	}
+	return result.Methods
 }
 
 func mustProviderJSON(t *testing.T, v any) json.RawMessage {

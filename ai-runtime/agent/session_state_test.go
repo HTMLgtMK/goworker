@@ -4,9 +4,55 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 )
 
 // 本文件验证多个 runtime 的 CWD 与 usage 状态相互隔离。
+
+func TestUsageContextWindowTracksAcceptedRunConfig(t *testing.T) {
+	s, _ := testSession(&captureProvider{})
+	windowConfig := func(window int) *runtimeconfig.Config {
+		cfg := runtimeconfig.Default()
+		provider := cfg.LLM.Providers["openai"]
+		model := provider.Models["gpt-4o"]
+		model.ContextWindow = window
+		provider.Models["gpt-4o"] = model
+		cfg.LLM.Providers["openai"] = provider
+		return cfg
+	}
+
+	for _, window := range []int{32 * 1024, 64 * 1024} {
+		result, err := s.Run(context.Background(), RunRequest{
+			Input:  "question",
+			Config: windowConfig(window),
+		}, testRunCallbacks(&strings.Builder{}))
+		if err != nil {
+			t.Fatalf("Run with %d-token window: %v", window, err)
+		}
+		if result.State != RunCompleted {
+			t.Fatalf("Run with %d-token window = %+v, want completed", window, result)
+		}
+		if got := s.LastUsageContextWindow(); got != window {
+			t.Errorf("last usage context window = %d after Run configured with %d", got, window)
+		}
+	}
+
+	// A run that exits before reaching a provider must not replace the last
+	// actual-call window with whichever config happened to be selected.
+	result, err := s.Run(context.Background(), RunRequest{
+		Config: windowConfig(96 * 1024),
+	}, testRunCallbacks(&strings.Builder{}))
+	if err != nil {
+		t.Fatalf("empty Run: %v", err)
+	}
+	if result.State != RunCancelled {
+		t.Fatalf("empty Run state = %s, want cancelled", result.State)
+	}
+	if got := s.LastUsageContextWindow(); got != 64*1024 {
+		t.Errorf("context window after call-free Run = %d, want 65536", got)
+	}
+}
 
 // TestSessionStateIsolation：manager 注册 A/B 两个 runtime，各自声明不同 cwd、
 // 各跑一轮 → 双方 DeclaredCWD / Session.cwd 互不覆盖；A 再跑一轮 → usage 各自

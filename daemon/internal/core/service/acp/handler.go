@@ -20,6 +20,12 @@ import (
 // Evaluator 执行一条用户输入（装配层通常注入 Engine.Eval）。
 type Evaluator = func(ctx *model.Context, input string) error
 
+// ProviderWriteAuthorizer decides whether one ACP connection may mutate the
+// daemon-wide provider registry. It is independent of session control leases.
+// The authorizer may be called concurrently for accepted connections. A nil
+// authorizer denies provider writes.
+type ProviderWriteAuthorizer func(connectionID string) bool
+
 // FrontendHandler 实现 daemon 的 ACP 会话操作。每个连接使用独立 handler，
 // 会话选择通过连接级 Binding 路由；BoundSessionSource 不可用时兼容单会话后端。
 // SessionGate 由装配层创建并由所有 handler 共享，只保护会话管理操作；prompt
@@ -48,6 +54,9 @@ type FrontendHandler struct {
 	// control lease 的持有者寻址面,连接退出时经 Close 归还(订阅泵清理与能力
 	// 解绑同钩子)。仅在本连接内自洽,跨连接无意义。
 	connectionID string
+	// providerWriteAllowed is granted once per connection by the transport's
+	// injected authorizer. It never follows from session lease ownership/revision.
+	providerWriteAllowed bool
 	// runs 是 x-goworker 扩展协议的消费面(model.RunControlSource,工厂内
 	// 对 sessions type-assert 获得)。nil = 后端无 run control 能力(纯
 	// SessionSource 插件/测试桩):全部 x-goworker 方法诚实报错,与 loader/lister
@@ -107,16 +116,27 @@ var (
 // NewFrontendHandlerFactory creates one handler per connection. sessions and commands may be
 // nil (session capabilities degrade honestly; command completion is omitted); evaluate and the
 // shared SessionGate are required. Each handler gets a connection ID and optional RunControlSource
-// capability; nil session sources skip the assertion.
-func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Command, sessions model.SessionSource, gate *SessionGate) HandlerFactory {
+// capability; nil session sources skip the assertion. Provider writes are denied unless an
+// authorizer is explicitly injected and grants that connection.
+func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Command, sessions model.SessionSource, gate *SessionGate, authorizers ...ProviderWriteAuthorizer) HandlerFactory {
+	var authorizeProviderWrites ProviderWriteAuthorizer
+	if len(authorizers) > 1 {
+		panic("acp: at most one provider write authorizer may be supplied")
+	}
+	if len(authorizers) == 1 {
+		authorizeProviderWrites = authorizers[0]
+	}
 	return func() aiacp.SessionHandler {
+		connectionID := newConnectionID()
+		providerWriteAllowed := authorizeProviderWrites != nil && authorizeProviderWrites(connectionID)
 		handler := &FrontendHandler{
-			evaluate:     evaluate,
-			commands:     commands,
-			sessions:     sessions,
-			gate:         gate,
-			connectionID: newConnectionID(),
-			toolsReady:   make(chan struct{}),
+			evaluate:             evaluate,
+			commands:             commands,
+			sessions:             sessions,
+			gate:                 gate,
+			connectionID:         connectionID,
+			providerWriteAllowed: providerWriteAllowed,
+			toolsReady:           make(chan struct{}),
 		}
 		if sessions != nil {
 			// RunControlSource deliberately excludes host-only synchronous methods, so ACP
@@ -453,7 +473,10 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 		// Inject the connection's live Binding and client ID into the evaluation context. The
 		// mutable Binding lets /new clear this connection's selection, while the client ID lets
 		// lifecycle cleanup remove its binding registration; both use h.connectionID as identity.
-		Ctx: agentcontrol.WithClientID(agentcontrol.WithBinding(ctx, &h.binding), h.connectionID),
+		Ctx: agentcontrol.WithProviderWriteAuthorization(
+			agentcontrol.WithClientID(agentcontrol.WithBinding(ctx, &h.binding), h.connectionID),
+			h.providerWriteAllowed,
+		),
 		FrontendContext: model.FrontendContext{
 			// 命令输出统一包成代码块（见 commandOutput）：命令侧仍按等宽终端排版，
 			// 由这里告诉渲染器「这段别重排」。

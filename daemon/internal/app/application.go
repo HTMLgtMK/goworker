@@ -14,6 +14,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/core/engine"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 	coreservice "github.com/tinguo/goworker/daemon/internal/core/service"
+	acpservice "github.com/tinguo/goworker/daemon/internal/core/service/acp"
 )
 
 // Application is the fully assembled backend exposed to frontend hosts.
@@ -28,7 +29,8 @@ type Application struct {
 var ErrCapabilityUnavailable = errors.New("capability unavailable")
 
 type applicationOptions struct {
-	acpConnection io.ReadWriteCloser
+	acpConnection           io.ReadWriteCloser
+	providerWriteAuthorizer acpservice.ProviderWriteAuthorizer
 }
 
 // Option customizes Application assembly without exposing ACP transport
@@ -37,12 +39,23 @@ type Option func(*applicationOptions)
 
 // WithACPConnection serves ACP over an already-established full-duplex
 // connection, such as a mobile pipe. A nil connection leaves the default Unix
-// socket transport in place.
+// socket transport in place. Provider writes over injected connections are denied
+// unless WithACPProviderWriteAuthorizer explicitly grants them.
 func WithACPConnection(conn io.ReadWriteCloser) Option {
 	return func(options *applicationOptions) {
 		if conn != nil {
 			options.acpConnection = conn
 		}
+	}
+}
+
+// WithACPProviderWriteAuthorizer injects the per-connection authorization policy
+// for daemon-wide provider mutations. The callback receives the server-generated
+// connection ID. A nil callback restores transport defaults: trusted Unix local
+// connections are allowed; injected/unknown transports are denied.
+func WithACPProviderWriteAuthorizer(authorizer acpservice.ProviderWriteAuthorizer) Option {
+	return func(options *applicationOptions) {
+		options.providerWriteAuthorizer = authorizer
 	}
 }
 
@@ -113,7 +126,7 @@ func New(options ...Option) (*Application, error) {
 		return nil, err
 	}
 
-	e := engine.NewEngine(cfg, runtimeCfg, log)
+	e := engine.NewEngine(cfg, runtimeCfg, log, engine.WithRuntimeConfigOverride(applySandboxModeOverride))
 
 	// 注册拦截器
 	e.Use(engine.LoggingInterceptor(log))

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -220,18 +221,38 @@ func DefaultPath() string {
 	return filepath.Join(DefaultDir(), "config.yaml")
 }
 
-// Display 返回 YAML 格式的配置文本（API Key 自动脱敏）。
+// Display returns YAML configuration text with API keys and endpoint path credentials redacted.
 func (c *Config) Display() string {
 	cfg := *c
 	cfg.LLM = c.LLM.Clone()
 	for name, provider := range cfg.LLM.Providers {
 		if provider.APIKey != "" {
 			provider.APIKey = "***"
-			cfg.LLM.Providers[name] = provider
 		}
+		provider.Endpoint = RedactEndpoint(provider.Endpoint)
+		cfg.LLM.Providers[name] = provider
 	}
 	data, _ := yaml.Marshal(cfg)
 	return string(data)
+}
+
+// RedactEndpoint removes URL credentials and masks every non-root path. Endpoint
+// path segments are opaque: reverse proxies commonly put bearer tokens there.
+func RedactEndpoint(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "[redacted]"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	if parsed.Path != "" && parsed.Path != "/" {
+		parsed.Path = "/[redacted]"
+		parsed.RawPath = ""
+	}
+	return parsed.String()
 }
 
 // SetField 按点分 key 设置配置项（如 "llm.endpoint"、"sandbox.mode"）。

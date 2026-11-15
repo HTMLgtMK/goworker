@@ -3,13 +3,257 @@ package engine
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
+
+func TestBuiltinConfigWriteRequiresExplicitProviderAuthorization(t *testing.T) {
+	cfg := config.Default()
+	e := NewEngine(cfg, cfg.ToRuntime(), nil)
+	e.configPath = filepath.Join(t.TempDir(), "config.yaml")
+	e.RegisterBuiltinCommands()
+
+	deniedCtx := &model.Context{Ctx: agentcontrol.WithProviderWriteAuthorization(context.Background(), false)}
+	for _, input := range []string{
+		"/config set llm.providers.openai.endpoint=https://attacker.example/v1",
+		"/cfg set llm.providers.openai.endpoint=https://attacker.example/v1",
+	} {
+		if err := e.Eval(deniedCtx, input); err == nil {
+			t.Errorf("Eval(%q) should be denied", input)
+		}
+	}
+	if got := e.Config().LLM.Providers["openai"].Endpoint; got != cfg.LLM.Providers["openai"].Endpoint {
+		t.Fatalf("denied prompt changed provider endpoint: %q", got)
+	}
+
+	var output string
+	readCtx := &model.Context{
+		Ctx:             agentcontrol.WithProviderWriteAuthorization(context.Background(), false),
+		FrontendContext: model.FrontendContext{Writer: func(text string) { output += text }},
+	}
+	if err := e.Eval(readCtx, "/config"); err != nil {
+		t.Fatalf("unauthorized config read: %v", err)
+	}
+	if !strings.Contains(output, "llm:") {
+		t.Fatalf("unauthorized config read returned no configuration: %q", output)
+	}
+
+	// Unmarked contexts are the trusted stdin/local management path, not ACP.
+	trustedCtx := &model.Context{FrontendContext: model.FrontendContext{Writer: func(string) {}}}
+	if err := e.Eval(trustedCtx, "/config set llm.providers.openai.endpoint=https://trusted.example/v1"); err != nil {
+		t.Fatalf("trusted local config write: %v", err)
+	}
+	if got := e.Config().LLM.Providers["openai"].Endpoint; got != "https://trusted.example/v1" {
+		t.Fatalf("trusted local write endpoint = %q", got)
+	}
+}
+
+func TestConfigUpdatesPreserveSandboxEnvironmentOverride(t *testing.T) {
+	tests := []struct {
+		name  string
+		apply func(*testing.T, *Engine) error
+	}{
+		{
+			name: "daemon-only update",
+			apply: func(t *testing.T, e *Engine) error {
+				return e.UpdateDaemonConfig(func(cfg *config.Config) error {
+					cfg.Log.Level = "debug"
+					return nil
+				})
+			},
+		},
+		{
+			name: "runtime update",
+			apply: func(t *testing.T, e *Engine) error {
+				_, err := e.UpdateConfig(func(cfg *runtimeconfig.Config) error {
+					cfg.Sandbox.AllowedWorkDir = "/workspace/updated"
+					return nil
+				})
+				return err
+			},
+		},
+		{
+			name: "revision-checked runtime update",
+			apply: func(t *testing.T, e *Engine) error {
+				_, revision := e.ConfigSnapshotWithRevision()
+				_, _, err := e.UpdateConfigAtRevision(revision, func(cfg *runtimeconfig.Config) error {
+					cfg.Sandbox.AllowedWorkDir = "/workspace/updated"
+					return nil
+				})
+				return err
+			},
+		},
+		{
+			name: "compatibility save",
+			apply: func(t *testing.T, e *Engine) error {
+				cfg := e.ConfigSnapshot()
+				cfg.Sandbox.AllowedWorkDir = "/workspace/updated"
+				return e.SaveConfig(cfg)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Sandbox.Mode = "normal"
+			runtimeCfg := cfg.ToRuntime()
+			runtimeCfg.Sandbox.Mode = "strict"
+			e := NewEngine(cfg, runtimeCfg, nil, WithRuntimeConfigOverride(func(runtimeCfg *runtimeconfig.Config) error {
+				runtimeCfg.Sandbox.Mode = "strict"
+				return nil
+			}))
+			e.configPath = filepath.Join(t.TempDir(), "config.yaml")
+
+			if got := e.ConfigSnapshot().Sandbox.Mode; got != "strict" {
+				t.Fatalf("initial runtime sandbox mode = %q, want strict", got)
+			}
+			if err := tt.apply(t, e); err != nil {
+				t.Fatalf("update failed: %v", err)
+			}
+			if got := e.ConfigSnapshot().Sandbox.Mode; got != "strict" {
+				t.Errorf("runtime sandbox mode = %q, want strict", got)
+			}
+			if got := e.Config().Sandbox.Mode; got != "normal" {
+				t.Errorf("persistent sandbox mode = %q, want normal", got)
+			}
+
+			saved := config.Load(e.configPath)
+			if saved == nil {
+				t.Fatal("saved config could not be loaded")
+			}
+			if got := saved.Sandbox.Mode; got != "normal" {
+				t.Errorf("saved sandbox mode = %q, want normal", got)
+			}
+		})
+	}
+}
+
+func TestRuntimeSandboxModeExplicitlySetToOverridePersists(t *testing.T) {
+	updates := []struct {
+		name  string
+		apply func(*Engine) error
+	}{
+		{
+			name: "runtime update",
+			apply: func(e *Engine) error {
+				_, err := e.UpdateConfig(func(cfg *runtimeconfig.Config) error {
+					if cfg.Sandbox.Mode != "normal" {
+						t.Fatalf("mutator sandbox mode = %q, want persisted base normal", cfg.Sandbox.Mode)
+					}
+					cfg.Sandbox.Mode = "strict"
+					return nil
+				})
+				return err
+			},
+		},
+		{
+			name: "revision-checked runtime update",
+			apply: func(e *Engine) error {
+				_, revision := e.ConfigSnapshotWithRevision()
+				_, _, err := e.UpdateConfigAtRevision(revision, func(cfg *runtimeconfig.Config) error {
+					if cfg.Sandbox.Mode != "normal" {
+						t.Fatalf("mutator sandbox mode = %q, want persisted base normal", cfg.Sandbox.Mode)
+					}
+					cfg.Sandbox.Mode = "strict"
+					return nil
+				})
+				return err
+			},
+		},
+	}
+
+	for _, tt := range updates {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Sandbox.Mode = "normal"
+			runtimeCfg := cfg.ToRuntime()
+			e := NewEngine(cfg, runtimeCfg, nil, WithRuntimeConfigOverride(func(runtimeCfg *runtimeconfig.Config) error {
+				runtimeCfg.Sandbox.Mode = "strict"
+				return nil
+			}))
+			e.configPath = filepath.Join(t.TempDir(), "config.yaml")
+
+			if err := tt.apply(e); err != nil {
+				t.Fatalf("update failed: %v", err)
+			}
+			if got := e.ConfigSnapshot().Sandbox.Mode; got != "strict" {
+				t.Errorf("effective sandbox mode = %q, want strict", got)
+			}
+			if got := e.Config().Sandbox.Mode; got != "strict" {
+				t.Errorf("persistent sandbox mode = %q, want strict", got)
+			}
+			saved := config.Load(e.configPath)
+			if saved == nil || saved.Sandbox.Mode != "strict" {
+				t.Errorf("saved sandbox mode = %v, want strict", saved)
+			}
+		})
+	}
+}
+
+func TestDaemonConfigSandboxModeExplicitlySetToOverridePersists(t *testing.T) {
+	cfg := config.Default()
+	cfg.Sandbox.Mode = "normal"
+	e := NewEngine(cfg, cfg.ToRuntime(), nil, WithRuntimeConfigOverride(func(runtimeCfg *runtimeconfig.Config) error {
+		runtimeCfg.Sandbox.Mode = "strict"
+		return nil
+	}))
+	e.configPath = filepath.Join(t.TempDir(), "config.yaml")
+
+	if err := e.UpdateDaemonConfig(func(cfg *config.Config) error {
+		cfg.Sandbox.Mode = "strict"
+		return nil
+	}); err != nil {
+		t.Fatalf("UpdateDaemonConfig: %v", err)
+	}
+	if got := e.ConfigSnapshot().Sandbox.Mode; got != "strict" {
+		t.Errorf("effective sandbox mode = %q, want strict", got)
+	}
+	if got := e.Config().Sandbox.Mode; got != "strict" {
+		t.Errorf("persistent sandbox mode = %q, want strict", got)
+	}
+	saved := config.Load(e.configPath)
+	if saved == nil || saved.Sandbox.Mode != "strict" {
+		t.Errorf("saved sandbox mode = %v, want strict", saved)
+	}
+}
+
+func TestRuntimeSandboxModeUpdatePersistsBaseValueUnderOverride(t *testing.T) {
+	cfg := config.Default()
+	cfg.Sandbox.Mode = "normal"
+	runtimeCfg := cfg.ToRuntime()
+	runtimeCfg.Sandbox.Mode = "strict"
+	e := NewEngine(cfg, runtimeCfg, nil, WithRuntimeConfigOverride(func(runtimeCfg *runtimeconfig.Config) error {
+		runtimeCfg.Sandbox.Mode = "strict"
+		return nil
+	}))
+	e.configPath = filepath.Join(t.TempDir(), "config.yaml")
+
+	_, err := e.UpdateConfig(func(runtimeCfg *runtimeconfig.Config) error {
+		runtimeCfg.Sandbox.Mode = "readonly"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateConfig: %v", err)
+	}
+	if got := e.ConfigSnapshot().Sandbox.Mode; got != "strict" {
+		t.Errorf("effective sandbox mode = %q, want strict", got)
+	}
+	if got := e.Config().Sandbox.Mode; got != "readonly" {
+		t.Errorf("persistent sandbox mode = %q, want readonly", got)
+	}
+	saved := config.Load(e.configPath)
+	if saved == nil || saved.Sandbox.Mode != "readonly" {
+		t.Errorf("saved sandbox mode = %v, want readonly", saved)
+	}
+}
 
 func TestSaveConfig_RollsBackOnWriteFailure(t *testing.T) {
 	cfg := config.Default()

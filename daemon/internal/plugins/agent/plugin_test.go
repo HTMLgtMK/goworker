@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -75,6 +76,33 @@ func testHub(cfg *runtimeconfig.Config) (*model.Hub, *[]*runtimeconfig.Config) {
 	}
 	hub.Tools = func() []model.Tool { return nil } // collectTools 依赖，缺了会 nil 函数 panic
 	return hub, &saved
+}
+
+func TestValidateSessionCWDUsesCurrentConfigSnapshot(t *testing.T) {
+	oldBoundary := t.TempDir()
+	oldCWD := filepath.Join(oldBoundary, "old")
+	if err := os.Mkdir(oldCWD, 0o700); err != nil {
+		t.Fatalf("mkdir old cwd: %v", err)
+	}
+	currentBoundary := t.TempDir()
+	currentCWD := filepath.Join(currentBoundary, "current")
+	if err := os.Mkdir(currentCWD, 0o700); err != nil {
+		t.Fatalf("mkdir current cwd: %v", err)
+	}
+
+	legacy := &runtimeconfig.Config{Sandbox: sandbox.SandboxConfig{AllowedWorkDir: oldBoundary}}
+	current := &runtimeconfig.Config{Sandbox: sandbox.SandboxConfig{AllowedWorkDir: currentBoundary}}
+	p := &AgentPlugin{
+		cfg: legacy,
+		hub: &model.Hub{ConfigSnapshot: func() *runtimeconfig.Config { return current }},
+	}
+
+	if err := p.validateSessionCWD(currentCWD); err != nil {
+		t.Errorf("CWD inside current boundary rejected: %v", err)
+	}
+	if err := p.validateSessionCWD(oldCWD); err == nil {
+		t.Errorf("CWD allowed only by construction-time config was accepted")
+	}
 }
 
 func TestCollectToolsPreservesRegisteredToolMetadata(t *testing.T) {
@@ -493,6 +521,10 @@ func TestHandleUsage_ShowsCompaction(t *testing.T) {
 	if err := p.handleCompact(compactCtx); err != nil {
 		t.Fatalf("handleCompact: %v", err)
 	}
+	_, compactions, _ := p.boundSession().UsageSnapshot()
+	if len(compactions) != 1 || compactions[0].ContextWindow != selectedContextWindow(cfg) {
+		t.Fatalf("compactions = %+v, want one summary call with window %d", compactions, selectedContextWindow(cfg))
+	}
 
 	ctx, buf := newContext()
 	if err := p.handleUsage(ctx); err != nil {
@@ -504,6 +536,49 @@ func TestHandleUsage_ShowsCompaction(t *testing.T) {
 	}
 	if !strings.Contains(out, "history:") {
 		t.Errorf("usage output missing current history estimate:\n%s", out)
+	}
+}
+
+func TestHandleUsage_UsesCallWindowAndCurrentSnapshot(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	provider := cfg.LLM.Providers[cfg.LLM.Current.Provider]
+	modelConfig := provider.Models[cfg.LLM.Current.Model]
+	modelConfig.ContextWindow = 32_000
+	provider.Models[cfg.LLM.Current.Model] = modelConfig
+	cfg.LLM.Providers[cfg.LLM.Current.Provider] = provider
+
+	hub, _ := testHub(cfg)
+	p := newAgentPluginP(hub, fixedProvider{content: "answer"})
+	seedRuns(p, "question")
+
+	calls, _, total := p.boundSession().UsageSnapshot()
+	if len(calls) != 1 || calls[0].ContextWindow != 32_000 {
+		t.Fatalf("recorded calls = %+v, want one call with window 32000", calls)
+	}
+	if err := p.updateRuntimeConfig(func(current *runtimeconfig.Config) error {
+		provider := current.LLM.Providers[current.LLM.Current.Provider]
+		modelConfig := provider.Models[current.LLM.Current.Model]
+		modelConfig.ContextWindow = 64_000
+		provider.Models[current.LLM.Current.Model] = modelConfig
+		current.LLM.Providers[current.LLM.Current.Provider] = provider
+		return nil
+	}); err != nil {
+		t.Fatalf("update current context window: %v", err)
+	}
+
+	ctx, buf := newContext()
+	if err := p.handleUsage(ctx); err != nil {
+		t.Fatalf("handleUsage: %v", err)
+	}
+	out := buf.String()
+	wantLastPromptPercent := fmt.Sprintf("context: %.2f%%", float64(total.LastPromptTokens)/32_000*100)
+	if !strings.Contains(out, wantLastPromptPercent) {
+		t.Errorf("output missing previous-call percentage %q:\n%s", wantLastPromptPercent, out)
+	}
+	historyEstimate := core.EstimateTokens(p.boundSession().Conversation())
+	wantHistoryPercent := fmt.Sprintf(", %.2f%% of window", float64(historyEstimate)/64_000*100)
+	if !strings.Contains(out, wantHistoryPercent) {
+		t.Errorf("output missing current-snapshot percentage %q:\n%s", wantHistoryPercent, out)
 	}
 }
 

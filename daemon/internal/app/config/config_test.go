@@ -28,6 +28,24 @@ func TestDefault_IncludesLog(t *testing.T) {
 	}
 }
 
+func TestDisplayRedactsProviderEndpointPath(t *testing.T) {
+	cfg := Default()
+	provider := cfg.LLM.Providers["openai"]
+	provider.Endpoint = "https://user:pass@example.test/private-token/v1?key=query-secret#fragment-secret"
+	provider.APIKey = "api-secret"
+	cfg.LLM.Providers["openai"] = provider
+
+	display := cfg.Display()
+	for _, secret := range []string{"private-token", "query-secret", "fragment-secret", "user:pass", "api-secret"} {
+		if strings.Contains(display, secret) {
+			t.Errorf("Display leaked %q: %s", secret, display)
+		}
+	}
+	if !strings.Contains(display, "https://example.test/%5Bredacted%5D") {
+		t.Fatalf("Display omitted redacted endpoint host: %s", display)
+	}
+}
+
 func TestLoad_NamedProvidersAndRejectLegacy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	data := `llm:

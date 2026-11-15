@@ -14,6 +14,8 @@ import (
 type stubProvider struct {
 	lastReq *core.ChatRequest
 	resp    string
+	usage   *core.UsageInfo
+	empty   bool
 	err     error
 }
 
@@ -24,7 +26,13 @@ func (p *stubProvider) Chat(_ context.Context, req *core.ChatRequest) (*core.Cha
 	if p.err != nil {
 		return nil, p.err
 	}
-	return &core.ChatResponse{Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: p.resp}}}}, nil
+	if p.empty {
+		return &core.ChatResponse{Usage: p.usage}, nil
+	}
+	return &core.ChatResponse{
+		Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: p.resp}}},
+		Usage:   p.usage,
+	}, nil
 }
 func (p *stubProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
 	return nil, errors.New("not implemented")
@@ -269,12 +277,75 @@ func TestCompressor_NoPanicOnZeroKeepLast(t *testing.T) {
 	}
 }
 
+func TestCompressor_ReportsUsageForEmptyResponseWithoutCompaction(t *testing.T) {
+	usage := &core.UsageInfo{PromptTokens: 17, CompletionTokens: 5, TotalTokens: 22}
+	stub := &stubProvider{empty: true, usage: usage}
+	var compactions []CompressReport
+	var reportedUsage *core.UsageInfo
+	var reportedEstimate int
+	c := NewCompressorWithCallbacks(stub, 1, false,
+		func(r CompressReport) { compactions = append(compactions, r) },
+		func(u *core.UsageInfo, estimate int) { reportedUsage = u; reportedEstimate = estimate },
+	)
+	history := []core.Message{msg("user", "a"), msg("user", "b"), msg("user", "c")}
+
+	out, err := c.Compress(context.Background(), history)
+	if err == nil || !strings.Contains(err.Error(), "empty response") {
+		t.Fatalf("Compress err = %v, want empty response error", err)
+	}
+	if !reflect.DeepEqual(out, history) {
+		t.Errorf("failed compression history = %+v, want original %+v", out, history)
+	}
+	if reportedUsage != usage {
+		t.Errorf("reported usage = %p, want response usage %p", reportedUsage, usage)
+	}
+	if reportedEstimate == 0 {
+		t.Error("reported estimate = 0, want an estimate for the failed summarize call")
+	}
+	if len(compactions) != 0 {
+		t.Errorf("compactions = %+v, want none for failed compression", compactions)
+	}
+}
+
+func TestCompressionMiddlewareKeepsHistoryAndAccountsUnusableSummary(t *testing.T) {
+	usage := &core.UsageInfo{PromptTokens: 11, CompletionTokens: 2, TotalTokens: 13}
+	stub := &stubProvider{empty: true, usage: usage}
+	var compactions, usageCalls int
+	compressor := NewCompressorWithCallbacks(stub, 1, false,
+		func(CompressReport) { compactions++ },
+		func(got *core.UsageInfo, estimate int) {
+			usageCalls++
+			if got != usage || estimate == 0 {
+				t.Errorf("usage callback = (%p, %d), want (%p, nonzero)", got, estimate, usage)
+			}
+		},
+	)
+	middleware := NewCompressionMiddleware(compressor, 1, 0.8)
+	history := []core.Message{msg("user", "a"), msg("assistant", "b"), msg("user", "c")}
+	ev := &core.BeforeModelEvent{Ctx: context.Background(), History: history}
+
+	middleware.OnBeforeModel(ev)
+
+	if !reflect.DeepEqual(ev.History, history) {
+		t.Errorf("history after failed automatic compression = %+v, want original %+v", ev.History, history)
+	}
+	if usageCalls != 1 {
+		t.Errorf("usage callbacks = %d, want 1", usageCalls)
+	}
+	if compactions != 0 {
+		t.Errorf("compaction callbacks = %d, want 0", compactions)
+	}
+}
+
 func TestCompressor_ProviderErrorPropagates(t *testing.T) {
 	hist := []core.Message{msg("user", "a"), msg("user", "b"), msg("user", "c")}
 	stub := &stubProvider{err: errors.New("api down")}
 	c := NewCompressor(stub, 1, false)
-	_, err := c.Compress(context.Background(), hist)
+	out, err := c.Compress(context.Background(), hist)
 	if err == nil || !strings.Contains(err.Error(), "api down") {
 		t.Errorf("err = %v, want wrapped provider error", err)
+	}
+	if !reflect.DeepEqual(out, hist) {
+		t.Errorf("failed compression history = %+v, want original %+v", out, hist)
 	}
 }

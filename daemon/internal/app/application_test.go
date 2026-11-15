@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/tinguo/goworker/daemon/internal/app/config"
 	acpservice "github.com/tinguo/goworker/daemon/internal/core/service/acp"
 )
 
@@ -74,6 +75,43 @@ func TestNew_DefaultConfig(t *testing.T) {
 		t.Fatalf("acp socket mode = %04o, want 0600", info.Mode().Perm())
 	}
 	appl.Stop()
+}
+
+func TestNew_UpdateDaemonConfigPreservesSandboxEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GOWORKER_CONFIG_DIR", dir)
+	t.Setenv("GOWORKER_SANDBOX_MODE", "strict")
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("frontend:\n  acp:\n    enabled: false\nsandbox:\n  mode: normal\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	appl, err := New()
+	if err != nil {
+		t.Fatalf("New with sandbox override: %v", err)
+	}
+	defer appl.Stop()
+
+	if err := appl.Engine.UpdateDaemonConfig(func(cfg *config.Config) error {
+		cfg.Log.Level = "debug"
+		return nil
+	}); err != nil {
+		t.Fatalf("UpdateDaemonConfig: %v", err)
+	}
+	if got := appl.Engine.ConfigSnapshot().Sandbox.Mode; got != "strict" {
+		t.Errorf("effective sandbox mode = %q, want strict", got)
+	}
+	if got := appl.Engine.Config().Sandbox.Mode; got != "normal" {
+		t.Errorf("persistent sandbox mode = %q, want normal", got)
+	}
+
+	saved := config.Load(configPath)
+	if saved == nil {
+		t.Fatal("saved config could not be loaded")
+	}
+	if got := saved.Sandbox.Mode; got != "normal" {
+		t.Errorf("saved sandbox mode = %q, want normal", got)
+	}
 }
 
 func TestNew_DisabledACPStillInitializesServiceRegistry(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	term "github.com/charmbracelet/x/term"
 	"github.com/muesli/termenv"
 
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 	"github.com/tinguo/goworker/daemon/internal/version"
@@ -48,6 +49,12 @@ func (e *Engine) RegisterBuiltinCommands() {
 		Name:        "/config",
 		Aliases:     []string{"/cfg"},
 		Description: "查看/修改全局配置",
+		Authorize: func(ctx *model.Context) error {
+			if len(ctx.Args) > 0 && ctx.Args[0] == "set" && !agentcontrol.ProviderWriteAuthorized(ctx.Ctx) {
+				return fmt.Errorf("configuration write is not authorized for this connection")
+			}
+			return nil
+		},
 		Handler: func(ctx *model.Context) error {
 			args := ctx.Args
 
@@ -133,7 +140,7 @@ func (e *Engine) handleDiagnose(ctx *model.Context) error {
 			key = fmt.Sprintf("***(%d chars)", len(p.APIKey))
 		}
 		w("  current=%s type=%s model=%s\n", llm.Current.Provider, p.Type, llm.Current.Model)
-		w("  endpoint=%s\n", p.Endpoint)
+		w("  endpoint=%s\n", config.RedactEndpoint(p.Endpoint))
 		w("  context_window=%d thinking(mode=%s effort=%s show=%v)\n",
 			selected.ContextWindow, selected.Thinking.RequestMode, selected.Thinking.Effort, llm.Thinking.Show)
 		w("  api_key=%s\n", key)

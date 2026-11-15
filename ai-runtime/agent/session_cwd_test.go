@@ -2,14 +2,66 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/tinguo/goworker/ai-core/core"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-sandbox"
 )
+
+// TestSessionRunRevalidatesExistingCWDAgainstRunSnapshot ensures a CWD accepted under
+// an earlier policy cannot be reused by a run whose immutable snapshot has a tighter boundary.
+func TestSessionRunRevalidatesExistingCWDAgainstRunSnapshot(t *testing.T) {
+	oldCWD := t.TempDir()
+	currentBoundary := t.TempDir()
+	current := &runtimeconfig.Config{Sandbox: sandbox.SandboxConfig{AllowedWorkDir: currentBoundary}}
+	var collected, providers int
+	sentinel := errors.New("cwd outside current sandbox")
+	s := NewSession(SessionDeps{
+		Config:         &runtimeconfig.Config{},
+		ConfigSnapshot: func() *runtimeconfig.Config { return current },
+		CWD:            oldCWD,
+		ValidateCWD: func(cwd string, cfg *runtimeconfig.Config) error {
+			if cfg.Sandbox.AllowedWorkDir != currentBoundary {
+				t.Errorf("validator boundary = %q, want snapshot boundary %q", cfg.Sandbox.AllowedWorkDir, currentBoundary)
+			}
+			if cwd != oldCWD {
+				t.Errorf("validator cwd = %q, want existing cwd %q", cwd, oldCWD)
+			}
+			return sentinel
+		},
+		CollectTools: func(*sandbox.Config) []core.Tool {
+			collected++
+			return nil
+		},
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
+			providers++
+			return nil, nil
+		},
+	})
+
+	var output strings.Builder
+	result, err := s.Run(context.Background(), RunRequest{Input: "run"}, RunCallbacks{
+		Write: func(text string) { output.WriteString(text) },
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil; validation failure belongs in RunResult", err)
+	}
+	if result.State != RunFailed || !errors.Is(result.Err, sentinel) || result.Persisted {
+		t.Fatalf("Run() = %+v, want failed, unpersisted result with validation error", result)
+	}
+	if !strings.Contains(output.String(), sentinel.Error()) {
+		t.Errorf("Run output = %q, want validation error", output.String())
+	}
+	if collected != 0 || providers != 0 {
+		t.Fatalf("tools/providers invoked = %d/%d, want neither before CWD validation", collected, providers)
+	}
+}
 
 // TestSessionCWDLifecycle 验证会话工作目录的构造注入与运行时更新（SetCWD 锁内
 // 写入，cwd() 快照读）。

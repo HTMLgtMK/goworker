@@ -76,7 +76,7 @@ type AgentPlugin struct {
 	// control 是应用内唯一的 agentcontrol.Service。run 控制能力委托给它；本插件
 	// 提供当前会话路由和 journal。锁序为 lease.mu → registry.mu → manager，
 	// 跨层路径的 h.mu → session lease 也保持单向。
-	control *agentcontrol.Service
+	control         *agentcontrol.Service
 	providerControl *providercontrol.Service
 
 	// inFlight tracks external maintenance requests, which may be queued at a session gate.
@@ -278,7 +278,13 @@ func (p *AgentPlugin) Init(h *model.Hub) error {
 	h.RegisterCommand(model.Command{
 		Name:        "/model",
 		Description: "查看/设置 LLM 配置，用法见 /model help",
-		Handler:     p.handleModel,
+		Authorize: func(ctx *model.Context) error {
+			if len(ctx.Args) > 0 && (ctx.Args[0] == "set" || ctx.Args[0] == "use") && !agentcontrol.ProviderWriteAuthorized(ctx.Ctx) {
+				return fmt.Errorf("provider configuration write is not authorized for this connection")
+			}
+			return nil
+		},
+		Handler: p.handleModel,
 	})
 
 	h.RegisterCommand(model.Command{
@@ -588,6 +594,7 @@ func (p *AgentPlugin) startSession() {
 			}
 			return p.cfg
 		},
+		ValidateCWD:          p.validateSessionCWDWithConfig,
 		AuditDir:             p.paths.AuditDir,
 		Memory:               p.memory,
 		CollectTools:         p.collectTools,
@@ -748,9 +755,15 @@ func (p *AgentPlugin) ActiveSessionID() string {
 // the configured sandbox root and the default tmp workspace root. Both checks compare
 // absolute paths after symlink resolution.
 func (p *AgentPlugin) validateSessionCWD(cwd string) error {
+	return p.validateSessionCWDWithConfig(cwd, p.configSnapshot())
+}
+
+// validateSessionCWDWithConfig checks against the supplied immutable config snapshot.
+// Run uses this variant so policy changes cannot make an already-bound CWD broader.
+func (p *AgentPlugin) validateSessionCWDWithConfig(cwd string, cfg *runtimeconfig.Config) error {
 	allowed := ""
-	if p.cfg != nil {
-		allowed = p.cfg.Sandbox.AllowedWorkDir
+	if cfg != nil {
+		allowed = cfg.Sandbox.AllowedWorkDir
 	}
 	if allowed == "" || cwd == "" {
 		return nil

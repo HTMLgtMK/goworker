@@ -95,23 +95,23 @@ run 生命周期）以持久化游标暴露给任意连接——断线重连不�
 
 ### 方法面
 
-| 方法 | 方向 | 入参 | 响应 | control lease |
+| 方法 | 方向 | 入参 | 响应 | 权限边界 |
 |---|---|---|---|---|
 | `x-goworker/capabilities` | 请求 | `{}` | `{methods: [...], notifications: [...]}` | 不需要（只读发现面） |
-| `x-goworker/run/start` | 请求 | `{sessionId, input, requestId}` | `{runId, state}` | **必须持有** |
+| `x-goworker/run/start` | 请求 | `{sessionId, input, requestId}` | `{runId, state}` | control lease |
 | `x-goworker/run/get` | 请求 | `{sessionId, runId}` | `{state, result?, latestSeq, replayIntegrity}` | 不需要（只读观察面） |
-| `x-goworker/run/cancel` | 请求 | `{sessionId, runId}` | `{accepted}` | **必须持有** |
+| `x-goworker/run/cancel` | 请求 | `{sessionId, runId}` | `{accepted}` | control lease |
 | `x-goworker/session/attach` | 请求 | `{sessionId, afterSeq, mode?}` | `{currentRun, latestSeq, replayIntegrity, tookOver?}` | `mode:"control"` 获取/接管；observe 不动 lease |
 | `x-goworker/session/detach` | 请求 | `{sessionId, mode?}` | `{detached}` | `mode:"control"` 归还（仅持有者本人有效） |
-| `x-goworker/session/archive` | 请求 | `{sessionId}` | `{archived}` | **必须持有**（声明的 `sessionId` 的 lease） |
-| `x-goworker/approval/respond` | 请求 | `{sessionId, requestId, decision}` | `{accepted}` | **必须持有**（声明的 `sessionId` 的 lease） |
+| `x-goworker/session/archive` | 请求 | `{sessionId}` | `{archived}` | control lease（声明的 `sessionId` 的 lease） |
+| `x-goworker/approval/respond` | 请求 | `{sessionId, requestId, decision}` | `{accepted}` | control lease（声明的 `sessionId` 的 lease） |
 | `x-goworker/session/modes` | 请求 | `{}` | `{currentModeId, availableModes}` | 不需要（只读展示面） |
-| `x-goworker/providers` | 请求 | `{}` | `{revision, current, providers}` | 不需要（全局配置只读面） |
-| `x-goworker/provider/detail` | 请求 | `{name}` | `{revision, current, provider}` | 不需要 |
-| `x-goworker/provider/current/get` | 请求 | `{}` | `{revision, current}` | 不需要（读当前选择） |
-| `x-goworker/provider/current/set` | 请求 | `{revision, provider, model}` | `{revision, current}` | 不需要（切换选择；revision 乐观并发，见下） |
-| `x-goworker/provider/upsert` | 请求 | `{revision, name, type, endpoint, authType?, secretAction, apiKey?, models, current?}` | `{revision, current, provider}` | 不需要（revision 乐观并发，见下） |
-| `x-goworker/provider/remove` | 请求 | `{revision, name}` | `{revision}` | 不需要（同上） |
+| `x-goworker/providers` | 请求 | `{}` | `{revision, current, providers}` | 不需要（只读） |
+| `x-goworker/provider/detail` | 请求 | `{name}` | `{revision, current, provider}` | 不需要（只读） |
+| `x-goworker/provider/current/get` | 请求 | `{}` | `{revision, current}` | 不需要（只读当前选择） |
+| `x-goworker/provider/current/set` | 请求 | `{revision, provider, model}` | `{revision, current}` | 独立的 connection-level provider-write 授权 |
+| `x-goworker/provider/upsert` | 请求 | `{revision, name, type, endpoint, endpointAction?, authType?, secretAction, apiKey?, models, current?}` | `{revision, current, provider}` | 独立的 connection-level provider-write 授权 |
+| `x-goworker/provider/remove` | 请求 | `{revision, name}` | `{revision}` | 独立的 connection-level provider-write 授权 |
 | `x-goworker/session/events` | **服务端通知** | `SessionEvent`（原样 JSON，蛇形键；逐事件投递） | — | attach 建立订阅后下行；observe/control 均可收 |
 
 - **`state` 取值**：`queued` / `running` / `waiting_input`（HITL 等审批）/
@@ -172,7 +172,8 @@ control lease **按会话记账**（拍板②原文「每会话至多一个 cont
   （daemon/internal/plugins/agent/runcontrol_test.go——前者钉死接管后旧持有者的
   StartRun/ResolveApproval/CancelRun 一律拒绝；后者断言已提交的后台 Run 在接管后
   继续收敛 completed、不被撤销）。
-- V1 采用本机信任的宿主授权（单用户 daemon，无账号体系）：不做 lease 过期
+- V1 的本机信任授权（单用户 daemon，无账号体系）仅描述 Session control lease 的
+  宿主策略；Provider 写权限另由上文的连接级 authorizer 决定。Session lease 不做过期
   与授权协商；**断开连接即释放该连接全部会话的 lease**（审批不悬死在已死
   连接上）；`detach` `mode:"control"` 按会话主动归还。权限检查全部在 daemon
   侧完成，不依赖客户端 UI 自律。
@@ -255,19 +256,36 @@ per-seq 事件后逐条下行，与实时流形状完全一致。
 
 - **`x-goworker/session/modes`（Plan B 任务3）**：数据源 cfg.LLM providers
   （`currentModeId` = current provider），纯展示面，无门禁。
-- **Provider 管理面（revision 乐观并发）**：`providers`/`provider/detail` 返回
+- **Provider 管理面（连接级授权 + revision 乐观并发）**：`providers`/`provider/detail` 返回
   全局 Provider 注册表与 `current {provider, model}`；模型属性
   （`name`（可选展示名；客户端可在缺省时显示模型 ID）/`contextWindow`/`thinking`/`maxTokens`）
-挂在每个 model 条目下，models 的 JSON key 是模型 ID（身份）。
-  **模型切换走 `provider/current/set`**（高频操作，不扛整个 upsert）：带读取时的
+  挂在每个 model 条目下，models 的 JSON key 是模型 ID（身份）。
+  **写权限独立于 session control lease**：每条 ACP 连接由服务端注入的
+  `ProviderWriteAuthorizer(connectionID)` 单独授权；未授权连接的
+  `provider/current/set`、`provider/upsert`、`provider/remove` 不注册，也不会出现在
+  该连接的 `x-goworker/capabilities` 方法清单中。调用未注册方法得到 method-not-found。
+  revision 只做并发冲突检测，绝不是授权凭证；即使持有某个 Session 的 control
+  lease 或拿到最新 revision，也不会因此获得 Provider 写权。读取方法仍可单独发现与调用。
+  默认信任路径是 daemon 自己创建的 Unix socket（socket mode 0600；新建父目录 0700，
+  按单用户本机信任模型视为本地可信）；经 `WithACPConnection` 注入的 pipe/其他来源
+  缺少可验证的 peer identity，默认拒绝 Provider 写操作。仓库内 Android `mobile.Host`
+  只把自己创建并持有的进程内管道视为可信，并显式启用写授权。其他宿主可通过
+  `app.WithACPProviderWriteAuthorizer` 注入逐连接策略；授权仅基于宿主实际信任的
+  连接身份/传输事实，不能把客户端自报字段当身份。
+  模型切换走 `provider/current/set`（高频操作，不扛整个 upsert）：带读取时的
   `revision` 切换到已注册的 `{provider, model}`，同一事务内校验模型归属。
-  写操作（current/set、upsert、remove）必须携带读取时的 `revision`，
+  已授权写操作（current/set、upsert、remove）必须携带读取时的 `revision`，
   版本不匹配返回 -32000（文案含 revision/conflict），不执行变更。约束：不允许
   删除 current provider、不允许空 `models`、`current.model` 必须属于对应
   provider——切换与删除在同一笔提交中原子完成。`secretAction` 三态：
   `keep`（保留现有 key，不可携带 apiKey）/ `replace`（必携新 key）/ `clear`
   （清除）；**明文 key 永不出现在任何响应中**（仅 `hasApiKey` 状态位）。API
   key 写入即时持久化，运行中 Run 使用启动时的配置快照不受影响，下一轮 Run 生效。
+  `endpointAction` 可选为 `keep` 或 `replace`：`keep` 保留现有 endpoint，不能用于新建
+  Provider；`replace` 将 `endpoint` 作为真实值写入。旧客户端省略该字段时维持兼容语义：
+  对已有 Provider，若 `endpoint` 等于读取时返回的脱敏值，则视为 round-trip 并保留原值；
+  否则视为替换。由于该脱敏值也可能是合法真实 URL（如路径恰为 `/%5Bredacted%5D`），
+  新客户端必须在有意设置此类值时传 `endpointAction: "replace"`，不能依赖字段省略。
 
 ### 能力通告与降级（两阶段发现）
 
@@ -278,9 +296,10 @@ per-seq 事件后逐条下行，与实时流形状完全一致。
    （老 daemon / stdio worker 形态），客户端不要假设方法存在。
 2. **动态发现**：initialize 响应收到后调用 `x-goworker/capabilities`，daemon
    返回**本连接实际可用**的方法与通知清单——清单来自连接级注册表，与真实
-   注册同源：后端接口缺失的方法不注册、不列出（如无 RunControlSource 时无
-   run/* 方法，无 ProviderControl 时无 provider 方法）。客户端按发现结果启用
-   功能，发现清单不构成授权——lease/revision 校验仍在每次操作时执行。
+   注册同源：后端接口缺失或授权缺失的方法不注册、不列出（如无 RunControlSource 时无
+   run/* 方法，无 ProviderControl 时无 provider 方法；Provider 写授权缺失时只省略
+   provider 写方法）。客户端按发现结果启用功能，发现清单不构成授权——Session 控制
+   lease 与 Provider 写授权仍分别在服务端执行。
 3. **降级路径**：initialize 未声明 x-goworker 时，旧客户端可保留试探性 attach
    （吃 `-32601` 即回退纯标准面：prompt 阻塞语义 + session/update 流）；
    新实现以握手通告为准，不做方法级试探。

@@ -143,11 +143,20 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 	// usage 是会话累计账本：跨多次 /agent 累计，直到 /new 用新对象替换当前会话才清零。
 	sandboxCfg := *sandbox.NewFromConfig(&cfg.Sandbox)
 	sandboxCfg.ToolAllowRules = s.toolAllowRulesSnapshot()
-	// 会话工作目录渗透：client 声明（且经宿主 sandbox 边界校验）的 cwd 优先作为
-	// 工具执行目录 —— bash 的 cmd.Dir 与 read/write 的相对路径基准都取自
-	// AllowedWorkDir，为空则回退现行为（cfg.AllowedWorkDir，NewFromConfig 兜底进程
-	// cwd）。只改本会话的沙箱配置副本，不动全局配置。
+	// 会话工作目录渗透：client 声明经宿主校验，并在每轮按本轮 cfg 快照重新验证，
+	// 避免 Sandbox 边界收紧后沿用旧声明。通过后才优先作为工具执行目录 —— bash 的
+	// cmd.Dir 与 read/write 的相对路径基准都取自 AllowedWorkDir；为空则回退现行为
+	//（cfg.AllowedWorkDir，NewFromConfig 兜底进程 cwd）。只改本会话的沙箱配置副本，
+	// 不动全局配置。
 	if cwd := s.cwd(); cwd != "" {
+		if s.deps.ValidateCWD != nil {
+			if err := s.deps.ValidateCWD(cwd, cfg); err != nil {
+				if cb.Write != nil {
+					cb.Write(fmt.Sprintf("✘ %v\n", err))
+				}
+				return RunResult{State: RunFailed, Err: err, Persisted: false}, nil
+			}
+		}
 		sandboxCfg.AllowedWorkDir = cwd
 	}
 	tools := s.deps.CollectTools(&sandboxCfg)
@@ -329,12 +338,13 @@ func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, 
 	hitlMw := middlewares.NewHITLMiddleware(*sandboxCfg, hitl.NewChannelDecisionProvider(decisions), hitlOptions...)
 	// usage：观察 AfterModel 记账（累计到会话边界才清零），publish 抛 core.Usage 快照。
 	// 事件契约在 ai-runtime/config（UsageEvent），前端 addon 订阅后自行渲染 —— statusbar 不进 SDK。
+	runContextWindow := contextWindow(cfg)
 	usageMw := middlewares.NewUsageMiddleware(s.usage, func(u core.Usage) {
 		publish(runtimeconfig.EventUsage, runtimeconfig.UsageEvent{
 			Usage:         u,
-			ContextWindow: contextWindow(cfg),
+			ContextWindow: u.LastPromptContextWindow,
 		})
-	})
+	}, runContextWindow)
 	// iteration：每轮迭代发一个计数事件
 	iterationMw := middlewares.NewIterationMiddleware(func() {
 		publish(runtimeconfig.EventIteration, nil)
@@ -366,8 +376,15 @@ func contextWindow(cfg *runtimeconfig.Config) int {
 // protectSystem=true：history[0] 是本轮注入的系统提示，压掉模型就忘了怎么用工具；
 // /compact 场景 conversation 不含系统提示，首位可能是上次的摘要，允许被再次滚动，传 false。
 func (s *Session) newCompressor(provider core.Provider, cfg *runtimeconfig.Config, protectSystem bool) *middlewares.Compressor {
-	return middlewares.NewCompressor(provider, cfg.LLM.CompactKeep, protectSystem, func(r middlewares.CompressReport) {
-		s.usage.RecordCompaction(core.Compaction{BeforeMsgs: r.BeforeMsgs, AfterMsgs: r.AfterMsgs, Tokens: r.Tokens})
+	window := contextWindow(cfg)
+	return middlewares.NewCompressorWithCallbacks(provider, cfg.LLM.CompactKeep, protectSystem, func(r middlewares.CompressReport) {
+		s.usage.RecordCompaction(core.Compaction{
+			BeforeMsgs: r.BeforeMsgs, AfterMsgs: r.AfterMsgs, Tokens: r.Tokens,
+			ContextWindow: window,
+		})
+	}, func(usage *core.UsageInfo, estimate int) {
+		// 不完整响应产生了实际调用，但没有完成压缩；记账时不伪造 Compaction 事件。
+		s.usage.RecordWithContextWindow(-1, estimate, usage, window)
 	})
 }
 
@@ -541,9 +558,14 @@ func (s *Session) refreshConversation() error {
 	return nil
 }
 
+// LastUsageContextWindow returns the context window used by the most recent recorded model call.
+func (s *Session) LastUsageContextWindow() int {
+	return s.usage.Snapshot().LastPromptContextWindow
+}
+
 // UsageSnapshot 返回当前会话的用量数据（/usage 展示用，渲染留 Plugin 层）。
 func (s *Session) UsageSnapshot() ([]core.Usage, []core.Compaction, core.Usage) {
-	return s.usage.Calls(), s.usage.Compactions(), s.usage.Snapshot()
+	return s.usage.SnapshotAll()
 }
 
 // stripMemoryBlocks removes memory middleware system messages without removing compact summaries.

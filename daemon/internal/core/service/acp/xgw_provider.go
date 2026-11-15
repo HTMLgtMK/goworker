@@ -27,9 +27,11 @@ func registerXGWProviderMethods(server *aiacp.Server, handler *FrontendHandler) 
 	handler.registerXGWMethod(server, xgwprotocol.ProviderMethodList, handler.xgwProviderList)
 	handler.registerXGWMethod(server, xgwprotocol.ProviderMethodDetail, handler.xgwProviderDetail)
 	handler.registerXGWMethod(server, xgwprotocol.ProviderMethodCurrentGet, handler.xgwProviderCurrentGet)
-	handler.registerXGWMethod(server, xgwprotocol.ProviderMethodCurrentSet, handler.xgwProviderCurrentSet)
-	handler.registerXGWMethod(server, xgwprotocol.ProviderMethodUpsert, handler.xgwProviderUpsert)
-	handler.registerXGWMethod(server, xgwprotocol.ProviderMethodRemove, handler.xgwProviderRemove)
+	if handler.providerWriteAllowed {
+		handler.registerXGWMethod(server, xgwprotocol.ProviderMethodCurrentSet, handler.xgwProviderCurrentSet)
+		handler.registerXGWMethod(server, xgwprotocol.ProviderMethodUpsert, handler.xgwProviderUpsert)
+		handler.registerXGWMethod(server, xgwprotocol.ProviderMethodRemove, handler.xgwProviderRemove)
+	}
 }
 
 func (h *FrontendHandler) xgwProviderList(_ context.Context, _ json.RawMessage) (any, error) {
@@ -65,6 +67,9 @@ func (h *FrontendHandler) xgwProviderDetail(_ context.Context, params json.RawMe
 }
 
 func (h *FrontendHandler) xgwProviderUpsert(_ context.Context, params json.RawMessage) (any, error) {
+	if err := h.requireProviderWrite(xgwprotocol.ProviderMethodUpsert); err != nil {
+		return nil, err
+	}
 	var req xgwprotocol.ProviderUpsertParams
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, xgwError("%s: invalid params", xgwprotocol.ProviderMethodUpsert)
@@ -88,15 +93,16 @@ func (h *FrontendHandler) xgwProviderUpsert(_ context.Context, params json.RawMe
 		current = &providercontrol.Current{Provider: req.Current.Provider, Model: req.Current.Model}
 	}
 	snapshot, provider, err := service.Upsert(providercontrol.UpsertRequest{
-		Revision:     req.Revision,
-		Name:         req.Name,
-		Type:         req.Type,
-		Endpoint:     req.Endpoint,
-		AuthType:     req.AuthType,
-		SecretAction: req.SecretAction,
-		APIKey:       req.APIKey,
-		Models:       models,
-		Current:      current,
+		Revision:       req.Revision,
+		Name:           req.Name,
+		Type:           req.Type,
+		Endpoint:       req.Endpoint,
+		EndpointAction: req.EndpointAction,
+		AuthType:       req.AuthType,
+		SecretAction:   req.SecretAction,
+		APIKey:         req.APIKey,
+		Models:         models,
+		Current:        current,
 	})
 	if err != nil {
 		return nil, xgwProviderError(xgwprotocol.ProviderMethodUpsert, err)
@@ -124,6 +130,9 @@ func (h *FrontendHandler) xgwProviderCurrentGet(_ context.Context, _ json.RawMes
 }
 
 func (h *FrontendHandler) xgwProviderCurrentSet(_ context.Context, params json.RawMessage) (any, error) {
+	if err := h.requireProviderWrite(xgwprotocol.ProviderMethodCurrentSet); err != nil {
+		return nil, err
+	}
 	var req xgwprotocol.ProviderCurrentSetParams
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, xgwError("%s: invalid params", xgwprotocol.ProviderMethodCurrentSet)
@@ -143,6 +152,9 @@ func (h *FrontendHandler) xgwProviderCurrentSet(_ context.Context, params json.R
 }
 
 func (h *FrontendHandler) xgwProviderRemove(_ context.Context, params json.RawMessage) (any, error) {
+	if err := h.requireProviderWrite(xgwprotocol.ProviderMethodRemove); err != nil {
+		return nil, err
+	}
 	var req xgwprotocol.ProviderRemoveParams
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, xgwError("%s: invalid params", xgwprotocol.ProviderMethodRemove)
@@ -156,6 +168,13 @@ func (h *FrontendHandler) xgwProviderRemove(_ context.Context, params json.RawMe
 		return nil, xgwProviderError(xgwprotocol.ProviderMethodRemove, err)
 	}
 	return xgwprotocol.ProviderRemoveResult{Revision: revision}, nil
+}
+
+func (h *FrontendHandler) requireProviderWrite(method string) error {
+	if h == nil || !h.providerWriteAllowed {
+		return xgwError("%s: provider write is not authorized for this connection", method)
+	}
+	return nil
 }
 
 func (h *FrontendHandler) providerControl() (*providercontrol.Service, error) {

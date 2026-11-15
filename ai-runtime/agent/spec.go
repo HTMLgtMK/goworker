@@ -79,6 +79,7 @@ type RunStateJournal interface {
 type SessionDeps struct {
 	Config               *runtimeconfig.Config                                  // Initial runtime configuration.
 	ConfigSnapshot       func() *runtimeconfig.Config                           // Current global config; called once for each accepted run.
+	ValidateCWD          func(cwd string, cfg *runtimeconfig.Config) error      // Revalidates an existing CWD against the immutable config snapshot used by this run.
 	AuditDir             string                                                 // sandbox 审计落盘目录
 	CWD                  string                                                 // 会话工作目录（client 经 wire 声明、宿主校验后注入）；空 = 未声明，工具回退 cfg.AllowedWorkDir
 	Memory               *memory.Client                                         // nil = 禁用

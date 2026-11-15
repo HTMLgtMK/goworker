@@ -170,7 +170,11 @@ llm:
 When `providers` is present it replaces the built-in registry. OpenAI model
 context window and thinking settings have defaults; Anthropic models require
 `context_window` and `max_tokens`. Older single-model LLM formats are rejected;
-use `current` and `models` as shown above.
+use `current` and `models` as shown above. Existing installations must manually
+rewrite legacy settings before upgrading; see the [LLM configuration migration
+guide](daemon/docs/config-migration.md) for field mappings, credential handling,
+verification, and rollback. No automatic migration or compatibility parsing is
+provided.
 
 (This sample is pinned by a test — `TestReadmeSampleConfigParses` — so it can't
 drift away from what the loader actually accepts.)

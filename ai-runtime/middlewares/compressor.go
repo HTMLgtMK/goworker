@@ -23,14 +23,28 @@ type Compressor struct {
 	protectSystem bool
 	// onCompress 压缩成功后回调（可选），调用方用它把压缩记进 token 账本。
 	onCompress func(CompressReport)
+	// onUsage tracks an unusable summarize response without marking compression successful.
+	onUsage func(*core.UsageInfo, int)
 }
 
 func NewCompressor(provider core.Provider, keepLast int, protectSystem bool, onCompress ...func(CompressReport)) *Compressor {
-	c := &Compressor{provider: provider, keepLast: keepLast, protectSystem: protectSystem}
+	var report func(CompressReport)
 	if len(onCompress) > 0 {
-		c.onCompress = onCompress[0]
+		report = onCompress[0]
 	}
-	return c
+	return NewCompressorWithCallbacks(provider, keepLast, protectSystem, report, nil)
+}
+
+// NewCompressorWithCallbacks configures separate callbacks for successful compression
+// and successful model responses that cannot produce a summary.
+func NewCompressorWithCallbacks(provider core.Provider, keepLast int, protectSystem bool, onCompress func(CompressReport), onUsage func(*core.UsageInfo, int)) *Compressor {
+	return &Compressor{
+		provider:      provider,
+		keepLast:      keepLast,
+		protectSystem: protectSystem,
+		onCompress:    onCompress,
+		onUsage:       onUsage,
+	}
 }
 
 // Compress 压缩 history。无可压缩内容（长度 <= keepLast 或找不到安全切点）时原样返回。
@@ -52,7 +66,7 @@ func (c *Compressor) Compress(ctx context.Context, history []core.Message) ([]co
 
 	summary, usage, err := c.summarize(ctx, old)
 	if err != nil {
-		return nil, fmt.Errorf("compress history: %w", err)
+		return history, fmt.Errorf("compress history: %w", err)
 	}
 
 	out := make([]core.Message, 0, keepHead+1+len(recent))
@@ -108,10 +122,26 @@ func (c *Compressor) summarize(ctx context.Context, old []core.Message) (string,
 	if err != nil {
 		return "", nil, fmt.Errorf("summarize history: %w", err)
 	}
-	if len(resp.Choices) == 0 {
+	if resp == nil {
+		c.reportUnusableSummaryUsage(nil, req.Messages)
 		return "", nil, fmt.Errorf("empty response")
 	}
-	return strings.TrimSpace(resp.Choices[0].Message.Content), resp.Usage, nil
+	if len(resp.Choices) == 0 {
+		c.reportUnusableSummaryUsage(resp.Usage, req.Messages)
+		return "", nil, fmt.Errorf("empty response")
+	}
+	summary := strings.TrimSpace(resp.Choices[0].Message.Content)
+	if summary == "" {
+		c.reportUnusableSummaryUsage(resp.Usage, req.Messages)
+		return "", nil, fmt.Errorf("empty response")
+	}
+	return summary, resp.Usage, nil
+}
+
+func (c *Compressor) reportUnusableSummaryUsage(usage *core.UsageInfo, request []core.Message) {
+	if c.onUsage != nil {
+		c.onUsage(usage, core.EstimateTokens(request))
+	}
 }
 
 // summaryPrompt 构造面向后续工作的压缩摘要指令。

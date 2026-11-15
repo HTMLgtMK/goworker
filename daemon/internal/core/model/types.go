@@ -69,7 +69,9 @@ type Command struct {
 	Name        string
 	Aliases     []string
 	Description string
-	Handler     func(ctx *Context) error
+	// Authorize runs after arguments are parsed and before middleware or handler execution.
+	Authorize func(ctx *Context) error
+	Handler   func(ctx *Context) error
 }
 
 // ---- MCP / AI Tool ----

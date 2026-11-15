@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,6 +31,172 @@ func testSession(pv core.Provider) (*Session, *runtimeconfig.Config) {
 		},
 	})
 	return s, cfg
+}
+
+func TestSessionCompactKeepsConversationWhenSummaryUnusable(t *testing.T) {
+	usage := &core.UsageInfo{PromptTokens: 19, CompletionTokens: 3, TotalTokens: 22}
+	provider := &emptyChoiceProvider{usage: usage}
+	s, cfg := testSession(provider)
+	cfg.LLM.CompactKeep = 1
+	history := []core.Message{{Role: "user", Content: "one"}, {Role: "user", Content: "two"}, {Role: "user", Content: "three"}}
+	s.mu.Lock()
+	s.conversation = history
+	s.mu.Unlock()
+
+	if err := s.Compact(context.Background(), RunCallbacks{}); err != nil {
+		t.Fatalf("Compact error = %v", err)
+	}
+	if got := s.Conversation(); !reflect.DeepEqual(got, history) {
+		t.Errorf("conversation after failed compact = %+v, want original %+v", got, history)
+	}
+	calls, compactions, total := s.UsageSnapshot()
+	if len(calls) != 1 || calls[0].TotalTokens != usage.TotalTokens {
+		t.Errorf("usage calls = %+v, want exactly one call with %d tokens", calls, usage.TotalTokens)
+	}
+	if total.TotalTokens != usage.TotalTokens {
+		t.Errorf("total tokens = %d, want %d", total.TotalTokens, usage.TotalTokens)
+	}
+	if len(compactions) != 0 {
+		t.Errorf("compactions = %+v, want none", compactions)
+	}
+}
+
+func TestSessionCompressorRecordsUsageWithoutCompaction(t *testing.T) {
+	usage := &core.UsageInfo{PromptTokens: 17, CompletionTokens: 5, TotalTokens: 22}
+	provider := &emptyChoiceProvider{usage: usage}
+	s, cfg := testSession(provider)
+	cfg.LLM.CompactKeep = 1
+	window := contextWindow(cfg)
+	compressor := s.newCompressor(provider, cfg, false)
+	history := []core.Message{{Role: "user", Content: "one"}, {Role: "user", Content: "two"}, {Role: "user", Content: "three"}}
+
+	if _, err := compressor.Compress(context.Background(), history); err == nil {
+		t.Fatal("Compress error = nil, want empty response error")
+	}
+	calls, compactions, total := s.UsageSnapshot()
+	if len(calls) != 1 {
+		t.Fatalf("usage calls = %d, want 1", len(calls))
+	}
+	if got := calls[0]; got.PromptTokens != 17 || got.CompletionTokens != 5 || got.TotalTokens != 22 || got.ContextWindow != window {
+		t.Errorf("usage call = %+v, want provider usage with context window %d", got, window)
+	}
+	if total.TotalTokens != 22 {
+		t.Errorf("total tokens = %d, want 22", total.TotalTokens)
+	}
+	if len(compactions) != 0 {
+		t.Errorf("compactions = %+v, want none for failed compression", compactions)
+	}
+}
+
+type emptyChoiceProvider struct {
+	usage *core.UsageInfo
+}
+
+func (p *emptyChoiceProvider) Name() string  { return "empty" }
+func (p *emptyChoiceProvider) Model() string { return "model" }
+func (p *emptyChoiceProvider) Chat(context.Context, *core.ChatRequest) (*core.ChatResponse, error) {
+	return &core.ChatResponse{Usage: p.usage}, nil
+}
+func (p *emptyChoiceProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	return make(chan core.Token), nil
+}
+
+func TestSessionCompressorEstimatesUsageForUnusableSummary(t *testing.T) {
+	tests := []struct {
+		name        string
+		usage       *core.UsageInfo
+		choices     []core.ResponseChoice
+		nilResponse bool
+	}{
+		{name: "empty response without usage"},
+		{
+			name:    "blank summary with usage",
+			usage:   &core.UsageInfo{PromptTokens: 13, CompletionTokens: 2, TotalTokens: 15},
+			choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: "  \n  "}}},
+		},
+		{name: "nil response without usage", nilResponse: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &unusableSummaryProvider{usage: tt.usage, choices: tt.choices, nilResponse: tt.nilResponse}
+			s, cfg := testSession(provider)
+			cfg.LLM.CompactKeep = 1
+			window := contextWindow(cfg)
+			compressor := s.newCompressor(provider, cfg, false)
+			history := []core.Message{{Role: "user", Content: "one"}, {Role: "user", Content: "two"}, {Role: "user", Content: "three"}}
+
+			if _, err := compressor.Compress(context.Background(), history); err == nil {
+				t.Fatal("Compress error = nil, want empty summary error")
+			}
+			calls, compactions, total := s.UsageSnapshot()
+			if len(calls) != 1 {
+				t.Fatalf("usage calls = %d, want 1", len(calls))
+			}
+			got := calls[0]
+			if got.ContextWindow != window || got.EstimateTokens == 0 {
+				t.Errorf("usage call = %+v, want estimated tokens and context window %d", got, window)
+			}
+			if tt.usage != nil && (got.PromptTokens != 13 || got.CompletionTokens != 2 || got.TotalTokens != 15) {
+				t.Errorf("usage call = %+v, want provider usage %+v", got, tt.usage)
+			}
+			if len(compactions) != 0 {
+				t.Errorf("compactions = %+v, want none for failed compression", compactions)
+			}
+			if total.TotalTokens != got.TotalTokens {
+				t.Errorf("total usage = %+v, does not include exactly one failed compression call", total)
+			}
+		})
+	}
+}
+
+type unusableSummaryProvider struct {
+	usage       *core.UsageInfo
+	choices     []core.ResponseChoice
+	nilResponse bool
+}
+
+func (p *unusableSummaryProvider) Name() string  { return "unusable" }
+func (p *unusableSummaryProvider) Model() string { return "model" }
+func (p *unusableSummaryProvider) Chat(context.Context, *core.ChatRequest) (*core.ChatResponse, error) {
+	if p.nilResponse {
+		return nil, nil
+	}
+	return &core.ChatResponse{Choices: p.choices, Usage: p.usage}, nil
+}
+func (p *unusableSummaryProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	return make(chan core.Token), nil
+}
+
+func TestSessionCompressorConcurrentUnusableSummariesAreCountedOnce(t *testing.T) {
+	provider := &unusableSummaryProvider{usage: &core.UsageInfo{PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12}}
+	s, cfg := testSession(provider)
+	cfg.LLM.CompactKeep = 1
+	compressor := s.newCompressor(provider, cfg, false)
+	history := []core.Message{{Role: "user", Content: "one"}, {Role: "user", Content: "two"}, {Role: "user", Content: "three"}}
+
+	const calls = 8
+	var wg sync.WaitGroup
+	for i := 0; i < calls; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := compressor.Compress(context.Background(), history); err == nil {
+				t.Error("Compress error = nil, want empty response error")
+			}
+		}()
+	}
+	wg.Wait()
+
+	usageCalls, compactions, total := s.UsageSnapshot()
+	if len(usageCalls) != calls {
+		t.Errorf("usage calls = %d, want %d", len(usageCalls), calls)
+	}
+	if total.TotalTokens != calls*12 {
+		t.Errorf("total tokens = %d, want %d", total.TotalTokens, calls*12)
+	}
+	if len(compactions) != 0 {
+		t.Errorf("compactions = %d, want 0", len(compactions))
+	}
 }
 
 // interruptIDEmitter 捕获 interrupt 事件的请求 ID:决策回执契约要求
