@@ -8,6 +8,8 @@ import (
 	term "github.com/charmbracelet/x/term"
 	"github.com/muesli/termenv"
 
+	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
+	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 	"github.com/tinguo/goworker/daemon/internal/version"
 )
@@ -47,6 +49,12 @@ func (e *Engine) RegisterBuiltinCommands() {
 		Name:        "/config",
 		Aliases:     []string{"/cfg"},
 		Description: "查看/修改全局配置",
+		Authorize: func(ctx *model.Context) error {
+			if len(ctx.Args) > 0 && ctx.Args[0] == "set" && !agentcontrol.ProviderWriteAuthorized(ctx.Ctx) {
+				return fmt.Errorf("configuration write is not authorized for this connection")
+			}
+			return nil
+		},
 		Handler: func(ctx *model.Context) error {
 			args := ctx.Args
 
@@ -75,12 +83,8 @@ func (e *Engine) RegisterBuiltinCommands() {
 				}
 				key, val := kv[0], kv[1]
 
-				cfg := e.Config()
-				if err := cfg.SetField(key, val); err != nil {
-					ctx.Writer(fmt.Sprintf("✘ %v\n", err))
-					return nil
-				}
-				if err := e.SaveConfig(cfg); err != nil {
+				err := e.UpdateDaemonConfig(func(cfg *config.Config) error { return cfg.SetField(key, val) })
+				if err != nil {
 					ctx.Writer(fmt.Sprintf("✘ 保存失败: %v\n", err))
 					return nil
 				}
@@ -127,7 +131,7 @@ func (e *Engine) handleDiagnose(ctx *model.Context) error {
 
 	w("== LLM ==\n")
 	llm := e.Config().LLM
-	name, p, err := llm.ResolveDefault()
+	p, selected, err := llm.ResolveCurrent()
 	if err != nil {
 		w("  default provider: 解析失败 — %v\n", err)
 	} else {
@@ -135,10 +139,10 @@ func (e *Engine) handleDiagnose(ctx *model.Context) error {
 		if p.APIKey != "" {
 			key = fmt.Sprintf("***(%d chars)", len(p.APIKey))
 		}
-		w("  default=%s type=%s model=%s\n", name, p.Type, p.Model)
-		w("  endpoint=%s\n", p.Endpoint)
+		w("  current=%s type=%s model=%s\n", llm.Current.Provider, p.Type, llm.Current.Model)
+		w("  endpoint=%s\n", config.RedactEndpoint(p.Endpoint))
 		w("  context_window=%d thinking(mode=%s effort=%s show=%v)\n",
-			p.ContextWindow, p.Thinking.RequestMode, p.Thinking.Effort, llm.Thinking.Show)
+			selected.ContextWindow, selected.Thinking.RequestMode, selected.Thinking.Effort, llm.Thinking.Show)
 		w("  api_key=%s\n", key)
 		w("  streaming: openai 类型自动启用 ChatStream（含 SSE 增量/usage），无需配置\n")
 	}

@@ -900,14 +900,30 @@ func TestAgentPlugin_SetSessionValidatesSandboxBoundary(t *testing.T) {
 
 // TestAgentPlugin_SessionModesFromConfig 验证 modes 数据源：providers 按名字排序、
 // name = "provider (model)"、currentModeId = default_provider；无 providers 返回 nil。
+func TestSessionModesUsesLatestConfigSnapshot(t *testing.T) {
+	old := runtimeconfig.Default()
+	latest := runtimeconfig.Default()
+	latest.LLM.Current = runtimeconfig.CurrentConfig{Provider: "other", Model: "model-b"}
+	latest.LLM.Providers["other"] = runtimeconfig.ProviderConfig{
+		Models: map[string]runtimeconfig.ModelConfig{"model-b": {}},
+	}
+	p := &AgentPlugin{cfg: old, hub: &model.Hub{
+		ConfigSnapshot: func() *runtimeconfig.Config { return latest },
+	}}
+	got := p.SessionModes()
+	if got == nil || got.CurrentModeID != "other" || len(got.AvailableModes) != 2 {
+		t.Fatalf("modes = %+v, want latest provider snapshot", got)
+	}
+}
+
 func TestAgentPlugin_SessionModesFromConfig(t *testing.T) {
 	p := &AgentPlugin{cfg: &runtimeconfig.Config{
 		LLM: runtimeconfig.LLMConfig{
-			DefaultProvider: "deepseek",
+			Current: runtimeconfig.CurrentConfig{Provider: "deepseek", Model: "deepseek-chat"},
 			Providers: map[string]runtimeconfig.ProviderConfig{
-				"anthropic": {Model: "claude-sonnet"},
-				"deepseek":  {Model: "deepseek-chat"},
-				"kimi":      {Model: "kimi-k2"},
+				"anthropic": {},
+				"deepseek":  {},
+				"kimi":      {},
 			},
 		},
 	}}
@@ -919,7 +935,7 @@ func TestAgentPlugin_SessionModesFromConfig(t *testing.T) {
 		t.Errorf("currentModeId = %q, want deepseek", got.CurrentModeID)
 	}
 	wantIDs := []string{"anthropic", "deepseek", "kimi"}
-	wantNames := []string{"anthropic (claude-sonnet)", "deepseek (deepseek-chat)", "kimi (kimi-k2)"}
+	wantNames := []string{"anthropic", "deepseek (deepseek-chat)", "kimi"}
 	if len(got.AvailableModes) != len(wantIDs) {
 		t.Fatalf("availableModes = %+v, want %d entries", got.AvailableModes, len(wantIDs))
 	}

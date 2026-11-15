@@ -8,6 +8,36 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 )
 
+func TestUsageMiddleware_StoresWindowForEachSuccessfulCall(t *testing.T) {
+	tracker := core.NewUsageTracker()
+
+	first := NewUsageMiddleware(tracker, nil, 32_000)
+	first.OnAfterModel(&core.AfterModelEvent{
+		Ctx:     context.Background(),
+		History: []core.Message{{Role: "user", Content: "first"}},
+		Usage:   &core.UsageInfo{PromptTokens: 100},
+	})
+	second := NewUsageMiddleware(tracker, nil, 64_000)
+	second.OnAfterModel(&core.AfterModelEvent{
+		Ctx:     context.Background(),
+		History: []core.Message{{Role: "user", Content: "second"}},
+		Usage:   &core.UsageInfo{PromptTokens: 200},
+	})
+
+	calls := tracker.Calls()
+	if len(calls) != 2 || calls[0].ContextWindow != 32_000 || calls[1].ContextWindow != 64_000 {
+		t.Fatalf("calls = %+v, want windows [32000, 64000]", calls)
+	}
+	if got := tracker.Snapshot().LastPromptContextWindow; got != 64_000 {
+		t.Errorf("snapshot context window = %d, want 64000", got)
+	}
+
+	second.OnAfterModel(&core.AfterModelEvent{Ctx: context.Background(), Err: errors.New("failed")})
+	if got := tracker.Snapshot().LastPromptContextWindow; got != 64_000 {
+		t.Errorf("failed call replaced last context window: got %d, want 64000", got)
+	}
+}
+
 func TestUsageMiddleware_RecordsRealUsage(t *testing.T) {
 	tracker := core.NewUsageTracker()
 	var last core.Usage

@@ -81,6 +81,28 @@ func ClientIDFromCtx(ctx context.Context) string {
 	return id
 }
 
+type providerWriteAuthorizationKey struct{}
+
+// WithProviderWriteAuthorization carries the ACP connection's provider-config
+// write grant through command routing. Session bindings and leases are unrelated.
+func WithProviderWriteAuthorization(ctx context.Context, allowed bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, providerWriteAuthorizationKey{}, allowed)
+}
+
+// ProviderWriteAuthorized reports whether a request may mutate daemon-wide config.
+// Contexts without an ACP authorization marker are trusted local management paths
+// such as stdin; marked ACP contexts must carry an explicit grant.
+func ProviderWriteAuthorized(ctx context.Context) bool {
+	if ctx == nil {
+		return true
+	}
+	allowed, marked := ctx.Value(providerWriteAuthorizationKey{}).(bool)
+	return !marked || allowed
+}
+
 // SessionRouter resolves a caller's session ID to its authoritative runtime.
 // The host checks the current runtime first, then the registered-session map;
 // unresolved IDs return nil rather than silently falling back to current.

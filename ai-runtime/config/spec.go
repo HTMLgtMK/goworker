@@ -56,26 +56,38 @@ const (
 	AnthropicAuthAPIKey AnthropicAuthType = "x-api-key"
 )
 
-// ProviderConfig 是一个命名 Provider 的连接与协议配置。
-type ProviderConfig struct {
-	Type          ProviderType           `yaml:"type"`
-	Endpoint      string                 `yaml:"endpoint"`
-	Model         string                 `yaml:"model"`
-	APIKey        string                 `yaml:"api_key"`
-	ContextWindow int                    `yaml:"context_window"`
+// CurrentConfig selects one model from the provider registry.
+type CurrentConfig struct {
+	Provider string `yaml:"provider"`
+	Model    string `yaml:"model"`
+}
+
+// ModelConfig contains model-specific request limits and reasoning options.
+// DisplayName is presentation metadata; the map key remains the model identity.
+type ModelConfig struct {
+	DisplayName   string                 `yaml:"display_name,omitempty"`
+	ContextWindow int                    `yaml:"context_window,omitempty"`
 	Thinking      ProviderThinkingConfig `yaml:"thinking,omitempty"`
-	AuthType      AnthropicAuthType      `yaml:"auth_type,omitempty"`
 	MaxTokens     int                    `yaml:"max_tokens,omitempty"`
 }
 
-// LLMConfig 保存 Provider 注册表与全局 Agent/UI 策略。
+// ProviderConfig stores connection/authentication settings and available models.
+type ProviderConfig struct {
+	Type     ProviderType           `yaml:"type"`
+	Endpoint string                 `yaml:"endpoint"`
+	APIKey   string                 `yaml:"api_key,omitempty"`
+	AuthType AnthropicAuthType      `yaml:"auth_type,omitempty"`
+	Models   map[string]ModelConfig `yaml:"models,omitempty"`
+}
+
+// LLMConfig saves the current selection, provider registry, and global policies.
 type LLMConfig struct {
-	DefaultProvider string                    `yaml:"default_provider"`
-	Providers       map[string]ProviderConfig `yaml:"providers"`
-	CompressAt      float64                   `yaml:"compress_at"`
-	CompactKeep     int                       `yaml:"compact_keep"`
-	MaxIterations   int                       `yaml:"max_iterations"`
-	Thinking        ThinkingConfig            `yaml:"thinking"`
+	Current       CurrentConfig             `yaml:"current"`
+	Providers     map[string]ProviderConfig `yaml:"providers"`
+	CompressAt    float64                   `yaml:"compress_at"`
+	CompactKeep   int                       `yaml:"compact_keep"`
+	MaxIterations int                       `yaml:"max_iterations"`
+	Thinking      ThinkingConfig            `yaml:"thinking"`
 }
 
 // MemoryConfig 是 agent 记忆模块（MTM 任务档案 + LTM 事实条目）的配置。

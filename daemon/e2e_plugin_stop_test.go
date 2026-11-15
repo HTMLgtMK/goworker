@@ -47,9 +47,9 @@ func TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := config.Default()
-	provider := cfg.LLM.Providers[cfg.LLM.DefaultProvider]
+	provider := cfg.LLM.Providers[cfg.LLM.Current.Provider]
 	provider.Endpoint = srv.URL
-	cfg.LLM.Providers[cfg.LLM.DefaultProvider] = provider
+	cfg.LLM.Providers[cfg.LLM.Current.Provider] = provider
 	cfg.Session.Enabled = true
 	cfg.Session.Dir = filepath.Join(dir, "sessions")
 	cfg.Memory.Enabled = false

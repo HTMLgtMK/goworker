@@ -319,16 +319,19 @@ type Usage struct {
 	EstimateTokens        int // 发送前粗估（JSON 字节数 / 4），对照模型返回值
 	PromptCacheHitTokens  int // 用户 prompt 中，命中上下文缓存的 token 数
 	PromptCacheMissTokens int // 用户 prompt 中，未命中上下文缓存的 token 数
+	ContextWindow         int // 本次 Chat 使用的模型上下文窗口
 
-	LastPromptTokens int // 仅快照有效：最近一次 Chat 的输入 token（上下文占用计算用）
+	LastPromptTokens        int // 仅快照有效：最近一次 Chat 的输入 token（上下文占用计算用）
+	LastPromptContextWindow int // 仅快照有效：最近一次 Chat 使用的上下文窗口
 }
 
 // Compaction 记录一次历史压缩。
 // 压缩是 ReAct 循环外的模型调用（summarize），也必须进账，否则 /usage 是漏水的桶。
 type Compaction struct {
-	BeforeMsgs int // 压缩前消息条数
-	AfterMsgs  int // 压缩后消息条数
-	Tokens     int // summarize 调用消耗（模型返回 total，缺省用估算）
+	BeforeMsgs    int // 压缩前消息条数
+	AfterMsgs     int // 压缩后消息条数
+	Tokens        int // summarize 调用消耗（模型返回 total，缺省用估算）
+	ContextWindow int // summarize 调用时使用的模型上下文窗口
 }
 
 // UsageTracker 累加一次 /agent 会话内所有 Chat 调用的用量。

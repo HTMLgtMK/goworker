@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +20,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
+	xgwprotocol "github.com/tinguo/goworker/daemon/xgoworker/protocol"
 )
 
 // xgw_test.go runs real ai-acp peers over net.Pipe to verify extension wire contracts, lease
@@ -306,7 +309,7 @@ func newXGWStack(t *testing.T, evaluate Evaluator, frc *fakeRunControl) *xgwStac
 	}
 	serverEnd, clientEnd := net.Pipe()
 	handler := NewFrontendHandlerFactory(evaluate, nil, frc, NewSessionGate())().(*FrontendHandler)
-	server, err := aiacp.NewServer(serverEnd, handler)
+	server, err := aiacp.NewServer(serverEnd, handler, aiacp.WithAgentCapability(xgwprotocol.XGWorkerCapability{}))
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -319,6 +322,95 @@ func newXGWStack(t *testing.T, evaluate Evaluator, frc *fakeRunControl) *xgwStac
 	}
 	t.Cleanup(func() { _ = client.Close() })
 	return &xgwStack{client: client, handler: handler, runs: frc}
+}
+
+func TestXGWCapabilitiesAdvertisedAndDiscoverable(t *testing.T) {
+	stack := newXGWStack(t, nil, newFakeRunControl())
+	init, err := stack.client.Initialize(context.Background())
+	if err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	capability, ok := init.AgentCapabilities.Get("x-goworker")
+	if !ok {
+		t.Fatal("initialize response does not advertise x-goworker")
+	}
+	wire, err := json.Marshal(capability)
+	if err != nil {
+		t.Fatalf("marshal x-goworker capability: %v", err)
+	}
+	if string(wire) != `{"version":1}` {
+		t.Fatalf("x-goworker capability = %s, want {\"version\":1}", wire)
+	}
+
+	got, err := stack.callRaw(t, XMethodCapabilities, nil)
+	if err != nil {
+		t.Fatalf("x-goworker/capabilities: %v", err)
+	}
+	var capabilities struct {
+		Methods       []string `json:"methods"`
+		Notifications []string `json:"notifications"`
+	}
+	if err := json.Unmarshal(got, &capabilities); err != nil {
+		t.Fatalf("decode capabilities %s: %v", got, err)
+	}
+	wantMethods := []string{
+		XMethodCapabilities, XMethodRunStart, XMethodRunGet, XMethodRunCancel, XMethodApprovalRespond,
+		XMethodSessionAttach, XMethodSessionDetach, XMethodSessionModes,
+	}
+	if !reflect.DeepEqual(capabilities.Methods, wantMethods) {
+		t.Fatalf("advertised methods = %v, want %v", capabilities.Methods, wantMethods)
+	}
+	if !reflect.DeepEqual(capabilities.Notifications, []string{XMethodSessionEvents}) {
+		t.Fatalf("advertised notifications = %v, want [%s]", capabilities.Notifications, XMethodSessionEvents)
+	}
+	for _, providerMethod := range XProviderMethods() {
+		if slices.Contains(capabilities.Methods, providerMethod) {
+			t.Fatalf("unimplemented provider method %q was advertised", providerMethod)
+		}
+	}
+}
+
+func TestXGWCapabilitiesReflectBackendSupport(t *testing.T) {
+	serverEnd, clientEnd := net.Pipe()
+	handler := NewFrontendHandlerFactory(nil, nil, &fakeSessionSource{}, NewSessionGate())().(*FrontendHandler)
+	server, err := aiacp.NewServer(serverEnd, handler)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	registerXGWMethods(server, handler)
+	server.Start()
+	t.Cleanup(func() { _ = server.Close() })
+	client, err := aiacp.NewClient("xgw-capabilities-test", clientEnd, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	if _, err := client.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	var raw json.RawMessage
+	if err := client.Call(context.Background(), XMethodCapabilities, nil, &raw); err != nil {
+		t.Fatalf("x-goworker/capabilities: %v", err)
+	}
+	var capabilities struct {
+		Methods       []string `json:"methods"`
+		Notifications []string `json:"notifications"`
+	}
+	if err := json.Unmarshal(raw, &capabilities); err != nil {
+		t.Fatalf("decode capabilities %s: %v", raw, err)
+	}
+	if !reflect.DeepEqual(capabilities.Methods, []string{XMethodCapabilities, XMethodSessionModes}) {
+		t.Fatalf("methods = %v, want capabilities and session/modes for SessionSource", capabilities.Methods)
+	}
+	if len(capabilities.Notifications) != 0 {
+		t.Fatalf("notifications = %v, want none without run control", capabilities.Notifications)
+	}
+	for _, method := range []string{XMethodRunStart, XMethodSessionAttach, XMethodSessionArchive} {
+		if err := client.Call(context.Background(), method, map[string]any{}, &raw); err == nil {
+			t.Fatalf("unsupported method %q was registered", method)
+		}
+	}
 }
 
 // initAndNew 走标准握手 + session/new,返回服务端签发的会话 id。

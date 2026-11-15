@@ -41,6 +41,42 @@ func cloneToolAllowRules(rules []sandbox.ToolAllowRule) []sandbox.ToolAllowRule 
 	return append([]sandbox.ToolAllowRule(nil), rules...)
 }
 
+func cloneRuntimeConfig(cfg *runtimeconfig.Config) *runtimeconfig.Config {
+	if cfg == nil {
+		return nil
+	}
+	clone := *cfg
+	clone.LLM = cfg.LLM.Clone()
+	clone.Sandbox.DeniedPatterns = append([]string(nil), cfg.Sandbox.DeniedPatterns...)
+	clone.Sandbox.RiskyPatterns = append(cfg.Sandbox.RiskyPatterns[:0:0], cfg.Sandbox.RiskyPatterns...)
+	clone.Sandbox.SafeCommands = append([]string(nil), cfg.Sandbox.SafeCommands...)
+	clone.Sandbox.AllowRules = append(cfg.Sandbox.AllowRules[:0:0], cfg.Sandbox.AllowRules...)
+	for i := range clone.Sandbox.AllowRules {
+		clone.Sandbox.AllowRules[i].Effects = append([]string(nil), cfg.Sandbox.AllowRules[i].Effects...)
+	}
+	clone.Sandbox.ToolAllowRules = append(cfg.Sandbox.ToolAllowRules[:0:0], cfg.Sandbox.ToolAllowRules...)
+	clone.MCP.Servers = append(cfg.MCP.Servers[:0:0], cfg.MCP.Servers...)
+	for i := range clone.MCP.Servers {
+		clone.MCP.Servers[i].Args = append([]string(nil), cfg.MCP.Servers[i].Args...)
+	}
+	clone.Dispatch.Workers = append(cfg.Dispatch.Workers[:0:0], cfg.Dispatch.Workers...)
+	for i := range clone.Dispatch.Workers {
+		clone.Dispatch.Workers[i].Args = append([]string(nil), cfg.Dispatch.Workers[i].Args...)
+	}
+	clone.Dispatch.Routes = append(cfg.Dispatch.Routes[:0:0], cfg.Dispatch.Routes...)
+	for i := range clone.Dispatch.Routes {
+		clone.Dispatch.Routes[i].Keywords = append([]string(nil), cfg.Dispatch.Routes[i].Keywords...)
+	}
+	return &clone
+}
+
+func (s *Session) configSnapshot() *runtimeconfig.Config {
+	if s.deps.ConfigSnapshot != nil {
+		return cloneRuntimeConfig(s.deps.ConfigSnapshot())
+	}
+	return cloneRuntimeConfig(s.deps.Config)
+}
+
 // SetCWD 更新会话工作目录（client 经 wire 重新声明、宿主校验后写入，如
 // session/load 重新声明 cwd）。锁内写入，与 Run 的读取互斥。
 func (s *Session) SetCWD(cwd string) {
@@ -90,14 +126,37 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 		return RunResult{State: RunCancelled}, nil
 	}
 
+	cfg := req.Config
+	if cfg == nil {
+		cfg = s.configSnapshot()
+	} else {
+		cfg = cloneRuntimeConfig(cfg)
+	}
+	if cfg == nil {
+		err := errors.New("agent: runtime configuration is unavailable")
+		if cb.Write != nil {
+			cb.Write(fmt.Sprintf("✘ %v\n", err))
+		}
+		return RunResult{State: RunFailed, Err: err, Persisted: false}, nil
+	}
+
 	// usage 是会话累计账本：跨多次 /agent 累计，直到 /new 用新对象替换当前会话才清零。
-	sandboxCfg := *sandbox.NewFromConfig(&s.deps.Config.Sandbox)
+	sandboxCfg := *sandbox.NewFromConfig(&cfg.Sandbox)
 	sandboxCfg.ToolAllowRules = s.toolAllowRulesSnapshot()
-	// 会话工作目录渗透：client 声明（且经宿主 sandbox 边界校验）的 cwd 优先作为
-	// 工具执行目录 —— bash 的 cmd.Dir 与 read/write 的相对路径基准都取自
-	// AllowedWorkDir，为空则回退现行为（cfg.AllowedWorkDir，NewFromConfig 兜底进程
-	// cwd）。只改本会话的沙箱配置副本，不动全局配置。
+	// 会话工作目录渗透：client 声明经宿主校验，并在每轮按本轮 cfg 快照重新验证，
+	// 避免 Sandbox 边界收紧后沿用旧声明。通过后才优先作为工具执行目录 —— bash 的
+	// cmd.Dir 与 read/write 的相对路径基准都取自 AllowedWorkDir；为空则回退现行为
+	//（cfg.AllowedWorkDir，NewFromConfig 兜底进程 cwd）。只改本会话的沙箱配置副本，
+	// 不动全局配置。
 	if cwd := s.cwd(); cwd != "" {
+		if s.deps.ValidateCWD != nil {
+			if err := s.deps.ValidateCWD(cwd, cfg); err != nil {
+				if cb.Write != nil {
+					cb.Write(fmt.Sprintf("✘ %v\n", err))
+				}
+				return RunResult{State: RunFailed, Err: err, Persisted: false}, nil
+			}
+		}
 		sandboxCfg.AllowedWorkDir = cwd
 	}
 	tools := s.deps.CollectTools(&sandboxCfg)
@@ -106,7 +165,6 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 	if req.ToolSource != nil {
 		tools = append(tools, req.ToolSource(ctx)...)
 	}
-	cfg := s.deps.Config
 
 	// 命令决策审计：配置开启时首次 Run 惰性打开，复用文件句柄（不每轮重开）。
 	if s.audit == nil && cfg.Sandbox.AuditLog {
@@ -158,7 +216,7 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 		}
 		return RunResult{State: RunFailed, Err: err, Persisted: false}, nil
 	}
-	s.streamTokens(cb, agentCtx, tokenCh, decisions)
+	s.streamTokens(cfg, cb, agentCtx, tokenCh, decisions)
 
 	// 保存对话历史（剔除首条 system prompt + memory 注入的记忆提醒块）。
 	// 记忆块只服务本次 run 的注入，若漏进 STM：下次 run 会重发它、检查点会把
@@ -217,11 +275,11 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 
 // streamTokens 消费 agent 的流式输出：渲染 token、转发 HITL 决策。
 // HITL 决策由前端按 spec 契约完成，plugin 只负责转交；agentCtx 取消时决策投递放弃。
-func (s *Session) streamTokens(cb RunCallbacks, agentCtx context.Context, tokenCh <-chan core.Token, decisions chan hitl.Decision) {
+func (s *Session) streamTokens(cfg *runtimeconfig.Config, cb RunCallbacks, agentCtx context.Context, tokenCh <-chan core.Token, decisions chan hitl.Decision) {
 	for tok := range tokenCh {
 		// 先输出内容再检查 Done — Done token 也可能带内容（如错误信息）。
 		// 空 content 的 Done 也要转发：前端靠它定稿未完成的流式渲染。
-		showToken := tok.Type != core.TokenTypeThinking || s.deps.Config.LLM.Thinking.Show
+		showToken := tok.Type != core.TokenTypeThinking || cfg.LLM.Thinking.Show
 		isToolLifecycle := tok.Type == core.TokenTypeToolCall || tok.Type == core.TokenTypeToolResult
 		if showToken && cb.EmitToken != nil && (tok.Content != "" || tok.Done || isToolLifecycle) {
 			cb.EmitToken(tok)
@@ -280,19 +338,20 @@ func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, 
 	hitlMw := middlewares.NewHITLMiddleware(*sandboxCfg, hitl.NewChannelDecisionProvider(decisions), hitlOptions...)
 	// usage：观察 AfterModel 记账（累计到会话边界才清零），publish 抛 core.Usage 快照。
 	// 事件契约在 ai-runtime/config（UsageEvent），前端 addon 订阅后自行渲染 —— statusbar 不进 SDK。
+	runContextWindow := contextWindow(cfg)
 	usageMw := middlewares.NewUsageMiddleware(s.usage, func(u core.Usage) {
 		publish(runtimeconfig.EventUsage, runtimeconfig.UsageEvent{
 			Usage:         u,
-			ContextWindow: contextWindow(cfg),
+			ContextWindow: u.LastPromptContextWindow,
 		})
-	})
+	}, runContextWindow)
 	// iteration：每轮迭代发一个计数事件
 	iterationMw := middlewares.NewIterationMiddleware(func() {
 		publish(runtimeconfig.EventIteration, nil)
 	})
 	// compress：自动压缩，protectSystem=true —— 保护本轮注入的系统提示
 	compressMw := middlewares.NewCompressionMiddleware(
-		s.newCompressor(provider, true),
+		s.newCompressor(provider, cfg, true),
 		contextWindow(cfg),
 		cfg.LLM.CompressAt,
 	)
@@ -306,7 +365,7 @@ func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, 
 }
 
 func contextWindow(cfg *runtimeconfig.Config) int {
-	_, provider, err := cfg.LLM.ResolveDefault()
+	_, provider, err := cfg.LLM.ResolveCurrent()
 	if err != nil {
 		return 0
 	}
@@ -316,24 +375,34 @@ func contextWindow(cfg *runtimeconfig.Config) int {
 // newCompressor 构造压缩器，onCompress 统一记进 token 账本（/usage 能看到压缩）。
 // protectSystem=true：history[0] 是本轮注入的系统提示，压掉模型就忘了怎么用工具；
 // /compact 场景 conversation 不含系统提示，首位可能是上次的摘要，允许被再次滚动，传 false。
-func (s *Session) newCompressor(provider core.Provider, protectSystem bool) *middlewares.Compressor {
-	cfg := s.deps.Config
-	return middlewares.NewCompressor(provider, cfg.LLM.CompactKeep, protectSystem, func(r middlewares.CompressReport) {
-		s.usage.RecordCompaction(core.Compaction{BeforeMsgs: r.BeforeMsgs, AfterMsgs: r.AfterMsgs, Tokens: r.Tokens})
+func (s *Session) newCompressor(provider core.Provider, cfg *runtimeconfig.Config, protectSystem bool) *middlewares.Compressor {
+	window := contextWindow(cfg)
+	return middlewares.NewCompressorWithCallbacks(provider, cfg.LLM.CompactKeep, protectSystem, func(r middlewares.CompressReport) {
+		s.usage.RecordCompaction(core.Compaction{
+			BeforeMsgs: r.BeforeMsgs, AfterMsgs: r.AfterMsgs, Tokens: r.Tokens,
+			ContextWindow: window,
+		})
+	}, func(usage *core.UsageInfo, estimate int) {
+		// 不完整响应产生了实际调用，但没有完成压缩；记账时不伪造 Compaction 事件。
+		s.usage.RecordWithContextWindow(-1, estimate, usage, window)
 	})
 }
 
 // Compact 执行 /compact：压缩会丢原文，先固化到任务档案，再压缩当前 conversation。
 func (s *Session) Compact(ctx context.Context, cb RunCallbacks) error {
+	cfg := s.configSnapshot()
+	if cfg == nil {
+		return errors.New("agent: runtime configuration is unavailable")
+	}
 	if s.deps.Store == nil {
 		// 纯内存模式：保持旧逻辑
-		return s.compactMemory(ctx, cb)
+		return s.compactMemory(ctx, cb, cfg)
 	}
-	return s.compactStore(ctx, cb)
+	return s.compactStore(ctx, cb, cfg)
 }
 
 // compactMemory 纯内存压缩（store 禁用时的回退路径）。
-func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks) error {
+func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks, cfg *runtimeconfig.Config) error {
 	s.mu.Lock()
 	history := s.conversation
 	before := len(history)
@@ -342,7 +411,7 @@ func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks) error {
 	// 压缩会丢原文，先固化到任务档案 —— 这是原文丢失前的最后一次机会。
 	if s.deps.Memory != nil {
 		publishStage(cb, "固化记忆中")
-		sum, err := s.checkpoint(ctx, history, s.deps.Config)
+		sum, err := s.checkpoint(ctx, history, cfg)
 		if err != nil {
 			if cb.Write != nil {
 				cb.Write(fmt.Sprintf("⚠ Memory consolidation failed (original text lost after compression): %v\n", err))
@@ -359,7 +428,6 @@ func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks) error {
 		return nil
 	}
 
-	cfg := s.deps.Config
 	provider, err := s.deps.NewProvider(cfg)
 	if err != nil {
 		if cb.Write != nil {
@@ -367,7 +435,7 @@ func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks) error {
 		}
 		return nil
 	}
-	compressor := s.newCompressor(provider, false)
+	compressor := s.newCompressor(provider, cfg, false)
 	publishStage(cb, "压缩会话历史中")
 
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -396,10 +464,10 @@ func (s *Session) compactMemory(ctx context.Context, cb RunCallbacks) error {
 }
 
 // compactStore store 持久化模式压缩：ActiveView 先固化 → 压缩 → detectCompact → 落 compact。
-func (s *Session) compactStore(ctx context.Context, cb RunCallbacks) error {
+func (s *Session) compactStore(ctx context.Context, cb RunCallbacks, cfg *runtimeconfig.Config) error {
 	// 先固化再折叠（原文丢失前最后一次机会）
 	publishStage(cb, "固化记忆中")
-	_, _ = s.Consolidate(ctx)
+	_, _ = s.consolidate(ctx, cfg)
 
 	view := s.deps.Store.ActiveView()
 	if len(view) == 0 {
@@ -410,7 +478,6 @@ func (s *Session) compactStore(ctx context.Context, cb RunCallbacks) error {
 	}
 	before := len(view)
 
-	cfg := s.deps.Config
 	provider, err := s.deps.NewProvider(cfg)
 	if err != nil {
 		if cb.Write != nil {
@@ -419,7 +486,7 @@ func (s *Session) compactStore(ctx context.Context, cb RunCallbacks) error {
 		return nil
 	}
 	// protectSystem=false：conversation 不含系统提示，首位可能是上次的摘要，允许被再次滚动
-	compressor := s.newCompressor(provider, false)
+	compressor := s.newCompressor(provider, cfg, false)
 	publishStage(cb, "压缩会话历史中")
 
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -491,9 +558,14 @@ func (s *Session) refreshConversation() error {
 	return nil
 }
 
+// LastUsageContextWindow returns the context window used by the most recent recorded model call.
+func (s *Session) LastUsageContextWindow() int {
+	return s.usage.Snapshot().LastPromptContextWindow
+}
+
 // UsageSnapshot 返回当前会话的用量数据（/usage 展示用，渲染留 Plugin 层）。
 func (s *Session) UsageSnapshot() ([]core.Usage, []core.Compaction, core.Usage) {
-	return s.usage.Calls(), s.usage.Compactions(), s.usage.Snapshot()
+	return s.usage.SnapshotAll()
 }
 
 // stripMemoryBlocks removes memory middleware system messages without removing compact summaries.

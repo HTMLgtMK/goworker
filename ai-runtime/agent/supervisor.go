@@ -93,6 +93,10 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 		return RunHandle{}, reject
 	}
 
+	// Capture one immutable global config generation before acceptance. A later /model
+	// update affects new runs only; this request carries its snapshot through execute.
+	req.Config = sess.configSnapshot()
+
 	// Wire the optional session EventHub before the durable queued acceptance record.
 	// Hub creation failure releases active/pending and aborts submission; it does not begin
 	// a run or write journal state. Install the approval fallback before the callback tee.

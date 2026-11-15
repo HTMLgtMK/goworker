@@ -16,33 +16,33 @@ import (
 // 保证两种入口的协议适配行为一致。
 func ProviderFactory(client *http.Client) func(*runtimeconfig.Config) (core.Provider, error) {
 	return func(cfg *runtimeconfig.Config) (core.Provider, error) {
-		name, provider, err := cfg.LLM.ResolveDefault()
+		provider, model, err := cfg.LLM.ResolveCurrent()
 		if err != nil {
 			return nil, err
 		}
 		switch provider.Type {
 		case runtimeconfig.ProviderTypeOpenAI:
 			return runtimeopenai.NewProvider(
-				name,
+				cfg.LLM.Current.Provider,
 				provider.Endpoint,
 				provider.APIKey,
-				provider.Model,
+				cfg.LLM.Current.Model,
 				client,
 				runtimeopenai.WithThinkingOptions(runtimeprovider.ThinkingOptions{
-					RequestMode: provider.Thinking.RequestMode,
-					Effort:      provider.Thinking.Effort,
+					RequestMode: model.Thinking.RequestMode,
+					Effort:      model.Thinking.Effort,
 				}),
 			), nil
 
 		case runtimeconfig.ProviderTypeAnthropic:
 			return runtimeanthropic.NewProvider(
-				name,
+				cfg.LLM.Current.Provider,
 				provider.Endpoint,
 				provider.APIKey,
-				provider.Model,
+				cfg.LLM.Current.Model,
 				client,
 				runtimeanthropic.AnthropicAuthType(provider.AuthType),
-				runtimeanthropic.WithAnthropicMaxTokens(provider.MaxTokens),
+				runtimeanthropic.WithAnthropicMaxTokens(model.MaxTokens),
 			), nil
 		default:
 			return nil, fmt.Errorf("unsupported provider type %q", provider.Type)

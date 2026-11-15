@@ -17,6 +17,7 @@ import (
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
+	appconfig "github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -291,36 +292,58 @@ func (p *AgentPlugin) handleModel(ctx *model.Context) error {
 	}
 	switch ctx.Args[0] {
 	case "list":
-		names := make([]string, 0, len(p.cfg.LLM.Providers))
-		for name := range p.cfg.LLM.Providers {
+		cfg := p.configSnapshot()
+		if cfg == nil {
+			ctx.Writer("✘ Provider 配置不可用\n")
+			return nil
+		}
+		names := make([]string, 0, len(cfg.LLM.Providers))
+		for name := range cfg.LLM.Providers {
 			names = append(names, name)
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			marker := " "
-			if name == p.cfg.LLM.DefaultProvider {
-				marker = "*"
+			provider := cfg.LLM.Providers[name]
+			modelIDs := make([]string, 0, len(provider.Models))
+			for id := range provider.Models {
+				modelIDs = append(modelIDs, id)
 			}
-			provider := p.cfg.LLM.Providers[name]
-			ctx.Writer(fmt.Sprintf("%s %s (%s, %s)\n", marker, name, provider.Type, provider.Model))
+			sort.Strings(modelIDs)
+			for _, id := range modelIDs {
+				marker := " "
+				if cfg.LLM.Current.Provider == name && cfg.LLM.Current.Model == id {
+					marker = "*"
+				}
+				ctx.Writer(fmt.Sprintf("%s %s/%s (%s)\n", marker, name, id, provider.Type))
+			}
 		}
 	case "use":
 		if len(ctx.Args) != 2 {
 			ctx.Writer("用法: /model use <provider>\n")
 			return nil
 		}
-		candidate := *p.cfg
-		candidate.LLM = p.cfg.LLM.Clone()
-		candidate.LLM.DefaultProvider = ctx.Args[1]
-		if err := candidate.LLM.Validate(); err != nil {
-			ctx.Writer(fmt.Sprintf("✘ %v\n", err))
+		providerName := ctx.Args[1]
+		if err := p.updateRuntimeConfig(func(cfg *runtimeconfig.Config) error {
+			provider, ok := cfg.LLM.Providers[providerName]
+			if !ok || len(provider.Models) == 0 {
+				return fmt.Errorf("provider %q 不存在或没有可用模型", providerName)
+			}
+			modelID := cfg.LLM.Current.Model
+			if _, ok := provider.Models[modelID]; !ok {
+				modelIDs := make([]string, 0, len(provider.Models))
+				for id := range provider.Models {
+					modelIDs = append(modelIDs, id)
+				}
+				sort.Strings(modelIDs)
+				modelID = modelIDs[0]
+			}
+			cfg.LLM.Current = runtimeconfig.CurrentConfig{Provider: providerName, Model: modelID}
+			return cfg.LLM.Validate()
+		}); err != nil {
+			ctx.Writer(fmt.Sprintf("✘ 切换失败: %v\n", err))
 			return nil
 		}
-		if err := p.hub.SaveConfig(&candidate); err != nil {
-			ctx.Writer(fmt.Sprintf("✘ 保存失败: %v\n", err))
-			return nil
-		}
-		ctx.Writer(fmt.Sprintf("✔ 已切换到 provider %s\n", ctx.Args[1]))
+		ctx.Writer(fmt.Sprintf("✔ 已切换到 provider %s\n", providerName))
 	case "set":
 		if len(ctx.Args) != 2 {
 			ctx.Writer("用法: /model set <key>=<value>\n")
@@ -328,23 +351,20 @@ func (p *AgentPlugin) handleModel(ctx *model.Context) error {
 		}
 		kv := strings.SplitN(ctx.Args[1], "=", 2)
 		if len(kv) != 2 {
-			ctx.Writer("格式错误，示例: /model set model=gpt-4o\n")
+			ctx.Writer("格式错误，示例: /model set context_window=128k\n")
 			return nil
 		}
-		candidate := *p.cfg
-		candidate.LLM = p.cfg.LLM.Clone()
-		if err := setModelField(&candidate, kv[0], kv[1]); err != nil {
-			ctx.Writer(fmt.Sprintf("✘ %v\n", err))
-			return nil
-		}
-		if err := p.hub.SaveConfig(&candidate); err != nil {
-			ctx.Writer(fmt.Sprintf("✘ 保存失败: %v\n", err))
+		if err := p.updateRuntimeConfig(func(cfg *runtimeconfig.Config) error {
+			return setModelField(cfg, kv[0], kv[1])
+		}); err != nil {
+			ctx.Writer(fmt.Sprintf("✘ 更新失败: %v\n", err))
 			return nil
 		}
 		ctx.Writer(fmt.Sprintf("✔ %s 已更新\n", kv[0]))
 	case "help":
 		ctx.Writer("用法: /model | /model list | /model use <provider> | /model set <key>=<value>\n")
-		ctx.Writer("Provider 字段: endpoint, model, api_key, context_window, thinking_request_mode, thinking_effort, auth_type, max_tokens\n")
+		ctx.Writer("当前模型字段: model, context_window, thinking_request_mode, thinking_effort, max_tokens\n")
+		ctx.Writer("Provider 字段: endpoint, api_key, auth_type\n")
 		ctx.Writer("全局字段: global.compress_at, global.compact_keep, global.max_iterations, global.thinking_show\n")
 	default:
 		ctx.Writer("未知子命令，使用 /model help 查看用法\n")
@@ -352,7 +372,28 @@ func (p *AgentPlugin) handleModel(ctx *model.Context) error {
 	return nil
 }
 
+func (p *AgentPlugin) configSnapshot() *runtimeconfig.Config {
+	if p.hub != nil && p.hub.ConfigSnapshot != nil {
+		return p.hub.ConfigSnapshot()
+	}
+	return p.cfg
+}
+
+func (p *AgentPlugin) updateRuntimeConfig(mutate func(*runtimeconfig.Config) error) error {
+	if p.hub == nil || p.hub.UpdateConfig == nil {
+		return fmt.Errorf("配置更新服务不可用")
+	}
+	_, err := p.hub.UpdateConfig(mutate)
+	if err != nil {
+		return fmt.Errorf("保存失败: %w", err)
+	}
+	return nil
+}
+
 func setModelField(cfg *runtimeconfig.Config, key, value string) error {
+	if cfg == nil {
+		return fmt.Errorf("runtime config is unavailable")
+	}
 	if strings.HasPrefix(key, "global.") {
 		switch strings.TrimPrefix(key, "global.") {
 		case "compress_at":
@@ -384,13 +425,25 @@ func setModelField(cfg *runtimeconfig.Config, key, value string) error {
 		}
 		return cfg.LLM.Validate()
 	}
-	providerName := cfg.LLM.DefaultProvider
-	provider := cfg.LLM.Providers[providerName]
+
+	providerName := cfg.LLM.Current.Provider
+	provider, ok := cfg.LLM.Providers[providerName]
+	if !ok {
+		return fmt.Errorf("当前 provider %q 不存在", providerName)
+	}
+	modelID := cfg.LLM.Current.Model
+	modelConfig, ok := provider.Models[modelID]
+	if !ok {
+		return fmt.Errorf("当前 model %q 不存在", modelID)
+	}
 	switch key {
 	case "endpoint":
 		provider.Endpoint = value
 	case "model":
-		provider.Model = value
+		if _, exists := provider.Models[value]; !exists {
+			return fmt.Errorf("provider %q 中不存在 model %q", providerName, value)
+		}
+		cfg.LLM.Current.Model = value
 	case "api_key":
 		provider.APIKey = value
 	case "context_window":
@@ -398,19 +451,19 @@ func setModelField(cfg *runtimeconfig.Config, key, value string) error {
 		if err != nil {
 			return err
 		}
-		provider.ContextWindow = parsed
+		modelConfig.ContextWindow = parsed
 	case "thinking_request_mode":
 		parsed, err := runtimeconfig.ParseThinkingRequestMode(value)
 		if err != nil {
 			return err
 		}
-		provider.Thinking.RequestMode = parsed
+		modelConfig.Thinking.RequestMode = parsed
 	case "thinking_effort":
 		parsed, err := runtimeconfig.ParseThinkingEffort(value)
 		if err != nil {
 			return err
 		}
-		provider.Thinking.Effort = parsed
+		modelConfig.Thinking.Effort = parsed
 	case "auth_type":
 		provider.AuthType = runtimeconfig.AnthropicAuthType(value)
 	case "max_tokens":
@@ -418,16 +471,22 @@ func setModelField(cfg *runtimeconfig.Config, key, value string) error {
 		if err != nil || parsed <= 0 {
 			return fmt.Errorf("无效 max_tokens: %s", value)
 		}
-		provider.MaxTokens = parsed
+		modelConfig.MaxTokens = parsed
 	default:
-		return fmt.Errorf("未知 provider 配置项: %s", key)
+		return fmt.Errorf("未知配置项: %s", key)
 	}
+	provider.Models[modelID] = modelConfig
 	cfg.LLM.Providers[providerName] = provider
 	return cfg.LLM.Validate()
 }
 
 func (p *AgentPlugin) showConfig(ctx *model.Context) {
-	name, provider, err := p.cfg.LLM.ResolveDefault()
+	cfg := p.configSnapshot()
+	if cfg == nil {
+		ctx.Writer("✘ Provider 配置不可用\n")
+		return
+	}
+	provider, modelConfig, err := cfg.LLM.ResolveCurrent()
 	if err != nil {
 		ctx.Writer(fmt.Sprintf("✘ Provider 配置错误: %v\n", err))
 		return
@@ -436,28 +495,31 @@ func (p *AgentPlugin) showConfig(ctx *model.Context) {
 	if provider.APIKey != "" {
 		keyDisplay = "***"
 	}
-	ctx.Writer(fmt.Sprintf("Provider:       %s (%s)\n", name, provider.Type))
-	ctx.Writer(fmt.Sprintf("Endpoint:       %s\n", provider.Endpoint))
-	ctx.Writer(fmt.Sprintf("Model:          %s\n", provider.Model))
+	ctx.Writer(fmt.Sprintf("Provider:       %s (%s)\n", cfg.LLM.Current.Provider, provider.Type))
+	ctx.Writer(fmt.Sprintf("Endpoint:       %s\n", appconfig.RedactEndpoint(provider.Endpoint)))
+	ctx.Writer(fmt.Sprintf("Model:          %s\n", cfg.LLM.Current.Model))
 	ctx.Writer(fmt.Sprintf("API Key:        %s\n", keyDisplay))
-	ctx.Writer(fmt.Sprintf("Context Window: %d\n", provider.ContextWindow))
-	ctx.Writer(fmt.Sprintf("Compress At:    %v\n", p.cfg.LLM.CompressAt))
-	ctx.Writer(fmt.Sprintf("Compact Keep:   %d\n", p.cfg.LLM.CompactKeep))
-	ctx.Writer(fmt.Sprintf("Max Iterations: %d\n", p.cfg.LLM.MaxIterations))
-	ctx.Writer(fmt.Sprintf("Thinking Show:  %t\n", p.cfg.LLM.Thinking.Show))
+	ctx.Writer(fmt.Sprintf("Context Window: %d\n", modelConfig.ContextWindow))
+	ctx.Writer(fmt.Sprintf("Compress At:    %v\n", cfg.LLM.CompressAt))
+	ctx.Writer(fmt.Sprintf("Compact Keep:   %d\n", cfg.LLM.CompactKeep))
+	ctx.Writer(fmt.Sprintf("Max Iterations: %d\n", cfg.LLM.MaxIterations))
+	ctx.Writer(fmt.Sprintf("Thinking Show:  %t\n", cfg.LLM.Thinking.Show))
 	if provider.Type == runtimeconfig.ProviderTypeOpenAI {
-		ctx.Writer(fmt.Sprintf("Thinking Mode:  %s\n", provider.Thinking.RequestMode))
-		ctx.Writer(fmt.Sprintf("Thinking Effort: %s\n", provider.Thinking.Effort))
+		ctx.Writer(fmt.Sprintf("Thinking Mode:  %s\n", modelConfig.Thinking.RequestMode))
+		ctx.Writer(fmt.Sprintf("Thinking Effort: %s\n", modelConfig.Thinking.Effort))
 	}
-	ctx.Writer(fmt.Sprintf("Sandbox Mode:   %s\n", p.cfg.Sandbox.Mode))
+	ctx.Writer(fmt.Sprintf("Sandbox Mode:   %s\n", cfg.Sandbox.Mode))
 }
 
 func selectedContextWindow(cfg *runtimeconfig.Config) int {
-	_, provider, err := cfg.LLM.ResolveDefault()
+	if cfg == nil {
+		return 0
+	}
+	_, modelConfig, err := cfg.LLM.ResolveCurrent()
 	if err != nil {
 		return 0
 	}
-	return provider.ContextWindow
+	return modelConfig.ContextWindow
 }
 
 // ---- /usage 命令 ----
@@ -473,6 +535,7 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 			return nil
 		}
 		calls, comps, total := s.UsageSnapshot()
+		currentWindow := selectedContextWindow(p.configSnapshot())
 		if len(calls) == 0 && len(comps) == 0 {
 			runContext.Writer("(no agent calls yet — run /agent first)\n")
 			return nil
@@ -500,7 +563,7 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 			runContext.Writer(totalLine + "\n")
 
 			// context usage uses "last prompt / window" — the final ReAct request already holds all history.
-			if w := selectedContextWindow(p.cfg); w > 0 && total.LastPromptTokens > 0 {
+			if w := total.LastPromptContextWindow; w > 0 && total.LastPromptTokens > 0 {
 				pct := float64(total.LastPromptTokens) / float64(w) * 100
 				runContext.Writer(fmt.Sprintf("  context: %.2f%% (last in %s / window %s)\n",
 					pct, runtimeagent.Humanize(total.LastPromptTokens), runtimeagent.Humanize(w)))
@@ -524,7 +587,7 @@ func (p *AgentPlugin) handleUsage(ctx *model.Context) error {
 		if convLen := len(conv); convLen > 0 {
 			convEst := core.EstimateTokens(conv)
 			line := fmt.Sprintf("  history: %s est (%d msgs)", runtimeagent.Humanize(convEst), convLen)
-			if w := selectedContextWindow(p.cfg); w > 0 {
+			if w := currentWindow; w > 0 {
 				line += fmt.Sprintf(", %.2f%% of window", float64(convEst)/float64(w)*100)
 			}
 			runContext.Writer(line + "\n")

@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -18,7 +20,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config 是 goworker 的整体配置。所有段顶层平铺，旧 config.yaml 不缩进 → 兼容。
+// Config 是 goworker 的整体配置。
 type Config struct {
 	Frontend FrontendConfig               `yaml:"frontend"`
 	LLM      runtimeconfig.LLMConfig      `yaml:"llm"`
@@ -219,18 +221,38 @@ func DefaultPath() string {
 	return filepath.Join(DefaultDir(), "config.yaml")
 }
 
-// Display 返回 YAML 格式的配置文本（API Key 自动脱敏）。
+// Display returns YAML configuration text with API keys and endpoint path credentials redacted.
 func (c *Config) Display() string {
 	cfg := *c
 	cfg.LLM = c.LLM.Clone()
 	for name, provider := range cfg.LLM.Providers {
 		if provider.APIKey != "" {
 			provider.APIKey = "***"
-			cfg.LLM.Providers[name] = provider
 		}
+		provider.Endpoint = RedactEndpoint(provider.Endpoint)
+		cfg.LLM.Providers[name] = provider
 	}
 	data, _ := yaml.Marshal(cfg)
 	return string(data)
+}
+
+// RedactEndpoint removes URL credentials and masks every non-root path. Endpoint
+// path segments are opaque: reverse proxies commonly put bearer tokens there.
+func RedactEndpoint(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "[redacted]"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	if parsed.Path != "" && parsed.Path != "/" {
+		parsed.Path = "/[redacted]"
+		parsed.RawPath = ""
+	}
+	return parsed.String()
 }
 
 // SetField 按点分 key 设置配置项（如 "llm.endpoint"、"sandbox.mode"）。
@@ -312,17 +334,39 @@ func (c *Config) SetField(key, value string) error {
 		}
 		c.Session.Enabled = b
 	default:
-		valid := "frontend.stdin.theme, llm.default_provider, llm.providers.<name>.{type,endpoint,model,api_key,context_window,max_tokens,auth_type,thinking.request_mode,thinking.effort}, llm.compress_at, llm.compact_keep, llm.max_iterations, llm.thinking.show, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days, memory.dir, memory.enabled, memory.task_keep, memory.task_inject_n, memory.ltm_inject_top_k, memory.ltm_extract, session.dir, session.enabled, memory.inject_budget_ratio"
+		valid := "frontend.stdin.theme, llm.current.{provider,model}, llm.providers.<name>.{type,endpoint,api_key,auth_type}, llm.providers.<name>.models.<model>.{display_name,context_window,max_tokens,thinking.request_mode,thinking.effort}, llm.compress_at, llm.compact_keep, llm.max_iterations, llm.thinking.show, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days, memory.dir, memory.enabled, memory.task_keep, memory.task_inject_n, memory.ltm_inject_top_k, memory.ltm_extract, session.dir, session.enabled, memory.inject_budget_ratio"
 		return fmt.Errorf("未知配置项: %s（可用: %s）", key, valid)
 	}
 	return nil
 }
 
 func (c *Config) setLLMField(key, value string) error {
-	if key == "default_provider" {
+	if key == "current.provider" {
 		candidate := c.LLM.Clone()
-		candidate.DefaultProvider = value
-		if _, _, err := candidate.ResolveDefault(); err != nil {
+		provider, ok := candidate.Providers[value]
+		if !ok || len(provider.Models) == 0 {
+			return fmt.Errorf("provider %q 不存在或没有可用模型", value)
+		}
+		modelID := candidate.Current.Model
+		if _, ok := provider.Models[modelID]; !ok {
+			modelIDs := make([]string, 0, len(provider.Models))
+			for id := range provider.Models {
+				modelIDs = append(modelIDs, id)
+			}
+			sort.Strings(modelIDs)
+			modelID = modelIDs[0]
+		}
+		candidate.Current = runtimeconfig.CurrentConfig{Provider: value, Model: modelID}
+		if err := candidate.Validate(); err != nil {
+			return err
+		}
+		c.LLM = candidate
+		return nil
+	}
+	if key == "current.model" {
+		candidate := c.LLM.Clone()
+		candidate.Current.Model = value
+		if err := candidate.Validate(); err != nil {
 			return err
 		}
 		c.LLM = candidate
@@ -370,46 +414,74 @@ func (c *Config) setLLMField(key, value string) error {
 		return fmt.Errorf("provider %q does not exist", parts[1])
 	}
 	field := strings.Join(parts[2:], ".")
+	if strings.HasPrefix(field, "models.") {
+		return c.setLLMModelField(parts[1], strings.TrimPrefix(field, "models."), value)
+	}
 	switch field {
 	case "type":
 		provider.Type = runtimeconfig.ProviderType(value)
 	case "endpoint":
 		provider.Endpoint = value
-	case "model":
-		provider.Model = value
 	case "api_key":
 		provider.APIKey = value
-	case "context_window":
-		parsed, err := runtimeconfig.ParseContextWindow(value)
-		if err != nil {
-			return err
-		}
-		provider.ContextWindow = parsed
 	case "auth_type":
 		provider.AuthType = runtimeconfig.AnthropicAuthType(value)
-	case "max_tokens":
-		parsed, err := strconv.Atoi(value)
-		if err != nil || parsed <= 0 {
-			return fmt.Errorf("无效 max_tokens: %s（应为正整数）", value)
-		}
-		provider.MaxTokens = parsed
-	case "thinking.request_mode":
-		parsed, err := runtimeconfig.ParseThinkingRequestMode(value)
-		if err != nil {
-			return err
-		}
-		provider.Thinking.RequestMode = parsed
-	case "thinking.effort":
-		parsed, err := runtimeconfig.ParseThinkingEffort(value)
-		if err != nil {
-			return err
-		}
-		provider.Thinking.Effort = parsed
 	default:
 		return fmt.Errorf("未知 Provider 配置项: %s", field)
 	}
 	candidate := c.LLM.Clone()
 	candidate.Providers[parts[1]] = provider
+	if err := candidate.Validate(); err != nil {
+		return err
+	}
+	c.LLM = candidate
+	return nil
+}
+
+func (c *Config) setLLMModelField(providerName, path, value string) error {
+	candidate := c.LLM.Clone()
+	provider := candidate.Providers[providerName]
+	var modelID, field string
+	for _, suffix := range []string{"thinking.request_mode", "thinking.effort", "context_window", "max_tokens", "display_name"} {
+		if strings.HasSuffix(path, "."+suffix) {
+			modelID, field = strings.TrimSuffix(path, "."+suffix), suffix
+			break
+		}
+	}
+	model, ok := provider.Models[modelID]
+	if !ok || field == "" {
+		return fmt.Errorf("未知模型配置项: %s", path)
+	}
+	switch field {
+	case "display_name":
+		model.DisplayName = value
+	case "context_window":
+		parsed, err := runtimeconfig.ParseContextWindow(value)
+		if err != nil {
+			return err
+		}
+		model.ContextWindow = parsed
+	case "max_tokens":
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			return fmt.Errorf("无效 max_tokens: %s", value)
+		}
+		model.MaxTokens = parsed
+	case "thinking.request_mode":
+		parsed, err := runtimeconfig.ParseThinkingRequestMode(value)
+		if err != nil {
+			return err
+		}
+		model.Thinking.RequestMode = parsed
+	case "thinking.effort":
+		parsed, err := runtimeconfig.ParseThinkingEffort(value)
+		if err != nil {
+			return err
+		}
+		model.Thinking.Effort = parsed
+	}
+	provider.Models[modelID] = model
+	candidate.Providers[providerName] = provider
 	if err := candidate.Validate(); err != nil {
 		return err
 	}
@@ -428,57 +500,10 @@ func Load(path string) *Config {
 		slog.Error("config: read failed", "err", err)
 		return nil
 	}
-	if hasMixedLLMFormats(data) {
-		slog.Error("config: legacy LLM fields and providers cannot be mixed")
-		return nil
-	}
 	cfg := Default()
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		slog.Error("config: parse failed", "err", err)
 		return nil
-	}
-	if !hasProviders(data) {
-		var legacy struct {
-			LLM struct {
-				Endpoint      string `yaml:"endpoint"`
-				Model         string `yaml:"model"`
-				APIKey        string `yaml:"api_key"`
-				ContextWindow int    `yaml:"context_window"`
-				Thinking      struct {
-					Show        *bool                             `yaml:"show"`
-					RequestMode runtimeconfig.ThinkingRequestMode `yaml:"request_mode"`
-					Effort      runtimeconfig.ThinkingEffort      `yaml:"effort"`
-				} `yaml:"thinking"`
-			} `yaml:"llm"`
-		}
-		if err := yaml.Unmarshal(data, &legacy); err != nil {
-			slog.Error("config: parse legacy LLM failed", "err", err)
-			return nil
-		}
-		provider := cfg.LLM.Providers["openai"]
-		if legacy.LLM.Endpoint != "" {
-			provider.Endpoint = legacy.LLM.Endpoint
-		}
-		if legacy.LLM.Model != "" {
-			provider.Model = legacy.LLM.Model
-		}
-		if legacy.LLM.APIKey != "" {
-			provider.APIKey = legacy.LLM.APIKey
-		}
-		if legacy.LLM.ContextWindow > 0 {
-			provider.ContextWindow = legacy.LLM.ContextWindow
-		}
-		if legacy.LLM.Thinking.RequestMode != "" {
-			provider.Thinking.RequestMode = legacy.LLM.Thinking.RequestMode
-		}
-		if legacy.LLM.Thinking.Effort != "" {
-			provider.Thinking.Effort = legacy.LLM.Thinking.Effort
-		}
-		if legacy.LLM.Thinking.Show != nil {
-			cfg.LLM.Thinking.Show = *legacy.LLM.Thinking.Show
-		}
-		cfg.LLM.Providers = map[string]runtimeconfig.ProviderConfig{"openai": provider}
-		cfg.LLM.DefaultProvider = "openai"
 	}
 	cfg.LLM = cfg.LLM.WithDefaults()
 	if cfg.Sandbox.AutoMaxRisk != "" {
@@ -496,42 +521,6 @@ func Load(path string) *Config {
 		return nil
 	}
 	return cfg
-}
-
-func hasProviders(data []byte) bool {
-	return llmYAMLKeys(data)["providers"]
-}
-
-func hasMixedLLMFormats(data []byte) bool {
-	keys := llmYAMLKeys(data)
-	if !keys["providers"] {
-		return false
-	}
-	for _, key := range []string{"endpoint", "model", "api_key", "context_window"} {
-		if keys[key] {
-			return true
-		}
-	}
-	return false
-}
-
-func llmYAMLKeys(data []byte) map[string]bool {
-	var root yaml.Node
-	if yaml.Unmarshal(data, &root) != nil || len(root.Content) == 0 {
-		return nil
-	}
-	keys := make(map[string]bool)
-	mapping := root.Content[0]
-	for i := 0; i+1 < len(mapping.Content); i += 2 {
-		if mapping.Content[i].Value != "llm" || mapping.Content[i+1].Kind != yaml.MappingNode {
-			continue
-		}
-		llm := mapping.Content[i+1]
-		for j := 0; j+1 < len(llm.Content); j += 2 {
-			keys[llm.Content[j].Value] = true
-		}
-	}
-	return keys
 }
 
 // Save 原子写入配置文件：先写临时文件再 rename，避免 crash 丢数据。

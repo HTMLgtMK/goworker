@@ -99,29 +99,32 @@ func (p *AgentPlugin) sessionIsLive(id string) bool {
 }
 
 // SessionModes 实现 modes 探测（经 ACP service 委托给 dispatch.Server）：
-// 数据源 cfg.LLM，只显示不切换 —— currentModeId = default_provider，
-// availableModes = providers 按名字排序（id = provider 名，name = "名 (model)"，
-// description 留空）。无 providers 或无配置返回 nil（响应省略 modes）。
+// 数据源为最新 cfg.LLM 快照，currentModeId 是当前 provider；只给当前 provider 标注模型。
+// availableModes 按 provider 名排序；无 providers 或无配置返回 nil（响应省略 modes）。
 func (p *AgentPlugin) SessionModes() *model.SessionModeState {
-	if p.cfg == nil || len(p.cfg.LLM.Providers) == 0 {
+	cfg := p.configSnapshot()
+	if cfg == nil || len(cfg.LLM.Providers) == 0 {
 		return nil
 	}
-	names := make([]string, 0, len(p.cfg.LLM.Providers))
-	for name := range p.cfg.LLM.Providers {
+	names := make([]string, 0, len(cfg.LLM.Providers))
+	for name := range cfg.LLM.Providers {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	modes := make([]model.SessionMode, 0, len(names))
 	for _, name := range names {
-		modes = append(modes, model.SessionMode{
-			ID:   name,
-			Name: fmt.Sprintf("%s (%s)", name, p.cfg.LLM.Providers[name].Model),
-		})
+		modelID := ""
+		if name == cfg.LLM.Current.Provider {
+			modelID = cfg.LLM.Current.Model
+		}
+		label := name
+		if modelID != "" {
+			label = fmt.Sprintf("%s (%s)", name, modelID)
+		}
+		modes = append(modes, model.SessionMode{ID: name, Name: label})
 	}
-	return &model.SessionModeState{
-		CurrentModeID:  p.cfg.LLM.DefaultProvider,
-		AvailableModes: modes,
-	}
+	current := cfg.LLM.Current.Provider
+	return &model.SessionModeState{CurrentModeID: current, AvailableModes: modes}
 }
 
 // currentSessionCwd 返回当前会话最近一次有效声明的 cwd（声明随 current

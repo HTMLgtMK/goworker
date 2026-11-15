@@ -13,6 +13,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 	acpservice "github.com/tinguo/goworker/daemon/internal/core/service/acp"
+	xgwprotocol "github.com/tinguo/goworker/daemon/xgoworker/protocol"
 )
 
 type serviceRegistration struct {
@@ -53,12 +54,13 @@ func registerACPService(a *Application, options applicationOptions) error {
 		logger = a.Log.Logger
 	}
 	acp, err := newACPService(acpServiceOptions{
-		socketPath: a.Config.Frontend.ACP.Socket,
-		connection: options.acpConnection,
-		evaluate:   a.Engine.Eval,
-		commands:   a.Engine.Commands,
-		sessions:   sessions,
-		logger:     logger,
+		socketPath:              a.Config.Frontend.ACP.Socket,
+		connection:              options.acpConnection,
+		providerWriteAuthorizer: options.providerWriteAuthorizer,
+		evaluate:                a.Engine.Eval,
+		commands:                a.Engine.Commands,
+		sessions:                sessions,
+		logger:                  logger,
 	})
 	if err != nil {
 		return fmt.Errorf("construct ACP service: %w", err)
@@ -81,12 +83,13 @@ func resolveACPSessions(a *Application) (model.SessionSource, error) {
 }
 
 type acpServiceOptions struct {
-	socketPath string
-	connection io.ReadWriteCloser
-	evaluate   acpservice.Evaluator
-	commands   func() []model.Command
-	sessions   model.SessionSource
-	logger     *slog.Logger
+	socketPath              string
+	connection              io.ReadWriteCloser
+	providerWriteAuthorizer acpservice.ProviderWriteAuthorizer
+	evaluate                acpservice.Evaluator
+	commands                func() []model.Command
+	sessions                model.SessionSource
+	logger                  *slog.Logger
 }
 
 // newACPService constructs the daemon's main ACP endpoint without starting it.
@@ -113,10 +116,20 @@ func newACPService(options acpServiceOptions) (*acpservice.Service, error) {
 		listenerFactory = newACPUnixListenerFactory(options.socketPath, options.logger)
 	}
 
+	providerWriteAuthorizer := options.providerWriteAuthorizer
+	if providerWriteAuthorizer == nil && options.connection == nil {
+		// NewUnixListener secures the socket to the daemon's local OS user (0600,
+		// with a private 0700 parent when it creates one). This is the existing
+		// trusted-local management path; an injected pipe has no authenticated peer
+		// identity, so its default remains deny.
+		providerWriteAuthorizer = func(string) bool { return true }
+	}
+
 	// 无会话数据源时显式关闭 loader/lister 自动发现：FrontendHandler 静态实现
 	// 了这两个接口，auto-discovery 会让 initialize 通告 loadSession，客户端随即
 	// 协商一个调用必然失败的能力。
 	var serverOptions []aiacp.ServerOption
+	serverOptions = append(serverOptions, aiacp.WithAgentCapability(xgwprotocol.XGWorkerCapability{}))
 	if options.sessions == nil {
 		serverOptions = append(serverOptions,
 			aiacp.WithSessionLoader(nil),
@@ -127,7 +140,7 @@ func newACPService(options acpServiceOptions) (*acpservice.Service, error) {
 	// gate 全 daemon 一份：prompt 执行与会话切换（session/new、load-current）跨
 	// 所有连接互斥。放在工厂闭包里被捕获，每连接 handler 共享同一把门禁。
 	return acpservice.NewService(
-		acpservice.NewFrontendHandlerFactory(options.evaluate, options.commands, options.sessions, acpservice.NewSessionGate()),
+		acpservice.NewFrontendHandlerFactory(options.evaluate, options.commands, options.sessions, acpservice.NewSessionGate(), providerWriteAuthorizer),
 		listenerFactory,
 		serverOptions...,
 	), nil

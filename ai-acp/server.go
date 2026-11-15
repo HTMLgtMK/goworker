@@ -57,18 +57,27 @@ type SessionModesProvider interface {
 }
 
 type serverConfig struct {
-	creator    SessionCreator
-	loader     SessionLoader
-	lister     SessionLister
-	modes      SessionModesProvider
-	creatorSet bool
-	loaderSet  bool
-	listerSet  bool
-	modesSet   bool
+	creator      SessionCreator
+	loader       SessionLoader
+	lister       SessionLister
+	modes        SessionModesProvider
+	capabilities []protocol.Capability
+	creatorSet   bool
+	loaderSet    bool
+	listerSet    bool
+	modesSet     bool
 }
 
 // ServerOption customizes optional session lifecycle adapters.
 type ServerOption func(*serverConfig)
+
+// WithAgentCapability adds a typed application capability to initialize.agentCapabilities.
+// Capability implementations remain owned by the application package; ai-acp only marshals them.
+func WithAgentCapability(capability protocol.Capability) ServerOption {
+	return func(config *serverConfig) {
+		config.capabilities = append(config.capabilities, capability)
+	}
+}
 
 // WithSessionCreator registers the session/new adapter.
 func WithSessionCreator(creator SessionCreator) ServerOption {
@@ -244,6 +253,13 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 		caps, err = caps.With(protocol.LoadSessionCapability{})
 		if err != nil {
 			return nil, fmt.Errorf("acp: advertise loadSession: %w", err)
+		}
+	}
+	for _, capability := range s.config.capabilities {
+		var err error
+		caps, err = caps.With(capability)
+		if err != nil {
+			return nil, fmt.Errorf("acp: advertise application capability: %w", err)
 		}
 	}
 	s.initMu.Lock()

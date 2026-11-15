@@ -16,10 +16,15 @@ func NewUsageTracker() *UsageTracker {
 
 // Record 记录一次 Chat 调用的用量并累加。u 可为 nil（模型不返回 usage）。
 func (t *UsageTracker) Record(iter, estimate int, u *UsageInfo) {
+	t.RecordWithContextWindow(iter, estimate, u, 0)
+}
+
+// RecordWithContextWindow 记录调用用量及该请求实际使用的上下文窗口。
+func (t *UsageTracker) RecordWithContextWindow(iter, estimate int, u *UsageInfo, contextWindow int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	call := Usage{Iteration: iter, EstimateTokens: estimate}
+	call := Usage{Iteration: iter, EstimateTokens: estimate, ContextWindow: contextWindow}
 	if u != nil {
 		call.PromptTokens = u.PromptTokens
 		call.CompletionTokens = u.CompletionTokens
@@ -42,6 +47,10 @@ func (t *UsageTracker) Record(iter, estimate int, u *UsageInfo) {
 func (t *UsageTracker) Snapshot() Usage {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.snapshotLocked()
+}
+
+func (t *UsageTracker) snapshotLocked() Usage {
 	s := t.total
 	if n := len(t.calls); n > 0 {
 		last := t.calls[n-1]
@@ -49,8 +58,21 @@ func (t *UsageTracker) Snapshot() Usage {
 		if s.LastPromptTokens == 0 {
 			s.LastPromptTokens = last.EstimateTokens
 		}
+		s.LastPromptContextWindow = last.ContextWindow
 	}
 	return s
+}
+
+// SnapshotAll returns one coherent copy of call, compaction, and total usage state.
+func (t *UsageTracker) SnapshotAll() ([]Usage, []Compaction, Usage) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	calls := make([]Usage, len(t.calls))
+	copy(calls, t.calls)
+	compactions := make([]Compaction, len(t.compactions))
+	copy(compactions, t.compactions)
+	return calls, compactions, t.snapshotLocked()
 }
 
 // Calls 返回明细的深拷贝，避免调用方在锁外持引用（线程安全）。

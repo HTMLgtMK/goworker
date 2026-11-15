@@ -5,6 +5,35 @@ import (
 	"testing"
 )
 
+func TestUsageTracker_RecordsContextWindowPerCall(t *testing.T) {
+	tracker := NewUsageTracker()
+	tracker.RecordWithContextWindow(0, 100, &UsageInfo{PromptTokens: 80}, 32_000)
+	tracker.RecordWithContextWindow(1, 200, nil, 64_000)
+
+	calls := tracker.Calls()
+	if len(calls) != 2 || calls[0].ContextWindow != 32_000 || calls[1].ContextWindow != 64_000 {
+		t.Fatalf("call context windows = %+v, want [32000, 64000]", calls)
+	}
+	if got := tracker.Snapshot().LastPromptContextWindow; got != 64_000 {
+		t.Errorf("last prompt context window = %d, want 64000", got)
+	}
+
+	tracker.Reset()
+	if got := tracker.Snapshot().LastPromptContextWindow; got != 0 {
+		t.Errorf("empty tracker context window = %d, want 0", got)
+	}
+}
+
+func TestUsageTracker_RecordCompactionKeepsContextWindow(t *testing.T) {
+	tracker := NewUsageTracker()
+	tracker.RecordCompaction(Compaction{BeforeMsgs: 8, AfterMsgs: 3, Tokens: 120, ContextWindow: 32_000})
+
+	comps := tracker.Compactions()
+	if len(comps) != 1 || comps[0].ContextWindow != 32_000 {
+		t.Fatalf("compactions = %+v, want context window 32000", comps)
+	}
+}
+
 func TestUsageTracker_RecordAndSnapshot(t *testing.T) {
 	tracker := NewUsageTracker()
 
@@ -29,6 +58,28 @@ func TestUsageTracker_RecordAndSnapshot(t *testing.T) {
 	// LastPromptTokens 取最近一次：第二次无 usage → 退回估算
 	if s.LastPromptTokens != 2300 {
 		t.Errorf("LastPromptTokens = %d, want 2300", s.LastPromptTokens)
+	}
+}
+
+func TestUsageTracker_TracksContextWindowPerModelCall(t *testing.T) {
+	tracker := NewUsageTracker()
+	tracker.RecordWithContextWindow(0, 900, &UsageInfo{PromptTokens: 800}, 32_000)
+	tracker.RecordWithContextWindow(1, 1_800, nil, 64_000)
+
+	calls := tracker.Calls()
+	if len(calls) != 2 {
+		t.Fatalf("calls = %d, want 2", len(calls))
+	}
+	if calls[0].ContextWindow != 32_000 || calls[1].ContextWindow != 64_000 {
+		t.Errorf("call context windows = [%d, %d], want [32000, 64000]", calls[0].ContextWindow, calls[1].ContextWindow)
+	}
+
+	snapshot := tracker.Snapshot()
+	if snapshot.LastPromptTokens != 1_800 {
+		t.Errorf("LastPromptTokens = %d, want estimate 1800 for missing provider usage", snapshot.LastPromptTokens)
+	}
+	if snapshot.LastPromptContextWindow != 64_000 {
+		t.Errorf("LastPromptContextWindow = %d, want 64000", snapshot.LastPromptContextWindow)
 	}
 }
 
@@ -173,6 +224,7 @@ func TestUsageTracker_Concurrent(t *testing.T) {
 		for i := 0; i < 1000; i++ {
 			_ = tracker.Snapshot()
 			_ = tracker.Calls()
+			_, _, _ = tracker.SnapshotAll()
 		}
 	}()
 

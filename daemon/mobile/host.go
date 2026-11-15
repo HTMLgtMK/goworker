@@ -169,7 +169,12 @@ func (h *Host) Start() (err error) {
 	// 阶段二（锁外）：app.New 是唯一 Application 创建入口。装配可耗时数秒，
 	// 绝不持有状态锁；panic 由上方 defer 捕获并复用同一条 rollback 路径。
 	assembling = true
-	appl, err := app.New(app.WithACPConnection(&pipeConn{r: toWorkerR, w: fromWorkerW}))
+	appl, err := app.New(
+		app.WithACPConnection(&pipeConn{r: toWorkerR, w: fromWorkerW}),
+		// This pipe is created and owned by this in-process mobile Host; explicitly
+		// retain the trusted local client's provider-management capability.
+		app.WithACPProviderWriteAuthorizer(func(string) bool { return true }),
+	)
 	assembling = false
 	if err != nil {
 		// app.New 内部失败已自行 cleanup（services/engine/log）；Host 只回收
