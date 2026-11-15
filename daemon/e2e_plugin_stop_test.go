@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,8 +31,15 @@ func TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles(t *testing.T) {
 	var releaseOnce sync.Once
 	release := make(chan struct{})
 	releaseGate := func() { releaseOnce.Do(func() { close(release) }) }
-	defer releaseGate()
+	started := make(chan struct{}, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return
+		}
+		select {
+		case started <- struct{}{}:
+		default:
+		}
 		select {
 		case <-release:
 			w.Header().Set("Content-Type", "application/json")
@@ -44,6 +52,7 @@ func TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
+	defer releaseGate()
 
 	dir := t.TempDir()
 	cfg := config.Default()
@@ -79,6 +88,11 @@ func TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles(t *testing.T) {
 		t.Fatalf("StartRun: %v", err)
 	}
 	waitRunning(t, p, sid, runID)
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("provider request did not start")
+	}
 
 	// 在飞订阅：Stop 的 hub 收口应把它断开。
 	res, err := p.SubscribeEvents(sid, 0)
@@ -93,7 +107,6 @@ func TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles(t *testing.T) {
 	case <-stopped:
 	case <-time.After(15 * time.Second):
 		releaseGate()
-		<-stopped
 		t.Fatal("Stop did not return in time (manager.Close wait stuck?)")
 	}
 
