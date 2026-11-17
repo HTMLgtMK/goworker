@@ -23,6 +23,7 @@ import (
 // 以 type-assert 获取(SessionSource 先例,capability.go:61-78)。
 var _ model.RunControlSource = (*AgentPlugin)(nil)
 var _ model.NegotiatedRunControlSource = (*AgentPlugin)(nil)
+var _ model.SessionTitleSource = (*AgentPlugin)(nil)
 
 // InternalRunner 编译期断言：AgentPlugin 实现受限的同步宿主入口。该接口只隔离静态方法集，
 // 不构成运行时授权边界；协议控制仍由 Service 的 lease fencing 保护。
@@ -109,6 +110,8 @@ func (p *AgentPlugin) StartRun(sessionID, connectionID, input, requestID string)
 // StartRunWithTools freezes the negotiated device-tool source into the initial run
 // submission. The idempotency registry ignores sources on replays by construction.
 func (p *AgentPlugin) StartRunWithTools(sessionID, connectionID, input, requestID string, toolSource func(context.Context) []core.Tool) (string, string, error) {
+	// RunCallbacks stays frontend-only; title proposals ride the AfterAgent middleware,
+	// which the runtime mounts from SessionDeps.TitleStore for every run.
 	runID, state, err := p.control.StartRunWithTools(sessionID, connectionID, input, requestID, runtimeagent.RunCallbacks{}, toolSource)
 	if errors.Is(err, runtimeagent.ErrSessionArchived) {
 		return "", "", fmt.Errorf("agent: session %q is archived and read-only", sessionID)
@@ -220,7 +223,17 @@ func flattenPendingApprovals(pending []runtimeagent.PendingApproval) []model.Pen
 // SubscribeEvents subscribes to the routed session's event hub after afterSeq. It does
 // not acquire a lease; attach orchestration handles subscription and control separately.
 func (p *AgentPlugin) SubscribeEvents(sessionID string, afterSeq uint64) (agentcontrol.AttachResult, error) {
-	return p.control.SubscribeEvents(sessionID, afterSeq)
+	live, stop, err := p.sessionEvents.subscribe(sessionID)
+	if err != nil {
+		return agentcontrol.AttachResult{}, err
+	}
+	result, err := p.control.SubscribeEvents(sessionID, afterSeq)
+	if err != nil {
+		stop()
+		return agentcontrol.AttachResult{}, err
+	}
+	result.Subscription = newSessionEventSubscription(result.Subscription, live, stop)
+	return result, nil
 }
 
 // ActiveRun returns the routed runtime's active run snapshot. A missing runtime or

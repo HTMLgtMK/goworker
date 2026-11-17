@@ -12,6 +12,7 @@ import (
 	memory "github.com/tinguo/goworker/ai-memory"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/hitl"
+	"github.com/tinguo/goworker/ai-runtime/middlewares"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	sandbox "github.com/tinguo/goworker/ai-sandbox"
 )
@@ -54,6 +55,9 @@ type Session struct {
 	workDir        string                  // 会话工作目录（SessionDeps.CWD 的运行时可变副本，锁内读写）
 	toolAllowRules []sandbox.ToolAllowRule // 会话级外部工具授权快照（锁内更新）
 
+	// titleOnce is the default when the host does not provide a logical-session guard.
+	titleOnce sync.Once
+
 	deps SessionDeps
 }
 
@@ -91,4 +95,12 @@ type SessionDeps struct {
 	RunEvents            EventJournal                                           // nil = 不启用事件流（P2+P3 的 daemon 不接线，openQuestion ④；P5 随 x-goworker 协议接入；接口字段必须真 nil，typed-nil 陷阱同 Store/RunJournal）
 	PersistAllowRule     func(sandbox.AllowRule) error                          // 持久化 bash allow_always 规则
 	PersistToolAllowRule func(sandbox.ToolAllowRule) error                      // 持久化外部工具 allow_always 规则
+	// TitleStore 是标题中间件的持久化面（nil = 自动标题禁用）。中间件在 AfterAgent
+	// 点位提议一次，判断与写回都在中间件内完成；接口字段必须真 nil，typed-nil 会让
+	// 禁用判断失效。*session.Store 实现它。
+	TitleStore middlewares.TitleStore
+	// TitleOnce may be shared by sessions reconstructed for the same logical conversation.
+	TitleOnce *sync.Once
+	// SessionEvent delivers live session notifications independently of a run's callbacks.
+	SessionEvent func(event string, data any)
 }

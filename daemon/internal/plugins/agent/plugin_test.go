@@ -251,6 +251,7 @@ func newAgentPlugin(hub *model.Hub) *AgentPlugin {
 		},
 		PersistAllowRule: p.persistAllowRule,
 	}
+	p.providerFactory = p.deps.NewProvider
 	p.refreshSession()
 	return p
 }
@@ -259,6 +260,7 @@ func newAgentPlugin(hub *model.Hub) *AgentPlugin {
 func newAgentPluginP(hub *model.Hub, pv core.Provider) *AgentPlugin {
 	cfg, _ := hub.Config.(*runtimeconfig.Config)
 	p := &AgentPlugin{hub: hub, cfg: cfg, manager: runtimeagent.NewSessionManager()}
+	p.providerFactory = func(*runtimeconfig.Config) (core.Provider, error) { return pv, nil }
 	// PR1:与 NewPlugin 同形装配 Application Control Plane(控制操作的委托面
 	// 消费方;直接构造 AgentPlugin 的测试桩必须自行接线)。
 	p.control = agentcontrol.NewService(p.manager, p, p)

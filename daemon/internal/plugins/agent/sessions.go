@@ -46,12 +46,17 @@ func (p *AgentPlugin) ListSessions() []model.SessionSummary {
 	entries := make([]entry, 0, len(digests))
 	for _, d := range digests {
 		id := d.Metadata.SessionID
+		title := d.Title
+		if title == "" {
+			title = truncateTitle(d.FirstUserText)
+		}
 		info := model.SessionSummary{
-			SessionID: id,
-			Title:     truncateTitle(d.FirstUserText),
-			Cwd:       d.Workspace,
-			UpdatedAt: d.ModTime.Format(time.RFC3339),
-			Archived:  d.Archived,
+			SessionID:    id,
+			Title:        title,
+			TitleVersion: d.TitleVersion,
+			Cwd:          d.Workspace,
+			UpdatedAt:    d.ModTime.Format(time.RFC3339),
+			Archived:     d.Archived,
 		}
 		switch {
 		case d.Archived:
@@ -219,6 +224,8 @@ func (p *AgentPlugin) ArchivedSessionHistory(sessionID string) ([]model.SessionU
 	// repo 层 per-id 分支（见函数头）：archive/ 目录未命中时
 	// 会话可能以原位终态形态存在。
 	if p.repo != nil {
+		p.lifecycleMu.Lock()
+		defer p.lifecycleMu.Unlock()
 		st, err := p.repo.Open(sessionID)
 		if err == nil {
 			if !st.Archived() {

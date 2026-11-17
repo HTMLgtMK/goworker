@@ -725,8 +725,8 @@ func TestEventTailRecovery(t *testing.T) {
 }
 
 // TestReadEventsFiltersBySessionID ensures replay and SeqRange exclude foreign-session
-// records from mixed files and separate run files, while retaining local events. It
-// covers both write-side mixed rows and historical files from another incarnation.
+// TestReadEventsFiltersBySessionID ensures replay and SeqRange exclude foreign-session
+// records from mixed files and separate run files, while retaining local events.
 func TestReadEventsFiltersBySessionID(t *testing.T) {
 	ctx := context.Background()
 	root := tempDir(t)

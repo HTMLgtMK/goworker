@@ -52,7 +52,7 @@ func TestSessionInfoFromDomainStatePassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal bare: %v", err)
 	}
-	if string(rawBare) != `{"sessionId":"session_abc","cwd":""}` {
+	if string(rawBare) != `{"sessionId":"session_abc","cwd":"","titleVersion":0}` {
 		t.Fatalf("bare wire = %s, want state omitted (omitempty 兼容旧客户端)", rawBare)
 	}
 }

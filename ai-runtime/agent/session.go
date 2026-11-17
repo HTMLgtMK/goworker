@@ -361,6 +361,14 @@ func (s *Session) buildMiddlewareChain(cb RunCallbacks, provider core.Provider, 
 		memMw := middlewares.NewMemoryMiddleware(&memoryClientAdapter{s.deps.Memory}, cfg.Memory, contextWindow(cfg))
 		mws = append(mws, memMw)
 	}
+	// Title updates outlive a run and use the host's session event publisher.
+	if s.deps.TitleStore != nil && provider != nil {
+		once := s.deps.TitleOnce
+		if once == nil {
+			once = &s.titleOnce
+		}
+		mws = append(mws, middlewares.NewTitleMiddleware(s.deps.TitleStore, once, provider, cfg, s.deps.SessionEvent))
+	}
 	return append(mws, compressMw, errCap)
 }
 

@@ -20,6 +20,7 @@ const (
 	kindMetadata   = "metadata"
 	kindWorkspace  = "workspace" // 工作目录声明，读取时采用最后一条
 	kindArchived   = "archived"  // 不可逆的归档终态标记
+	kindTitle      = "title"     // 标题状态，读取时采用最后一条
 )
 
 // msgFields 真实消息（含 compact 时的保留段副本）。
@@ -84,19 +85,33 @@ type archivedFields struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// TitleState 是最后一条 title 记录的只读视图。旧记录中的 source/state 仅作为未知字段兼容读取，不再暴露业务状态。
+type TitleState struct {
+	Title     string    `json:"title,omitempty"`
+	Version   uint64    `json:"titleVersion,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type TitleUpdated struct {
+	Title        string `json:"title"`
+	TitleVersion uint64 `json:"titleVersion"`
+	Source       string `json:"source"`
+}
+
 // Record 是 jsonl 记录的统一视图：kind 判别 + 对应类型的字段组。
 // 磁盘格式保持扁平单行，序列化/反序列化见 MarshalJSON/UnmarshalJSON。
 type Record struct {
 	Kind string `json:"kind"`
 
-	Msg  *msgFields        // kind == kindMsg（含副本）
-	Comp *compactFields    // kind == kindCompact
-	Head *headFields       // kind == kindHead
-	CK   *checkpointFields // kind == kindCheckpoint
-	Cur  *cursorFields     // kind == kindCursor
-	Meta *metadataFields   // kind == kindMetadata
-	Ws   *workspaceFields  // kind == kindWorkspace
-	Arc  *archivedFields   // kind == kindArchived
+	Msg   *msgFields        // kind == kindMsg（含副本）
+	Comp  *compactFields    // kind == kindCompact
+	Head  *headFields       // kind == kindHead
+	CK    *checkpointFields // kind == kindCheckpoint
+	Cur   *cursorFields     // kind == kindCursor
+	Meta  *metadataFields   // kind == kindMetadata
+	Ws    *workspaceFields  // kind == kindWorkspace
+	Arc   *archivedFields   // kind == kindArchived
+	Title *TitleState       // kind == kindTitle
 }
 
 // NodeID 返回节点 id（msg/compact/checkpoint 有，head/cursor 无则空串）。
@@ -168,6 +183,10 @@ func (r Record) Created() time.Time {
 		if r.Arc != nil {
 			return r.Arc.CreatedAt
 		}
+	case kindTitle:
+		if r.Title != nil {
+			return r.Title.CreatedAt
+		}
 	}
 	return time.Time{}
 }
@@ -178,26 +197,28 @@ func (r Record) Created() time.Time {
 // record_format_test.go guards against silently lost fields, kinds, or timestamps.
 func (r Record) MarshalJSON() ([]byte, error) {
 	type flat struct {
-		Kind        string                     `json:"kind"`
-		ID          string                     `json:"id,omitempty"`
-		Parent      string                     `json:"parent,omitempty"`
-		Summary     string                     `json:"summary,omitempty"`
-		Role        string                     `json:"role,omitempty"`
-		Content     string                     `json:"content,omitempty"`
-		ToolCalls   []core.ToolCall            `json:"tool_calls,omitempty"`
-		ToolCallID  string                     `json:"tool_call_id,omitempty"`
-		Thinking    string                     `json:"thinking,omitempty"`
-		Custom      map[string]json.RawMessage `json:"custom,omitempty"`
-		CoveredFrom string                     `json:"covered_from,omitempty"`
-		CoveredTo   string                     `json:"covered_to,omitempty"`
-		CloneOf     string                     `json:"clone_of,omitempty"`
-		Tail        string                     `json:"tail,omitempty"`
-		At          string                     `json:"at,omitempty"`
-		Preview     string                     `json:"preview,omitempty"`
-		MsgID       string                     `json:"msg_id,omitempty"`
-		SessionID   string                     `json:"session_id,omitempty"`
-		Path        string                     `json:"path,omitempty"`
-		CreatedAt   time.Time                  `json:"created_at"`
+		Kind         string                     `json:"kind"`
+		ID           string                     `json:"id,omitempty"`
+		Parent       string                     `json:"parent,omitempty"`
+		Summary      string                     `json:"summary,omitempty"`
+		Role         string                     `json:"role,omitempty"`
+		Content      string                     `json:"content,omitempty"`
+		ToolCalls    []core.ToolCall            `json:"tool_calls,omitempty"`
+		ToolCallID   string                     `json:"tool_call_id,omitempty"`
+		Thinking     string                     `json:"thinking,omitempty"`
+		Custom       map[string]json.RawMessage `json:"custom,omitempty"`
+		CoveredFrom  string                     `json:"covered_from,omitempty"`
+		CoveredTo    string                     `json:"covered_to,omitempty"`
+		CloneOf      string                     `json:"clone_of,omitempty"`
+		Tail         string                     `json:"tail,omitempty"`
+		At           string                     `json:"at,omitempty"`
+		Preview      string                     `json:"preview,omitempty"`
+		MsgID        string                     `json:"msg_id,omitempty"`
+		SessionID    string                     `json:"session_id,omitempty"`
+		Path         string                     `json:"path,omitempty"`
+		Title        string                     `json:"title,omitempty"`
+		TitleVersion uint64                     `json:"titleVersion,omitempty"`
+		CreatedAt    time.Time                  `json:"created_at"`
 	}
 
 	f := flat{Kind: r.Kind, CreatedAt: r.Created()}
@@ -233,6 +254,11 @@ func (r Record) MarshalJSON() ([]byte, error) {
 	case kindWorkspace:
 		if r.Ws != nil {
 			f.Path = r.Ws.Path
+		}
+	case kindTitle:
+		if r.Title != nil {
+			f.Title = r.Title.Title
+			f.TitleVersion = r.Title.Version
 		}
 	case kindArchived:
 		// archived 无附加字段：created_at 已在 flat 初始化时由 r.Created() 填充。
@@ -301,6 +327,12 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		r.Arc = &f
+	case kindTitle:
+		var f TitleState
+		if err := json.Unmarshal(data, &f); err != nil {
+			return err
+		}
+		r.Title = &f
 	}
 	return nil
 }
@@ -354,6 +386,10 @@ func newWorkspaceRecord(path string, created time.Time) Record {
 // newArchivedRecord 构造只读归档终态标记。
 func newArchivedRecord(created time.Time) Record {
 	return Record{Kind: kindArchived, Arc: &archivedFields{CreatedAt: created}}
+}
+
+func newTitleRecord(title string, created time.Time) Record {
+	return Record{Kind: kindTitle, Title: &TitleState{Title: title, CreatedAt: created}}
 }
 
 // ── 记录与消息互转 ──────────────────────────────────────────────────────

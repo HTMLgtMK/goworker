@@ -54,6 +54,8 @@ type AgentPlugin struct {
 	// deps 是 Session 的资源依赖，startSession 每次会话边界全量重建（含指令快照
 	// 与当前 store 注入），/new 经同一路径刷新后以新 deps 创建新会话。
 	deps runtimeagent.SessionDeps
+	// providerFactory is initialized once and shared across session rebuilds.
+	providerFactory func(*runtimeconfig.Config) (core.Provider, error)
 	// repo caches one store instance per session across boundaries. It is initialized during
 	// Init before concurrent readers exist; nil means persistence is disabled.
 	repo       *session.Repository
@@ -78,6 +80,8 @@ type AgentPlugin struct {
 	// 跨层路径的 h.mu → session lease 也保持单向。
 	control         *agentcontrol.Service
 	providerControl *providercontrol.Service
+	sessionEvents   sessionEventHub
+	titleAttempts   sync.Map
 
 	// inFlight tracks external maintenance requests, which may be queued at a session gate.
 	// Stop closes admission, closes the manager, waits for these requests, and then releases
@@ -103,6 +107,7 @@ func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *AgentPlugi
 	// run contexts, and register the terminal-run hook. The reentry marker lets a run invoke
 	// same-session commands without requeuing on its own gate.
 	p := &AgentPlugin{cfg: cfg, paths: paths}
+	p.providerFactory = acpworker.ProviderFactory(p.createhHttpClient())
 	p.manager = runtimeagent.NewSessionManager(
 		runtimeagent.WithRunLimits(cfg.Session.MaxConcurrentRuns, cfg.Session.MaxPendingRuns),
 		runtimeagent.WithRunContext(runtimeagent.RunContextValue{Key: sessionGateKey{}, Value: p}),
@@ -375,15 +380,18 @@ func (p *AgentPlugin) Start() error { return nil }
 // 固化，随后关闭 MCP、memory、store 与 repository。等待均为协作式；不能在 run
 // 仍可能写 store 时超时后强行关闭资源。外部工具需自行配置超时以保证收敛。
 func (p *AgentPlugin) Stop() error {
-	// 先关维护请求入口，再关闭执行平面。closeAdmission 只持 tracker 锁修改
-	// 状态，随后 manager.Close 与 wait 均在锁外等待，避免互相卡住。
+	// Serialize admission closure with title-store resolution: once closed, no adapter
+	// can pass its guard and then reopen a repository store afterward.
+	p.lifecycleMu.Lock()
 	p.inFlight.closeAdmission()
+	p.lifecycleMu.Unlock()
 	if p.hub != nil && p.hub.UnregisterCapability != nil {
 		p.hub.UnregisterCapability(model.SessionSourceCapability)
 	}
 	// manager.Close 取消宿主 runCtx，等待全部 Run 终态落盘，再收口事件枢纽并清
 	// 注册表。返回后无 Run 继续写 journal/conversation。
 	p.manager.Close()
+	p.sessionEvents.close()
 	// 维护请求可能仍在 Session Gate 前排队；等它们完整返回后才可关闭其访问的
 	// MCP、memory、store 与 repo 句柄。
 	p.inFlight.wait()
@@ -411,9 +419,10 @@ func (p *AgentPlugin) Stop() error {
 			slog.Warn("memory close error", "err", err)
 		}
 	}
-	// Close persistent stores after all run and maintenance work has stopped. The current
-	// store is closed before the repository closes its remaining cached instances; both
-	// operations are idempotent and skip setups without persistence.
+	// Closing admission prevents title adapters from reopening stores after Stop begins.
+	// Serialize the final store/repository close with an adapter write already in flight.
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
 	if st := p.currentStore(); st != nil {
 		if err := st.Close(); err != nil {
 			slog.Warn("session: store close failed", "err", err)
@@ -579,13 +588,7 @@ func (p *AgentPlugin) startSession() {
 	// 连接 MCP server 并拉取工具清单。坏 server 只降级不阻塞插件启动。
 	p.loadMCP()
 
-	// 创建 HTTP client。
-	client := p.createhHttpClient()
-
 	// 会话层组装：资源就绪后构造 deps 与首会话。
-
-	modelProvider := acpworker.ProviderFactory(client)
-
 	p.deps = runtimeagent.SessionDeps{
 		Config: p.cfg,
 		ConfigSnapshot: func() *runtimeconfig.Config {
@@ -598,7 +601,7 @@ func (p *AgentPlugin) startSession() {
 		AuditDir:             p.paths.AuditDir,
 		Memory:               p.memory,
 		CollectTools:         p.collectTools,
-		NewProvider:          modelProvider,
+		NewProvider:          p.providerFactory,
 		PersistAllowRule:     p.persistAllowRule,
 		PersistToolAllowRule: p.persistToolAllowRule,
 	}
@@ -607,6 +610,9 @@ func (p *AgentPlugin) startSession() {
 	// SDK's in-memory checks; the same journal store backs state, events, and reads.
 	if st != nil {
 		p.deps.Store = st
+		p.deps.TitleStore = &generatedTitleStore{plugin: p, sessionID: st.SessionID()}
+		p.deps.TitleOnce = p.titleOnceFor(st.SessionID())
+		p.deps.SessionEvent = p.sessionEventPublisher(st.SessionID())
 		journalStore := session.NewRunJournalStore(p.repo, st)
 		p.deps.RunJournal = journalStore
 		p.deps.RunEvents = journalStore

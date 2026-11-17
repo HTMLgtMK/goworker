@@ -97,6 +97,10 @@ func TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles(t *testing.T) {
 		t.Fatal("Stop did not return in time (manager.Close wait stuck?)")
 	}
 
+	// Title generation is intentionally fire-and-forget and may still be using the
+	// mock provider after Stop. Release the test server before its deferred Close.
+	releaseGate()
+
 	// ① run 终态（磁盘可证）：journal 末条 cancelled。Close 返回 ⇒ 等待面已见
 	// done，终态记录先于 done 落盘（finalizeRun 次序不变量）。
 	states := e2eStateRecords(t, filepath.Join(cfg.Session.Dir, sid, "runs", runID+".jsonl"))
@@ -122,10 +126,17 @@ func TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles(t *testing.T) {
 	// ③ 订阅不遗留：hub.Close 断开全部订阅者 → 订阅通道关闭（replay 缓冲排干
 	// 后读到 ok=false）。
 	subDeadline := time.Now().Add(5 * time.Second)
+	finishedSeen := false
 	for {
 		select {
-		case _, ok := <-res.Subscription.Events():
+		case event, ok := <-res.Subscription.Events():
+			if ok && event.Type == session.EventRunFinished && event.RunID == runID {
+				finishedSeen = true
+			}
 			if !ok {
+				if !finishedSeen {
+					t.Fatal("subscription missed run.finished during Stop")
+				}
 				// 通道已关闭，进入 ④
 				e2eAssertStoreHandleReleased(t, cfg.Session.Dir, sid)
 				return

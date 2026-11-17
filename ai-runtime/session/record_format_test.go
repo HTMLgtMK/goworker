@@ -2,6 +2,9 @@ package session
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +69,48 @@ func TestRecord_UnmarshalOldFormat(t *testing.T) {
 	}
 	if c.Comp == nil || c.Comp.Summary != "s" || c.Comp.CoveredFrom != "a" || c.Comp.CoveredTo != "b" {
 		t.Errorf("compact fields wrong: %+v", c.Comp)
+	}
+}
+
+func TestStoreTitlePreservesLegacyTitle(t *testing.T) {
+	dir := t.TempDir()
+	legacy := `{"kind":"title","title":"Existing title","source":"manual","state":"manual","created_at":"2024-01-01T00:00:00Z"}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "current.jsonl"), []byte(legacy), 0o600); err != nil {
+		t.Fatalf("write legacy title: %v", err)
+	}
+
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	if title := store.Title(); title.Title != "Existing title" || !title.CreatedAt.Equal(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("legacy title = %+v, want title and timestamp preserved", title)
+	}
+	if title := store.Title(); title.Title != "Existing title" || !title.CreatedAt.Equal(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("legacy title = %+v, want title and timestamp preserved", title)
+	}
+	if _, err := store.AppendTitle("New title"); err != nil {
+		t.Fatalf("AppendTitle: %v", err)
+	}
+	if title := store.Title(); title.Title != "New title" {
+		t.Fatalf("title = %+v, want last appended title", title)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "current.jsonl"))
+	if err != nil {
+		t.Fatalf("read title records: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var latest map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &latest); err != nil {
+		t.Fatalf("decode latest title record: %v", err)
+	}
+	if _, ok := latest["source"]; ok {
+		t.Fatalf("new title record contains legacy source field: %s", lines[len(lines)-1])
+	}
+	if _, ok := latest["state"]; ok {
+		t.Fatalf("new title record contains legacy state field: %s", lines[len(lines)-1])
 	}
 }
 

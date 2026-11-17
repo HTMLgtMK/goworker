@@ -1683,3 +1683,123 @@ func TestStartRunEmitsRunLifecycleEvents(t *testing.T) {
 		assertEventBeforeTerminalState(t, fxB, hB.RunID, session.EventRunFinished, string(RunCancelled))
 	})
 }
+
+type titleReadyScriptedProvider struct{ *scriptedStreamProvider }
+
+func (*titleReadyScriptedProvider) Chat(context.Context, *core.ChatRequest) (*core.ChatResponse, error) {
+	return &core.ChatResponse{Choices: []core.ResponseChoice{{Message: core.Message{Content: "Generated session title"}}}}, nil
+}
+
+// TestTitleMiddlewareProposesFirstTurn verifies a generated title is persisted and sent as a
+// live-only notification, without entering the run journal or sequence cursor.
+func TestTitleMiddlewareProposesFirstTurn(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	repo, err := session.OpenRepository(t.TempDir())
+	if err != nil {
+		t.Fatalf("open repository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	st, err := repo.Create(context.Background(), session.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create session store: %v", err)
+	}
+	jr := session.NewRunJournalStore(repo, st)
+	pv := &titleReadyScriptedProvider{scriptedStreamProvider: &scriptedStreamProvider{rounds: []func(ch chan<- core.Token){func(ch chan<- core.Token) {
+		ch <- core.Token{Type: core.TokenTypeText, Done: true, Response: &core.ChatResponse{
+			Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: "reply"}}},
+		}}
+	}}}}
+	titles := make(chan string, 1)
+	s := NewSession(SessionDeps{
+		Config:       runtimeconfig.Default(),
+		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		NewProvider:  func(*runtimeconfig.Config) (core.Provider, error) { return pv, nil },
+		Store:        st, RunJournal: jr, RunEvents: jr, TitleStore: st,
+		SessionEvent: func(event string, data any) { titles <- event },
+	})
+	rt := NewSessionRuntime(st.SessionID(), s)
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	hub, err := rt.EnsureHub()
+	if err != nil {
+		t.Fatalf("EnsureHub: %v", err)
+	}
+	live, err := hub.Subscribe(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	h, err := m.StartRun(st.SessionID(), RunRequest{Input: "q"}, eventRunCallbacks())
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if _, err := h.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		title := st.Title()
+		if title.Title != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("title was not persisted: %+v", title)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := st.Title(); got.Title != "Generated session title" {
+		t.Fatalf("title = %+v", got)
+	}
+	select {
+	case event := <-titles:
+		if event != session.EventSessionTitleUpdated {
+			t.Fatalf("session event = %q", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session title event not published")
+	}
+	var lastLiveSeq uint64
+	for lastLiveSeq < hub.LatestSeq() {
+		ev := recvEvent(t, live)
+		if ev.Type == session.EventSessionTitleUpdated || ev.Seq != lastLiveSeq+1 {
+			t.Fatalf("unexpected run event: seq=%d type=%s", ev.Seq, ev.Type)
+		}
+		lastLiveSeq = ev.Seq
+	}
+	if got := hub.LatestSeq(); got != lastLiveSeq || got == 0 {
+		t.Fatalf("LatestSeq = %d, last run event seq = %d; title must not advance cursor", got, lastLiveSeq)
+	}
+	events, err := jr.ReadEvents(0)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	for _, ev := range events {
+		if ev.Type == session.EventSessionTitleUpdated {
+			t.Fatalf("title notification was persisted at seq %d", ev.Seq)
+		}
+	}
+	if len(events) == 0 {
+		t.Fatal("run events were not persisted")
+	}
+	if err := hub.Close(); err != nil {
+		t.Fatalf("Close hub: %v", err)
+	}
+	restarted := mustNewEventHub(t, st.SessionID(), jr)
+	defer restarted.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	replay, err := restarted.Subscribe(ctx, 0)
+	if err != nil {
+		t.Fatalf("Subscribe after recreation: %v", err)
+	}
+	for wantSeq := uint64(1); wantSeq <= restarted.LatestSeq(); wantSeq++ {
+		ev := recvEvent(t, replay)
+		if ev.Seq != wantSeq || ev.Type == session.EventSessionTitleUpdated {
+			t.Fatalf("replay event = {seq:%d type:%s}, want run event seq %d", ev.Seq, ev.Type, wantSeq)
+		}
+	}
+	requireNoEvent(t, replay)
+}

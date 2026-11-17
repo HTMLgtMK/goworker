@@ -2222,3 +2222,151 @@ func TestXGWControlFencingTakeoverStorm(t *testing.T) {
 			gotStarts, gotCancels, gotApprovals, baseStarts, baseCancels, baseApprovals)
 	}
 }
+
+type fakeSessionTitleSource struct {
+	sessionID string
+	clientID  string
+	title     string
+	err       error
+}
+
+func (f *fakeSessionTitleSource) SetSessionTitle(sessionID, clientID, title string) error {
+	f.sessionID, f.clientID, f.title = sessionID, clientID, title
+	return f.err
+}
+
+func TestXGWSessionTitleSetValidatesAndFencesSource(t *testing.T) {
+	source := &fakeSessionTitleSource{}
+	h := &FrontendHandler{titleSource: source, connectionID: "conn-title"}
+
+	result, err := h.xgwSessionTitleSet(context.Background(), json.RawMessage(`{"sessionId":"sess-title","title":"  Renamed  "}`))
+	if err != nil {
+		t.Fatalf("xgwSessionTitleSet: %v", err)
+	}
+	if got, ok := result.(XSessionTitleSetResult); !ok || !got.Updated {
+		t.Fatalf("result = %#v, want updated", result)
+	}
+	if source.sessionID != "sess-title" || source.clientID != "conn-title" || source.title != "Renamed" {
+		t.Fatalf("source call = (%q, %q, %q), want trimmed title and connection fence", source.sessionID, source.clientID, source.title)
+	}
+
+	invalid := []json.RawMessage{
+		json.RawMessage(`{"title":"missing session"}`),
+		json.RawMessage(`{"sessionId":"sess-title","title":" \n "}`),
+		json.RawMessage(fmt.Sprintf(`{"sessionId":"sess-title","title":%q}`, strings.Repeat("界", maxSessionTitleRunes+1))),
+	}
+	for _, params := range invalid {
+		if _, err := h.xgwSessionTitleSet(context.Background(), params); err == nil {
+			t.Errorf("xgwSessionTitleSet(%s) succeeded, want validation error", params)
+		}
+	}
+	if source.title != "Renamed" {
+		t.Fatalf("invalid request reached source: title = %q", source.title)
+	}
+
+	source.err = fakeLeaseLostErr("sess-title", "conn-title")
+	if _, err := h.xgwSessionTitleSet(context.Background(), json.RawMessage(`{"sessionId":"sess-title","title":"Again"}`)); err == nil {
+		t.Fatal("source fencing error was not propagated")
+	}
+}
+
+func TestXGWSessionTitleSetCapabilityDiscoveryIsOptional(t *testing.T) {
+	for _, withTitles := range []bool{false, true} {
+		t.Run(fmt.Sprintf("with-title-source-%t", withTitles), func(t *testing.T) {
+			clientConn, serverConn := net.Pipe()
+			defer clientConn.Close()
+			defer serverConn.Close()
+
+			h := &FrontendHandler{}
+			if withTitles {
+				h.titleSource = &fakeSessionTitleSource{}
+			}
+			server, err := aiacp.NewServer(serverConn, h)
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+			registerXGWMethods(server, h)
+			result, err := h.xgwCapabilities(context.Background(), nil)
+			if err != nil {
+				t.Fatalf("xgwCapabilities: %v", err)
+			}
+			capabilities := result.(xgwprotocol.CapabilitiesResult)
+			got := slices.Contains(capabilities.Methods, XMethodSessionTitleSet)
+			if got != withTitles {
+				t.Fatalf("title method advertised = %t, want %t (%v)", got, withTitles, capabilities.Methods)
+			}
+		})
+	}
+}
+
+type fakeSessionTitleGeneratorSource struct {
+	sessionID string
+	clientID  string
+	title     string
+	err       error
+}
+
+func (f *fakeSessionTitleGeneratorSource) GenerateSessionTitle(sessionID, clientID string) (string, error) {
+	f.sessionID, f.clientID = sessionID, clientID
+	return f.title, f.err
+}
+
+func TestXGWSessionTitleGenerateDelegatesToFencedSource(t *testing.T) {
+	source := &fakeSessionTitleGeneratorSource{title: "Generated on demand"}
+	h := &FrontendHandler{titleGenerator: source, connectionID: "conn-title"}
+
+	result, err := h.xgwSessionTitleGenerate(context.Background(), json.RawMessage(`{"sessionId":"sess-title"}`))
+	if err != nil {
+		t.Fatalf("xgwSessionTitleGenerate: %v", err)
+	}
+	got, ok := result.(XSessionTitleGenerateResult)
+	if !ok || got.Title != "Generated on demand" || got.Source != "manual" {
+		t.Fatalf("result = %#v, want generated manual title", result)
+	}
+	if source.sessionID != "sess-title" || source.clientID != "conn-title" {
+		t.Fatalf("source call = (%q, %q), want the connection fence", source.sessionID, source.clientID)
+	}
+
+	for _, params := range []json.RawMessage{
+		json.RawMessage(`not-json`),
+		json.RawMessage(`{}`),
+	} {
+		if _, err := h.xgwSessionTitleGenerate(context.Background(), params); err == nil {
+			t.Fatalf("xgwSessionTitleGenerate(%s) succeeded, want validation error", params)
+		}
+	}
+
+	source.err = fakeLeaseLostErr("sess-title", "conn-title")
+	if _, err := h.xgwSessionTitleGenerate(context.Background(), json.RawMessage(`{"sessionId":"sess-title"}`)); err == nil {
+		t.Fatal("source fencing error was not propagated")
+	}
+}
+
+func TestXGWSessionTitleGenerateCapabilityDiscoveryIsOptional(t *testing.T) {
+	for _, withGenerator := range []bool{false, true} {
+		t.Run(fmt.Sprintf("with-title-generator-%t", withGenerator), func(t *testing.T) {
+			clientConn, serverConn := net.Pipe()
+			defer clientConn.Close()
+			defer serverConn.Close()
+
+			h := &FrontendHandler{}
+			if withGenerator {
+				h.titleGenerator = &fakeSessionTitleGeneratorSource{}
+			}
+			server, err := aiacp.NewServer(serverConn, h)
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+			registerXGWMethods(server, h)
+			result, err := h.xgwCapabilities(context.Background(), nil)
+			if err != nil {
+				t.Fatalf("xgwCapabilities: %v", err)
+			}
+			capabilities := result.(xgwprotocol.CapabilitiesResult)
+			got := slices.Contains(capabilities.Methods, XMethodSessionTitleGenerate)
+			if got != withGenerator {
+				t.Fatalf("title/generate advertised = %t, want %t (%v)", got, withGenerator, capabilities.Methods)
+			}
+		})
+	}
+}

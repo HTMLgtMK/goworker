@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
+	"unicode/utf8"
 
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
@@ -151,6 +153,15 @@ func registerXGWMethods(server *aiacp.Server, handler aiacp.SessionHandler) {
 	if fh.multi != nil {
 		fh.registerXGWMethod(server, XMethodSessionArchive, fh.xgwSessionArchive)
 	}
+	if fh.titleReader != nil {
+		fh.registerXGWMethod(server, XMethodSessionTitleGet, fh.xgwSessionTitleGet)
+	}
+	if fh.titleSource != nil {
+		fh.registerXGWMethod(server, XMethodSessionTitleSet, fh.xgwSessionTitleSet)
+	}
+	if fh.titleGenerator != nil {
+		fh.registerXGWMethod(server, XMethodSessionTitleGenerate, fh.xgwSessionTitleGenerate)
+	}
 	if fh.sessions != nil {
 		fh.registerXGWMethod(server, XMethodSessionModes, fh.xgwSessionModes)
 	}
@@ -252,6 +263,71 @@ func (h *FrontendHandler) xgwSessionArchive(_ context.Context, params json.RawMe
 		return nil, xgwError("%s: %v", XMethodSessionArchive, err)
 	}
 	return XSessionArchiveResult{Archived: true}, nil
+}
+
+func (h *FrontendHandler) xgwSessionTitleGet(_ context.Context, params json.RawMessage) (any, error) {
+	if h.titleReader == nil {
+		return nil, xgwNotAvailableError(XMethodSessionTitleGet)
+	}
+	var req XSessionTitleGetParams
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, xgwError("%s: invalid params: %v", XMethodSessionTitleGet, err)
+	}
+	if req.SessionID == "" {
+		return nil, xgwError("%s: sessionId is required", XMethodSessionTitleGet)
+	}
+	state, err := h.titleReader.GetSessionTitle(req.SessionID)
+	if err != nil {
+		return nil, xgwError("%s: %v", XMethodSessionTitleGet, err)
+	}
+	return XSessionTitleGetResult{Title: state.Title, TitleVersion: state.TitleVersion}, nil
+}
+
+const maxSessionTitleRunes = 80
+
+// xgwSessionTitleSet applies a manual rename through the optional, lease-fenced source.
+func (h *FrontendHandler) xgwSessionTitleSet(_ context.Context, params json.RawMessage) (any, error) {
+	if h.titleSource == nil {
+		return nil, xgwNotAvailableError(XMethodSessionTitleSet)
+	}
+	var req XSessionTitleSetParams
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, xgwError("%s: invalid params: %v", XMethodSessionTitleSet, err)
+	}
+	if req.SessionID == "" {
+		return nil, xgwError("%s: sessionId is required", XMethodSessionTitleSet)
+	}
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		return nil, xgwError("%s: title is required", XMethodSessionTitleSet)
+	}
+	if utf8.RuneCountInString(title) > maxSessionTitleRunes {
+		return nil, xgwError("%s: title must be at most %d characters", XMethodSessionTitleSet, maxSessionTitleRunes)
+	}
+	if err := h.titleSource.SetSessionTitle(req.SessionID, h.connectionID, title); err != nil {
+		return nil, xgwError("%s: %v", XMethodSessionTitleSet, err)
+	}
+	return XSessionTitleSetResult{Updated: true}, nil
+}
+
+// xgwSessionTitleGenerate generates a title on demand through the optional,
+// lease-fenced generator source.
+func (h *FrontendHandler) xgwSessionTitleGenerate(_ context.Context, params json.RawMessage) (any, error) {
+	if h.titleGenerator == nil {
+		return nil, xgwNotAvailableError(XMethodSessionTitleGenerate)
+	}
+	var req XSessionTitleGenerateParams
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, xgwError("%s: invalid params: %v", XMethodSessionTitleGenerate, err)
+	}
+	if req.SessionID == "" {
+		return nil, xgwError("%s: sessionId is required", XMethodSessionTitleGenerate)
+	}
+	title, err := h.titleGenerator.GenerateSessionTitle(req.SessionID, h.connectionID)
+	if err != nil {
+		return nil, xgwError("%s: %v", XMethodSessionTitleGenerate, err)
+	}
+	return XSessionTitleGenerateResult{Title: title, Source: "manual"}, nil
 }
 
 // xgwSessionModes 处理 x-goworker/session/modes（Plan B 任务3）：无 session 即取

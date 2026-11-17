@@ -18,11 +18,12 @@ import (
 // 判定与取值语义归 plugin 清单方，mapping 只做形状搬运）。
 func SessionInfoFromDomain(info model.SessionSummary) protocol.SessionInfo {
 	return protocol.SessionInfo{
-		SessionID: info.SessionID,
-		Cwd:       info.Cwd,
-		Title:     info.Title,
-		UpdatedAt: info.UpdatedAt,
-		State:     info.State,
+		SessionID:    info.SessionID,
+		Cwd:          info.Cwd,
+		Title:        info.Title,
+		TitleVersion: info.TitleVersion,
+		UpdatedAt:    info.UpdatedAt,
+		State:        info.State,
 	}
 }
 

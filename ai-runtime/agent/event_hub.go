@@ -236,15 +236,14 @@ func (h *EventHub) EndRun() {
 	h.curRunID = ""
 }
 
-// Publish assigns a session-wide sequence and broadcasts while holding hub.mu.
-// Key events are durable-first and rejected on append failure (the sequence is
-// consumed); deltas broadcast immediately, then flush in batches with warn-only
-// persistence failure. Slow subscribers are disconnected without blocking callers.
 func (h *EventHub) Publish(ev IngressEvent) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
 		return ErrHubClosed
+	}
+	if ev.Type == session.EventSessionTitleUpdated {
+		return fmt.Errorf("agent: event hub: title updates are session events")
 	}
 
 	// 取用后自增:seq 语义是「下一个待分配」(播种 latest+1),首个事件即取
@@ -458,16 +457,12 @@ func (h *EventHub) pumpEvents(ctx context.Context, id uint64, ch chan<- session.
 	// (Seq 恒 ≥1,0 即「尚未投递」)。
 	var lastSeq uint64
 	for _, ev := range replay {
-		select {
-		case ch <- ev:
-		case <-ctx.Done():
-			return
-		case <-h.done:
-			return
-		case <-sub.dead:
+		if !h.deliverEvent(ctx, ch, sub, ev) {
 			return
 		}
-		lastSeq = ev.Seq
+		if ev.Seq > lastSeq {
+			lastSeq = ev.Seq
+		}
 	}
 	// 阶段二:live 转发。fan-out 只投 seq>watermark ≥ 快照最大 seq,序天然
 	// 衔接;skip ≤ lastSeq 是 Race B 的 belt-and-braces(真重复在 mu 临界区
@@ -482,18 +477,39 @@ func (h *EventHub) pumpEvents(ctx context.Context, id uint64, ch chan<- session.
 			if ev.Seq <= lastSeq {
 				continue
 			}
-			select {
-			case ch <- ev:
-			case <-ctx.Done():
-				return
-			case <-sub.dead: // ch 满被停读阻塞时,断开信号解锁退出(见函数头)
+			if !h.deliverEvent(ctx, ch, sub, ev) {
 				return
 			}
-			lastSeq = ev.Seq
+			if ev.Seq > lastSeq {
+				lastSeq = ev.Seq
+			}
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+func (h *EventHub) deliverEvent(ctx context.Context, ch chan<- session.SessionEvent, sub *hubSub, ev session.SessionEvent) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-sub.dead:
+		return false
+	default:
+	}
+	select {
+	case ch <- ev:
+		return true
+	default:
+	}
+	select {
+	case ch <- ev:
+		return true
+	case <-ctx.Done():
+	case <-h.done:
+	case <-sub.dead:
+	}
+	return false
 }
 
 // removeSub 从订阅表摘除一个订阅者(pump 退出路径专用)。Close/fanOutLocked
@@ -521,7 +537,6 @@ func (h *EventHub) Close() error {
 	for id, sub := range h.subs {
 		delete(h.subs, id)
 		close(sub.live)
-		close(sub.dead) // 与慢订阅者断开同款:解锁可能阻塞在投递上的 pump
 	}
 	var err error
 	if c, ok := h.journal.(io.Closer); ok {

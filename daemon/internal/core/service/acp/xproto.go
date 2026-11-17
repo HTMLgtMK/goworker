@@ -9,16 +9,19 @@ import (
 )
 
 const (
-	XMethodCapabilities    = xgwprotocol.MethodCapabilities
-	XMethodRunStart        = xgwprotocol.MethodRunStart
-	XMethodRunGet          = xgwprotocol.MethodRunGet
-	XMethodRunCancel       = xgwprotocol.MethodRunCancel
-	XMethodApprovalRespond = xgwprotocol.MethodApprovalRespond
-	XMethodSessionAttach   = xgwprotocol.MethodSessionAttach
-	XMethodSessionDetach   = xgwprotocol.MethodSessionDetach
-	XMethodSessionEvents   = xgwprotocol.NotificationSessionEvents
-	XMethodSessionArchive  = xgwprotocol.MethodSessionArchive
-	XMethodSessionModes    = xgwprotocol.MethodSessionModes
+	XMethodCapabilities         = xgwprotocol.MethodCapabilities
+	XMethodRunStart             = xgwprotocol.MethodRunStart
+	XMethodRunGet               = xgwprotocol.MethodRunGet
+	XMethodRunCancel            = xgwprotocol.MethodRunCancel
+	XMethodApprovalRespond      = xgwprotocol.MethodApprovalRespond
+	XMethodSessionAttach        = xgwprotocol.MethodSessionAttach
+	XMethodSessionDetach        = xgwprotocol.MethodSessionDetach
+	XMethodSessionEvents        = xgwprotocol.NotificationSessionEvents
+	XMethodSessionArchive       = xgwprotocol.MethodSessionArchive
+	XMethodSessionTitleGet      = xgwprotocol.MethodSessionTitleGet
+	XMethodSessionTitleSet      = xgwprotocol.MethodSessionTitleSet
+	XMethodSessionTitleGenerate = xgwprotocol.MethodSessionTitleGenerate
+	XMethodSessionModes         = xgwprotocol.MethodSessionModes
 
 	XProviderMethodList   = xgwprotocol.ProviderMethodList
 	XProviderMethodDetail = xgwprotocol.ProviderMethodDetail
@@ -47,6 +50,12 @@ type XSessionDetachParams = xgwprotocol.XSessionDetachParams
 type XSessionDetachResult = xgwprotocol.XSessionDetachResult
 type XSessionArchiveParams = xgwprotocol.XSessionArchiveParams
 type XSessionArchiveResult = xgwprotocol.XSessionArchiveResult
+type XSessionTitleGetParams = xgwprotocol.XSessionTitleGetParams
+type XSessionTitleGetResult = xgwprotocol.XSessionTitleGetResult
+type XSessionTitleSetParams = xgwprotocol.XSessionTitleSetParams
+type XSessionTitleSetResult = xgwprotocol.XSessionTitleSetResult
+type XSessionTitleGenerateParams = xgwprotocol.XSessionTitleGenerateParams
+type XSessionTitleGenerateResult = xgwprotocol.XSessionTitleGenerateResult
 type XSessionModesResult = xgwprotocol.XSessionModesResult
 type SessionModeChoice = xgwprotocol.SessionModeChoice
 
