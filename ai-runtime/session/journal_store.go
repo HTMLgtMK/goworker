@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -115,7 +116,7 @@ func (s *RunJournalStore) AppendEvent(rec EventRecord) error {
 	return nil
 }
 
-// ReadEvents returns this session's event records with Seq > afterSeq in filename order.
+// ReadEvents returns this session's event records with Seq > afterSeq in sequence order.
 // Serialized run creation makes file order match nonoverlapping Seq ranges. Malformed rows
 // are skipped without truncation, and SessionID filtering excludes legacy mixed-incarnation
 // data; reads tolerate concurrent appends without locking the handle map.
@@ -131,6 +132,7 @@ func (s *RunJournalStore) ReadEvents(afterSeq uint64) ([]EventRecord, error) {
 	}); err != nil {
 		return nil, err
 	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
 	return out, nil
 }
 

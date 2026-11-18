@@ -48,10 +48,11 @@ type Store struct {
 	file *os.File // 追加写入句柄，Open 后保持打开
 	lock *os.File // 跨进程文件锁句柄（flock on <dir>/lock，unix；非 unix 恒 nil）
 
-	recs     []Record // 全部记录（仅加载时填充，后续追加写文件不维护内存全量——但为了回溯便捷保留）
-	metadata Metadata
-	head     string // 当前 head 节点 id
-	cursor   string // 固化游标指向的消息 id
+	recs         []Record // 全部记录（仅加载时填充，后续追加写文件不维护内存全量——但为了回溯便捷保留）
+	metadata     Metadata
+	titleVersion uint64
+	head         string // 当前 head 节点 id
+	cursor       string // 固化游标指向的消息 id
 }
 
 // Open opens or creates dir with 0700 permissions, then acquires its nonblocking
@@ -134,11 +135,12 @@ func Open(dir string) (*Store, error) {
 	}
 
 	s := &Store{
-		path:     path,
-		dir:      dir,
-		file:     f,
-		recs:     recs,
-		metadata: metadata,
+		path:         path,
+		dir:          dir,
+		file:         f,
+		recs:         recs,
+		metadata:     metadata,
+		titleVersion: titleFromRecords(recs).Version,
 	}
 	if needsMetadata {
 		// Metadata is append-only and written exactly once. Old files are
@@ -241,6 +243,19 @@ func (s *Store) ActiveView() []core.Message {
 
 // Commit 将一批消息追加落盘。已存在的 id 跳过（幂等）。
 // 新消息链到当前 head 后，返回实际落盘的消息（补充了 id/时间戳）。
+// OriginalMessages returns recorded messages without compact-created copies.
+func (s *Store) OriginalMessages() []core.Message {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var messages []core.Message
+	for _, rec := range s.recs {
+		if rec.Kind == kindMsg && rec.Msg != nil && rec.Msg.CloneOf == "" {
+			messages = append(messages, recordToMessage(rec))
+		}
+	}
+	return messages
+}
+
 func (s *Store) Commit(msgs []core.Message) ([]core.Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -562,6 +577,46 @@ func (s *Store) Archived() bool {
 	return archivedFromRecords(s.recs)
 }
 
+// Title 返回最后一条 title 记录，没有则零值。
+func (s *Store) Title() TitleState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return titleFromRecords(s.recs)
+}
+
+// AppendTitle 原样追加一条标题记录。归档会话只读，拒绝任何标题写入。
+// TitleSnapshot returns the latest title and the first recorded user message.
+func (s *Store) TitleSnapshot() (TitleState, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, rec := range s.recs {
+		if rec.Kind == kindMsg && rec.Msg != nil && rec.Msg.Role == "user" {
+			return titleFromRecords(s.recs), rec.Msg.Content
+		}
+	}
+	return titleFromRecords(s.recs), ""
+}
+
+func (s *Store) AppendTitle(title string) (TitleState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if archivedFromRecords(s.recs) {
+		return TitleState{}, fmt.Errorf("session: cannot title archived session")
+	}
+	if s.titleVersion == ^uint64(0) {
+		return TitleState{}, fmt.Errorf("session: title version exhausted")
+	}
+	// A failed sync may still leave the record on disk; never reuse its version in this Store.
+	s.titleVersion++
+	rec := newTitleRecord(title, time.Now())
+	rec.Title.Version = s.titleVersion
+	if err := s.appendRecord(rec); err != nil {
+		return TitleState{}, fmt.Errorf("session: append title: %w", err)
+	}
+	s.recs = append(s.recs, rec)
+	return *rec.Title, nil
+}
+
 // ── 内部辅助 ──────────────────────────────────────────────────────────
 
 // buildActiveView 从记录集与 head 构建活跃视图：沿 parent 链回溯到根（带 visited
@@ -653,6 +708,15 @@ func archivedFromRecords(recs []Record) bool {
 		}
 	}
 	return false
+}
+
+func titleFromRecords(recs []Record) TitleState {
+	for i := len(recs) - 1; i >= 0; i-- {
+		if r := recs[i]; r.Kind == kindTitle && r.Title != nil {
+			return *r.Title
+		}
+	}
+	return TitleState{}
 }
 
 func firstNodeID(recs []Record) string {

@@ -59,8 +59,8 @@ type EventRecord struct {
 }
 
 // SessionEvent is the per-event wire shape. Storage-only Kind/FromSeq fields are
-// omitted; replay expands stored batches, so clients advance their cursor by each
-// received Seq just as they do for live delivery.
+// omitted; replay expands stored batches. A live-only notification may use Seq=0 and does not
+// participate in replay cursors.
 type SessionEvent struct {
 	SessionID string          `json:"session_id"`
 	RunID     string          `json:"run_id"`
@@ -85,6 +85,7 @@ const (
 	EventRunStateChanged           = "run.state_changed"
 	EventRunFinished               = "run.finished"
 	EventRunError                  = "run.error"
+	EventSessionTitleUpdated       = "session.title.updated"
 )
 
 // 高频 delta 事件类型（契约表的 3 类）：进合并缓冲，50ms/4KB 窗合并为

@@ -198,17 +198,24 @@ func TestAgentRunJournalsThroughDaemon(t *testing.T) {
 		t.Fatalf("handleAgent: %v", err)
 	}
 
-	// 当前会话 runs/ 下恰一个 run 文件（新布局 <root>/<sid>/runs/）。
+	// 当前会话 runs/ 下恰一个 run 文件（新布局 <root>/<sid>/runs/）；标题更新
+	// 是 live-only 通知，不创建独立 ledger，也不进入 run journal。
 	sid := p.currentStore().SessionID()
 	runsDir := filepath.Join(root, sid, "runs")
 	entries, err := os.ReadDir(runsDir)
 	if err != nil {
 		t.Fatalf("read runs dir %s: %v", runsDir, err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("runs dir has %d entries, want 1", len(entries))
+	var runFiles []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			runFiles = append(runFiles, entry.Name())
+		}
 	}
-	recs := readRunJournalFile(t, filepath.Join(runsDir, entries[0].Name()))
+	if len(runFiles) != 1 {
+		t.Fatalf("runs dir has %d run files, want 1", len(runFiles))
+	}
+	recs := readRunJournalFile(t, filepath.Join(runsDir, runFiles[0]))
 	// 事件记录与 state 记录同文件混存(P3-1):只断言 kind=="state" 的行。
 	var states []session.RunStateRecord
 	for _, rec := range recs {

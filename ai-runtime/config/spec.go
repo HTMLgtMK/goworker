@@ -261,6 +261,8 @@ const (
 	EventUsage     = "usage"
 	EventIteration = "iteration"
 	EventPhase     = "phase"
+	// EventSessionTitleUpdated is emitted to the host's session event publisher.
+	EventSessionTitleUpdated = "session.title.updated"
 )
 
 // UsageEvent 是 EventUsage 的载荷：usage 快照 + 上下文窗口。

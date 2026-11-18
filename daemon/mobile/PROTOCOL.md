@@ -104,6 +104,9 @@ run 生命周期）以持久化游标暴露给任意连接——断线重连不�
 | `x-goworker/session/attach` | 请求 | `{sessionId, afterSeq, mode?}` | `{currentRun, latestSeq, replayIntegrity, tookOver?}` | `mode:"control"` 获取/接管；observe 不动 lease |
 | `x-goworker/session/detach` | 请求 | `{sessionId, mode?}` | `{detached}` | `mode:"control"` 归还（仅持有者本人有效） |
 | `x-goworker/session/archive` | 请求 | `{sessionId}` | `{archived}` | control lease（声明的 `sessionId` 的 lease） |
+| `x-goworker/session/title/get` | 请求 | `{sessionId}` | `{title, titleVersion}` | 不需要（只读，支持清单 50 条之外的会话） |
+| `x-goworker/session/title/set` | 请求 | `{sessionId, title}` | `{updated}` | control lease（声明的 `sessionId` 的 lease）；标题去除首尾空白，1–80 个 Unicode 字符 |
+| `x-goworker/session/title/generate` | 请求 | `{sessionId}` | `{title, source}` | control lease（声明的 `sessionId` 的 lease）；按需用会话首个 user/assistant 轮生成并追加标题，标题为纯 last-wins，手动与自动生成不设优先级 |
 | `x-goworker/approval/respond` | 请求 | `{sessionId, requestId, decision}` | `{accepted}` | control lease（声明的 `sessionId` 的 lease） |
 | `x-goworker/session/modes` | 请求 | `{}` | `{currentModeId, availableModes}` | 不需要（只读展示面） |
 | `x-goworker/providers` | 请求 | `{}` | `{revision, current, providers}` | 不需要（只读） |
@@ -112,7 +115,7 @@ run 生命周期）以持久化游标暴露给任意连接——断线重连不�
 | `x-goworker/provider/current/set` | 请求 | `{revision, provider, model}` | `{revision, current}` | 独立的 connection-level provider-write 授权 |
 | `x-goworker/provider/upsert` | 请求 | `{revision, name, type, endpoint, endpointAction?, authType?, secretAction, apiKey?, models, current?}` | `{revision, current, provider}` | 独立的 connection-level provider-write 授权 |
 | `x-goworker/provider/remove` | 请求 | `{revision, name}` | `{revision}` | 独立的 connection-level provider-write 授权 |
-| `x-goworker/session/events` | **服务端通知** | `SessionEvent`（原样 JSON，蛇形键；逐事件投递） | — | attach 建立订阅后下行；observe/control 均可收 |
+| `x-goworker/session/events` | **服务端通知** | `SessionEvent`（原样 JSON，蛇形键；逐事件投递；标题更新为 `seq:0` 的 live-only 通知，不进入回放） | — | attach 建立订阅后下行；observe/control 均可收 |
 
 - **`state` 取值**：`queued` / `running` / `waiting_input`（HITL 等审批）/
   `waiting_capability`（设备工具等重绑）/ `completed` / `failed` /
@@ -196,6 +199,8 @@ control lease **按会话记账**（拍板②原文「每会话至多一个 cont
     或高频 delta 合并落盘失败——重放缺 delta 段），粘滞标记，不因后续成功
     翻回。
   非 `complete` 时**不得把收到的事件当完整历史**。
+- **标题更新不回放**：`session.title.updated` 是 `seq:0` 的 live-only 通知，payload 为 `{title, source, titleVersion}`，不进入事件 journal，也不推进 `latestSeq` 或客户端游标。`session/list` 的每项和 `title/get` 快照都携带 `titleVersion`；清单最多 50 条，任意会话使用 `title/get`。
+- **标题版本合并**：每次成功追加标题，版本按该会话持久化顺序递增；旧记录及首条用户消息回退标题的版本为 0。客户端先 attach 再获取 `title/get`，为每个会话维护独立的「已初始化」标记和版本：未初始化时接受首个快照或事件，即使版本为 0；之后通常只接受版本严格更大的快照或事件。**唯一例外**：已初始化的标题为空、版本为 0，收到非空标题的版本 0 快照时应接受（首条消息可能在空快照之后才落盘）；反向的空快照不得覆盖已有非空标题。回退标题不是标题更新事件；初始标题为空时，首轮结束后应重新读取 `title/get` 或刷新清单。快照与事件可能任意顺序到达，断线重连后重新 attach 并读取快照。`title/set` 和 `title/generate` 的响应不是带版本的快照，不要用响应中的标题覆盖已有状态；通过事件或 `title/get` 更新。忽略版本的旧客户端仍可能显示乱序通知中的过期标题。
 - **响应的 `latestSeq` 仅描述 attach 时刻事件流的位置，不是游标授权**：
   客户端不得把本地游标直接跳到 latestSeq——只有真正应用了对应事件之后，
   才能按逐事件 `seq` 推进本地 cursor。
@@ -224,15 +229,14 @@ control lease **按会话记账**（拍板②原文「每会话至多一个 cont
 
 ### 事件语义（逐事件投递与断点恢复）
 
-`x-goworker/session/events` 下行的每条 `SessionEvent` 均为**单条逐事件**形状：
-`seq` 即该事件自身序号，wire 上单条与批次不可区分，不存在批量/聚合形态
-（实现侧事实源：`ai-runtime/session/journal.go` 的 SessionEvent 注释、
-`ai-runtime/agent/event_hub.go` 的回放注释）。高频 delta（`text.delta` /
-`thinking.delta` / `usage.progress`）在**持久化侧**按窗（50ms/4KB）合并为批次
+`x-goworker/session/events` 下行的普通 `SessionEvent` 均为**单条逐事件**形状：
+`seq` 即该事件自身序号，wire 上单条与批次不可区分，不存在批量/聚合形态。
+标题更新是例外：使用 `seq:0` 的 live-only 通知，不进入回放游标。
+高频 delta（`text.delta` / `thinking.delta` / `usage.progress`）在**持久化侧**按窗（50ms/4KB）合并为批次
 记录以压缩落盘条数，但批次只存在于存储面——服务端回放时把批次展开为原始
 per-seq 事件后逐条下行，与实时流形状完全一致。
 
-- **游标以实际收到的每条事件 `seq` 逐条推进**；禁止按 `latestSeq` 批量前移。
+- **游标只按普通事件推进**：客户端仅对 `seq > 0` 的事件逐条推进本地 cursor；`seq:0` 的标题 live 通知不得推进游标。禁止按 `latestSeq` 批量前移。
 - **断点恢复精确到 seq**：断线重连 `attach(afterSeq=N)` 时，服务端重放所有
   `seq > N` 的事件——合并批次内 `seq > N` 的部分逐条重发、`seq <= N` 的部分
   不再重发，不重复、不丢失（游标停在批次中间也能精确续传）。

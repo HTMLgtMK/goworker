@@ -155,11 +155,10 @@ func (p *AgentPlugin) SessionHistory(sessionID string) ([]model.SessionUpdate, e
 	return replayUpdates(store.ActiveView(), checkpointAnchors(store)), nil
 }
 
-// SessionArchived 实现 model.BoundSessionSource：repo 层只读探测会话是否已落
-// archived 终态标记（Plan A1 记录模型）。探测是 session/load 只读分流的前提
-// （handler 无门禁调用——终态重放是纯只读，与在飞 prompt 无共享可变状态），
-// repo.Open 内部自锁（r.mu + flock），与门内操作无锁序交叉。
+// SessionArchived reports whether the persisted session is archived.
 func (p *AgentPlugin) SessionArchived(sessionID string) bool {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
 	if p.repo == nil {
 		return false
 	}
@@ -175,6 +174,9 @@ func (p *AgentPlugin) SessionArchived(sessionID string) bool {
 func (p *AgentPlugin) mountRuntime(st *session.Store) (*runtimeagent.SessionRuntime, error) {
 	deps := p.deps
 	deps.Store = st
+	deps.TitleStore = &generatedTitleStore{plugin: p, sessionID: st.SessionID()}
+	deps.TitleOnce = p.titleOnceFor(st.SessionID())
+	deps.SessionEvent = p.sessionEventPublisher(st.SessionID())
 	journalStore := session.NewRunJournalStore(p.repo, st)
 	deps.RunJournal = journalStore
 	deps.RunEvents = journalStore

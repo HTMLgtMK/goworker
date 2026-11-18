@@ -523,6 +523,7 @@ func newPersistedSession(t *testing.T, p *AgentPlugin, pv core.Provider) string 
 	p.deps.RunJournal = journalStore
 	p.deps.RunEvents = journalStore
 	p.deps.NewProvider = func(*runtimeconfig.Config) (core.Provider, error) { return pv, nil }
+	p.deps.TitleStore = nil // run-control tests do not exercise title generation.
 	p.refreshSession()
 	return st.SessionID()
 }
@@ -544,6 +545,7 @@ func newPersistedPlugin(t *testing.T, pv core.Provider) *AgentPlugin {
 	}
 	t.Cleanup(func() { _ = p.Stop() })
 	p.deps.NewProvider = func(*runtimeconfig.Config) (core.Provider, error) { return pv, nil }
+	p.deps.TitleStore = nil // run-control tests do not exercise title generation.
 	p.refreshSession()
 	if id := p.CurrentSessionID(); id == "" {
 		t.Fatal("no current session id (store mount failed)")

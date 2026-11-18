@@ -49,6 +49,11 @@ type FrontendHandler struct {
 	// multi is the optional multi-session declaration capability. Without it, new keeps an
 	// empty binding and load uses the single-session fallback; details are in BoundSessionSource.
 	multi model.BoundSessionSource
+	// titleSource is optional so backends without fenced rename retain their existing surface.
+	titleSource model.SessionTitleSource
+	titleReader model.SessionTitleReader
+	// titleGenerator is optional: only backends that can create a title advertise title/generate.
+	titleGenerator model.SessionTitleGeneratorSource
 
 	// connectionID 是本连接的稳定句柄(工厂内 crypto/rand 生成):x-goworker
 	// control lease 的持有者寻址面,连接退出时经 Close 归还(订阅泵清理与能力
@@ -153,6 +158,15 @@ func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Comma
 			// 只读判定面(可选能力,缺省 nil 时落单活动降级路径)。
 			if multi, ok := sessions.(model.BoundSessionSource); ok {
 				handler.multi = multi
+			}
+			if reader, ok := sessions.(model.SessionTitleReader); ok {
+				handler.titleReader = reader
+			}
+			if titles, ok := sessions.(model.SessionTitleSource); ok {
+				handler.titleSource = titles
+			}
+			if generator, ok := sessions.(model.SessionTitleGeneratorSource); ok {
+				handler.titleGenerator = generator
 			}
 		}
 		return handler

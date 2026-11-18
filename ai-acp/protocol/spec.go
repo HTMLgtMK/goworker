@@ -114,10 +114,11 @@ type ListSessionsRequest struct {
 }
 
 type SessionInfo struct {
-	SessionID string `json:"sessionId"`
-	Cwd       string `json:"cwd"`
-	Title     string `json:"title,omitempty"`
-	UpdatedAt string `json:"updatedAt,omitempty"` // RFC3339
+	SessionID    string `json:"sessionId"`
+	Cwd          string `json:"cwd"`
+	Title        string `json:"title,omitempty"`
+	TitleVersion uint64 `json:"titleVersion"`
+	UpdatedAt    string `json:"updatedAt,omitempty"` // RFC3339
 	// State 是可选的会话状态：active、idle 或只读终态 archived。
 	State string `json:"state,omitempty"`
 }

@@ -8,16 +8,19 @@ import (
 )
 
 const (
-	MethodCapabilities        = "x-goworker/capabilities"
-	MethodRunStart            = "x-goworker/run/start"
-	MethodRunGet              = "x-goworker/run/get"
-	MethodRunCancel           = "x-goworker/run/cancel"
-	MethodApprovalRespond     = "x-goworker/approval/respond"
-	MethodSessionAttach       = "x-goworker/session/attach"
-	MethodSessionDetach       = "x-goworker/session/detach"
-	MethodSessionArchive      = "x-goworker/session/archive"
-	MethodSessionModes        = "x-goworker/session/modes"
-	NotificationSessionEvents = "x-goworker/session/events"
+	MethodCapabilities         = "x-goworker/capabilities"
+	MethodRunStart             = "x-goworker/run/start"
+	MethodRunGet               = "x-goworker/run/get"
+	MethodRunCancel            = "x-goworker/run/cancel"
+	MethodApprovalRespond      = "x-goworker/approval/respond"
+	MethodSessionAttach        = "x-goworker/session/attach"
+	MethodSessionDetach        = "x-goworker/session/detach"
+	MethodSessionArchive       = "x-goworker/session/archive"
+	MethodSessionTitleGet      = "x-goworker/session/title/get"
+	MethodSessionTitleSet      = "x-goworker/session/title/set"
+	MethodSessionTitleGenerate = "x-goworker/session/title/generate"
+	MethodSessionModes         = "x-goworker/session/modes"
+	NotificationSessionEvents  = "x-goworker/session/events"
 
 	ProviderMethodList       = "x-goworker/providers"
 	ProviderMethodDetail     = "x-goworker/provider/detail"
@@ -136,6 +139,35 @@ type XSessionArchiveResult struct {
 	Archived bool `json:"archived"`
 }
 
+type XSessionTitleGetParams struct {
+	SessionID string `json:"sessionId"`
+}
+
+type XSessionTitleGetResult struct {
+	Title        string `json:"title"`
+	TitleVersion uint64 `json:"titleVersion"`
+}
+
+type XSessionTitleSetParams struct {
+	SessionID string `json:"sessionId"`
+	Title     string `json:"title"`
+}
+
+type XSessionTitleSetResult struct {
+	Updated bool `json:"updated"`
+}
+
+// XSessionTitleGenerateParams asks the daemon to create a title on demand for a session.
+type XSessionTitleGenerateParams struct {
+	SessionID string `json:"sessionId"`
+}
+
+// XSessionTitleGenerateResult carries the persisted title; source is always "manual".
+type XSessionTitleGenerateResult struct {
+	Title  string `json:"title"`
+	Source string `json:"source"`
+}
+
 type XSessionModesResult struct {
 	CurrentModeID  string              `json:"currentModeId"`
 	AvailableModes []SessionModeChoice `json:"availableModes"`
@@ -159,6 +191,9 @@ func Methods() []string {
 		MethodSessionAttach,
 		MethodSessionDetach,
 		MethodSessionArchive,
+		MethodSessionTitleGet,
+		MethodSessionTitleSet,
+		MethodSessionTitleGenerate,
 		MethodSessionModes,
 		ProviderMethodList,
 		ProviderMethodDetail,

@@ -68,6 +68,12 @@ func (f *inFlightTracker) closeAdmission() {
 	f.mu.Unlock()
 }
 
+func (f *inFlightTracker) isClosed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
+}
+
 // wait 只等待已经登记的维护请求；入口必须先由 closeAdmission 关闭。这里不持有
 // tracker 锁，避免 Stop 等待请求或 manager 时形成锁环。幂等。
 func (f *inFlightTracker) wait() { f.wg.Wait() }

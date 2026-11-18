@@ -47,7 +47,11 @@ type SessionRuntime struct {
 	// 连续不重置依赖此语义)。RecordRun 同步路径**不**创建、**不**写事件
 	// ——同步路径行为零变化。读写全部在 rt.mu 内,见
 	// bindEvents/eventHub 的并发论证。
-	events *EventHub
+	// Once-only shutdown covers both a bound hub and an unbound journal.
+	eventsCloseOnce sync.Once
+	eventsMu        sync.Mutex
+	eventsClosed    bool
+	events          *EventHub
 	// onRunDone is injected at Register and called after finalizeRun clears active.
 	// It is the shared completion hook for synchronous and background runs; invoke
 	// it outside rt.mu because the host may close stores or inspect the manager.
@@ -209,6 +213,11 @@ func (r *SessionRuntime) bindEvents(sessionID string, journal EventJournal) (*Ev
 	if journal == nil {
 		return nil, nil
 	}
+	r.eventsMu.Lock()
+	defer r.eventsMu.Unlock()
+	if r.eventsClosed {
+		return nil, ErrHubClosed
+	}
 	r.mu.Lock()
 	if hub := r.events; hub != nil {
 		r.mu.Unlock()
@@ -248,7 +257,7 @@ func (r *SessionRuntime) Hub() *EventHub {
 
 // CloseEvents ends and closes the runtime's event hub idempotently. Call only when no
 // Publish can be in flight; closed hubs reject Subscribe/Publish, and a later runtime
-// rebinds and seeds its sequence from the persistent journal. A nil hub is a no-op.
+// rebinds and seeds its sequence from the persistent journal.
 func (r *SessionRuntime) CloseEvents() {
 	r.closeEvents()
 }
@@ -266,18 +275,30 @@ func (r *SessionRuntime) EnsureHub() (*EventHub, error) {
 	return r.bindEvents(r.ID, sess.deps.RunEvents)
 }
 
-// closeEvents ends and closes the hub after all in-flight runs are done, so no Publish
-// can reach a closed journal. Hub locks and file I/O run outside rt.mu; the locks never nest.
+// closeEvents closes the hub or unbound journal once, serialized with hub construction.
 func (r *SessionRuntime) closeEvents() {
-	if hub := r.eventHub(); hub != nil {
-		hub.EndRun()
-		if err := hub.Close(); err != nil {
-			// 桥接 journal 的 Close 失败只 warn:与 journalRunState/teePublish 的
-			// 降级语义一致(journal.go:493-513,RunJournalStore 不实现 io.Closer,
-			// 此路仅自定义桥接可达),不阻断 manager 停机。
-			slog.Warn("agent: event hub close failed", "err", err, "session", r.ID)
+	r.eventsCloseOnce.Do(func() {
+		r.eventsMu.Lock()
+		defer r.eventsMu.Unlock()
+		r.eventsClosed = true
+		if hub := r.eventHub(); hub != nil {
+			hub.EndRun()
+			if err := hub.Close(); err != nil {
+				slog.Warn("agent: event hub close failed", "err", err, "session", r.ID)
+			}
+			return
 		}
-	}
+		r.mu.Lock()
+		sess := r.session
+		r.mu.Unlock()
+		if sess != nil {
+			if closer, ok := sess.deps.RunEvents.(interface{ Close() error }); ok {
+				if err := closer.Close(); err != nil {
+					slog.Warn("agent: event journal close failed", "err", err, "session", r.ID)
+				}
+			}
+		}
+	})
 }
 
 // appendRunState writes and returns errors so StartRun can reject an accepted-but-untracked

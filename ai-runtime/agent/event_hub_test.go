@@ -98,7 +98,7 @@ func (j *stubEventJournal) snapshot() []session.EventRecord {
 	return append([]session.EventRecord(nil), j.recs...)
 }
 
-// orderLog 是 stub 与订阅者读侧共用的顺序日志(mutex 保护,跨 goroutine)。
+// orderLog is shared by the stub and consumer side and protected across goroutines.
 type orderLog struct {
 	mu    sync.Mutex
 	steps []string
@@ -168,9 +168,17 @@ func waitEntered(t *testing.T, entered <-chan struct{}) {
 	}
 }
 
-// TestEventHubSeqMonotonicAcrossRuns:BeginRun/EndRun 切换 run 前后 seq 连续
-// 不重复不重置(P3-0 契约表第 1 行「Seq 是 Session 维度严格递增游标,跨 Run
-// 不重复」);key 事件落盘 seq 与广播 seq 同源。
+func TestEventHubRejectsSessionTitleEvents(t *testing.T) {
+	hub := mustNewEventHub(t, "session", nil)
+	defer hub.Close()
+	if err := hub.Publish(IngressEvent{Type: session.EventSessionTitleUpdated}); err == nil {
+		t.Fatal("run event hub accepted a session title update")
+	}
+	if got := hub.LatestSeq(); got != 0 {
+		t.Fatalf("LatestSeq = %d, want 0", got)
+	}
+}
+
 func TestEventHubSeqMonotonicAcrossRuns(t *testing.T) {
 	jr := &stubEventJournal{}
 	hub := mustNewEventHub(t, "seq-test", jr)

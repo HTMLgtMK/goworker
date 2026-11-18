@@ -17,10 +17,11 @@ const SessionSourceCapability = "session.source"
 // SessionSummary is the protocol-neutral view of a persisted session. State is the active/idle/
 // archived lifecycle value; Archived exposes the persisted terminal marker for load routing.
 type SessionSummary struct {
-	SessionID string
-	Cwd       string
-	Title     string
-	UpdatedAt string
+	SessionID    string
+	Cwd          string
+	Title        string
+	TitleVersion uint64
+	UpdatedAt    string
 	// Archived 报告会话是否已落 archived 终态标记（与 State=archived
 	// 同源——终态是互斥三态的一支，字段冗余是为 wire 之外的 domain 消费方
 	// （load 分流）提供不解析 State 字符串的直读面）。
@@ -192,6 +193,25 @@ type NegotiatedRunControlSource interface {
 // to preserve the existing -32000 unknown-session wire error. ACP cannot import ai-runtime/agent,
 // so implementations wrap this and any execution-layer sentinel for their respective consumers.
 var ErrSessionUnknown = errors.New("session: unknown session")
+
+type SessionTitleSnapshot struct {
+	Title        string
+	TitleVersion uint64
+}
+
+type SessionTitleReader interface {
+	GetSessionTitle(sessionID string) (SessionTitleSnapshot, error)
+}
+
+// SessionTitleSource exposes a lease-fenced manual session rename operation.
+type SessionTitleSource interface {
+	SetSessionTitle(sessionID, clientID, title string) error
+}
+
+// SessionTitleGeneratorSource exposes on-demand, lease-fenced title generation.
+type SessionTitleGeneratorSource interface {
+	GenerateSessionTitle(sessionID, clientID string) (string, error)
+}
 
 // BoundSessionSource is an optional capability for connection-bound session
 // creation, loading, history, and archival. Implementations without it retain the

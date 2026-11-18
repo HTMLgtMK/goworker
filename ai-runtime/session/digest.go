@@ -18,6 +18,9 @@ type SessionDigest struct {
 	// FirstUserText 是首条 user 消息的原文（清单 title 的原料；无 user 消息
 	// 或全是坏行的空会话为空串）。
 	FirstUserText string
+	// Title is an explicit persisted title; empty means the caller should use FirstUserText.
+	Title        string
+	TitleVersion uint64
 	// Workspace 是最后一条 workspace 声明（last-wins；从未声明为空）。
 	Workspace string
 	// Archived 报告是否已落 archived 终态标记（原位终态，只读保留）。
@@ -78,10 +81,13 @@ func digestFromPath(path string) (SessionDigest, bool) {
 			CreatedAt: timeFromRecords(recs),
 		}
 	}
+	title := titleFromRecords(recs)
 	d := SessionDigest{
-		Metadata:  m,
-		Workspace: workspaceFromRecords(recs),
-		Archived:  archivedFromRecords(recs),
+		Metadata:     m,
+		Workspace:    workspaceFromRecords(recs),
+		Archived:     archivedFromRecords(recs),
+		Title:        title.Title,
+		TitleVersion: title.Version,
 	}
 	// 首条 user 消息原文（清单 title 原料）：kind/role 字面量即磁盘格式契约
 	// （record_format_test 兜底）。

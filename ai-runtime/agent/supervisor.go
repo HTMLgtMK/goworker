@@ -185,6 +185,7 @@ func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx conte
 		// EndRun(显式调用,不依赖 defer)。
 		emitRunEvent(hub, run.ID, session.EventRunFinished, map[string]any{"state": string(RunCancelled)})
 		finalizeRun(rt, run, RunResult{State: RunCancelled, Err: err, Persisted: false})
+
 		return
 	}
 
@@ -199,6 +200,7 @@ func (m *SessionManager) execute(rt *SessionRuntime, run *AgentRun, runCtx conte
 		// run.finished{cancelled}(同 ① 早退出口的次序铁律)。
 		emitRunEvent(hub, run.ID, session.EventRunFinished, map[string]any{"state": string(RunCancelled)})
 		finalizeRun(rt, run, RunResult{State: RunCancelled, Err: runCtx.Err(), Persisted: false})
+
 		return
 	}
 	// 注册次序即释放次序(defer LIFO):runSlots 先于 gate 释放——两把「锁」
@@ -354,8 +356,7 @@ func teeRunCallbacks(cb RunCallbacks, hub *EventHub, runID string) RunCallbacks 
 	return teed
 }
 
-// teePublishCallbackEvent maps usage and iteration events to usage.progress deltas; other
-// names are outside the event contract and skipped.
+// teePublishCallbackEvent maps usage and iteration callbacks to run events.
 func teePublishCallbackEvent(hub *EventHub, runID, event string, data any) {
 	switch event {
 	case runtimeconfig.EventUsage, runtimeconfig.EventIteration:
