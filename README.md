@@ -27,7 +27,7 @@ ai-runtime/                    ← aggregation: out-of-the-box agent for externa
 │  ├── session/                ← conversation store (checkpoint/rewind)
 │  ├── mcp/ skills/ logger/    ← moved from daemon, reusable
 daemon/                        ← agent backend: engine + plugins + shell per frontend + dispatcher host
-│  ├── cmd/goworker/           ← CLI 壳：stdin 前端 + `acp` worker 模式 + 信号处理
+│  ├── cmd/goworker/           ← CLI 壳：daemon/tui 运行模式 + acp/status/web/service 子命令 + 信号处理
 │  ├── mobile/                 ← Android Agent-only 壳（gobind 入口，ACP Host）
 │  ├── internal/app/           ← 装配层：Application（配置→日志→Engine→RegisterPlugins→StartAll）+ config/
 │  ├── internal/core/          ← engine + model（通用 Plugin/Capability 协议）
@@ -192,7 +192,11 @@ Config: YAML at `~/.config/goworker/config.yaml` (`GOWORKER_CONFIG_DIR` relocate
 
 ```bash
 cmake -B build && cmake --build build   # -> build/bin/goworker（版本号经 git describe 注入）
-./build/bin/goworker                    # REPL
+./build/bin/goworker                    # daemon 模式（默认）：service 形态，banner 后安静运行
+./build/bin/goworker --tui              # 交互式终端 REPL（原默认行为）
+./build/bin/goworker status             # 查看运行中 daemon 的状态（--json 输出原始快照）
+./build/bin/goworker web                # 托管启动 web 网关（Node，见下）
+./build/bin/goworker service install    # 注册 macOS LaunchAgent 服务（见下）
 ./build/bin/goworker acp                # ACP worker 模式（被 dispatcher/编辑器驱动）
 ./build/bin/goworker -version           # 版本信息
 
@@ -203,8 +207,82 @@ cmake --build build --target instance   # 生成本地隔离子实例目录（�
 # 交叉编译
 cmake -B build -DGOOS=linux -DGOARCH=amd64 && cmake --build build
 
-# 无 CMake 时：go build（workspace 内）
+# 无 CMake 时：go run（workspace 内，开发用；临时二进制不能注册 service）
 cd daemon && go run cmd/goworker/main.go
+```
+
+## Usage
+
+| 命令 | 说明 |
+|------|------|
+| `goworker`（= `--daemon`） | daemon 模式（默认）：service 形态跑后台服务，banner 后安静运行 |
+| `goworker --tui` | 交互式终端 REPL（原默认行为） |
+| `goworker status [--json]` | 查看运行中 daemon 的状态 |
+| `goworker web [flags]` | 托管启动 web 网关（Node） |
+| `goworker service <action>` | 注册/管理 macOS LaunchAgent 常驻服务 |
+| `goworker acp` | ACP worker 模式（被 dispatcher/编辑器经 stdio 驱动） |
+| `goworker -version` | 版本信息 |
+
+### 运行模式
+
+daemon 模式只装配后台服务（frontend ACP、dispatcher ingress、status socket），启动时
+stdout 打印一段 banner（版本 / 各 socket 端点 / config / 日志路径）后保持安静，等
+SIGINT/SIGTERM 收尾；详细运行日志按配置走 stderr 与日志文件。`--tui` 额外起 stdin REPL；
+`--daemon` 与 `--tui` 同时给出直接报错。
+
+### status
+
+`goworker status` 拨号 `<config-dir>/status.sock` 读取运行快照：版本、PID、uptime、模式
+（daemon/tui）、config/日志路径，并对 frontend/dispatch socket 做 100ms 拨号探活；
+`--json` 输出原始快照。daemon 未运行 / socket 残留时给出对应提示（残留文件下次启动自动清理）。
+
+### service（macOS launchd 常驻）
+
+```bash
+goworker service install [--web]                       # 注册 daemon（--web 连网关）为 LaunchAgent
+goworker service start|stop|restart [daemon|web|all]   # 生命周期（默认目标 daemon）
+goworker service status                                # agent 状态 + daemon 运行快照
+goworker service uninstall                             # 卸载全部
+```
+
+- plist：`~/Library/LaunchAgents/com.goworker.{daemon,web}.plist`；`RunAtLoad` 登录自启 +
+  `KeepAlive` 崩溃自动拉起（ThrottleInterval 10s）；日志在 `~/Library/Logs/goworker/`
+- launchd 不继承 shell env：install 时把当前 `PATH` 与 `GOWORKER_*`（如
+  `GOWORKER_CONFIG_DIR`、`GOWORKER_WEB_PORT`）烘焙进 plist —— 先设好环境变量再 install
+- web 服务的 ProgramArguments 是 `[goworker, web]`（入口解析逻辑单源），不是直接跑 node
+- 已在跑但不受 launchd 托管的 daemon / 端口已被占用会拒绝 install（防 socket 冲突崩溃
+  循环）；`go run` 的临时二进制拒装，先构建到固定路径
+
+典型部署：
+
+```bash
+cmake -B build && cmake --build build
+./build/bin/goworker service install --web    # daemon + 网关双双常驻
+./build/bin/goworker service status           # 验证
+```
+
+### web（Node 网关托管）
+
+```bash
+goworker web [--entry <gateway.js>] [--port N] [--host H] [--workspace DIR]
+```
+
+入口解析优先级：flag > `GOWORKER_WEB_ENTRY` > config `frontend.web.entry` > 自动探测
+`~/Work/*/apps/web-host/dist/gateway.js`（`src/gateway.ts` 兜底，npx tsx 运行）。workspace
+未显式指定时从 `apps/web-host` 布局派生仓库根注入 `GOWORKER_WEB_WORKSPACE`（托管启动时
+网关 cwd 不可信）；端口默认 5177、host 默认 127.0.0.1。子进程跑在独立进程组，轮询
+`/api/health` 报就绪，随信号收停整组不留孤儿 node；daemon 未运行只提示不阻塞（网关自带
+socket 重连），端口已被占用时拒绝启动。
+
+config.yaml 对应段（均可省略走默认 / 自动探测）：
+
+```yaml
+frontend:
+  web:
+    entry: ""          # 网关入口路径；空 = 自动探测
+    port: 5177
+    host: 127.0.0.1
+    workspace: ""      # 空 = 从 entry 派生（apps/web-host 布局命中时）
 ```
 
 多运行时：`GOWORKER_CONFIG_DIR=<dir>` 隔离每个实例的 config/sessions/memory/dispatch 与 acp.sock，
