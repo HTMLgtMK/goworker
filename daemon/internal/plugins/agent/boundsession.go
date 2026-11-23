@@ -67,8 +67,19 @@ func (p *AgentPlugin) LoadBoundSession(sessionID, cwd string) error {
 				return fmt.Errorf("agent: reload session %s: %w", sessionID, err)
 			}
 		}
-		if normalized := normalizeSessionCWDSilent(cwd); normalized != "" {
-			p.declareSessionCWD(rt, normalized)
+		// 客户端重申 cwd 只补空位/迁出 tmp：会话已固化非 tmp workspace（A1 记录，
+		// 创建时的显式选择）时不覆盖 —— session/load 的 cwd 是宿主环境根（编辑器/
+		// 网关的工作区），不是 workspace 请求；拿它覆盖固化值会让 Projects 分组在
+		// 重进页面后消失（web 草稿选区工作流实测踩中）。同值重写还顺带清掉 runtime
+		// 上可能残留的 cwdErr（未固化的会话在重开前可能带 tmp 注入失败的老错误）。
+		stored := ""
+		if st := p.storeFor(rt); st != nil {
+			stored = st.Workspace()
+		}
+		if restore, record := p.resolveReopenCWD(sessionID, stored, cwd); restore == "" {
+			p.declareSessionCWD(rt, "")
+		} else {
+			p.applySessionCWD(rt, restore, record)
 		}
 		return nil
 	}
@@ -95,13 +106,17 @@ func (p *AgentPlugin) LoadBoundSession(sessionID, cwd string) error {
 	} else if len(marked) > 0 {
 		slog.Warn("agent: marked interrupted runs from previous process on reopen", "count", len(marked), "session", st.SessionID(), "runs", strings.Join(marked, ","))
 	}
-	// cwd 恢复：实参非空优先（客户端重申），否则 workspace 记录（A1 访问器；
-	// 从未声明过则维持未声明——执行域回退既有语义，A4 的 tmp 注入接管空 cwd）。
-	restore := normalizeSessionCWDSilent(cwd)
+	// cwd 恢复：已固化的非 tmp workspace 是持久事实（A1 记录，「load 恢复持久
+	// 事实源」A7 设计点 5），优先于客户端重申——session/load 的 cwd 是宿主环境
+	// 根，重申只该补空位/迁出 tmp；都无则维持未声明（A4 的 tmp 注入接管空 cwd）。
+	// 固化的持久事实本身可能已失效（目录删除/沙箱收紧），失效时回退客户端 cwd
+	// 而非把会话钉死（resolveReopenCWD 内做校验 + 告警）。
+	restore, record := p.resolveReopenCWD(sessionID, st.Workspace(), cwd)
 	if restore == "" {
-		restore = st.Workspace()
+		p.declareSessionCWD(rt, "")
+	} else {
+		p.applySessionCWD(rt, restore, record)
 	}
-	p.declareSessionCWD(rt, restore)
 	return nil
 }
 
@@ -253,6 +268,25 @@ func normalizeSessionCWDSilent(cwd string) string {
 		return strings.TrimSpace(cwd)
 	}
 	return normalized
+}
+
+// resolveReopenCWD 决定重开/重载时给 runtime 的执行 cwd 与是否落持久记录。
+// 固化非 tmp workspace 是持久事实（优先）；空/tmp 或固化值已失效（目录删除/
+// 沙箱边界收紧）则回退客户端重申——session/load 的 cwd 是宿主环境根，只作
+// 本次执行域、不落持久记录（避免 Projects 凭空长出宿主根条目，A7 设计点 5）。
+// 返回空串表示无可用声明，交由 declareSessionCWD 走 tmp 注入兜底。
+func (p *AgentPlugin) resolveReopenCWD(sessionID, stored, client string) (string, bool) {
+	if stored == "" || isTmpWorkspacePath(stored) {
+		return normalizeSessionCWDSilent(client), false
+	}
+	if err := p.validateSessionCWD(stored); err != nil {
+		// 固化的 workspace 已失效：拿它钉死会话会让 load 成功返回后每个 prompt
+		// 都被 cwd 门拒死，且 ACP 没有重声明入口。回退并留可观测告警。
+		slog.Warn("agent: solidified workspace invalid, falling back to client cwd",
+			"session", sessionID, "workspace", stored, "err", err)
+		return normalizeSessionCWDSilent(client), false
+	}
+	return stored, true
 }
 
 // ArchiveSession runs under the caller's SessionGate and lifecycleMu. It fences the

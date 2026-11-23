@@ -211,3 +211,90 @@ func TestTmpRootSecondAllowedRoot(t *testing.T) {
 		t.Errorf("out-of-boundary declaration = %v, want outside sandbox boundary", err)
 	}
 }
+
+// TestLoadKeepsSolidifiedWorkspace 验证 load 的客户端重申不覆盖已固化的非 tmp
+// workspace（A1 记录 = 会话事实）：web 草稿选定工作区创建会话后，重进页面触发的
+// session/load（cwd = 宿主环境根）曾把固化值覆盖掉，Projects 分组随之消失。
+func TestLoadKeepsSolidifiedWorkspace(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "ok"})
+	stored := t.TempDir()   // 会话创建时固化的 workspace
+	hostRoot := t.TempDir() // load 请求携带的宿主环境根（≠ 固化值）
+	id := makeSideSession(t, p, stored, "草稿选定的工作区")
+
+	if err := p.LoadBoundSession(id, hostRoot); err != nil {
+		t.Fatalf("LoadBoundSession: %v", err)
+	}
+	rt := p.manager.Get(id)
+	if rt == nil {
+		t.Fatal("reopened runtime not registered")
+	}
+	if cwd, err := rt.DeclaredCWD(); err != nil || cwd != stored {
+		t.Errorf("DeclaredCWD after load = (%q, %v), want stored %q", cwd, err, stored)
+	}
+	if st := p.storeFor(rt); st != nil {
+		if got := st.Workspace(); got != stored {
+			t.Errorf("workspace record after load = %q, want stored %q", got, stored)
+		}
+	}
+
+	// 固化值是 tmp 域时客户端 cwd 迁入本次执行域（tmp 域随旧会话 id 失效，不是
+	// 持久事实）；且 load 的 cwd 只作执行域、不落持久记录——workspace 记录保持
+	// 原 tmp 值，别把宿主根钉成永久 workspace。
+	p2 := newPersistedPlugin(t, fixedProvider{content: "ok"})
+	id2 := makeSideSession(t, p2, "", "tmp 域会话")
+	st2, err := p2.repo.Open(id2)
+	if err != nil {
+		t.Fatalf("repo.Open(tmp session): %v", err)
+	}
+	tmpWs := tmpWorkspaceDir(id2)
+	if err := st2.DeclareWorkspace(tmpWs); err != nil {
+		t.Fatalf("DeclareWorkspace(tmp): %v", err)
+	}
+	if err := p2.repo.CloseSession(id2); err != nil {
+		t.Fatalf("CloseSession(tmp): %v", err)
+	}
+
+	if err := p2.LoadBoundSession(id2, stored); err != nil {
+		t.Fatalf("LoadBoundSession(tmp session): %v", err)
+	}
+	rt2 := p2.manager.Get(id2)
+	if rt2 == nil {
+		t.Fatal("tmp session runtime not registered")
+	}
+	if cwd, err := rt2.DeclaredCWD(); err != nil || cwd != stored {
+		t.Errorf("tmp-session DeclaredCWD after load = (%q, %v), want client %q", cwd, err, stored)
+	}
+	if got := p2.storeFor(rt2); got != nil && got.Workspace() != tmpWs {
+		t.Errorf("tmp-session workspace record after load = %q, want unchanged %q (load cwd 不落持久记录)", got.Workspace(), tmpWs)
+	}
+}
+
+// TestLoadKeepsSolidifiedWorkspaceWhenRegistered 覆盖分支 1（已注册 runtime 的
+// 重载）：客户端重申的 cwd 不得覆盖已固化的 workspace，同值重写不改变持久记录。
+func TestLoadKeepsSolidifiedWorkspaceWhenRegistered(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "ok"})
+	stored := t.TempDir()
+	hostRoot := t.TempDir()
+	id := makeSideSession(t, p, stored, "草稿选定的工作区")
+
+	// 第一次 load 重开并注册 runtime（固化 stored）
+	if err := p.LoadBoundSession(id, stored); err != nil {
+		t.Fatalf("first LoadBoundSession: %v", err)
+	}
+	// 第二次 load 命中分支 1（已注册）：客户端重申 hostRoot 不得覆盖固化值
+	if err := p.LoadBoundSession(id, hostRoot); err != nil {
+		t.Fatalf("second LoadBoundSession: %v", err)
+	}
+	rt := p.manager.Get(id)
+	if rt == nil {
+		t.Fatal("runtime not registered after reload")
+	}
+	if cwd, err := rt.DeclaredCWD(); err != nil || cwd != stored {
+		t.Errorf("DeclaredCWD after reload = (%q, %v), want stored %q (分支 1 不覆盖固化值)", cwd, err, stored)
+	}
+	if st := p.storeFor(rt); st != nil {
+		if got := st.Workspace(); got != stored {
+			t.Errorf("workspace record after reload = %q, want stored %q", got, stored)
+		}
+	}
+}

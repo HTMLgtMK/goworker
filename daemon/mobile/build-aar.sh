@@ -35,4 +35,4 @@ if grep -Fxq "$dispatcher_package" <<< "$deps"; then
     printf 'mobile Agent-only build unexpectedly includes the Dispatcher plugin (tags: %s)\n' "$go_tags" >&2
     exit 1
 fi
-exec "$gomobile" bind -target=android -tags="$go_tags" -o "$output" ./mobile
+exec "$gomobile" bind -target=android -javapkg=dev.tinguo.goworker -tags="$go_tags" -o "$output" ./mobile

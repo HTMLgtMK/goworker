@@ -90,6 +90,9 @@ func (p *Provider) Chat(ctx context.Context, req *core.ChatRequest) (*core.ChatR
 		if slog.Default().Enabled(ctx, slog.LevelDebug) {
 			slog.Debug("llm.chat response", "status", resp.StatusCode, "model", request.Model)
 		}
+		if detail := provider.UpstreamErrorDetail(resp, p.Name()); detail != "" {
+			return nil, fmt.Errorf("API %d: %s", resp.StatusCode, detail)
+		}
 		return nil, fmt.Errorf("API %d", resp.StatusCode)
 	}
 
@@ -327,7 +330,11 @@ func (p *Provider) ChatStream(ctx context.Context, req *core.ChatRequest) (<-cha
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		detail := provider.UpstreamErrorDetail(resp, p.Name())
 		resp.Body.Close()
+		if detail != "" {
+			return nil, fmt.Errorf("API %d: %s", resp.StatusCode, detail)
+		}
 		return nil, fmt.Errorf("API %d", resp.StatusCode)
 	}
 

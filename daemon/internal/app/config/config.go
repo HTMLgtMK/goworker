@@ -35,6 +35,7 @@ type Config struct {
 type FrontendConfig struct {
 	Stdin StdinConfig       `yaml:"stdin"`
 	ACP   ACPFrontendConfig `yaml:"acp"`
+	Web   WebFrontendConfig `yaml:"web"`
 }
 
 type StdinConfig struct {
@@ -45,6 +46,15 @@ type StdinConfig struct {
 type ACPFrontendConfig struct {
 	Enabled bool   `yaml:"enabled"`          // false = 不启动 ACP service（默认 true）
 	Socket  string `yaml:"socket,omitempty"` // 完整 Unix socket 路径；空 = app 按 DefaultDir 派生
+}
+
+// WebFrontendConfig 是 `goworker web`（Node web 网关托管）的解析层配置。
+// 全部字段只是解析优先级的最低一档：flag > 同名 GOWORKER_WEB_* 环境变量 > 这里的值 > 内置默认。
+type WebFrontendConfig struct {
+	Entry     string `yaml:"entry,omitempty"`     // gateway.js/gateway.ts 路径；空 = 自动探测（apps/web-host 布局）
+	Port      int    `yaml:"port,omitempty"`      // 空 = 5177
+	Host      string `yaml:"host,omitempty"`      // 空 = 127.0.0.1
+	Workspace string `yaml:"workspace,omitempty"` // GOWORKER_WEB_WORKSPACE；空 = 从 entry 派生（apps/web-host 布局命中时）
 }
 
 // ---- sandbox 解析层（保留双格式兼容，运行时转 ai-sandbox）----
@@ -178,6 +188,8 @@ func Default() *Config {
 			Stdin: StdinConfig{Theme: "default"},
 			// daemon 主会话 ACP service 默认开启；socket 路径留空，由 app 按 DefaultDir 派生
 			ACP: ACPFrontendConfig{Enabled: true},
+			// web 网关默认值在此定底：entry/workspace 留空走自动探测与派生
+			Web: WebFrontendConfig{Port: 5177, Host: "127.0.0.1"},
 		},
 		LLM:    runtimeconfig.DefaultLLM(),
 		Memory: mem,
@@ -264,6 +276,18 @@ func (c *Config) SetField(key, value string) error {
 	switch key {
 	case "frontend.stdin.theme":
 		c.Frontend.Stdin.Theme = value
+	case "frontend.web.entry":
+		c.Frontend.Web.Entry = value
+	case "frontend.web.port":
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 || n > 65535 {
+			return fmt.Errorf("无效 frontend.web.port: %s（应为 1-65535）", value)
+		}
+		c.Frontend.Web.Port = n
+	case "frontend.web.host":
+		c.Frontend.Web.Host = value
+	case "frontend.web.workspace":
+		c.Frontend.Web.Workspace = value
 	case "sandbox.mode":
 		c.Sandbox.Mode = value
 	case "sandbox.allowed_work_dir":
@@ -334,7 +358,7 @@ func (c *Config) SetField(key, value string) error {
 		}
 		c.Session.Enabled = b
 	default:
-		valid := "frontend.stdin.theme, llm.current.{provider,model}, llm.providers.<name>.{type,endpoint,api_key,auth_type}, llm.providers.<name>.models.<model>.{display_name,context_window,max_tokens,thinking.request_mode,thinking.effort}, llm.compress_at, llm.compact_keep, llm.max_iterations, llm.thinking.show, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days, memory.dir, memory.enabled, memory.task_keep, memory.task_inject_n, memory.ltm_inject_top_k, memory.ltm_extract, session.dir, session.enabled, memory.inject_budget_ratio"
+		valid := "frontend.stdin.theme, frontend.web.{entry,port,host,workspace}, llm.current.{provider,model}, llm.providers.<name>.{type,endpoint,api_key,auth_type}, llm.providers.<name>.models.<model>.{display_name,context_window,max_tokens,thinking.request_mode,thinking.effort}, llm.compress_at, llm.compact_keep, llm.max_iterations, llm.thinking.show, sandbox.mode, sandbox.allowed_work_dir, log.level, log.file, log.max_size_mb, log.max_age_days, memory.dir, memory.enabled, memory.task_keep, memory.task_inject_n, memory.ltm_inject_top_k, memory.ltm_extract, session.dir, session.enabled, memory.inject_budget_ratio"
 		return fmt.Errorf("未知配置项: %s（可用: %s）", key, valid)
 	}
 	return nil

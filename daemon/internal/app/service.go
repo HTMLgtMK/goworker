@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"path/filepath"
 
 	aiacp "github.com/tinguo/goworker/ai-acp"
-	"github.com/tinguo/goworker/daemon/internal/app/config"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 	acpservice "github.com/tinguo/goworker/daemon/internal/core/service/acp"
 	xgwprotocol "github.com/tinguo/goworker/daemon/xgoworker/protocol"
@@ -23,6 +21,7 @@ type serviceRegistration struct {
 
 var serviceRegistrations = []serviceRegistration{
 	{name: "acp", register: registerACPService},
+	{name: "status", register: registerStatusService},
 }
 
 // registerServices wires every application-owned service into the generic core
@@ -33,6 +32,17 @@ func registerServices(a *Application, options applicationOptions) error {
 		if err := registration.register(a, options); err != nil {
 			return fmt.Errorf("register service %q: %w", registration.name, err)
 		}
+	}
+	return nil
+}
+
+func registerStatusService(a *Application, options applicationOptions) error {
+	// 只有 CLI 壳声明了 mode 才注册：mobile 等进程内装配不落查询 socket。
+	if options.mode == "" {
+		return nil
+	}
+	if err := a.Services.Register(&statusService{app: a}); err != nil {
+		return fmt.Errorf("register status service: %w", err)
 	}
 	return nil
 }
@@ -100,7 +110,7 @@ func newACPService(options acpServiceOptions) (*acpservice.Service, error) {
 		return nil, errors.New("app: ACP evaluator is required")
 	}
 	if options.socketPath == "" {
-		options.socketPath = filepath.Join(config.DefaultDir(), "frontend", "acp.sock")
+		options.socketPath = FrontendSocketPath()
 	}
 	if options.logger == nil {
 		options.logger = slog.Default()

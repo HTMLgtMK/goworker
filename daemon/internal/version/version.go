@@ -88,7 +88,7 @@ func (i Info) String() string {
 	s := fmt.Sprintf("goworker %s (%s, %s) %s/%s %s",
 		i.Version, i.ShortCommit(), i.Date, i.OS, i.Arch, i.GoVer)
 	if i.Modified {
-		s += " [工作区有未提交改动，commit 不精确]"
+		s += " [dirty worktree, commit may be inaccurate]"
 	}
 	return s
 }

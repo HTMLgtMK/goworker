@@ -84,7 +84,7 @@ func TestString(t *testing.T) {
 			t.Errorf("String() = %q, 缺少 %q", got, want)
 		}
 	}
-	if strings.Contains(got, "未提交改动") {
+	if strings.Contains(got, "dirty worktree") {
 		t.Errorf("干净工作区不该带脏标记: %q", got)
 	}
 }
@@ -93,7 +93,7 @@ func TestString(t *testing.T) {
 func TestStringFlagsModified(t *testing.T) {
 	got := Info{Version: "v1", Commit: "abc", Date: "d", Modified: true}.String()
 
-	if !strings.Contains(got, "未提交改动") {
+	if !strings.Contains(got, "dirty worktree") {
 		t.Errorf("Modified=true 时应提示工作区脏: %q", got)
 	}
 }

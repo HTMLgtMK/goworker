@@ -477,7 +477,8 @@ AAR 默认只编入 Agent：
 
 ```bash
 daemon/mobile/build-aar.sh
-# 等价于 gomobile bind -target=android -tags=goworker_no_dispatcher -o build/goworker-agent.aar ./mobile
+# 等价于在 daemon 目录执行：
+# gomobile bind -target=android -javapkg=dev.tinguo.goworker -tags=goworker_no_dispatcher -o ../build/goworker-agent.aar ./mobile
 ```
 
 脚本在 bind 前检查依赖图：必须包含 `daemon/internal/plugins/agent`，不得包含

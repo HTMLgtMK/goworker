@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/logger"
@@ -24,6 +25,11 @@ type Application struct {
 	Engine   *engine.Engine
 	Log      *logger.Logger
 	Services *coreservice.Registry
+	// Mode 是装配来源声明的运行形态（CLI 壳传 "daemon"/"tui"），随 status 快照
+	// 展示。空 = 非 CLI 壳装配（mobile 等），status 服务不注册。
+	Mode string
+
+	startedAt time.Time
 }
 
 var ErrCapabilityUnavailable = errors.New("capability unavailable")
@@ -31,6 +37,7 @@ var ErrCapabilityUnavailable = errors.New("capability unavailable")
 type applicationOptions struct {
 	acpConnection           io.ReadWriteCloser
 	providerWriteAuthorizer acpservice.ProviderWriteAuthorizer
+	mode                    string
 }
 
 // Option customizes Application assembly without exposing ACP transport
@@ -59,6 +66,14 @@ func WithACPProviderWriteAuthorizer(authorizer acpservice.ProviderWriteAuthorize
 	}
 }
 
+// WithMode 声明 CLI 壳的运行形态（"daemon" 或 "tui"），随 status 快照展示。
+// 仅 CLI 壳使用；不设置即视为进程内装配，status 服务不注册。
+func WithMode(mode string) Option {
+	return func(options *applicationOptions) {
+		options.mode = mode
+	}
+}
+
 func (a *Application) SessionSource() (model.SessionSource, error) {
 	capability, ok := a.Engine.Capability(model.SessionSourceCapability)
 	if !ok {
@@ -80,7 +95,7 @@ func loadConfigAndLogger() (*config.Config, *logger.Logger, error) {
 		// Load 遇到无效配置会返回 nil（具体原因它已经记日志了）。
 		// 不挡一下的话下一行 cfg.Log 就是空指针解引用——配置写错一个字段
 		// 换来一个段错误，排查成本高得离谱。
-		return nil, nil, fmt.Errorf("配置无效: %s\n详见上方日志；修好后重试，或删掉该文件用默认配置。", cfgPath)
+		return nil, nil, fmt.Errorf("invalid config: %s\nsee the log above; fix it and retry, or delete the file to start with defaults", cfgPath)
 	}
 
 	// 初始化日志器（等级过滤 + 可选文件轮转/清理）
@@ -132,11 +147,13 @@ func New(options ...Option) (*Application, error) {
 	e.Use(engine.LoggingInterceptor(log))
 
 	a := &Application{
-		Config:   cfg,
-		Runtime:  runtimeCfg,
-		Engine:   e,
-		Log:      log,
-		Services: coreservice.NewRegistry(),
+		Config:    cfg,
+		Runtime:   runtimeCfg,
+		Engine:    e,
+		Log:       log,
+		Services:  coreservice.NewRegistry(),
+		Mode:      appOptions.mode,
+		startedAt: time.Now(),
 	}
 
 	// 注册插件：builtin 的条件导入决定编译集合，registry factory 负责统一装配。
