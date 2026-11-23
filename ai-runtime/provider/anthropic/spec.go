@@ -60,6 +60,13 @@ type anthropicStreamEvent struct {
 	ContentBlock *anthropicStreamBlock     `json:"content_block"`
 	Delta        *anthropicStreamDelta     `json:"delta"`
 	Usage        *anthropicUsage           `json:"usage"`
+	Error        *anthropicStreamError     `json:"error"`
+}
+
+// anthropicStreamError 是流内 error 事件的详情。
+type anthropicStreamError struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
 }
 
 // anthropicStreamBlock 描述 content_block_start 的块头（thinking/text/tool_use）。

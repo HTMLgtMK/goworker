@@ -663,9 +663,8 @@ func assertNonSSEFallback(t *testing.T, baseURL, wantContent string) {
 	}
 }
 
-// TestAnthropicProvider_ChatStreamDeltaOnlyReassembles 回归：部分代理省略
-// content_block_start 只发 content_block_delta；此前只靠 start 置 sawContent，
-// 整段重组响应会被 !sawContent 丢弃，调用方拿到增量却回填不了历史。
+// TestAnthropicProvider_ChatStreamDeltaOnlyReassembles 回归：省略
+// content_block_start 的代理也要拿到收尾响应。
 func TestAnthropicProvider_ChatStreamDeltaOnlyReassembles(t *testing.T) {
 	sse := strings.Join([]string{
 		"event: message_start",
@@ -715,5 +714,53 @@ func TestAnthropicProvider_ChatStreamDeltaOnlyReassembles(t *testing.T) {
 	}
 	if final.Choices[0].FinishReason != "stop" {
 		t.Errorf("finish reason = %q, want stop", final.Choices[0].FinishReason)
+	}
+}
+
+// TestAnthropicProvider_ChatStreamMalformedIndex 回归：负/超大 index 不能
+// panic 也不能吃内存，增量与重组必须保住。
+func TestAnthropicProvider_ChatStreamMalformedIndex(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}`,
+		"",
+		`data: {"type":"content_block_delta","index":-1,"delta":{"type":"text_delta","text":"负"}}`,
+		"",
+		`data: {"type":"content_block_delta","index":1000000,"delta":{"type":"text_delta","text":"大"}}`,
+		"",
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
+		"",
+	}, "\n")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse))
+	}))
+	t.Cleanup(srv.Close)
+
+	p := NewProvider("", srv.URL, "token", "claude-test", srv.Client(), AnthropicAuthAPIKey)
+	ch, err := p.ChatStream(context.Background(), &core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	var final *core.ChatResponse
+	var text string
+	for tok := range ch {
+		if tok.Response != nil {
+			final = tok.Response
+			continue
+		}
+		if tok.Type == core.TokenTypeText {
+			text += tok.Content
+		}
+	}
+	if text != "负大" {
+		t.Errorf("streamed text = %q, want 负大", text)
+	}
+	if final == nil {
+		t.Fatal("malformed indexes must not break reassembly")
+	}
+	if got := final.Choices[0].Message.Content; got != "负大" {
+		t.Errorf("content = %q, want 负大", got)
 	}
 }

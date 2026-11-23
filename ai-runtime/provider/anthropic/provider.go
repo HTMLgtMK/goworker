@@ -203,6 +203,9 @@ func (p *Provider) ChatStream(ctx context.Context, req *core.ChatRequest) (<-cha
 	return tokenCh, nil
 }
 
+// maxStreamBlocks 限制 index 位图上限，防负值 panic / 超大值吃内存。
+const maxStreamBlocks = 1024
+
 // anthropicStreamBlockState 是单个 content block 的增量累积状态。
 type anthropicStreamBlockState struct {
 	kind      string // thinking / text / tool_use
@@ -238,6 +241,12 @@ func (p *Provider) readSSE(ctx context.Context, body io.ReadCloser, tokenCh chan
 		}
 	}
 	blockAt := func(index int) *anthropicStreamBlockState {
+		// 越界夹到边界：宁可并进相邻块也不能 panic 或无界扩容。
+		if index < 0 {
+			index = 0
+		} else if index >= maxStreamBlocks {
+			index = maxStreamBlocks - 1
+		}
 		for len(blocks) <= index {
 			blocks = append(blocks, &anthropicStreamBlockState{})
 		}
@@ -338,8 +347,13 @@ func (p *Provider) readSSE(ctx context.Context, body io.ReadCloser, tokenCh chan
 							usage.OutputTokens = ev.Usage.OutputTokens
 						}
 					case "error":
-						// 服务端错误事件：不重组（半截响应不能当成功交付），只落日志。
-						slog.Warn("anthropic: SSE stream reported an error event", "provider", p.Name())
+						// 不重组半截响应，只落日志；带上上游的 type/message。
+						errType, errMsg := "", ""
+						if ev.Error != nil {
+							errType, errMsg = ev.Error.Type, ev.Error.Message
+						}
+						slog.Warn("anthropic: SSE stream reported an error event",
+							"provider", p.Name(), "type", errType, "message", errMsg)
 						return
 					}
 				}
