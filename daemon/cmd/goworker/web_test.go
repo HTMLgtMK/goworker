@@ -112,9 +112,7 @@ func TestResolveWebSettingsMissingEntry(t *testing.T) {
 	}
 }
 
-// TestWebChildEnvOverridesHostEnv 回归：settings 是 flag > env 解析后的权威值，
-// 宿主 env 里残留的 GOWORKER_WEB_* 必须被覆盖——否则 `--port 6002` 在父进程生效、
-// 子进程仍旧听 GOWORKER_WEB_PORT 的值，两边各说各话。
+// TestWebChildEnvOverridesHostEnv 回归：宿主 env 残留不能盖掉 flag 解析结果。
 func TestWebChildEnvOverridesHostEnv(t *testing.T) {
 	t.Setenv("GOWORKER_WEB_PORT", "9999")
 	t.Setenv("GOWORKER_WEB_HOST", "10.0.0.1")

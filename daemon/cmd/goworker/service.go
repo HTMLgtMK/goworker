@@ -81,18 +81,51 @@ func serviceInstall(withWeb bool) {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
+
+	// web 前置检查提前：避免 daemon 已常驻、web 却安装失败。
+	var web *webSettings
+	if withWeb {
+		settings, err := precheckWebInstall()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to register the web service: %v\n", err)
+			os.Exit(1)
+		}
+		web = &settings
+	}
+
 	if err := installDaemonAgent(exe); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to register the daemon service: %v\n", err)
 		os.Exit(1)
 	}
-	if withWeb {
-		if err := installWebAgent(exe); err != nil {
+	if web != nil {
+		if err := installWebAgent(exe, *web); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to register the web service: %v\n", err)
+			fmt.Fprintln(os.Stderr, "note: the daemon service was already registered and is running; remove it with `goworker service uninstall` if you want a clean slate")
 			os.Exit(1)
 		}
 	} else {
 		fmt.Println("hint: run `goworker service install --web` to keep the web gateway running as a service too")
 	}
+}
+
+// precheckWebInstall 做 web 侧确定性检查；旧 agent 占的端口会在 bootout 后释放。
+func precheckWebInstall() (webSettings, error) {
+	settings, err := resolveWebSettings(webOverrides{})
+	if err != nil {
+		return webSettings{}, fmt.Errorf("resolve gateway entry: %w", err)
+	}
+	if isBootstrapped(serviceWebLabel) {
+		return settings, nil
+	}
+	inUse, err := tcpInUse(settings.Host, settings.Port)
+	if err != nil {
+		return webSettings{}, fmt.Errorf("port precheck failed for %s:%s: %w", settings.Host, settings.Port, err)
+	}
+	if inUse {
+		return webSettings{}, fmt.Errorf("port %s:%s is already in use; stop the process holding it first (possibly a gateway outside launchd)",
+			settings.Host, settings.Port)
+	}
+	return settings, nil
 }
 
 // stableExecutable 取本二进制的稳定路径。服务注册的是路径不是进程，go run 的
@@ -123,7 +156,7 @@ func installDaemonAgent(exe string) error {
 		return fmt.Errorf("a daemon is already running outside of launchd; stop it first (see PID via `goworker status`), then install")
 	}
 
-	plistPath, err := writeAgentPlist(serviceDaemonLabel, []string{exe, "--daemon"}, "daemon")
+	plistPath, err := writeAgentPlist(serviceDaemonLabel, []string{exe, "--daemon"}, "daemon", nil)
 	if err != nil {
 		return err
 	}
@@ -141,12 +174,7 @@ func installDaemonAgent(exe string) error {
 	return nil
 }
 
-func installWebAgent(exe string) error {
-	settings, err := resolveWebSettings(webOverrides{})
-	if err != nil {
-		return fmt.Errorf("resolve gateway entry: %w", err)
-	}
-
+func installWebAgent(exe string, settings webSettings) error {
 	if isBootstrapped(serviceWebLabel) {
 		if err := bootoutAndWait(serviceWebLabel); err != nil {
 			return fmt.Errorf("uninstall previous web agent: %w", err)
@@ -161,7 +189,9 @@ func installWebAgent(exe string) error {
 			settings.Host, settings.Port)
 	}
 
-	plistPath, err := writeAgentPlist(serviceWebLabel, []string{exe, "web"}, "web")
+	// 烘焙 entry：运行时不再重新 glob 探测，install 打印的就是实际入口。
+	plistPath, err := writeAgentPlist(serviceWebLabel, []string{exe, "web"}, "web",
+		map[string]string{"GOWORKER_WEB_ENTRY": settings.Entry})
 	if err != nil {
 		return err
 	}
@@ -422,7 +452,7 @@ func bakedEnv() map[string]string {
 	return env
 }
 
-func writeAgentPlist(label string, programArgs []string, logName string) (string, error) {
+func writeAgentPlist(label string, programArgs []string, logName string, extraEnv map[string]string) (string, error) {
 	plistPath, err := agentPlistPath(label)
 	if err != nil {
 		return "", err
@@ -431,11 +461,16 @@ func writeAgentPlist(label string, programArgs []string, logName string) (string
 		return "", err
 	}
 
+	env := bakedEnv()
+	for k, v := range extraEnv {
+		env[k] = v
+	}
+
 	logsDir := mustLaunchLogsDir()
 	plist := renderPlist(label, programArgs,
 		filepath.Join(logsDir, logName+".out.log"),
 		filepath.Join(logsDir, logName+".err.log"),
-		bakedEnv(),
+		env,
 	)
 	if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
 		return "", fmt.Errorf("write plist: %w", err)

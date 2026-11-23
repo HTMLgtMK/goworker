@@ -206,8 +206,7 @@ func startWebGateway(settings webSettings) {
 	cmd.Env = webChildEnv(settings)
 	// 独立进程组：收停时对整组发信号，网关自己的子进程不留孤儿
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// LaunchAgent 下 cwd 是 "/"：用 workspace 根当子进程工作目录，npx tsx / node
-	// 才能正确解析 node_modules 与相对资源（resolveWebSettings 已保证 workspace 非空）。
+	// launchd 下 cwd 是 "/"，给子进程一个可信的工作目录。
 	cmd.Dir = settings.Workspace
 
 	logLine("web gateway entry: %s (source: %s)", settings.Entry, settings.EntrySource)
@@ -238,9 +237,7 @@ func startWebGateway(settings webSettings) {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case err := <-waitCh:
-		// 网关自己退出（崩溃/正常结束）时，守着 Setpgid 建的进程组把残留成员
-		// 一并收掉：node/npx 拉起的子进程不会因为主进程消失而自动退出，留着
-		// 就是占端口的孤儿（launchd 只看得到主进程）。
+		// 主进程退出后 node 子进程可能还占着端口，整组收掉。
 		stopWebProcessGroup(cmd.Process.Pid)
 		exitCodeFromWait(err)
 	case <-sigCh:
@@ -287,9 +284,7 @@ func lookTool(name string) (string, error) {
 	return "", fmt.Errorf("%s not found (neither in PATH nor at common install locations)", name)
 }
 
-// webChildEnv 组装子进程环境：以 resolveWebSettings 解出的 settings 为权威（flag >
-// env > config > default），用 appendEnvOverride 覆盖宿主 env 里的同名 key——否则
-// 宿主 env 残留的 GOWORKER_WEB_PORT 会让 flag 设的值失效、Go 与 Node 各听各的。
+// webChildEnv 以解析后的 settings 为准覆盖宿主 env 里的同名 key。
 func webChildEnv(settings webSettings) []string {
 	env := appendEnvOverride(os.Environ(), "GOWORKER_CONFIG_DIR", appconfig.DefaultDir())
 	env = appendEnvOverride(env, "GOWORKER_WEB_PORT", settings.Port)
@@ -300,9 +295,7 @@ func webChildEnv(settings webSettings) []string {
 	return env
 }
 
-// appendEnvOverride 追加一个「强制覆盖」的环境变量：先清掉宿主 env 里的同名项，
-// 再追加我们自己的值，避免向子进程传重复 key（node 靠最后一个覆盖才不炸，属于
-// 依实现而定的巧合，不该依赖）。
+// appendEnvOverride 先剔除同名 key 再追加，避免子进程收到重复环境变量。
 func appendEnvOverride(env []string, key, value string) []string {
 	prefix := key + "="
 	out := make([]string, 0, len(env)+1)
@@ -359,16 +352,14 @@ func tcpInUse(host, port string) (bool, error) {
 		_ = conn.Close()
 		return true, nil
 	}
-	// 只有「连接被拒绝」才判定空闲；其余错误（非法地址/超时/权限）要么探测本身
-	// 出了问题，要么意味着真有服务在——原样上抛，别把非法端口当成「端口空闲」放行。
+	// 只有连接被拒绝才判定空闲；其余错误原样上抛。
 	if errors.Is(err, syscall.ECONNREFUSED) {
 		return false, nil
 	}
 	return false, err
 }
 
-// validatePort 校验合并后的端口值，非法直接报错（别让 node 用 ERR_SOCKET_BAD_PORT
-// 崩在 launchd 日志里）。
+// validatePort 校验端口范围，避免 node 用非法端口崩在 launchd 日志里。
 func validatePort(port string) error {
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 1 || n > 65535 {
