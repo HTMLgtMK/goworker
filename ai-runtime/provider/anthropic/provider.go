@@ -293,6 +293,9 @@ func (p *Provider) readSSE(ctx context.Context, body io.ReadCloser, tokenCh chan
 						}
 					case "content_block_delta":
 						if ev.Delta != nil {
+							// 兼容省略 content_block_start 的代理：delta 也算看到内容，
+							// 否则流结束的 !sawContent 会把重组响应整个丢掉。
+							sawContent = true
 							b := blockAt(ev.Index)
 							switch ev.Delta.Type {
 							case "text_delta":

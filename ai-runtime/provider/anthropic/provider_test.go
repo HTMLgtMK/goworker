@@ -662,3 +662,58 @@ func assertNonSSEFallback(t *testing.T, baseURL, wantContent string) {
 		t.Errorf("content = %q, want %q", got, wantContent)
 	}
 }
+
+// TestAnthropicProvider_ChatStreamDeltaOnlyReassembles 回归：部分代理省略
+// content_block_start 只发 content_block_delta；此前只靠 start 置 sawContent，
+// 整段重组响应会被 !sawContent 丢弃，调用方拿到增量却回填不了历史。
+func TestAnthropicProvider_ChatStreamDeltaOnlyReassembles(t *testing.T) {
+	sse := strings.Join([]string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"usage":{"input_tokens":2,"output_tokens":0}}}`,
+		"",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"裸"}}`,
+		"",
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"增量"}}`,
+		"",
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
+		"",
+		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sse))
+	}))
+	t.Cleanup(srv.Close)
+
+	p := NewProvider("", srv.URL, "token", "claude-test", srv.Client(), AnthropicAuthAPIKey)
+	ch, err := p.ChatStream(context.Background(), &core.ChatRequest{})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+
+	var textDeltas []string
+	var final *core.ChatResponse
+	for tok := range ch {
+		if tok.Response != nil {
+			final = tok.Response
+			continue
+		}
+		if tok.Type == core.TokenTypeText {
+			textDeltas = append(textDeltas, tok.Content)
+		}
+	}
+	if want := []string{"裸", "增量"}; !reflect.DeepEqual(textDeltas, want) {
+		t.Errorf("text deltas = %v, want %v", textDeltas, want)
+	}
+	if final == nil {
+		t.Fatal("delta-only stream should still deliver a reassembled response")
+	}
+	if msg := final.Choices[0].Message; msg.Content != "裸增量" {
+		t.Errorf("content = %q, want 裸增量", msg.Content)
+	}
+	if final.Choices[0].FinishReason != "stop" {
+		t.Errorf("finish reason = %q, want stop", final.Choices[0].FinishReason)
+	}
+}
