@@ -53,8 +53,8 @@ type anthropicUsage struct {
 // anthropicStreamEvent 是 SSE data 行的统一视图：事件类型 + 各事件用到的字段组。
 // event: 行本身不参与判别（部分兼容代理只发 data: 行），一律按 data.type 分派。
 type anthropicStreamEvent struct {
-	Type  string                  `json:"type"`
-	Index int                     `json:"index"`
+	Type  string `json:"type"`
+	Index int    `json:"index"`
 	// message_start 携带完整消息头（id/model/role + 初始 usage）。
 	Message      *anthropicMessageResponse `json:"message"`
 	ContentBlock *anthropicStreamBlock     `json:"content_block"`

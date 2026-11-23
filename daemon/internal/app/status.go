@@ -22,10 +22,10 @@ import (
 
 // StatusInfo 是 status socket 下发与启动 banner 共用的运行状态快照。
 type StatusInfo struct {
-	Version        string `json:"version"`      // version.Get().String() 单行摘要
+	Version        string `json:"version"` // version.Get().String() 单行摘要
 	PID            int    `json:"pid"`
-	Mode           string `json:"mode"`         // "daemon" / "tui"；空 = 非 CLI 壳装配
-	StartedAt      string `json:"started_at"`   // RFC3339
+	Mode           string `json:"mode"`       // "daemon" / "tui"；空 = 非 CLI 壳装配
+	StartedAt      string `json:"started_at"` // RFC3339
 	UptimeSeconds  int64  `json:"uptime_seconds"`
 	ConfigDir      string `json:"config_dir"`
 	ConfigPath     string `json:"config_path"`
