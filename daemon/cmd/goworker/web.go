@@ -238,6 +238,10 @@ func startWebGateway(settings webSettings) {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case err := <-waitCh:
+		// 网关自己退出（崩溃/正常结束）时，守着 Setpgid 建的进程组把残留成员
+		// 一并收掉：node/npx 拉起的子进程不会因为主进程消失而自动退出，留着
+		// 就是占端口的孤儿（launchd 只看得到主进程）。
+		stopWebProcessGroup(cmd.Process.Pid)
 		exitCodeFromWait(err)
 	case <-sigCh:
 		stopWebProcessGroup(cmd.Process.Pid)
