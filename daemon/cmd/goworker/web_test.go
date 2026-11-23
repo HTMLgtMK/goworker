@@ -112,6 +112,33 @@ func TestResolveWebSettingsMissingEntry(t *testing.T) {
 	}
 }
 
+// TestWebChildEnvOverridesHostEnv 回归：settings 是 flag > env 解析后的权威值，
+// 宿主 env 里残留的 GOWORKER_WEB_* 必须被覆盖——否则 `--port 6002` 在父进程生效、
+// 子进程仍旧听 GOWORKER_WEB_PORT 的值，两边各说各话。
+func TestWebChildEnvOverridesHostEnv(t *testing.T) {
+	t.Setenv("GOWORKER_WEB_PORT", "9999")
+	t.Setenv("GOWORKER_WEB_HOST", "10.0.0.1")
+	t.Setenv("GOWORKER_WEB_WORKSPACE", "/stale/ws")
+
+	env := webChildEnv(webSettings{Port: "6002", Host: "0.0.0.0", Workspace: "/flag/ws"})
+
+	got := map[string][]string{}
+	for _, kv := range env {
+		if i := strings.IndexByte(kv, '='); i > 0 {
+			got[kv[:i]] = append(got[kv[:i]], kv[i+1:])
+		}
+	}
+	for key, want := range map[string]string{
+		"GOWORKER_WEB_PORT":      "6002",
+		"GOWORKER_WEB_HOST":      "0.0.0.0",
+		"GOWORKER_WEB_WORKSPACE": "/flag/ws",
+	} {
+		if vals := got[key]; len(vals) != 1 || vals[0] != want {
+			t.Errorf("%s = %v, want exactly [%q] (宿主残留必须被覆盖且不重复)", key, vals, want)
+		}
+	}
+}
+
 func TestRenderPlist(t *testing.T) {
 	plist := renderPlist("com.goworker.daemon",
 		[]string{"/usr/local/bin/goworker", "--daemon"},

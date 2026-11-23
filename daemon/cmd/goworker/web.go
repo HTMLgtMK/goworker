@@ -206,6 +206,9 @@ func startWebGateway(settings webSettings) {
 	cmd.Env = webChildEnv(settings)
 	// 独立进程组：收停时对整组发信号，网关自己的子进程不留孤儿
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// LaunchAgent 下 cwd 是 "/"：用 workspace 根当子进程工作目录，npx tsx / node
+	// 才能正确解析 node_modules 与相对资源（resolveWebSettings 已保证 workspace 非空）。
+	cmd.Dir = settings.Workspace
 
 	logLine("web gateway entry: %s (source: %s)", settings.Entry, settings.EntrySource)
 	if settings.Workspace != "" {
@@ -280,18 +283,15 @@ func lookTool(name string) (string, error) {
 	return "", fmt.Errorf("%s not found (neither in PATH nor at common install locations)", name)
 }
 
-// webChildEnv 组装子进程环境：强制与 daemon 同一配置目录；port/host/workspace
-// 只在宿主 env 未设时注入 —— env 显式值优先是网关自己的约定，别在托管层抢。
+// webChildEnv 组装子进程环境：以 resolveWebSettings 解出的 settings 为权威（flag >
+// env > config > default），用 appendEnvOverride 覆盖宿主 env 里的同名 key——否则
+// 宿主 env 残留的 GOWORKER_WEB_PORT 会让 flag 设的值失效、Go 与 Node 各听各的。
 func webChildEnv(settings webSettings) []string {
 	env := appendEnvOverride(os.Environ(), "GOWORKER_CONFIG_DIR", appconfig.DefaultDir())
-	if os.Getenv("GOWORKER_WEB_PORT") == "" {
-		env = append(env, "GOWORKER_WEB_PORT="+settings.Port)
-	}
-	if os.Getenv("GOWORKER_WEB_HOST") == "" {
-		env = append(env, "GOWORKER_WEB_HOST="+settings.Host)
-	}
-	if settings.Workspace != "" && os.Getenv("GOWORKER_WEB_WORKSPACE") == "" {
-		env = append(env, "GOWORKER_WEB_WORKSPACE="+settings.Workspace)
+	env = appendEnvOverride(env, "GOWORKER_WEB_PORT", settings.Port)
+	env = appendEnvOverride(env, "GOWORKER_WEB_HOST", settings.Host)
+	if settings.Workspace != "" {
+		env = appendEnvOverride(env, "GOWORKER_WEB_WORKSPACE", settings.Workspace)
 	}
 	return env
 }
