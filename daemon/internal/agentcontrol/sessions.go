@@ -61,8 +61,8 @@ func BindingFromCtx(ctx context.Context) *SessionBinding {
 }
 
 // clientIDContextKey carries the connection ID alongside SessionBinding. It is consumed by
-// /new cleanup to unbind the connection from BindingRegistry: SessionBinding has no client
-// identity, while that ledger is keyed by connection ID.
+// /new to remove the initiator's precise lifecycle reference: SessionBinding has no client
+// identity, while BindingRegistry is keyed by connection ID.
 type clientIDContextKey struct{}
 
 // WithClientID 把连接句柄挂上请求 ctx。clientID 为空串时不包装(等价无连接身份

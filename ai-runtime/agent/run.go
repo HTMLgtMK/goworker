@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,32 @@ type RunResult struct {
 	State     RunState
 	Err       error
 	Persisted bool
+}
+
+// RunIdentity is the immutable, manager-issued identity for one managed Run.
+// Its context key is private; callers can inspect the identity but cannot forge it.
+type RunIdentity struct {
+	SessionID string
+	RunID     string
+}
+
+type runIdentityContextKey struct{}
+
+func withRunIdentity(ctx context.Context, sessionID, runID string) context.Context {
+	return context.WithValue(ctx, runIdentityContextKey{}, RunIdentity{SessionID: sessionID, RunID: runID})
+}
+
+// RunIdentityFromContext returns the identity installed by SessionManager for a
+// managed Run. Unmanaged calls and malformed identities fail closed.
+func RunIdentityFromContext(ctx context.Context) (RunIdentity, bool) {
+	if ctx == nil {
+		return RunIdentity{}, false
+	}
+	identity, ok := ctx.Value(runIdentityContextKey{}).(RunIdentity)
+	if !ok || strings.TrimSpace(identity.SessionID) == "" || strings.TrimSpace(identity.RunID) == "" {
+		return RunIdentity{}, false
+	}
+	return identity, true
 }
 
 // AgentRun 记录一次会话执行，以独立 RunID 标识，可用于查询、等待和取消。
@@ -95,9 +122,14 @@ func (run *AgentRun) snapshot() RunResult {
 	return res
 }
 
-// State 返回当前运行状态快照。
+// State returns the current run state snapshot.
 func (run *AgentRun) State() RunState {
 	return run.snapshot().State
+}
+
+// Done returns a channel closed when the run reaches a terminal state.
+func (run *AgentRun) Done() <-chan struct{} {
+	return run.done
 }
 
 // cancelFunc 返回运行取消函数;未设置(RecordRun 同步路径)返回 nil。

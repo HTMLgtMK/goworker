@@ -127,6 +127,15 @@ func (f *xgwLiveControl) CreateBoundSession(cwd string) (string, error) {
 	return f.sid, nil
 }
 
+func (f *xgwLiveControl) CreateBoundSessionWithRollback(cwd string) (string, func() error, error) {
+	id, err := f.CreateBoundSession(cwd)
+	if err != nil {
+		return "", nil, err
+	}
+	// This test shim creates no session resource; it exposes its pre-registered runtime.
+	return id, func() error { return nil }, nil
+}
+
 // LoadBoundSession mirror 生产二分支(单 runtime 形态):已注册(runtime id 命中)
 // → reload no-op(store 无,ReloadFromStore 本身 no-op);不在册 → 诚实未知
 // (ErrSessionUnknown 契约,handler 映射 -32000)。cwd 不动声明。
@@ -492,7 +501,7 @@ func newXGWLiveStack(t *testing.T, evaluate Evaluator, src *xgwLiveControl) *xgw
 	}
 	serverEnd, clientEnd := net.Pipe()
 	handler := NewFrontendHandlerFactory(evaluate, nil, src, NewSessionGate())().(*FrontendHandler)
-	server, err := aiacp.NewServer(serverEnd, handler)
+	server, err := aiacp.NewServer(serverEnd, handler, frontendSessionLifecycleOptions(handler)...)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -1282,24 +1291,28 @@ func TestXGWIntegrationDeviceToolBinderProbeAndDisconnectUnbind(t *testing.T) {
 	}}
 	src := newXGWLiveControl(t, "xgw-proto-dev", pv, nil)
 
-	// evaluate mirror 插件的同步 prompt 路径(commands.go handleAgent):持
-	// handler 门禁的请求 goroutine 上经 RecordRun 跑真实会话,ToolSource 用
-	// handler 注入的 binder 工具源(④ 的被测接缝)。
+	// Mirror the production synchronous prompt path: submit through SessionManager so the
+	// run receives its manager-issued identity before negotiated device tools execute.
 	evaluate := func(ctx *model.Context, input string) error {
-		rt := src.m.Get(src.sid)
-		if rt == nil {
-			return errors.New("xgw integration: no runtime")
+		reqCtx := ctx.Ctx
+		if reqCtx == nil {
+			reqCtx = context.Background()
 		}
 		cb := runtimeagent.RunCallbacks{Write: ctx.Writer, Decide: ctx.Decide}
 		if ctx.FrontendContext.EmitToken != nil {
 			cb.EmitToken = ctx.FrontendContext.EmitToken
 		}
-		res := rt.RecordRun(func(s *runtimeagent.Session) (runtimeagent.RunResult, error) {
-			return s.Run(ctx.Ctx, runtimeagent.RunRequest{
-				Input:      input,
-				ToolSource: ctx.FrontendContext.ToolSource,
-			}, cb)
-		})
+		h, err := src.m.StartRun(src.sid, runtimeagent.RunRequest{
+			Input:      input,
+			ToolSource: ctx.FrontendContext.ToolSource,
+		}, cb)
+		if err != nil {
+			return err
+		}
+		res, err := h.Wait(reqCtx)
+		if err != nil {
+			return err
+		}
 		return res.Err
 	}
 	l := newXGWLiveStack(t, evaluate, src)

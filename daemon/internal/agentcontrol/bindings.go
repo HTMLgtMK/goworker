@@ -9,21 +9,51 @@ import (
 // 锁内不做 I/O 或回调；绑定变化后的生命周期评估由调用方在锁外执行。
 // 连接绑定与引用收口的关系见 ../../docs/README.md。
 
-// BindingRegistry 是 clientID → 当前绑定 sessionID 的登记表。每条连接至多绑定
-// 一个会话（与 SessionBinding 的「本连接当前选择」语义一一对应）：改绑即替换
-// （旧会话失去该连接的引用），断连即整行清除。
 type BindingRegistry struct {
-	mu       sync.Mutex
-	byClient map[string]string // clientID → 当前绑定的 sessionID
+	mu        sync.Mutex
+	byClient  map[string]map[string]struct{} // clientID → referenced session IDs
+	bySession map[string]map[string]struct{} // sessionID → referencing client IDs
 }
 
 // NewBindingRegistry 构造空登记表。
 func NewBindingRegistry() *BindingRegistry {
-	return &BindingRegistry{byClient: make(map[string]string)}
+	return &BindingRegistry{
+		byClient:  make(map[string]map[string]struct{}),
+		bySession: make(map[string]map[string]struct{}),
+	}
 }
 
-// Bind records the connection's session and returns its previous session ID.
-// Empty client IDs are ignored; an empty session ID unbinds; repeating the same ID is a no-op.
+// BindReference adds one lifecycle reference. Duplicate bindings are idempotent.
+// Empty client or session IDs are ignored.
+func (r *BindingRegistry) BindReference(clientID, sessionID string) bool {
+	if clientID == "" || sessionID == "" {
+		return false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.byClient == nil {
+		r.byClient = make(map[string]map[string]struct{})
+	}
+	if r.bySession == nil {
+		r.bySession = make(map[string]map[string]struct{})
+	}
+	if _, ok := r.byClient[clientID][sessionID]; ok {
+		return false
+	}
+	if r.byClient[clientID] == nil {
+		r.byClient[clientID] = make(map[string]struct{})
+	}
+	if r.bySession[sessionID] == nil {
+		r.bySession[sessionID] = make(map[string]struct{})
+	}
+	r.byClient[clientID][sessionID] = struct{}{}
+	r.bySession[sessionID][clientID] = struct{}{}
+	return true
+}
+
+// Bind preserves the legacy replace-current behavior for callers that model a single
+// selected session. Lifecycle registration uses BindReference instead.
 func (r *BindingRegistry) Bind(clientID, sessionID string) (prev string) {
 	if clientID == "" {
 		return ""
@@ -31,46 +61,133 @@ func (r *BindingRegistry) Bind(clientID, sessionID string) (prev string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.byClient == nil {
-		r.byClient = make(map[string]string)
+		r.byClient = make(map[string]map[string]struct{})
 	}
-	prev = r.byClient[clientID]
-	if sessionID == "" {
-		delete(r.byClient, clientID)
+	if r.bySession == nil {
+		r.bySession = make(map[string]map[string]struct{})
+	}
+	prev = firstSortedKey(r.byClient[clientID])
+	if prev == sessionID && len(r.byClient[clientID]) == 1 {
 		return prev
 	}
-	if prev == sessionID {
-		return prev // 幂等：同一会话重复登记，引用计数不变
+	r.removeClientLocked(clientID)
+	if sessionID != "" {
+		r.addLocked(clientID, sessionID)
 	}
-	r.byClient[clientID] = sessionID
 	return prev
 }
 
-// Unbind 解除 clientID 的绑定（整行清除，不区分此前绑定的会话），返回改绑前的
-// 会话 id（未登记返回空串）。空 clientID 幂等空操作。断连收口（ReleaseConnection）
-// 与 /new 摘发起方绑定共用本方法。
-func (r *BindingRegistry) Unbind(clientID string) (prev string) {
+// ReplaceReferences preserves the single-selected-session contract while returning every
+// previous reference so lifecycle owners can recheck sessions removed by replacement.
+func (r *BindingRegistry) ReplaceReferences(clientID, sessionID string) []string {
 	if clientID == "" {
-		return ""
+		return []string{}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	prev = r.byClient[clientID]
-	delete(r.byClient, clientID)
-	return prev
+	if r.byClient == nil {
+		r.byClient = make(map[string]map[string]struct{})
+	}
+	if r.bySession == nil {
+		r.bySession = make(map[string]map[string]struct{})
+	}
+	previous := sortedKeys(r.byClient[clientID])
+	r.removeClientLocked(clientID)
+	if sessionID != "" {
+		r.addLocked(clientID, sessionID)
+	}
+	return previous
 }
 
-// Bindings 返回当前绑定在 sessionID 上的全部连接 id（升序拷贝，调用方可安全
-// 持有/遍历）。无绑定返回空切片（非 nil，len 判定即「引用归零」）。这是生命周期
-// 归零判定与 state=active 判定的取数点。
+// UnbindReference removes only the requested client/session relationship.
+func (r *BindingRegistry) UnbindReference(clientID, sessionID string) bool {
+	if clientID == "" || sessionID == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.byClient[clientID][sessionID]; !ok {
+		return false
+	}
+	r.removeLocked(clientID, sessionID)
+	return true
+}
+
+// UnbindAll removes all lifecycle references held by a client and returns their session IDs
+// in sorted order. Locks protect only the ledger update; callers perform lifecycle work later.
+func (r *BindingRegistry) UnbindAll(clientID string) []string {
+	if clientID == "" {
+		return []string{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sessions := sortedKeys(r.byClient[clientID])
+	r.removeClientLocked(clientID)
+	return sessions
+}
+
+// Unbind retains the legacy all-references behavior and returns one prior session ID.
+// Callers that need exact cleanup should use UnbindReference; disconnect uses UnbindAll.
+func (r *BindingRegistry) Unbind(clientID string) (prev string) {
+	sessions := r.UnbindAll(clientID)
+	if len(sessions) > 0 {
+		return sessions[0]
+	}
+	return ""
+}
+
+// Bindings returns all client IDs referencing sessionID as a sorted copy.
 func (r *BindingRegistry) Bindings(sessionID string) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]string, 0, 2)
-	for client, sid := range r.byClient {
-		if sid == sessionID {
-			out = append(out, client)
+	return sortedKeys(r.bySession[sessionID])
+}
+
+func (r *BindingRegistry) addLocked(clientID, sessionID string) {
+	if r.byClient[clientID] == nil {
+		r.byClient[clientID] = make(map[string]struct{})
+	}
+	if r.bySession[sessionID] == nil {
+		r.bySession[sessionID] = make(map[string]struct{})
+	}
+	r.byClient[clientID][sessionID] = struct{}{}
+	r.bySession[sessionID][clientID] = struct{}{}
+}
+
+func (r *BindingRegistry) removeLocked(clientID, sessionID string) {
+	delete(r.byClient[clientID], sessionID)
+	if len(r.byClient[clientID]) == 0 {
+		delete(r.byClient, clientID)
+	}
+	delete(r.bySession[sessionID], clientID)
+	if len(r.bySession[sessionID]) == 0 {
+		delete(r.bySession, sessionID)
+	}
+}
+
+func (r *BindingRegistry) removeClientLocked(clientID string) {
+	for sessionID := range r.byClient[clientID] {
+		delete(r.bySession[sessionID], clientID)
+		if len(r.bySession[sessionID]) == 0 {
+			delete(r.bySession, sessionID)
 		}
 	}
-	sort.Strings(out)
-	return out
+	delete(r.byClient, clientID)
+}
+
+func firstSortedKey(values map[string]struct{}) string {
+	keys := sortedKeys(values)
+	if len(keys) > 0 {
+		return keys[0]
+	}
+	return ""
+}
+
+func sortedKeys(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }

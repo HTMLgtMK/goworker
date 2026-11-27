@@ -61,19 +61,34 @@ func (p *AgentPlugin) onSessionRunDone(sessionID string) {
 	p.tryReleaseSessionLocked(sessionID)
 }
 
-// BindConnectionSession records the connection's selected session and rechecks its previous
-// session for release. It is serialized by lifecycleMu and is a no-op without control.
+// BindConnectionSession preserves the legacy single-selected-session replacement behavior.
+// Multi-session frontends use BindConnectionSessionReference instead.
 func (p *AgentPlugin) BindConnectionSession(clientID, sessionID string) {
 	if p.control == nil {
 		return
 	}
 	p.lifecycleMu.Lock()
 	defer p.lifecycleMu.Unlock()
+	p.replaceConnectionSessionLocked(clientID, sessionID)
+}
+
+// BindConnectionSessionReference adds one lifecycle reference without releasing sessions
+// previously loaded by this client. Routing selection remains frontend-owned.
+func (p *AgentPlugin) BindConnectionSessionReference(clientID, sessionID string) {
+	if p.control == nil {
+		return
+	}
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if sessionID == "" {
+		p.unbindConnectionSessionsLocked(clientID)
+		return
+	}
 	p.bindConnectionSessionLocked(clientID, sessionID)
 }
 
-// BindConnectionSessionGuarded linearizes a connection binding against disconnect.
-// allowBind must be a non-blocking state check and must not acquire lifecycle locks.
+// BindConnectionSessionGuarded preserves replacement semantics and linearizes a bind against
+// disconnect. allowBind must be a non-blocking state check and must not acquire lifecycle locks.
 func (p *AgentPlugin) BindConnectionSessionGuarded(clientID, sessionID string, allowBind func() bool) bool {
 	if p.control == nil {
 		return false
@@ -84,15 +99,55 @@ func (p *AgentPlugin) BindConnectionSessionGuarded(clientID, sessionID string, a
 		p.tryReleaseSessionLocked(sessionID)
 		return false
 	}
+	p.replaceConnectionSessionLocked(clientID, sessionID)
+	return true
+}
+
+// BindConnectionSessionReferenceGuarded adds a reference only if the connection is still open.
+func (p *AgentPlugin) BindConnectionSessionReferenceGuarded(clientID, sessionID string, allowBind func() bool) bool {
+	if p.control == nil {
+		return false
+	}
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if allowBind == nil || !allowBind() {
+		p.tryReleaseSessionLocked(sessionID)
+		return false
+	}
+	if sessionID == "" {
+		p.unbindConnectionSessionsLocked(clientID)
+		return true
+	}
 	p.bindConnectionSessionLocked(clientID, sessionID)
 	return true
 }
 
-func (p *AgentPlugin) bindConnectionSessionLocked(clientID, sessionID string) {
-	prev := p.control.BindSession(clientID, sessionID)
-	if prev != "" && prev != sessionID {
-		p.tryReleaseSessionLocked(prev)
+func (p *AgentPlugin) replaceConnectionSessionLocked(clientID, sessionID string) {
+	for _, previousID := range p.control.ReplaceSessionReferences(clientID, sessionID) {
+		p.tryReleaseSessionLocked(previousID)
 	}
+}
+
+func (p *AgentPlugin) unbindConnectionSessionsLocked(clientID string) {
+	for _, sessionID := range p.control.UnbindSessionReferences(clientID) {
+		p.tryReleaseSessionLocked(sessionID)
+	}
+}
+
+func (p *AgentPlugin) bindConnectionSessionLocked(clientID, sessionID string) {
+	p.control.BindSessionReference(clientID, sessionID)
+}
+
+// UnbindConnectionSession removes a single reference and rechecks its lifecycle while holding
+// the same lock used by bind and disconnect, so a concurrent rebind cannot be lost.
+func (p *AgentPlugin) UnbindConnectionSession(clientID, sessionID string) {
+	if p.control == nil {
+		return
+	}
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	p.control.UnbindSessionReference(clientID, sessionID)
+	p.tryReleaseSessionLocked(sessionID)
 }
 
 // tryReleaseSession evaluates release after unbinding or run completion. Bindings and current
@@ -134,7 +189,7 @@ func (p *AgentPlugin) tryReleaseSessionLocked(sessionID string) {
 	}
 	p.clearSuspendedRelease(sessionID)
 
-	p.manager.Remove(sessionID)
+	_ = p.manager.RemoveRuntime(rt)
 	// Close events before the store so no late publisher reaches a closed journal.
 	rt.CloseEvents()
 	// store 收口:同 id 重建窗口(纯内存 /new 的 Register 冲突、会话边界的同 id

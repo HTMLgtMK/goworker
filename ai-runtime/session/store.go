@@ -30,8 +30,11 @@ type Checkpoint struct {
 // Metadata identifies one logical conversation. The identity is immutable for
 // the lifetime of a JSONL file and is independent from its mutable head.
 type Metadata struct {
-	SessionID string    `json:"session_id"`
-	CreatedAt time.Time `json:"created_at"`
+	SessionID string            `json:"session_id"`
+	CreatedAt time.Time         `json:"created_at"`
+	UpdatedAt time.Time         `json:"updated_at,omitempty"`
+	Values    map[string]string `json:"metadata,omitempty"`
+	Workspace string            `json:"workspace,omitempty"`
 }
 
 // ErrStoreLocked 表示会话目录的跨进程文件锁已被占用，调用方可用 errors.Is 判定。
@@ -125,9 +128,11 @@ func Open(dir string) (*Store, error) {
 			content = data
 		}
 		firstID := firstNodeID(recs)
+		createdAt := time.Now()
 		metadata = Metadata{
 			SessionID: legacySessionID(firstID, content),
-			CreatedAt: time.Now(),
+			CreatedAt: createdAt,
+			UpdatedAt: createdAt,
 		}
 		if firstID == "" && len(content) == 0 {
 			metadata.SessionID = NewSessionID()
@@ -146,7 +151,7 @@ func Open(dir string) (*Store, error) {
 		// Metadata is append-only and written exactly once. Old files are
 		// migrated in place so subsequent archive/reopen operations retain the
 		// same logical identity.
-		metadataRec := newMetadataRecord(metadata.SessionID, metadata.CreatedAt)
+		metadataRec := newMetadataRecord(metadata.SessionID, metadata.CreatedAt, metadata.UpdatedAt, metadata.Values)
 		if err := s.appendRecord(metadataRec); err != nil {
 			_ = f.Close()
 			_ = releaseDirLock(lock)
@@ -681,10 +686,20 @@ func checkpointsFromRecords(recs []Record, limit int) []Checkpoint {
 func metadataFromRecords(recs []Record) (Metadata, bool) {
 	for _, r := range recs {
 		if r.Kind == kindMetadata && r.Meta != nil && r.Meta.SessionID != "" {
-			return Metadata{SessionID: r.Meta.SessionID, CreatedAt: r.Meta.CreatedAt}, true
+			return Metadata{SessionID: r.Meta.SessionID, CreatedAt: r.Meta.CreatedAt, UpdatedAt: metadataUpdatedAt(r.Meta), Values: cloneStringMap(r.Meta.Values)}, true
 		}
 	}
 	return Metadata{}, false
+}
+
+func metadataUpdatedAt(metadata *metadataFields) time.Time {
+	if metadata != nil && metadata.UpdatedAt != nil && !metadata.UpdatedAt.IsZero() {
+		return *metadata.UpdatedAt
+	}
+	if metadata == nil {
+		return time.Time{}
+	}
+	return metadata.CreatedAt
 }
 
 // workspaceFromRecords 返回最后一条 workspace 记录声明的路径（last-wins，

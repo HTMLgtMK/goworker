@@ -4,6 +4,8 @@ package session
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +20,10 @@ import (
 // Repository 级 sentinel 错误。调用方用 errors.Is 判定。
 var (
 	// ErrSessionNotFound：id 无法解析到任何会话（目录与 legacy 槽都不命中，或 id 非法）。
-	ErrSessionNotFound = errors.New("session: session not found")
+	ErrSessionNotFound      = errors.New("session: session not found")
+	ErrSessionAlreadyExists = errors.New("session: session already exists")
+	// ErrLockUnavailable signals that this platform cannot provide safe file locking.
+	ErrLockUnavailable = errors.New("session: cross-process locking unavailable")
 	// ErrSessionInUse：id 的 Store 仍在本 Repository 的 open 缓存中，拒绝删除。
 	ErrSessionInUse = errors.New("session: session in use")
 	// ErrLegacyImmutable prevents deleting the only copy of a legacy root session.
@@ -32,13 +37,15 @@ var (
 	ErrRunExists = errors.New("session: run journal already exists")
 )
 
-// CreateOptions 是 Create 的选项。Title 仅作接口占位：本层不持久化
-// （不新增 metadata.json，避免第二个身份事实源）——标题由清单方按需扫描
-// 首条 user 消息得出。CWD 已接通：cwd 兼任 workspace，
-// Create 以 workspace 记录「创建即声明」持久化到会话 jsonl。
+// CreateOptions 是 Create 的选项。Title 仅作接口占位：本层不持久化标题，
+// 标题由清单方按需扫描首条 user 消息得出。CWD 以 workspace 记录持久化；
+// Metadata 是可选 ai-session 元数据，写在同一 JSONL metadata 行。
 type CreateOptions struct {
-	Title string
-	CWD   string
+	Title     string
+	CWD       string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	Metadata  map[string]string
 }
 
 // Repository 管理一个会话根目录下的全部会话存储。
@@ -50,8 +57,12 @@ type Repository struct {
 }
 
 // OpenRepository 打开会话根目录仓库。目录不存在则创建（对齐 store.Open 的
-// MkdirAll + Chmod，store.go:52-57），权限收紧到 0700。
+// MkdirAll + Chmod，store.go:52-57），权限收紧到 0700。平台未提供锁实现时，
+// 在触碰持久目录前失败关闭。
 func OpenRepository(root string) (*Repository, error) {
+	if err := requireLockSupport(); err != nil {
+		return nil, fmt.Errorf("session: open repository: %w", err)
+	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("session: create repo root %s: %w", root, err)
 	}
@@ -61,54 +72,154 @@ func OpenRepository(root string) (*Repository, error) {
 	return &Repository{root: root, open: make(map[string]*Store)}, nil
 }
 
-// Create 新建一个会话：id = session.NewSessionID()，确认 <root>/<id>/ 不存在后
-// 种入首行 metadata（保证目录名 == 文件内 SessionID，见文件头「附加不变量」），
-// CWD 非空时追加 workspace 记录（「创建即声明」），再 Open 该目录并进
-// 缓存。返回的 Store 的 SessionID() 即新会话 id。
+// lockSessionID acquires a stable repository-level lock for id. The lock directory lives
+// outside the removable session directory, so failed creates and deletes never unlink a
+// lock inode another Repository may already be waiting on.
+func (r *Repository) lockSessionID(id string) (func(), error) {
+	return r.lockSessionIDContext(context.Background(), id)
+}
+
+func (r *Repository) lockSessionIDContext(ctx context.Context, id string) (func(), error) {
+	if ctx == nil {
+		return nil, errors.New("session: nil lock context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	lockRoot := filepath.Join(r.root, ".repository-locks")
+	if err := os.MkdirAll(lockRoot, 0o700); err != nil {
+		return nil, fmt.Errorf("session: create repository lock dir: %w", err)
+	}
+	hash := sha256.Sum256([]byte(id))
+	lockDir := filepath.Join(lockRoot, hex.EncodeToString(hash[:]))
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		return nil, fmt.Errorf("session: create lock for %q: %w", id, err)
+	}
+	lock, err := acquireDirLockContext(ctx, lockDir)
+	if err != nil {
+		return nil, fmt.Errorf("session: lock repository ID %q: %w", id, err)
+	}
+	return func() {
+		if err := releaseDirLock(lock); err != nil {
+			slog.Warn("session: release repository ID lock failed", "id", id, "err", err)
+		}
+	}, nil
+}
+
+// Create 新建一个随机 ID 会话。指定 ID 的事务语义由 CreateWithID 统一实现。
 func (r *Repository) Create(ctx context.Context, opts CreateOptions) (*Store, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	return r.CreateWithID(ctx, NewSessionID(), opts)
+}
 
-	// Title is ignored; an empty CWD leaves the workspace undeclared.
-	// The host may inject a temporary execution directory without persisting it.
-	_ = opts.Title
+// CreateWithID persists one session at exactly id. An exclusive repository-level ID lock
+// coordinates publication and rollback with Open, List, and Delete across Repository instances.
+// CreateOptions.CWD is already validated by the caller; Metadata["cwd"] remains opaque unless
+// the caller explicitly supplies CWD. The repository does not authorize workspace paths.
+func (r *Repository) CreateWithID(ctx context.Context, id string, opts CreateOptions) (*Store, error) {
+	return r.createWithID(ctx, id, opts, Open)
+}
 
-	id := NewSessionID()
-	dir := filepath.Join(r.root, id)
-	if _, err := os.Stat(dir); err == nil {
-		// 128-bit 随机 id 撞名概率可忽略；真撞了让调用方重试一次 Create 即可。
-		return nil, fmt.Errorf("session: create %s: dir already exists", dir)
-	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("session: create %s: %w", dir, err)
-	}
-
-	if err := seedSessionMetadata(dir, id); err != nil {
+func (r *Repository) createWithID(ctx context.Context, id string, opts CreateOptions, openStore func(string) (*Store, error)) (*Store, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	s, err := Open(dir)
+	if !validSessionID(id) {
+		return nil, fmt.Errorf("session: create %q: %w", id, ErrSessionNotFound)
+	}
+	if opts.CreatedAt.IsZero() {
+		opts.CreatedAt = time.Now().UTC()
+	}
+	if opts.UpdatedAt.IsZero() {
+		opts.UpdatedAt = opts.CreatedAt
+	}
+	values := cloneStringMap(opts.Metadata)
+	cwd := opts.CWD
+	if cwd != "" {
+		if values == nil {
+			values = make(map[string]string)
+		}
+		values[aiSessionCWDMetadataKey] = cwd
+	}
+	_ = opts.Title // Title is derived from conversation content, not persisted as identity metadata.
+
+	unlockID, err := r.lockSessionIDContext(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	if opts.CWD != "" {
-		if err := s.DeclareWorkspace(opts.CWD); err != nil {
-			_ = s.Close()
-			return nil, fmt.Errorf("session: create %s: %w", id, err)
-		}
+	defer unlockID()
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
-	// 防御性双检：全新随机 id 正常不会已有实例；万一命中以先注册者为准。
 	r.mu.Lock()
-	existing, ok := r.open[id]
-	if !ok {
-		r.open[id] = s
+	defer r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	r.mu.Unlock()
-	if ok {
-		closeLoser(s)
-		return existing, nil
+	if _, exists := r.open[id]; exists {
+		return nil, fmt.Errorf("session: create %s: %w", id, ErrSessionAlreadyExists)
 	}
-	return s, nil
+	if m, ok := resolveSlotMetadata(filepath.Join(r.root, "current.jsonl")); ok && m.SessionID == id {
+		return nil, fmt.Errorf("session: create %s: %w", id, ErrSessionAlreadyExists)
+	}
+
+	dir := filepath.Join(r.root, id)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		if os.IsExist(err) {
+			return nil, fmt.Errorf("session: create %s: %w", dir, ErrSessionAlreadyExists)
+		}
+		return nil, fmt.Errorf("session: create dir %s: %w", dir, err)
+	}
+	created := true
+	var store *Store
+	cleanup := func(cause error) (*Store, error) {
+		if store != nil {
+			if closeErr := store.Close(); closeErr != nil {
+				cause = errors.Join(cause, fmt.Errorf("session: close failed create %s: %w", id, closeErr))
+			}
+		}
+		if created {
+			if removeErr := os.RemoveAll(dir); removeErr != nil {
+				cause = errors.Join(cause, fmt.Errorf("session: clean failed create %s: %w", id, removeErr))
+			}
+		}
+		return nil, cause
+	}
+
+	if err := ctx.Err(); err != nil {
+		return cleanup(err)
+	}
+	if err := seedSessionMetadata(dir, id, opts.CreatedAt, opts.UpdatedAt, values); err != nil {
+		return cleanup(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return cleanup(err)
+	}
+	store, err = openStore(dir)
+	if err != nil {
+		return cleanup(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return cleanup(err)
+	}
+	if cwd != "" {
+		if err := store.DeclareWorkspace(cwd); err != nil {
+			return cleanup(fmt.Errorf("session: create %s: %w", id, err))
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return cleanup(err)
+	}
+
+	r.open[id] = store
+	created = false
+	return store, nil
 }
 
 // Open resolves an ID to a session directory or the legacy root slot, then caches
@@ -119,6 +230,11 @@ func (r *Repository) Open(id string) (*Store, error) {
 	if !validSessionID(id) {
 		return nil, fmt.Errorf("session: open %q: %w", id, ErrSessionNotFound)
 	}
+	unlockID, err := r.lockSessionID(id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockID()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -180,10 +296,20 @@ func (r *Repository) List(ctx context.Context) ([]Metadata, error) {
 	}
 	var out []Metadata
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || e.Name() == ".repository-locks" || e.Name() == ".repository-tombstones" {
 			continue
 		}
-		if m, ok := resolveSlotMetadata(resolveDataFilePath(filepath.Join(r.root, e.Name()))); ok {
+		unlockID, err := r.lockSessionIDContext(ctx, e.Name())
+		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			unlockID()
+			return nil, err
+		}
+		m, ok := resolveSlotMetadata(resolveDataFilePath(filepath.Join(r.root, e.Name())))
+		unlockID()
+		if ok {
 			out = append(out, m)
 		}
 	}
@@ -206,25 +332,82 @@ func (r *Repository) Delete(ctx context.Context, id string) error {
 	if !validSessionID(id) {
 		return fmt.Errorf("session: delete %q: %w", id, ErrSessionNotFound)
 	}
+	unlockID, err := r.lockSessionIDContext(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlockID()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	r.mu.Lock()
 	_, inUse := r.open[id]
 	r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if inUse {
 		return fmt.Errorf("session: delete %s: %w", id, ErrSessionInUse)
 	}
 
 	dir := filepath.Join(r.root, id)
 	if _, err := os.Stat(dir); err == nil {
-		if err := os.RemoveAll(dir); err != nil {
-			return fmt.Errorf("session: delete %s: %w", id, err)
+		storeLock, err := acquireDirLock(dir)
+		if errors.Is(err, ErrStoreLocked) {
+			return fmt.Errorf("session: delete %s: %w", id, ErrSessionInUse)
 		}
-		return nil
+		if err != nil {
+			return fmt.Errorf("session: lock before delete %s: %w", id, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return errors.Join(err, releaseDirLock(storeLock))
+		}
+
+		tombstoneRoot := filepath.Join(r.root, ".repository-tombstones")
+		if err := os.MkdirAll(tombstoneRoot, 0o700); err != nil {
+			_ = releaseDirLock(storeLock)
+			return fmt.Errorf("session: create tombstone dir: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return errors.Join(err, releaseDirLock(storeLock))
+		}
+		tombstone, err := os.MkdirTemp(tombstoneRoot, "deleted-")
+		if err != nil {
+			_ = releaseDirLock(storeLock)
+			return fmt.Errorf("session: reserve delete tombstone: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return errors.Join(
+				err,
+				releaseDirLock(storeLock),
+				wrapRepositoryCleanupError("remove unused delete tombstone", os.RemoveAll(tombstone)),
+			)
+		}
+		retired := filepath.Join(tombstone, "store")
+		if err := os.Rename(dir, retired); err != nil {
+			_ = releaseDirLock(storeLock)
+			_ = os.RemoveAll(tombstone)
+			return fmt.Errorf("session: detach session %s for delete: %w", id, err)
+		}
+		unlockStoreErr := releaseDirLock(storeLock)
+		removeErr := os.RemoveAll(tombstone)
+		return errors.Join(
+			wrapRepositoryCleanupError("release deleted store lock", unlockStoreErr),
+			wrapRepositoryCleanupError("remove deleted store", removeErr),
+		)
 	}
 	if m, ok := resolveSlotMetadata(filepath.Join(r.root, "current.jsonl")); ok && m.SessionID == id {
 		return fmt.Errorf("session: delete %s: %w", id, ErrLegacyImmutable)
 	}
 	return fmt.Errorf("session: delete %s: %w", id, ErrSessionNotFound)
+}
+
+func wrapRepositoryCleanupError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("session: %s: %w", operation, err)
 }
 
 // Close 关闭 open 缓存中的全部 Store（逐个 Store.Close，store.go:134-148）并清空
@@ -278,11 +461,11 @@ func (r *Repository) CloseSession(id string) error {
 // the logical ID to the directory name. It uses the v2 filename for session-shaped
 // directories and the legacy filename otherwise; JSONL bytes and 0600 permissions match
 // Store.appendRecord so Store.Open can take over safely.
-func seedSessionMetadata(dir, id string) error {
+func seedSessionMetadata(dir, id string, createdAt, updatedAt time.Time, values map[string]string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("session: create dir %s: %w", dir, err)
 	}
-	data, err := json.Marshal(newMetadataRecord(id, time.Now()))
+	data, err := json.Marshal(newMetadataRecord(id, createdAt, updatedAt, values))
 	if err != nil {
 		return fmt.Errorf("session: marshal seed metadata: %w", err)
 	}
@@ -304,6 +487,7 @@ func resolveSlotMetadata(path string) (Metadata, bool) {
 		return Metadata{}, false
 	}
 	if m, ok := metadataFromRecords(recs); ok && m.SessionID != "" {
+		m.Workspace = workspaceFromRecords(recs)
 		return m, true
 	}
 	content, readErr := os.ReadFile(path)
@@ -317,6 +501,8 @@ func resolveSlotMetadata(path string) (Metadata, bool) {
 	return Metadata{
 		SessionID: legacySessionID(firstID, content),
 		CreatedAt: timeFromRecords(recs),
+		UpdatedAt: timeFromRecords(recs),
+		Workspace: workspaceFromRecords(recs),
 	}, true
 }
 

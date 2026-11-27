@@ -217,52 +217,67 @@ func callbacksFromPlugin(ctx *model.Context) runtimeagent.RunCallbacks {
 // ---- /new 命令 ----
 
 func (p *AgentPlugin) handleNew(ctx *model.Context) error {
+	if ctx != nil && ctx.Ctx != nil && agentcontrol.BindingFromCtx(ctx.Ctx) != nil {
+		return fmt.Errorf("agent: /new is not supported in an ACP prompt; use the standard ACP session/new method")
+	}
 	return p.withSession(ctx.Ctx, func(runCtx context.Context) error {
 		runContext := withPluginContext(ctx, runCtx)
-		// 结束当前会话：用新实例替换旧实例，旧会话状态（conversation/usage）随对象回收。
-		// 同步固化旧会话（阻塞，状态栏显示进度）；快照走只读，先取好再重建。
+		// A dangling Binding is an explicit error: falling back to current here could
+		// create a session for a different connection's selected workspace.
 		oldRT, rtErr := p.sessionRuntimeIn(runCtx)
 		if rtErr != nil {
-			// Binding 悬空(指向的会话已被收口)诚实失败:无可换轨的会话,不静默
-			// 回落 current——那会把别人(或新会话)的工作区卷进本连接的 /new。
 			return rtErr
 		}
 		var old *runtimeagent.Session
 		if oldRT != nil {
 			old = oldRT.Session()
 		}
-		// 会话 store 经同一 runtime 解析(storeFor):快照落在 startSession
-		// 换轨前的同一实例上。
 		oldStore := p.storeFor(oldRT)
 
-		// pending 快照（store 生效时用游标后的增量，否则全量）。/new 不再轮转
-		// 旧 store，快照的「归档前取出」次序约束消失，
-		// 仍在此处先取——CheckpointSync 消费的是换轨前捕获的同一份增量。
+		// Capture pending conversation before selecting the new runtime. Creating a
+		// session must not archive, rotate, or otherwise mutate the old persisted record.
 		var pending []core.Message
 		if oldStore != nil {
 			pending = oldStore.PendingAfterCursor()
 			if len(pending) == 0 && old != nil {
-				pending = old.Conversation() // 兜底全量
+				pending = old.Conversation()
 			}
 		} else if old != nil {
 			pending = old.Conversation()
 		}
 		consolidate := p.memory != nil && len(pending) > 0
 
+		cwd := ""
+		if oldRT != nil {
+			if declared, err := oldRT.DeclaredCWD(); err == nil && !isTmpWorkspacePath(declared) {
+				cwd = declared
+			}
+		}
+		newID, rollback, err := p.CreateBoundSessionWithRollback(cwd)
+		if err != nil {
+			return fmt.Errorf("agent: /new create session: %w", err)
+		}
+		newRT := p.manager.Get(newID)
+		if newRT == nil {
+			rollbackErr := rollback()
+			return errors.Join(
+				fmt.Errorf("agent: /new created session %q without an attached runtime", newID),
+				rollbackErr,
+			)
+		}
+		if err := p.swapCurrentRuntime(newRT); err != nil {
+			return errors.Join(
+				fmt.Errorf("agent: /new select session %q: %w", newID, err),
+				rollback(),
+			)
+		}
+
 		if p.memory == nil {
 			runContext.Writer("✔ New session started (memory disabled)\n")
 		} else {
 			runContext.Writer("✔ New session started\n")
 		}
-
-		// /new creates a fresh session and leaves the old persisted session unchanged.
-		// Archiving is explicit; /new does not archive or rotate the old session.
-
-		// 创建新会话（新对象 = 新会话，旧状态随对象回收）。startSession
-		// 经 Repository.Create 产出独立目录新会话（<Session.Dir>/<id>/）。
-		p.startSession()
-
-		runContext.Writer("✔ STM cleared, memory will be retrieved on every query\n")
+		runContext.Writer("✔ STM cleared, memory will be retrieved on every query\\n")
 
 		// Background consolidation survives disconnects and cancellation; failures are reported through callbacks.
 		if consolidate {
@@ -273,12 +288,14 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 			}()
 		}
 
-		// Remove this connection's binding, then retire the old runtime only when no references or runs remain.
-		if clientID := agentcontrol.ClientIDFromCtx(runCtx); clientID != "" && p.control != nil {
-			p.control.UnbindSession(clientID)
-		}
+		// Detach only this caller's prior lifecycle reference. Other connections and
+		// active runs keep their existing session/runtime alive.
 		if oldRT != nil {
-			p.tryReleaseSession(oldRT.ID)
+			if clientID := agentcontrol.ClientIDFromCtx(runCtx); clientID != "" && p.control != nil {
+				p.UnbindConnectionSession(clientID, oldRT.ID)
+			} else {
+				p.tryReleaseSession(oldRT.ID)
+			}
 		}
 
 		// /new clears only the initiating connection's selection. It does not cancel runs or release the control lease.

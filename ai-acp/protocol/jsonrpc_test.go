@@ -63,6 +63,38 @@ func TestNewConnNilTransportPanics(t *testing.T) {
 	NewConn(nil)
 }
 
+type failingMarshalHookResult struct {
+	failed chan struct{}
+}
+
+func (failingMarshalHookResult) MarshalJSON() ([]byte, error) {
+	return nil, errors.New("marshal failure")
+}
+
+func (failingMarshalHookResult) AfterResponseWritten(context.Context) {}
+
+func (r failingMarshalHookResult) AfterResponseWriteFailed(context.Context) {
+	close(r.failed)
+}
+
+func TestConn_PostWriteFailureHookRunsWhenResultEncodingFails(t *testing.T) {
+	server, client := pipeConns(t)
+	failed := make(chan struct{})
+	server.Handle("fail-marshal", func(context.Context, json.RawMessage) (any, error) {
+		return failingMarshalHookResult{failed: failed}, nil
+	})
+
+	var rpcErr *RPCError
+	if err := client.Call(context.Background(), "fail-marshal", nil, nil); !errors.As(err, &rpcErr) || rpcErr.Code != CodeInternalError {
+		t.Fatalf("Call error = %v, want internal error", err)
+	}
+	select {
+	case <-failed:
+	case <-time.After(time.Second):
+		t.Fatal("response failure hook was not called")
+	}
+}
+
 func TestConn_CallRoundtrip(t *testing.T) {
 	server, client := pipeConns(t)
 	server.Handle("echo", func(_ context.Context, params json.RawMessage) (any, error) {

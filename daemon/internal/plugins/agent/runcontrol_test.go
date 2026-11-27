@@ -561,6 +561,7 @@ func TestCrossSessionRunControl(t *testing.T) {
 	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
 	p := newPersistedPlugin(t, gated)
 	sidA := p.CurrentSessionID()
+	p.BindConnectionSessionReference("conn-A", sidA)
 
 	// fencing(第三轮评审 I4):两连接各持各会话的 lease。
 	p.AcquireControl(sidA, "conn-A")
@@ -642,6 +643,7 @@ func TestCrossSessionRunControl(t *testing.T) {
 func TestCrossSessionRequestIdempotency(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "idem-A"})
 	sidA := p.CurrentSessionID()
+	p.BindConnectionSessionReference("conn-A", sidA)
 	p.AcquireControl(sidA, "conn-A") // fencing(第三轮评审 I4):控制操作须持 lease
 
 	// A 用 req-x 提交并等终态:后续判定不被 queued/running 时序干扰。
@@ -694,6 +696,7 @@ func TestCrossSessionRequestIdempotency(t *testing.T) {
 func TestCrossSessionApprovalOwnership(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "approval-A"})
 	sidA := p.CurrentSessionID()
+	p.BindConnectionSessionReference("conn-A", sidA)
 	sidB := newPersistedSession(t, p, fixedProvider{content: "approval-B"})
 	// fencing(第三轮评审 I4):两连接各持各会话的 lease(① 声明 sidA、②③④⑤
 	// 声明 sidB 的调用形,均以持照连接发起)。
@@ -776,6 +779,7 @@ func TestActiveRunNonCurrentSession(t *testing.T) {
 	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
 	p := newPersistedPlugin(t, gated)
 	sidA := p.CurrentSessionID()
+	p.BindConnectionSessionReference("conn-A", sidA)
 	p.AcquireControl(sidA, "conn-A") // fencing(第三轮评审 I4):控制操作须持 lease
 
 	// A 的后台 run 提交并等它真实开工(started 关闭 ⇒ run 已 running)。
@@ -1073,6 +1077,7 @@ func TestCrossSessionStartRunNotBlockedByFsync(t *testing.T) {
 	if got := p.CurrentSessionID(); got != sidA {
 		t.Fatalf("refreshSession changed session id = %q, want %q", got, sidA)
 	}
+	p.BindConnectionSessionReference("conn-A", sidA)
 
 	if p.AcquireControl(sidA, "conn-A") {
 		t.Fatal("test setup: fresh acquire must not report takeover")

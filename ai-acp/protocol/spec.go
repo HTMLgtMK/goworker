@@ -81,10 +81,10 @@ type LoadSessionRequest struct {
 	McpServers []map[string]any `json:"mcpServers"`
 }
 
-// LoadSessionResponse 是 load 成功响应。按 ACP 只含可选的 modes；handler 未提供
-// modes（SessionModesProvider 未实现或返回 nil）时序列化为 {}。
+// LoadSessionResponse is the successful response to session/load.
 type LoadSessionResponse struct {
 	Modes *SessionModeState `json:"modes,omitempty"`
+	Meta  map[string]any    `json:"_meta,omitempty"`
 }
 
 // ---- session/modes（只显示不切换）----
@@ -138,6 +138,7 @@ type NewSessionRequest struct {
 type NewSessionResponse struct {
 	SessionID string            `json:"sessionId"`
 	Modes     *SessionModeState `json:"modes,omitempty"`
+	Meta      map[string]any    `json:"_meta,omitempty"`
 }
 
 // ---- session/prompt ----

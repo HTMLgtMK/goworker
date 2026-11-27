@@ -182,13 +182,17 @@ func (p *AgentPlugin) HoldControl(sessionID, connectionID string) bool {
 	return p.control.HoldControl(sessionID, connectionID)
 }
 
-// ReleaseConnection releases every lease and binding owned by the connection, then checks
-// the returned previous session for lifecycle release. Active runs keep that session alive
-// until the terminal-run callback rechecks it.
+// ReleaseConnection releases every lease and binding owned by the connection, then rechecks
+// every affected session after the agentcontrol ledger locks are released. Active runs suspend
+// their own release until the terminal-run callback rechecks them.
 func (p *AgentPlugin) ReleaseConnection(connectionID string) {
-	prev := p.control.ReleaseConnection(connectionID)
-	if prev != "" {
-		p.tryReleaseSession(prev)
+	if p.control == nil {
+		return
+	}
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	for _, sessionID := range p.control.ReleaseConnectionSessions(connectionID) {
+		p.tryReleaseSessionLocked(sessionID)
 	}
 }
 

@@ -272,7 +272,7 @@ func TestUnauthorizedACPPromptCannotChangeDaemonProviderConfig(t *testing.T) {
 		t.Helper()
 		serverConn, clientConn := net.Pipe()
 		handler := NewFrontendHandlerFactory(e.Eval, e.Commands, sessions, NewSessionGate(), func(string) bool { return allowed })().(*FrontendHandler)
-		server, err := aiacp.NewServer(serverConn, handler)
+		server, err := aiacp.NewServer(serverConn, handler, frontendSessionLifecycleOptions(handler)...)
 		if err != nil {
 			t.Fatalf("NewServer: %v", err)
 		}
@@ -457,7 +457,7 @@ func newProviderWireStack(t *testing.T, authorizer ProviderWriteAuthorizer) (*pr
 	base, backend := newProviderControlHandler()
 	serverConn, clientConn := net.Pipe()
 	handler := NewFrontendHandlerFactory(nil, nil, base.sessions, NewSessionGate(), authorizer)().(*FrontendHandler)
-	server, err := aiacp.NewServer(serverConn, handler, aiacp.WithAgentCapability(xgwprotocol.XGWorkerCapability{}))
+	server, err := aiacp.NewServer(serverConn, handler, append(frontendSessionLifecycleOptions(handler), aiacp.WithAgentCapability(xgwprotocol.XGWorkerCapability{}))...)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}

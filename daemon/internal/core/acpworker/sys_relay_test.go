@@ -3,8 +3,17 @@ package acpworker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/tinguo/goworker/ai-core/core"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
+	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
+	"github.com/tinguo/goworker/ai-runtime/hitl"
+	"github.com/tinguo/goworker/ai-sandbox"
 )
 
 // fakeCaller 记录调用并回放预设结果，充当 Kotlin 侧的 x-device 端点。
@@ -52,25 +61,157 @@ func TestRelayDeviceTools_WrapsAndForwards(t *testing.T) {
 		t.Error("schema not parsed into Parameters")
 	}
 
-	result, err := tool.Execute(context.Background(), map[string]any{"title": "hi"})
+	if _, err := tool.Execute(context.Background(), map[string]any{"title": "hi"}); err == nil {
+		t.Fatal("device tool accepted a call without managed run identity")
+	}
+	if caller.method != "" {
+		t.Fatalf("device caller invoked with method %q without managed identity", caller.method)
+	}
+}
+
+func TestRelayDeviceToolsForSessionRejectsMissingIdentity(t *testing.T) {
+	caller := &fakeCaller{result: `{"result":"buzzed"}`}
+	tools := RelayDeviceToolsForSession(caller, []DeviceToolDescriptor{{Name: "vibrate"}}, "runtime-A")
+
+	if _, err := tools[0].Execute(context.Background(), map[string]any{}); err == nil {
+		t.Fatal("relay accepted a call without managed runtime identity")
+	}
+	if caller.method != "" {
+		t.Fatalf("caller invoked with method %q without managed identity", caller.method)
+	}
+}
+
+// managedWireProvider returns a device tool call then a final response. Its
+// managed identity is supplied by SessionManager.StartRun, not by the test.
+type managedWireProvider struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (*managedWireProvider) Name() string  { return "managed-wire-test" }
+func (*managedWireProvider) Model() string { return "test" }
+
+func (p *managedWireProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	return nil, errors.New("stream unsupported by test provider")
+}
+
+func (p *managedWireProvider) Chat(context.Context, *core.ChatRequest) (*core.ChatResponse, error) {
+	p.mu.Lock()
+	call := p.calls
+	p.calls++
+	p.mu.Unlock()
+	if call == 0 {
+		return &core.ChatResponse{Choices: []core.ResponseChoice{{Message: core.Message{
+			Role: "assistant",
+			ToolCalls: []core.ToolCall{{
+				ID:   "call-vibrate",
+				Type: "function",
+				Function: core.ToolCallFunction{
+					Name:      "sys_vibrate",
+					Arguments: `{"duration":1}`,
+				},
+			}},
+		}}}}, nil
+	}
+	return &core.ChatResponse{Choices: []core.ResponseChoice{{Message: core.Message{
+		Role:    "assistant",
+		Content: "done",
+	}}}}, nil
+}
+
+func TestRelayDeviceToolsForSessionWritesManagedIdentityToWire(t *testing.T) {
+	const runtimeID = "runtime-A"
+	caller := &fakeCaller{result: `{"result":"buzzed"}`}
+	provider := &managedWireProvider{}
+	cfg := runtimeconfig.Default()
+	sess := runtimeagent.NewSession(runtimeagent.SessionDeps{
+		Config: cfg,
+		CollectTools: func(*sandbox.Config) []core.Tool {
+			return RelayDeviceToolsForSession(caller, []DeviceToolDescriptor{{Name: "vibrate", RiskLevel: "never"}}, runtimeID)
+		},
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) { return provider, nil },
+	})
+	manager := runtimeagent.NewSessionManager()
+	defer manager.Close()
+	if err := manager.Register(runtimeagent.NewSessionRuntime(runtimeID, sess)); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	handle, err := manager.StartRun(runtimeID, runtimeagent.RunRequest{Input: "vibrate"}, runtimeagent.RunCallbacks{
+		Decide: func(req *hitl.InterruptRequest) hitl.Decision {
+			return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionApprove}
+		},
+	})
 	if err != nil {
-		t.Fatalf("Execute: %v", err)
+		t.Fatalf("StartRun: %v", err)
 	}
-	if result != "notification delivered" {
-		t.Errorf("result = %q", result)
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := handle.Wait(waitCtx)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
 	}
+	if result.Err != nil {
+		t.Fatalf("run error: %v", result.Err)
+	}
+
 	if caller.method != MethodDeviceCall {
-		t.Errorf("method = %q, want %s", caller.method, MethodDeviceCall)
+		t.Fatalf("method = %q, want %q", caller.method, MethodDeviceCall)
 	}
-	var req deviceCallRequest
-	if err := json.Unmarshal(caller.params, &req); err != nil {
-		t.Fatalf("decode call request: %v", err)
+	var wire deviceCallRequest
+	if err := json.Unmarshal(caller.params, &wire); err != nil {
+		t.Fatalf("decode wire request: %v", err)
 	}
-	if req.Name != "send_notification" {
-		t.Errorf("call name = %q (应为不带前缀的原始名)", req.Name)
+	if !strings.Contains(string(caller.params), `"sessionId"`) || !strings.Contains(string(caller.params), `"runId"`) {
+		t.Errorf("wire request must include top-level sessionId and runId fields")
 	}
-	if !strings.Contains(string(req.Arguments), `"title"`) {
-		t.Errorf("arguments missing title: %s", req.Arguments)
+	if strings.Contains(string(caller.params), `"session_id"`) || strings.Contains(string(caller.params), `"run_id"`) {
+		t.Errorf("wire request must not contain legacy identity field names")
+	}
+	if wire.SessionID != runtimeID {
+		t.Errorf("wire sessionId = %q, want managed runtime ID %q", wire.SessionID, runtimeID)
+	}
+	if wire.RunID != handle.RunID {
+		t.Errorf("wire runId = %q, want accepted run ID %q", wire.RunID, handle.RunID)
+	}
+	if wire.SessionID == "" || wire.RunID == "" {
+		t.Fatalf("wire request missing managed identity: %+v", wire)
+	}
+	if wire.Name != "vibrate" || string(wire.Arguments) != `{"duration":1}` {
+		t.Errorf("wire call = name:%q args:%s, want vibrate and encoded args", wire.Name, wire.Arguments)
+	}
+}
+
+func TestRelayDeviceToolsForSessionRejectsMismatchedManagedIdentity(t *testing.T) {
+	caller := &fakeCaller{result: `{"result":"buzzed"}`}
+	provider := &managedWireProvider{}
+	cfg := runtimeconfig.Default()
+	sess := runtimeagent.NewSession(runtimeagent.SessionDeps{
+		Config: cfg,
+		CollectTools: func(*sandbox.Config) []core.Tool {
+			return RelayDeviceToolsForSession(caller, []DeviceToolDescriptor{{Name: "vibrate", RiskLevel: "never"}}, "runtime-B")
+		},
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) { return provider, nil },
+	})
+	manager := runtimeagent.NewSessionManager()
+	defer manager.Close()
+	if err := manager.Register(runtimeagent.NewSessionRuntime("runtime-A", sess)); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	handle, err := manager.StartRun("runtime-A", runtimeagent.RunRequest{Input: "vibrate"}, runtimeagent.RunCallbacks{
+		Decide: func(req *hitl.InterruptRequest) hitl.Decision {
+			return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionApprove}
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := handle.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if caller.method != "" {
+		t.Fatalf("mismatched runtime identity dispatched method %q", caller.method)
 	}
 }
 
@@ -199,51 +340,25 @@ func TestSpecDeviceTools_ProbeFailureCollapses(t *testing.T) {
 	}
 }
 
-// TestCallDeviceTool_StripsRegisteredPrefixAndForwards:x-device/call 的 wire
-// 形状单一事实源——注册名(sys_ 前缀,P5-9 代理路径)剥回客户端原名转发;原名
-// 直传(原始中继路径)不受影响;结果与错误包装语义与原 RelayDeviceTools.Execute
-// 一致。
-func TestCallDeviceTool_StripsRegisteredPrefixAndForwards(t *testing.T) {
+// TestCallDeviceToolRejectsUnmanagedCalls proves stdio workers without a manager-issued
+// runtime identity cannot reach the client-side device endpoint.
+func TestCallDeviceToolRejectsUnmanagedCalls(t *testing.T) {
 	caller := &fakeCaller{result: `{"result":"buzzed"}`}
-	got, err := CallDeviceTool(context.Background(), caller, "sys_vibrate", []byte(`{"duration":1}`))
-	if err != nil {
-		t.Fatalf("CallDeviceTool: %v", err)
+	if _, err := CallDeviceTool(context.Background(), caller, "sys_vibrate", []byte(`{"duration":1}`)); err == nil {
+		t.Fatal("CallDeviceTool accepted a call without managed run identity")
 	}
-	if got != "buzzed" {
-		t.Errorf("result = %q, want buzzed", got)
-	}
-	if caller.method != MethodDeviceCall {
-		t.Errorf("method = %q, want %s", caller.method, MethodDeviceCall)
-	}
-	var req deviceCallRequest
-	if err := json.Unmarshal(caller.params, &req); err != nil {
-		t.Fatalf("decode call request: %v", err)
-	}
-	if req.Name != "vibrate" {
-		t.Errorf("call name = %q, want vibrate (注册名剥回客户端原名)", req.Name)
-	}
-	if !strings.Contains(string(req.Arguments), `"duration"`) {
-		t.Errorf("arguments missing duration: %s", req.Arguments)
-	}
-
-	// 原名直传(原始中继路径):剥前缀为 no-op,语义不变。
-	if _, err := CallDeviceTool(context.Background(), caller, "vibrate", []byte(`{}`)); err != nil {
-		t.Fatalf("CallDeviceTool with bare name: %v", err)
-	}
-	if err := json.Unmarshal(caller.params, &req); err != nil {
-		t.Fatalf("decode call request: %v", err)
-	}
-	if req.Name != "vibrate" {
-		t.Errorf("bare-name call name = %q, want vibrate", req.Name)
+	if caller.method != "" {
+		t.Fatalf("caller invoked with method %q without managed run identity", caller.method)
 	}
 }
 
-// TestCallDeviceTool_ErrorWrapping:调用失败 → 「device call <原名>: …」包装,
-// 与原始中继的既有错误文案一致(stdio worker 路径行为不变)。
-func TestCallDeviceTool_ErrorWrapping(t *testing.T) {
+func TestCallDeviceToolRejectsBeforeDispatchError(t *testing.T) {
 	caller := &fakeCaller{err: context.DeadlineExceeded}
 	if _, err := CallDeviceTool(context.Background(), caller, "sys_vibrate", []byte(`{}`)); err == nil ||
 		!strings.Contains(err.Error(), "device call vibrate") {
-		t.Fatalf("err = %v, want wrapped `device call vibrate` message", err)
+		t.Fatalf("err = %v, want explicit identity failure", err)
+	}
+	if caller.method != "" {
+		t.Fatalf("caller invoked with method %q without managed run identity", caller.method)
 	}
 }

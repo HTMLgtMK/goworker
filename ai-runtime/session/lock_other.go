@@ -1,19 +1,28 @@
 //go:build !unix
 
-// lock_other.go 是非 unix 平台的无锁桩。仓库 CI（ubuntu）与目标平台
-// （android/darwin/linux）均为 unix 族，本文件仅为跨平台编译兜底：非 unix 上
-// 不提供跨进程互斥（acquireDirLock 恒成功，Store.lock 恒 nil），
-// ErrStoreLocked 不会由本层返回。
+// lock_other.go fails closed on platforms without the repository's verified flock
+// implementation. Adding an unverified lock backend would make shared session storage unsafe.
 package session
 
-import "os"
+import (
+	"context"
+	"fmt"
+	"os"
+)
 
-// acquireDirLock 非 unix 无锁桩：不做任何加锁，恒成功。
+func requireLockSupport() error { return ErrLockUnavailable }
+
+// acquireDirLock refuses to open a Store when mutual exclusion cannot be guaranteed.
 func acquireDirLock(dir string) (*os.File, error) {
-	return nil, nil
+	return nil, fmt.Errorf("session: lock store %s: %w", dir, ErrLockUnavailable)
 }
 
-// releaseDirLock 非 unix 无锁桩：no-op。
+// acquireDirLockContext refuses repository operations without mutual exclusion.
+func acquireDirLockContext(_ context.Context, dir string) (*os.File, error) {
+	return nil, fmt.Errorf("session: lock repository path %s: %w", dir, ErrLockUnavailable)
+}
+
+// releaseDirLock is a no-op because unsupported platforms never return a lock handle.
 func releaseDirLock(f *os.File) error {
 	return nil
 }

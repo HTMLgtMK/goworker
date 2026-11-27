@@ -12,6 +12,7 @@ import (
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
+	aisession "github.com/tinguo/goworker/ai-session"
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
@@ -46,8 +47,8 @@ type FrontendHandler struct {
 	// 生命周期登记能力(简化壳/测试桩):Set 照常、登记跳过,行为与单会话降级一致。
 	binder model.ConnectionBinder
 
-	// multi is the optional multi-session declaration capability. Without it, new keeps an
-	// empty binding and load uses the single-session fallback; details are in BoundSessionSource.
+	// multi is optional: without it, session/new is unsupported and session/load uses the
+	// guarded single-current-session fallback.
 	multi model.BoundSessionSource
 	// titleSource is optional so backends without fenced rename retain their existing surface.
 	titleSource model.SessionTitleSource
@@ -96,29 +97,40 @@ type FrontendHandler struct {
 	deviceDescriptors []acpworker.DeviceToolDescriptor
 	deviceProbeCancel context.CancelFunc
 
+	// selectionCommitHook 仅供测试，在管理门禁释放后、会话路由提交前注入并发交错。
+	selectionCommitHook func(sessionID string)
+
 	// preCommitHook 仅供测试，在订阅准备完成、提交锁获取前注入 Close/detach
 	// 竞态。生产环境保持 nil；测试须在无并发 attach 时设置或清除。
 	preCommitHook func()
 
-	mu         sync.Mutex
-	promptable map[string]struct{} // 可 prompt 集合：session/new 与当前会话 load 记入
-	readOnly   map[string]struct{} // 只读集合：归档 load 记入，prompt 诚实报错
-	// active is this connection's latest declared session. Empty means no declaration, so the
-	// membership guard rejects prompts rather than falling back to a process-wide session.
-	// It stores transport IDs for new and stable store IDs for load; other connections cannot
-	// overwrite it. promptable/readOnly and active are protected by h.mu.
-	active string
+	mu           sync.Mutex
+	readOnly     map[string]struct{}      // 只读集合：归档 load 记入，prompt 诚实报错
+	promptRoutes map[string]*sessionRoute // canonical session IDs with a live, promptable binding
+	legacyID     string                   // non-multi backends may expose only one ACP session per connection
+	active       string                   // latest declared canonical ID; diagnostics only, never a routing fallback
 }
+
+type sessionRoute struct{}
 
 var (
 	_ aiacp.SessionHandler       = (*FrontendHandler)(nil)
-	_ aiacp.SessionCreator       = (*FrontendHandler)(nil)
-	_ aiacp.SessionLoader        = (*FrontendHandler)(nil)
+	_ aiacp.SessionCreator       = (*frontendSessionLifecycle)(nil)
+	_ aiacp.SessionLoader        = (*frontendSessionLifecycle)(nil)
 	_ aiacp.SessionLister        = (*FrontendHandler)(nil)
 	_ aiacp.SessionModesProvider = (*FrontendHandler)(nil)
 )
 
-// NewFrontendHandlerFactory creates one handler per connection. sessions and commands may be
+type frontendSessionLifecycle struct{ handler *FrontendHandler }
+
+func (a *frontendSessionLifecycle) CreateSession(ctx context.Context, req protocol.NewSessionRequest, reporter aiacp.Reporter) (aisession.ID, error) {
+	return a.handler.CreateManagedSession(ctx, req, reporter)
+}
+
+func (a *frontendSessionLifecycle) LoadSession(ctx context.Context, id aisession.ID, req protocol.LoadSessionRequest, reporter aiacp.Reporter) error {
+	return a.handler.loadCanonicalSession(ctx, id, req, reporter)
+}
+
 // nil (session capabilities degrade honestly; command completion is omitted); evaluate and the
 // shared SessionGate are required. Each handler gets a connection ID and optional RunControlSource
 // capability; nil session sources skip the assertion. Provider writes are denied unless an
@@ -282,50 +294,156 @@ func (h *FrontendHandler) bindDeviceToolsLocked(sessionID string) {
 }
 
 // 只读集合。归档会话只读：load 成功记入只读集合，prompt 该 id 诚实报错而非掩盖
-// 成未知会话。活动声明归连接(h.active)——superseded 守卫据此只拦本连接
-// 自己的过期声明。
+// 成未知会话。promptRoutes 只记录可写的 canonical session ID，不承担身份映射。
 func (h *FrontendHandler) remember(sessionID string) {
 	h.mu.Lock()
+	if h.promptRoutes == nil {
+		h.promptRoutes = make(map[string]*sessionRoute)
+	}
+	h.promptRoutes[sessionID] = &sessionRoute{}
 	h.rememberLocked(sessionID)
 	h.mu.Unlock()
 }
 
 func (h *FrontendHandler) rememberLocked(sessionID string) {
-	if h.promptable == nil {
-		h.promptable = map[string]struct{}{}
-	}
-	h.promptable[sessionID] = struct{}{}
 	delete(h.readOnly, sessionID)
 	h.active = sessionID
 }
 
-// commitSessionSelection updates connection-local routing state, then commits the
-// lifecycle reference through the source's disconnect-aware serialization point.
-func (h *FrontendHandler) commitSessionSelection(transportID, runtimeID string, bindLifecycle bool) bool {
+func (h *FrontendHandler) routeBindingError(sessionID string) error {
+	if h.multi == nil || h.binder == nil {
+		return nil
+	}
+	if _, ok := h.sessions.(model.MultiSessionBinder); ok {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.sessions.(model.GuardedMultiSessionBinder); ok {
+		return nil
+	}
+	for otherSessionID := range h.promptRoutes {
+		if otherSessionID != sessionID {
+			return &protocol.RPCError{Code: -32000, Message: "acp frontend: backend lifecycle binding does not support multiple sessions per connection"}
+		}
+	}
+	return nil
+}
+
+// commitSessionSelection atomically publishes a canonical session ID and its lifecycle
+// reference against Close. ACP transport IDs are the session IDs; there is no remapping layer.
+func (h *FrontendHandler) commitSessionSelection(sessionID string, bindLifecycle, legacy bool) (bool, error) {
+	if h.selectionCommitHook != nil {
+		h.selectionCommitHook(sessionID)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
-		if bindLifecycle && runtimeID != "" {
-			if binder, ok := h.sessions.(model.GuardedConnectionBinder); ok {
-				binder.BindConnectionSessionGuarded(h.connectionID, runtimeID, func() bool { return false })
+		if bindLifecycle && sessionID != "" {
+			if binder, ok := h.sessions.(model.GuardedMultiSessionBinder); ok {
+				binder.BindConnectionSessionReferenceGuarded(h.connectionID, sessionID, func() bool { return false })
+			} else if binder, ok := h.sessions.(model.GuardedConnectionBinder); ok {
+				binder.BindConnectionSessionGuarded(h.connectionID, sessionID, func() bool { return false })
 			}
 		}
-		return false
+		return false, nil
 	}
-	h.rememberLocked(transportID)
-	h.binding.Set(runtimeID)
-	if !bindLifecycle || runtimeID == "" || h.binder == nil {
-		return true
+	if sessionID == "" {
+		return false, nil
 	}
-	if binder, ok := h.sessions.(model.GuardedConnectionBinder); ok {
-		return binder.BindConnectionSessionGuarded(h.connectionID, runtimeID, func() bool {
-			return !h.closedForBinding.Load()
-		})
+	if legacy {
+		if h.legacyID != "" && h.legacyID != sessionID {
+			return false, &protocol.RPCError{Code: -32000, Message: "acp frontend: this backend supports one session per connection"}
+		}
+		for otherSessionID := range h.promptRoutes {
+			if otherSessionID != sessionID {
+				return false, &protocol.RPCError{Code: -32000, Message: "acp frontend: this backend supports one session per connection"}
+			}
+		}
 	}
-	// Legacy binders have no atomic guard. Keep h.mu through their registration so
-	// Close either runs afterwards and releases the reference or wins before us.
-	h.binder.BindConnectionSession(h.connectionID, runtimeID)
-	return true
+	if bindLifecycle && h.multi != nil {
+		if binder, ok := h.sessions.(model.GuardedMultiSessionBinder); ok {
+			if !binder.BindConnectionSessionReferenceGuarded(h.connectionID, sessionID, func() bool {
+				return !h.closedForBinding.Load()
+			}) {
+				return false, nil
+			}
+		} else if binder, ok := h.sessions.(model.MultiSessionBinder); ok {
+			binder.BindConnectionSessionReference(h.connectionID, sessionID)
+		} else if h.binder != nil {
+			// A replacement-only binder cannot represent two session IDs for one connection.
+			for otherSessionID := range h.promptRoutes {
+				if otherSessionID != sessionID {
+					return false, &protocol.RPCError{Code: -32000, Message: "acp frontend: backend lifecycle binding does not support multiple sessions per connection"}
+				}
+			}
+			if binder, ok := h.sessions.(model.GuardedConnectionBinder); ok {
+				if !binder.BindConnectionSessionGuarded(h.connectionID, sessionID, func() bool {
+					return !h.closedForBinding.Load()
+				}) {
+					return false, nil
+				}
+			} else {
+				// Keep h.mu through legacy registration so Close either runs afterwards and
+				// releases the reference or wins before this commit.
+				h.binder.BindConnectionSession(h.connectionID, sessionID)
+			}
+		}
+	} else if bindLifecycle && h.binder != nil {
+		if binder, ok := h.sessions.(model.GuardedConnectionBinder); ok {
+			if !binder.BindConnectionSessionGuarded(h.connectionID, sessionID, func() bool {
+				return !h.closedForBinding.Load()
+			}) {
+				return false, nil
+			}
+		} else {
+			// Keep h.mu through legacy registration so Close either runs afterwards and
+			// releases the reference or wins before this commit.
+			h.binder.BindConnectionSession(h.connectionID, sessionID)
+		}
+	}
+	if h.promptRoutes == nil {
+		h.promptRoutes = make(map[string]*sessionRoute)
+	}
+	h.promptRoutes[sessionID] = &sessionRoute{}
+	h.rememberLocked(sessionID)
+	if legacy {
+		h.legacyID = sessionID
+	}
+	h.binding.Set(sessionID)
+	return true, nil
+}
+
+func (h *FrontendHandler) routeFor(sessionID string) (*sessionRoute, bool, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.readOnly[sessionID]; ok {
+		return nil, false, true
+	}
+	route, ok := h.promptRoutes[sessionID]
+	return route, ok, false
+}
+
+// finishPromptRoute applies /new's request-local binding clear to this canonical session.
+func (h *FrontendHandler) finishPromptRoute(sessionID string, route *sessionRoute, requestBinding *agentcontrol.SessionBinding) {
+	if requestBinding.Get() != "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.promptRoutes[sessionID] != route {
+		return
+	}
+	delete(h.promptRoutes, sessionID)
+	if h.binding.Get() == sessionID {
+		h.binding.Set("")
+	}
+	if h.closed {
+		return // Close releases every connection reference after dropping h.mu.
+	}
+	if unbinder, ok := h.sessions.(interface{ UnbindConnectionSession(string, string) }); ok {
+		unbinder.UnbindConnectionSession(h.connectionID, sessionID)
+	}
 }
 
 func (h *FrontendHandler) rememberReadOnly(sessionID string) {
@@ -341,7 +459,7 @@ func (h *FrontendHandler) rememberReadOnly(sessionID string) {
 func (h *FrontendHandler) membership(sessionID string) (promptable, readOnly bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	_, promptable = h.promptable[sessionID]
+	_, promptable = h.promptRoutes[sessionID]
 	_, readOnly = h.readOnly[sessionID]
 	return promptable, readOnly
 }
@@ -356,62 +474,57 @@ func sessionBusyError() *protocol.RPCError {
 	}
 }
 
-// CreateSession implements aiacp.SessionCreator. With BoundSessionSource, it creates
-// a persistent session and updates this connection's Binding and lifecycle registration.
-// That branch leaves the global current session unchanged; without it, the existing
-// single-session fallback remains in effect.
-func (h *FrontendHandler) CreateSession(ctx context.Context, sessionID string, req protocol.NewSessionRequest, reporter aiacp.Reporter) error {
+// CreateManagedSession is the canonical session/new path for embedded adapters.
+// The returned identity is the same stable ID used for persistence and routing.
+func (h *FrontendHandler) CreateManagedSession(ctx context.Context, req protocol.NewSessionRequest, reporter aiacp.Reporter) (aisession.ID, error) {
 	if !h.waitDeviceTools(ctx) {
-		return protocol.ErrClosed
+		return "", protocol.ErrClosed
 	}
-	// 真新建突变 manager 注册表与 repo（管理面共享状态），prompt 在飞时诚实报
-	// busy 而非排队：客户端取消在飞 prompt 或稍后重试即可。SessionGate 本步
-	// 不动（管理操作互斥；本使用点语义不变）。
+	if h.multi == nil {
+		return "", &protocol.RPCError{Code: -32000, Message: "acp frontend: session creation not supported"}
+	}
 	if !h.gate.tryAcquire() {
-		return sessionBusyError()
+		return "", sessionBusyError()
 	}
-	boundTo := ""
-	if h.multi != nil {
-		id, err := h.multi.CreateBoundSession(req.Cwd)
-		if err != nil {
-			h.gate.release()
-			return &protocol.RPCError{
-				Code:    -32000,
-				Message: fmt.Sprintf("acp frontend: create session: %v", err),
-			}
+	defer h.gate.release()
+	var id string
+	var rollback func() error
+	var err error
+	creator, ok := h.multi.(model.TransactionalBoundSessionCreator)
+	if !ok {
+		return "", &protocol.RPCError{Code: -32000, Message: "acp frontend: backend does not support transactional session creation"}
+	}
+	id, rollback, err = creator.CreateBoundSessionWithRollback(req.Cwd)
+	if err != nil {
+		return "", &protocol.RPCError{Code: -32000, Message: fmt.Sprintf("acp frontend: create session: %v", err)}
+	}
+	rollbackOnError := func(cause error) error {
+		if rollback == nil {
+			return cause
 		}
-		boundTo = id
+		if cleanupErr := rollback(); cleanupErr != nil {
+			return errors.Join(cause, fmt.Errorf("acp frontend: rollback newly created session %q: %w", id, cleanupErr))
+		}
+		return cause
 	}
-	// 临界区只包共享状态突变，手动释放（不能用 defer：release 双还会偷走下一个
-	// 持有者的 token）。Update 是连接 I/O，客户端停摆时管道写会无限阻塞——
-	// 门禁绝不能被一个卡死的客户端攥住，否则全 daemon 的 prompt 都堵在这。
-	h.gate.release()
-
-	// Commit connection-local routing and lifecycle registration together with Close.
-	// If disconnect won, the guarded binder releases the newly created runtime.
-	if !h.commitSessionSelection(sessionID, boundTo, true) {
-		return protocol.ErrClosed
+	sessionID, err := aisession.ParseID(id)
+	if err != nil {
+		return "", rollbackOnError(fmt.Errorf("acp frontend: backend returned invalid session ID %q: %w", id, err))
 	}
-	h.bindDeviceTools(boundTo)
-
+	committed, err := h.commitSessionSelection(id, true, false)
+	if err != nil {
+		return "", rollbackOnError(err)
+	}
+	if !committed {
+		return "", rollbackOnError(protocol.ErrClosed)
+	}
+	h.bindDeviceTools(id)
 	if h.commands != nil {
 		if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
-			reporter.Update(sessionID, body)
+			reporter.Update(id, body)
 		}
 	}
-	return nil
-}
-
-// deviceRuntimeSessionID resolves the runtime selected by this ACP connection.
-// Transport session IDs are not necessarily runtime IDs in the persistent-session path.
-func (h *FrontendHandler) deviceRuntimeSessionID() string {
-	if sessionID := h.binding.Get(); sessionID != "" {
-		return sessionID
-	}
-	if h.sessions != nil {
-		return h.sessions.CurrentSessionID()
-	}
-	return ""
+	return sessionID, nil
 }
 
 // deviceToolSource reuses the initialize-time snapshot. Prompt execution must not
@@ -434,84 +547,57 @@ func (h *FrontendHandler) deviceToolSource(sessionID string) func(ctx context.Co
 		return binder.ClientToolSource(h.connectionID, caller)
 	}
 	return func(context.Context) []core.Tool {
-		return acpworker.RelayDeviceTools(caller, descriptors)
+		return acpworker.RelayDeviceToolsForSession(caller, descriptors, sessionID)
 	}
 }
 
-// Prompt validates this connection's session, injects its Binding, and streams evaluation output.
-// Execution uses the target runtime's gate, so management operations can proceed during a prompt.
-// A redeclaration may race membership checking, but once resolved the runtime gate pins execution;
-// the connection-local Binding prevents other clients from redirecting it.
+// Prompt validates the transport session and snapshots its runtime identity before
+// evaluation. A later load/new on another transport cannot redirect this request.
 func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt []protocol.ContentBlock, reporter aiacp.Reporter) (string, error) {
-	promptable, readOnly := h.membership(sessionID)
+	route, promptable, readOnly := h.routeFor(sessionID)
 	if readOnly {
-		// 归档会话续写防护：诚实报错，优于报 unknown session 掩盖真相
-		return "", &protocol.RPCError{
-			Code:    -32000,
-			Message: fmt.Sprintf("acp frontend: archived session %q is read-only", sessionID),
-		}
+		return "", &protocol.RPCError{Code: -32000, Message: fmt.Sprintf("acp frontend: archived session %q is read-only", sessionID)}
 	}
-	if !promptable {
-		return "", &protocol.RPCError{
-			Code:    -32000,
-			Message: fmt.Sprintf("acp frontend: unknown session %q", sessionID),
-		}
+	if !promptable || route == nil {
+		return "", &protocol.RPCError{Code: -32000, Message: fmt.Sprintf("acp frontend: unknown or invalidated session %q", sessionID)}
 	}
+	requestBinding := &agentcontrol.SessionBinding{}
+	requestBinding.Set(sessionID)
+	defer h.finishPromptRoute(sessionID, route, requestBinding)
 
-	// Reject a prompt superseded by this connection's later declaration. An empty local
-	// selection is allowed for compatibility shims and routes through the empty Binding;
-	// a process-wide active-session fallback is intentionally not consulted.
-	h.mu.Lock()
-	local := h.active
-	h.mu.Unlock()
-	if local != "" && local != sessionID {
-		return "", &protocol.RPCError{
-			Code:    -32000,
-			Message: fmt.Sprintf("acp frontend: session %q is no longer active on this connection (last declared %q); create a new session or load the session again", sessionID, local),
-		}
-	}
-
-	var input string
+	var input strings.Builder
 	for _, block := range prompt {
 		if block.Type != "text" {
 			continue
 		}
-		if input != "" {
-			input += "\n"
+		if input.Len() != 0 {
+			input.WriteByte('\n')
 		}
-		input += block.Text
+		input.WriteString(block.Text)
 	}
 
 	output := &commandOutput{reporter: reporter, sessionID: sessionID}
+	// /new must not let the plugin drop the connection-wide lifecycle reference before
+	// we know whether another request-local selection was cleared. The unique request
+	// identity is intentionally not registered; finishPromptRoute performs the exact
+	// connection/session unbind after checking the route token under h.mu.
+	requestClientID := h.connectionID + "\x00acp-session\x00" + sessionID
 	commandContext := &model.Context{
-		// Inject the connection's live Binding and client ID into the evaluation context. The
-		// mutable Binding lets /new clear this connection's selection, while the client ID lets
-		// lifecycle cleanup remove its binding registration; both use h.connectionID as identity.
 		Ctx: agentcontrol.WithProviderWriteAuthorization(
-			agentcontrol.WithClientID(agentcontrol.WithBinding(ctx, &h.binding), h.connectionID),
+			agentcontrol.WithClientID(agentcontrol.WithBinding(ctx, requestBinding), requestClientID),
 			h.providerWriteAllowed,
 		),
 		FrontendContext: model.FrontendContext{
-			// 命令输出统一包成代码块（见 commandOutput）：命令侧仍按等宽终端排版，
-			// 由这里告诉渲染器「这段别重排」。
 			Writer: output.Write,
 			EmitToken: func(token core.Token) {
 				reporter.Update(sessionID, TokenToUpdate(token))
 			},
-			// Decide 接上 ACP 授权请求：沙箱中间件的 HITL 决策经
-			// Reporter.RequestPermission 到客户端，nil 的静默拒绝不再吞掉危险命令提示。
-			Decide: model.DecideViaACP(ctx, reporter, sessionID),
-			// Device tool source is gated on the initialize-time clientCapabilities
-			// of this connection. Assigning nil directly is safe: Session.Run and
-			// the plugin both treat a nil ToolSource as "no device tools".
-			// 优先 binder 能力代理面（断连等待重绑），装配点不变。
-			ToolSource: h.deviceToolSource(h.deviceRuntimeSessionID()),
+			Decide:     model.DecideViaACP(ctx, reporter, sessionID),
+			ToolSource: h.deviceToolSource(sessionID),
 		},
 		Values: make(map[string]any),
 	}
-	// evaluate 内部的报错也经 Writer 写出（命令自己格式化 ✘ 前缀），因此先闭合
-	// 代码块再返回错误，否则已经流出去的内容会留一个未闭合的围栏。
-	evalErr := h.evaluate(commandContext, input)
+	evalErr := h.evaluate(commandContext, input.String())
 	output.Close()
 	if evalErr != nil {
 		return "", evalErr
@@ -519,24 +605,40 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 	return protocol.StopEndTurn, nil
 }
 
-// LoadSession handles connection-scoped load for multi-session backends: reload registered
-// sessions, reopen persisted sessions, replay archived sessions read-only, and report unknown
-// IDs as the existing -32000 error. Reopening and archive probing are serialized with session
-// management; backends without BoundSessionSource retain the single-session fallback.
+// LoadSession is retained for legacy in-package callers. ACP uses the strict typed
+// adapter and validates the requested canonical ID before routing.
 func (h *FrontendHandler) LoadSession(ctx context.Context, req protocol.LoadSessionRequest, reporter aiacp.Reporter) error {
+	_, err := h.LoadSessionWithSessionID(ctx, req, reporter)
+	return err
+}
+
+func (h *FrontendHandler) loadCanonicalSession(ctx context.Context, sessionID aisession.ID, req protocol.LoadSessionRequest, reporter aiacp.Reporter) error {
+	if err := sessionID.Validate(); err != nil {
+		return err
+	}
+	req.SessionID = sessionID.String()
+	_, err := h.LoadSessionWithSessionID(ctx, req, reporter)
+	return err
+}
+
+// LoadSessionWithSessionID returns the runtime selected by this exact session/load call.
+// Archived sessions have no writable runtime and therefore return an empty identity.
+func (h *FrontendHandler) LoadSessionWithSessionID(ctx context.Context, req protocol.LoadSessionRequest, reporter aiacp.Reporter) (string, error) {
 	if !h.waitDeviceTools(ctx) {
-		return protocol.ErrClosed
+		return "", protocol.ErrClosed
+	}
+	if req.SessionID == "" {
+		return "", &protocol.RPCError{Code: -32000, Message: "acp frontend: session/load requires a session ID"}
 	}
 	if h.sessions == nil {
-		return &protocol.RPCError{Code: -32000, Message: "acp frontend: session load not supported"}
+		return "", &protocol.RPCError{Code: -32000, Message: "acp frontend: session load not supported"}
 	}
+	backendID := req.SessionID
 	if h.multi != nil {
-		// 归档终态：只读重放。先探测（repo 层持久化事实，无门禁）——重放数据
-		// 是 store 快照，解析失败保持未知会话语义之外的诚实报错。
-		if h.multi.SessionArchived(req.SessionID) {
-			history, err := h.sessions.ArchivedSessionHistory(req.SessionID)
+		if h.multi.SessionArchived(backendID) {
+			history, err := h.sessions.ArchivedSessionHistory(backendID)
 			if err != nil {
-				return fmt.Errorf("acp frontend: load archived session %q: %w", req.SessionID, err)
+				return "", fmt.Errorf("acp frontend: load archived session %q: %w", backendID, err)
 			}
 			h.rememberReadOnly(req.SessionID)
 			if h.commands != nil {
@@ -547,14 +649,13 @@ func (h *FrontendHandler) LoadSession(ctx context.Context, req protocol.LoadSess
 			for _, body := range history {
 				reporter.Update(req.SessionID, SessionUpdateFromDomain(body))
 			}
-			return nil
+			return "", nil
 		}
-		// 可 prompt 分支（reload/重开）：门禁内完成状态突变（注册表突变、共享
-		// 视图 reload、repo 打开），busy 语义与 CreateSession 同款。临界区手动
-		// 收窄到突变 + 历史快照：重放 Update 是连接 I/O，停摆客户端的阻塞写不
-		// 能攥住门禁（同 CreateSession；release 不得双还）。
+		if bindingErr := h.routeBindingError(backendID); bindingErr != nil {
+			return "", bindingErr
+		}
 		if !h.gate.tryAcquire() {
-			return sessionBusyError()
+			return "", sessionBusyError()
 		}
 		var (
 			history         []model.SessionUpdate
@@ -565,7 +666,7 @@ func (h *FrontendHandler) LoadSession(ctx context.Context, req protocol.LoadSess
 		)
 		if loader, ok := h.multi.(model.GuardedBoundSessionLoader); ok {
 			history, boundByLoader, loadErr = loader.LoadBoundSessionForConnectionGuarded(
-				req.SessionID, req.Cwd, h.connectionID,
+				backendID, req.Cwd, h.connectionID,
 				func() bool { return !h.closedForBinding.Load() },
 			)
 			bindingRejected = loadErr == nil && !boundByLoader
@@ -574,38 +675,39 @@ func (h *FrontendHandler) LoadSession(ctx context.Context, req protocol.LoadSess
 			if h.closed {
 				bindingRejected = true
 			} else {
-				history, loadErr = loader.LoadBoundSessionForConnection(req.SessionID, req.Cwd, h.connectionID)
+				history, loadErr = loader.LoadBoundSessionForConnection(backendID, req.Cwd, h.connectionID)
 				boundByLoader = loadErr == nil
 			}
 			h.mu.Unlock()
 		} else {
-			loadErr = h.multi.LoadBoundSession(req.SessionID, req.Cwd)
+			loadErr = h.multi.LoadBoundSession(backendID, req.Cwd)
 			if loadErr == nil {
-				history, historyErr = h.multi.SessionHistory(req.SessionID)
+				history, historyErr = h.multi.SessionHistory(backendID)
 			}
 		}
 		h.gate.release()
 		if loadErr != nil {
 			if errors.Is(loadErr, model.ErrSessionUnknown) {
-				return &protocol.RPCError{
-					Code:    -32000,
-					Message: fmt.Sprintf("acp frontend: unknown session %q", req.SessionID),
-				}
+				return "", &protocol.RPCError{Code: -32000, Message: fmt.Sprintf("acp frontend: unknown session %q", req.SessionID)}
 			}
-			return fmt.Errorf("acp frontend: load session %q: %w", req.SessionID, loadErr)
+			return "", fmt.Errorf("acp frontend: load session %q: %w", backendID, loadErr)
 		}
 		if bindingRejected {
-			return protocol.ErrClosed
+			return "", protocol.ErrClosed
 		}
 		if historyErr != nil {
-			return fmt.Errorf("acp frontend: load session %q history: %w", req.SessionID, historyErr)
+			return "", fmt.Errorf("acp frontend: load session %q history: %w", backendID, historyErr)
 		}
-		// Guarded loaders commit the source reference atomically with lifecycle cleanup;
-		// this commits routing state and covers compatible legacy loaders.
-		if !h.commitSessionSelection(req.SessionID, req.SessionID, !boundByLoader) {
-			return protocol.ErrClosed
+		// The loader may have added the lifecycle reference before a concurrent /new removed it.
+		// Re-adding idempotently under h.mu makes route publication the final linearization point.
+		committed, commitErr := h.commitSessionSelection(backendID, true, false)
+		if commitErr != nil {
+			return "", commitErr
 		}
-		h.bindDeviceTools(req.SessionID)
+		if !committed {
+			return "", protocol.ErrClosed
+		}
+		h.bindDeviceTools(backendID)
 		if h.commands != nil {
 			if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
 				reporter.Update(req.SessionID, body)
@@ -614,64 +716,71 @@ func (h *FrontendHandler) LoadSession(ctx context.Context, req protocol.LoadSess
 		for _, body := range history {
 			reporter.Update(req.SessionID, SessionUpdateFromDomain(body))
 		}
-		return nil
+		return backendID, nil
 	}
 
-	// ── 降级路径（后端无 model.BoundSessionSource：简化壳/测试桩）──────────
-	// 单活动语义：load 的语义是「确认会话上下文已在」。
-	if req.SessionID == h.sessions.CurrentSessionID() {
-		// 与 prompt 互斥：load-current 同样改写共享会话状态（reload）。
-		// prompt 在飞时诚实报 busy，归档分支只读、不碰共享状态，不需要门禁。
-		// 临界区手动收窄到状态突变+历史快照：重放 Update 是连接 I/O，停摆客户端
-		// 的阻塞写不能攥住门禁（同 CreateSession；release 不得双还）。
-		if !h.gate.tryAcquire() {
-			return sessionBusyError()
+	// Read-only replay does not claim a writable route, so it must be resolved before
+	// enforcing the legacy backend's one-session binding limit.
+	if backendID != h.sessions.CurrentSessionID() {
+		for _, info := range h.sessions.ListSessions() {
+			if info.SessionID != backendID {
+				continue
+			}
+			history, err := h.sessions.ArchivedSessionHistory(backendID)
+			if err != nil {
+				return "", fmt.Errorf("acp frontend: load archived session %q: %w", backendID, err)
+			}
+			h.rememberReadOnly(req.SessionID)
+			if h.commands != nil {
+				if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
+					reporter.Update(req.SessionID, body)
+				}
+			}
+			for _, body := range history {
+				reporter.Update(req.SessionID, SessionUpdateFromDomain(body))
+			}
+			return "", nil
 		}
-		if err := h.sessions.ReloadCurrentSession(); err != nil {
-			h.gate.release()
-			return fmt.Errorf("acp frontend: reload current session: %w", err)
-		}
-		history := h.sessions.CurrentSessionHistory()
-		h.gate.release()
-		if !h.commitSessionSelection(req.SessionID, req.SessionID, true) {
-			return protocol.ErrClosed
-		}
-		h.bindDeviceTools(req.SessionID)
+		return "", &protocol.RPCError{Code: -32000, Message: fmt.Sprintf("acp frontend: unknown session %q", req.SessionID)}
+	}
 
-		if h.commands != nil {
-			if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
-				reporter.Update(req.SessionID, body)
-			}
-		}
-		for _, body := range history {
-			reporter.Update(req.SessionID, SessionUpdateFromDomain(body))
-		}
-		return nil
+	// Legacy sources must own the current-session check and snapshot as one atomic backend
+	// operation. A handler-side recheck cannot exclude ABA between the check and history read.
+	loader, ok := h.sessions.(model.CurrentSessionHistoryLoader)
+	if !ok {
+		return "", &protocol.RPCError{Code: -32000, Message: "acp frontend: backend cannot safely load the current session"}
 	}
-	// 归档会话：只读重放。先解析成功再入只读集合，解析失败保持未知会话语义。
-	for _, info := range h.sessions.ListSessions() {
-		if info.SessionID != req.SessionID {
-			continue
-		}
-		history, err := h.sessions.ArchivedSessionHistory(req.SessionID)
-		if err != nil {
-			return fmt.Errorf("acp frontend: load archived session %q: %w", req.SessionID, err)
-		}
-		h.rememberReadOnly(req.SessionID)
-		if h.commands != nil {
-			if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
-				reporter.Update(req.SessionID, body)
-			}
-		}
-		for _, body := range history {
-			reporter.Update(req.SessionID, SessionUpdateFromDomain(body))
-		}
-		return nil
+	h.mu.Lock()
+	legacyID, legacyTransport := h.legacyID, h.active
+	h.mu.Unlock()
+	if legacyID != "" && legacyTransport != req.SessionID {
+		return "", &protocol.RPCError{Code: -32000, Message: "acp frontend: this backend supports one session per connection"}
 	}
-	return &protocol.RPCError{
-		Code:    -32000,
-		Message: fmt.Sprintf("acp frontend: unknown session %q", req.SessionID),
+	if !h.gate.tryAcquire() {
+		return "", sessionBusyError()
 	}
+	history, err := loader.ReloadAndReadCurrentSession(backendID)
+	h.gate.release()
+	if err != nil {
+		return "", fmt.Errorf("acp frontend: load current session %q: %w", backendID, err)
+	}
+	committed, commitErr := h.commitSessionSelection(backendID, true, true)
+	if commitErr != nil {
+		return "", commitErr
+	}
+	if !committed {
+		return "", protocol.ErrClosed
+	}
+	h.bindDeviceTools(backendID)
+	if h.commands != nil {
+		if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
+			reporter.Update(req.SessionID, body)
+		}
+	}
+	for _, body := range history {
+		reporter.Update(req.SessionID, SessionUpdateFromDomain(body))
+	}
+	return backendID, nil
 }
 
 // ListSessions 实现 aiacp.SessionLister：转发给会话数据源；无数据源时返回空清单

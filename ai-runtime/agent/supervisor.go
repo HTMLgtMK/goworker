@@ -135,6 +135,9 @@ func (m *SessionManager) StartRun(sessionID string, req RunRequest, cb RunCallba
 	for _, kv := range m.runCtxValues {
 		runCtx = context.WithValue(runCtx, kv.Key, kv.Value)
 	}
+	// The identity is created after configurable values so only this manager-owned
+	// context binding can identify the admitted runtime and its accepted Run.
+	runCtx = withRunIdentity(runCtx, run.SessionID, run.ID)
 	runCtx, cancel := context.WithCancel(runCtx)
 	run.mu.Lock()
 	run.cancel = cancel

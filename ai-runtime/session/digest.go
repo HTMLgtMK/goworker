@@ -39,14 +39,19 @@ func ScanSessionDigests(root string) ([]SessionDigest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("session: scan digests %s: %w", root, err)
 	}
+	repository := &Repository{root: root}
 	out := make([]SessionDigest, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || e.Name() == ".repository-locks" || e.Name() == ".repository-tombstones" {
 			continue
 		}
-		dir := filepath.Join(root, e.Name())
-		path := resolveDataFilePath(dir)
-		if d, ok := digestFromPath(path); ok {
+		unlockID, err := repository.lockSessionID(e.Name())
+		if err != nil {
+			return nil, fmt.Errorf("session: lock digest %q: %w", e.Name(), err)
+		}
+		d, ok := digestFromPath(resolveDataFilePath(filepath.Join(root, e.Name())))
+		unlockID()
+		if ok {
 			out = append(out, d)
 		}
 	}

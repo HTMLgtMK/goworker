@@ -80,6 +80,13 @@ type PostWriteHook interface {
 	AfterResponseWritten(ctx context.Context)
 }
 
+// PostWriteFailureHook is an optional counterpart for response values that
+// own resources pending successful publication. It runs when result encoding
+// or response writing fails, and when the response is an error.
+type PostWriteFailureHook interface {
+	AfterResponseWriteFailed(ctx context.Context)
+}
+
 // ConnOptions 配置一条 JSON-RPC 连接。
 type ConnOptions struct {
 	// MaxMessageBytes 是 JSON payload 的最大字节数，不包含末尾换行符。
@@ -294,10 +301,15 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 	}
 
 	go func() {
+		var postWriteHook PostWriteHook
+		var postWriteFailureHook PostWriteFailureHook
 		defer cancel()
 		defer c.unregisterRequest(requestID)
 		defer func() {
 			if r := recover(); r != nil {
+				if postWriteFailureHook != nil {
+					callPostWriteFailureHook(method, ctx, postWriteFailureHook)
+				}
 				slog.Error("acp: request handler panic", "method", method, "panic", r, "stack", string(debug.Stack()))
 				_ = c.write(Response{
 					JSONRPC: JSONRPCVersion,
@@ -312,7 +324,6 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 		c.mu.Unlock()
 
 		var response Response
-		var postWriteHook PostWriteHook
 		response.JSONRPC = JSONRPCVersion
 		response.ID = id
 		if h == nil {
@@ -330,6 +341,9 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 				if pw, ok := result.(PostWriteHook); ok {
 					postWriteHook = pw
 				}
+				if pw, ok := result.(PostWriteFailureHook); ok {
+					postWriteFailureHook = pw
+				}
 				data, marshalErr := json.Marshal(result)
 				if marshalErr != nil {
 					response.Error = &RPCError{Code: CodeInternalError, Message: "marshal result: " + marshalErr.Error()}
@@ -338,7 +352,15 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 				}
 			}
 		}
-		if err := c.write(response); err == nil && response.Error == nil && postWriteHook != nil {
+
+		writeErr := c.write(response)
+		if writeErr != nil || response.Error != nil {
+			if postWriteFailureHook != nil {
+				callPostWriteFailureHook(method, ctx, postWriteFailureHook)
+			}
+			return
+		}
+		if postWriteHook != nil {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -349,6 +371,15 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 			}()
 		}
 	}()
+}
+
+func callPostWriteFailureHook(method string, ctx context.Context, hook PostWriteFailureHook) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("acp: post-write failure hook panic", "method", method, "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	hook.AfterResponseWriteFailed(ctx)
 }
 
 func (c *Conn) dispatchNotification(method string, params json.RawMessage) {

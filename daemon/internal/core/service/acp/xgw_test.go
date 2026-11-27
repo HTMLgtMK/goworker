@@ -78,9 +78,10 @@ type fakeRunControl struct {
 
 	// With attachHub configured, StartRun publishes three key events and exposes an active-run
 	// snapshot; ActiveRun is tracked per session. attachErr scripts subscription failure.
-	attachHub  *runtimeagent.EventHub
-	attachErr  error
-	activeRuns map[string]fakeActiveRun
+	attachHub   *runtimeagent.EventHub
+	attachErr   error
+	activeRuns  map[string]fakeActiveRun
+	nextSession int
 }
 
 // fakeActiveRun 是 fakeRunControl 按会话记账的活动 run 快照(ActiveRun 返回值)。
@@ -97,6 +98,45 @@ func newFakeRunControl() *fakeRunControl {
 		approvalOwner:     map[string]string{},
 		activeRuns:        map[string]fakeActiveRun{},
 	}
+}
+
+func (f *fakeRunControl) CreateBoundSession(string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextSession++
+	return fmt.Sprintf("xgw-runtime-%d", f.nextSession), nil
+}
+
+func (f *fakeRunControl) CreateBoundSessionWithRollback(cwd string) (string, func() error, error) {
+	id, err := f.CreateBoundSession(cwd)
+	if err != nil {
+		return "", nil, err
+	}
+	return id, func() error { return nil }, nil
+}
+
+func (f *fakeRunControl) LoadBoundSession(string, string) error { return nil }
+
+func (f *fakeRunControl) SessionHistory(string) ([]model.SessionUpdate, error) { return nil, nil }
+
+func (f *fakeRunControl) SessionArchived(sessionID string) bool {
+	f.fakeSessionSource.mu.Lock()
+	defer f.fakeSessionSource.mu.Unlock()
+	_, ok := f.fakeSessionSource.archived[sessionID]
+	return ok
+}
+
+func (f *fakeRunControl) ArchiveSession(string, string) error { return nil }
+
+// xgwStack exposes only canonical session IDs to extension calls. The ACP session ID
+// is also the backend identity; no transport-to-runtime translation is involved.
+func (s *xgwStack) canonicalSessionID(t *testing.T, sessionID string) string {
+	t.Helper()
+	_, ok, _ := s.handler.routeFor(sessionID)
+	if !ok {
+		t.Fatalf("canonical session %q has no live route", sessionID)
+	}
+	return sessionID
 }
 
 func (f *fakeRunControl) StartRun(sessionID, connectionID, input, requestID string) (string, string, error) {
@@ -309,7 +349,7 @@ func newXGWStack(t *testing.T, evaluate Evaluator, frc *fakeRunControl) *xgwStac
 	}
 	serverEnd, clientEnd := net.Pipe()
 	handler := NewFrontendHandlerFactory(evaluate, nil, frc, NewSessionGate())().(*FrontendHandler)
-	server, err := aiacp.NewServer(serverEnd, handler, aiacp.WithAgentCapability(xgwprotocol.XGWorkerCapability{}))
+	server, err := aiacp.NewServer(serverEnd, handler, append(frontendSessionLifecycleOptions(handler), aiacp.WithAgentCapability(xgwprotocol.XGWorkerCapability{}))...)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -355,7 +395,7 @@ func TestXGWCapabilitiesAdvertisedAndDiscoverable(t *testing.T) {
 	}
 	wantMethods := []string{
 		XMethodCapabilities, XMethodRunStart, XMethodRunGet, XMethodRunCancel, XMethodApprovalRespond,
-		XMethodSessionAttach, XMethodSessionDetach, XMethodSessionModes,
+		XMethodSessionAttach, XMethodSessionDetach, XMethodSessionArchive, XMethodSessionModes,
 	}
 	if !reflect.DeepEqual(capabilities.Methods, wantMethods) {
 		t.Fatalf("advertised methods = %v, want %v", capabilities.Methods, wantMethods)
@@ -373,7 +413,7 @@ func TestXGWCapabilitiesAdvertisedAndDiscoverable(t *testing.T) {
 func TestXGWCapabilitiesReflectBackendSupport(t *testing.T) {
 	serverEnd, clientEnd := net.Pipe()
 	handler := NewFrontendHandlerFactory(nil, nil, &fakeSessionSource{}, NewSessionGate())().(*FrontendHandler)
-	server, err := aiacp.NewServer(serverEnd, handler)
+	server, err := aiacp.NewServer(serverEnd, handler, frontendSessionLifecycleOptions(handler)...)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -413,7 +453,8 @@ func TestXGWCapabilitiesReflectBackendSupport(t *testing.T) {
 	}
 }
 
-// initAndNew 走标准握手 + session/new,返回服务端签发的会话 id。
+// initAndNew 走标准握手 + session/new,返回该调用绑定的 runtime id。标准 ACP
+// session/prompt 仍使用服务端签发的 transport ID。
 func (s *xgwStack) initAndNew(t *testing.T) string {
 	t.Helper()
 	init, err := s.client.Initialize(context.Background())
@@ -427,7 +468,7 @@ func (s *xgwStack) initAndNew(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
-	return sid
+	return s.canonicalSessionID(t, sid)
 }
 
 // callRaw 以原始 map 入参发起 x- 请求并取回原始 result:两侧都不过 Go 结构体,
@@ -970,6 +1011,9 @@ func TestXGWStandardMethodsUnaffected(t *testing.T) {
 	frc := newFakeRunControl()
 	stack := newXGWStack(t, nil, frc)
 	sid := stack.initAndNew(t)
+	stack.handler.mu.Lock()
+	transportID := stack.handler.active
+	stack.handler.mu.Unlock()
 
 	// session/list:domain → wire 映射形状不变。
 	frc.mu.Lock()
@@ -997,7 +1041,7 @@ func TestXGWStandardMethodsUnaffected(t *testing.T) {
 	// 不经 Go 结构体——形状回归须钉住 wire 字节)。
 	var raw json.RawMessage
 	err = stack.client.Call(context.Background(), protocol.MethodSessionPrompt, protocol.PromptRequest{
-		SessionID: sid,
+		SessionID: transportID,
 		Prompt:    []protocol.ContentBlock{protocol.TextBlock("hello")},
 	}, &raw)
 	if err != nil {
@@ -1008,7 +1052,7 @@ func TestXGWStandardMethodsUnaffected(t *testing.T) {
 	}
 
 	// session/cancel:通知面照常派发,连接随后仍可用(流未破坏)。
-	if err := stack.client.Cancel(sid); err != nil {
+	if err := stack.client.Cancel(transportID); err != nil {
 		t.Fatalf("session/cancel: %v", err)
 	}
 	if _, err := stack.callRaw(t, XMethodRunGet, map[string]any{"sessionId": sid, "runId": "run-1"}); err != nil {

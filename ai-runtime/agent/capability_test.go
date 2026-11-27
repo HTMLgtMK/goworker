@@ -23,16 +23,20 @@ import (
 // fakeClientExecutor 是 ClientToolExecutor 的测试桩:记录调用次数,返回预置
 // 结果。各绑定用独立实例,靠指针相等断言 Lookup 返回的正是登记的执行通道。
 type fakeClientExecutor struct {
-	mu     sync.Mutex
-	calls  int
-	result string
-	err    error
+	mu        sync.Mutex
+	calls     int
+	result    string
+	err       error
+	afterCall func()
 }
 
 func (f *fakeClientExecutor) Invoke(ctx context.Context, toolName string, argsJSON []byte) (string, error) {
 	f.mu.Lock()
 	f.calls++
 	f.mu.Unlock()
+	if f.afterCall != nil {
+		f.afterCall()
+	}
 	return f.result, f.err
 }
 
@@ -60,7 +64,7 @@ func TestCapabilityRegistryBindConnectionWakesWaiter(t *testing.T) {
 	r := NewCapabilityRegistry()
 	tools := NewClientToolProxy(r, "sess-wait", []ClientToolSpec{{Name: "sys_x", Schema: "{}"}}, time.Second)
 	waitState := make(chan bool, 2)
-	ctx := withCapabilityWaitObserver(context.Background(), func(waiting bool) {
+	ctx := withCapabilityWaitObserver(withRunIdentity(context.Background(), "sess-wait", "run-test"), func(waiting bool) {
 		waitState <- waiting
 	})
 	result := make(chan string, 1)
@@ -136,7 +140,7 @@ func TestSpecAwareProxyMatchesFrozenSchemaAndPolicy(t *testing.T) {
 	}
 
 	oldProxy := NewSpecAwareClientToolProxy(r, "sess-spec", []ClientToolSpec{oldSpec}, 40*time.Millisecond)
-	got, err := oldProxy[0].Execute(context.Background(), map[string]any{})
+	got, err := oldProxy[0].Execute(withRunIdentity(context.Background(), "sess-spec", "run-test"), map[string]any{})
 	if err != nil || !strings.Contains(got, "unavailable") {
 		t.Fatalf("old proxy result = (%q, %v), want compatibility wait timeout", got, err)
 	}
@@ -145,7 +149,7 @@ func TestSpecAwareProxyMatchesFrozenSchemaAndPolicy(t *testing.T) {
 	}
 
 	newProxy := NewSpecAwareClientToolProxy(r, "sess-spec", []ClientToolSpec{newSpec}, time.Second)
-	if got, err := newProxy[0].Execute(context.Background(), map[string]any{}); err != nil || got != "new-contract" {
+	if got, err := newProxy[0].Execute(withRunIdentity(context.Background(), "sess-spec", "run-test"), map[string]any{}); err != nil || got != "new-contract" {
 		t.Fatalf("new proxy result = (%q, %v), want new-contract", got, err)
 	}
 
@@ -163,7 +167,7 @@ func TestSpecAwareProxyMatchesFrozenSchemaAndPolicy(t *testing.T) {
 	if r.BindConnectionSpecs("sess-spec", "conn-B", []ClientToolSpec{oldAdvertised}, oldExec) {
 		t.Fatal("first conn-B binding must report refreshed=false")
 	}
-	if got, err := oldProxy[0].Execute(context.Background(), map[string]any{}); err != nil || got != "old-contract" {
+	if got, err := oldProxy[0].Execute(withRunIdentity(context.Background(), "sess-spec", "run-test"), map[string]any{}); err != nil || got != "old-contract" {
 		t.Fatalf("old proxy must match canonical schema and policy despite description change: (%q, %v)", got, err)
 	}
 }
@@ -177,7 +181,7 @@ func TestSpecAwareProxyDistinguishesLargeSchemaIntegers(t *testing.T) {
 	r.BindConnectionSpecs("sess-large-integer", "conn-A", []ClientToolSpec{{Name: "sys_x", Schema: advertisedSchema}}, exec)
 	proxy := NewSpecAwareClientToolProxy(r, "sess-large-integer", []ClientToolSpec{{Name: "sys_x", Schema: expectedSchema}}, 25*time.Millisecond)
 
-	got, err := proxy[0].Execute(context.Background(), map[string]any{})
+	got, err := proxy[0].Execute(withRunIdentity(context.Background(), "sess-large-integer", "run-test"), map[string]any{})
 	if err != nil || !strings.Contains(got, "unavailable") {
 		t.Fatalf("proxy result = (%q, %v), want compatibility timeout for distinct integers above 2^53", got, err)
 	}
@@ -198,10 +202,10 @@ func TestSpecAwareProxyFingerprintPreservesSchemaFallbackAndParameters(t *testin
 		{Name: "sys_fallback", Schema: `{"type":"object"}`},
 		{Name: "sys_large", Schema: validLargeSchema},
 	}, time.Second)
-	if got, err := proxy[0].Execute(context.Background(), map[string]any{}); err != nil || got != "fallback-matched" {
+	if got, err := proxy[0].Execute(withRunIdentity(context.Background(), "sess-schema-fallback", "run-test"), map[string]any{}); err != nil || got != "fallback-matched" {
 		t.Fatalf("trailing-invalid schema fallback result = (%q, %v), want fallback-matched", got, err)
 	}
-	if got, err := proxy[1].Execute(context.Background(), map[string]any{}); err != nil || got != "valid-schema-matched" {
+	if got, err := proxy[1].Execute(withRunIdentity(context.Background(), "sess-schema-fallback", "run-test"), map[string]any{}); err != nil || got != "valid-schema-matched" {
 		t.Fatalf("valid large-number schema result = (%q, %v), want valid-schema-matched", got, err)
 	}
 
@@ -258,7 +262,7 @@ func TestSpecAwareProxyRejectsSchemaOrPolicyDriftIndependently(t *testing.T) {
 			exec := &fakeClientExecutor{result: "must-not-run"}
 			r.BindConnectionSpecs("sess-drift", "conn-A", []ClientToolSpec{tt.advertised}, exec)
 			proxy := NewSpecAwareClientToolProxy(r, "sess-drift", []ClientToolSpec{tt.expected}, 25*time.Millisecond)
-			got, err := proxy[0].Execute(context.Background(), map[string]any{})
+			got, err := proxy[0].Execute(withRunIdentity(context.Background(), "sess-drift", "run-test"), map[string]any{})
 			if err != nil || !strings.Contains(got, "unavailable") {
 				t.Fatalf("proxy result = (%q, %v), want compatibility timeout", got, err)
 			}
@@ -294,7 +298,7 @@ func TestLegacyProxyRejectsMismatchedSpecAwareBinding(t *testing.T) {
 	// spec-aware connection whose always_hitl behavior is not present in that Run.
 	// A same-name legacy binding cannot bypass the incompatible verified candidate.
 	oldProxy := NewClientToolProxy(r, "sess-legacy-proxy", []ClientToolSpec{oldSpec}, 25*time.Millisecond)
-	got, err := oldProxy[0].Execute(context.Background(), map[string]any{})
+	got, err := oldProxy[0].Execute(withRunIdentity(context.Background(), "sess-legacy-proxy", "run-test"), map[string]any{})
 	if err != nil || !strings.Contains(got, "unavailable") {
 		t.Fatalf("old proxy result = (%q, %v), want timeout for mismatched always_hitl registration", got, err)
 	}
@@ -328,7 +332,7 @@ func TestSpecAwareProxyFreezesMetadataAndSharesSchemaFallback(t *testing.T) {
 	proxySpec.Metadata["risk_level"] = "critical"
 	proxySpec.Schema = `{"type":"array"}`
 
-	if got, err := proxy[0].Execute(context.Background(), map[string]any{}); err != nil || got != "fallback-matched" {
+	if got, err := proxy[0].Execute(withRunIdentity(context.Background(), "sess-frozen", "run-test"), map[string]any{}); err != nil || got != "fallback-matched" {
 		t.Fatalf("proxy did not preserve its snapshotted contract: (%q, %v)", got, err)
 	}
 }
@@ -339,7 +343,7 @@ func TestSpecAwareProxyRejectsLegacyUnverifiedBinding(t *testing.T) {
 	r.BindConnection("sess-legacy", "conn-A", []string{"sys_x"}, legacyExec)
 	proxy := NewSpecAwareClientToolProxy(r, "sess-legacy", []ClientToolSpec{{Name: "sys_x", Schema: `{"type":"object"}`}}, 30*time.Millisecond)
 
-	got, err := proxy[0].Execute(context.Background(), map[string]any{})
+	got, err := proxy[0].Execute(withRunIdentity(context.Background(), "sess-legacy", "run-test"), map[string]any{})
 	if err != nil || !strings.Contains(got, "unavailable") {
 		t.Fatalf("strict proxy result = (%q, %v), want timeout for unverified legacy binding", got, err)
 	}
@@ -357,7 +361,7 @@ func TestSpecAwareWaitersAllWakeAndCleanUp(t *testing.T) {
 	results := make(chan string, waiterCount)
 	for i := 0; i < waiterCount; i++ {
 		go func() {
-			ctx := withCapabilityWaitObserver(context.Background(), func(waiting bool) {
+			ctx := withCapabilityWaitObserver(withRunIdentity(context.Background(), "sess-many-waiters", "run-test"), func(waiting bool) {
 				if waiting {
 					ready <- struct{}{}
 				}
@@ -424,7 +428,7 @@ func TestSpecAwareInvokeFailureDoesNotInvalidateReplacement(t *testing.T) {
 	result := make(chan string, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		got, err := proxy[0].Execute(context.Background(), map[string]any{})
+		got, err := proxy[0].Execute(withRunIdentity(context.Background(), "sess-rebind", "run-test"), map[string]any{})
 		result <- got
 		errCh <- err
 	}()
@@ -441,17 +445,17 @@ func TestSpecAwareInvokeFailureDoesNotInvalidateReplacement(t *testing.T) {
 	close(stale.release)
 	select {
 	case got := <-result:
-		if got != "replacement" {
-			t.Fatalf("Execute result = %q, want replacement after stale failure", got)
+		if got != "stale failure" {
+			t.Fatalf("Execute result = %q, want original uncertain-call result", got)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("replacement binding was removed by stale Invoke failure")
+		t.Fatal("uncertain Invoke result was not returned")
 	}
-	if err := <-errCh; err != nil {
-		t.Fatalf("Execute returned error: %v", err)
+	if err := <-errCh; err == nil || !strings.Contains(err.Error(), "old channel failed") {
+		t.Fatalf("Execute error = %v, want original channel failure", err)
 	}
-	if replacement.calls != 1 {
-		t.Fatalf("replacement executor invoked %d times, want 1", replacement.calls)
+	if replacement.calls != 0 {
+		t.Fatalf("replacement executor invoked %d times, want 0 for the in-flight call", replacement.calls)
 	}
 }
 
@@ -701,6 +705,32 @@ func TestClientToolProxyConstruction(t *testing.T) {
 	}
 }
 
+func TestClientToolProxyRequiresBoundRuntimeIdentity(t *testing.T) {
+	r := NewCapabilityRegistry()
+	exec := &fakeClientExecutor{result: "invoked"}
+	r.BindConnection("bound-session", "conn-A", []string{"sys_x"}, exec)
+	proxy := NewClientToolProxy(r, "bound-session", []ClientToolSpec{{Name: "sys_x", Schema: `{}`}}, time.Second)
+
+	if _, err := proxy[0].Execute(context.Background(), map[string]any{}); err == nil {
+		t.Fatal("proxy accepted a call without managed run identity")
+	}
+	wrongSession := withRunIdentity(context.Background(), "other-session", "run-1")
+	if _, err := proxy[0].Execute(wrongSession, map[string]any{}); err == nil {
+		t.Fatal("proxy accepted an identity for a different runtime session")
+	}
+	if exec.calls != 0 {
+		t.Fatalf("executor invoked %d times for untrusted identity, want 0", exec.calls)
+	}
+
+	validRun := withRunIdentity(context.Background(), "bound-session", "run-2")
+	if got, err := proxy[0].Execute(validRun, map[string]any{}); err != nil || got != "invoked" {
+		t.Fatalf("proxy with trusted identity = (%q, %v), want invoked", got, err)
+	}
+	if exec.calls != 1 {
+		t.Fatalf("executor invoked %d times with valid identity, want 1", exec.calls)
+	}
+}
+
 // TestClientToolProxyExecuteInvokeAndTimeoutFail(P4-4):Execute 真实语义的
 // 单元面——绑定在 → Invoke 结果直通;无绑定 → 等待满短预算 → 明确失败文本
 // (device tool X unavailable: connection lost, waited Ns)。失败是工具结果
@@ -713,7 +743,7 @@ func TestClientToolProxyExecuteInvokeAndTimeoutFail(t *testing.T) {
 	exec := &fakeClientExecutor{result: "invoked-ok"}
 	r.Bind("sess-1", "conn-A", []string{"sys_x"}, time.Minute, exec)
 	tools := NewClientToolProxy(r, "sess-1", specs, time.Second)
-	got, err := tools[0].Execute(context.Background(), map[string]any{"k": "v"})
+	got, err := tools[0].Execute(withRunIdentity(context.Background(), "sess-1", "run-test"), map[string]any{"k": "v"})
 	if err != nil || got != "invoked-ok" {
 		t.Fatalf("Execute with live binding = (%q, %v), want (invoked-ok, nil)", got, err)
 	}
@@ -724,7 +754,7 @@ func TestClientToolProxyExecuteInvokeAndTimeoutFail(t *testing.T) {
 	// 无绑定:等待满短预算 → 明确失败文本(error 恒 nil,不 panic、不中断)。
 	empty := NewClientToolProxy(NewCapabilityRegistry(), "sess-1", specs, 80*time.Millisecond)
 	start := time.Now()
-	res, err := empty[0].Execute(context.Background(), map[string]any{})
+	res, err := empty[0].Execute(withRunIdentity(context.Background(), "sess-1", "run-test"), map[string]any{})
 	if err != nil {
 		t.Fatalf("timeout exit must be a tool result, not an error: %v", err)
 	}
@@ -790,8 +820,8 @@ func TestCapabilityWaitTimeoutClampedToToolCtxBudget(t *testing.T) {
 // TestCapabilityInvokeFailureClassification(P4 评审 issue5):Invoke 失败按
 // 错误类别分流——context.Canceled/DeadlineExceeded(run 取消传播 / toolCtx
 // 60s 到点)不是「通道事实不可用」,跳过 Invalidate 直接上抛(健康绑定不得
-// 误失效;Invalidate 无计数面,以「绑定仍可 Lookup 命中」为等价观测);其余
-// 失败仍即时失效并转入等待,超时返回明确失败文本。
+// 误失效);其余 Invoke 错误都可能发生在设备执行后响应丢失,失效绑定并立即上抛,
+// 绝不在当前工具调用中重试。无绑定时等待/重绑的行为由独立等待测试覆盖。
 func TestCapabilityInvokeFailureClassification(t *testing.T) {
 	specs := []ClientToolSpec{{Name: "sys_x", Schema: "{}"}}
 
@@ -801,7 +831,7 @@ func TestCapabilityInvokeFailureClassification(t *testing.T) {
 		r.Bind("sess-1", "conn-A", []string{"sys_x"}, time.Minute, exec)
 		tools := NewClientToolProxy(r, "sess-1", specs, time.Second)
 
-		_, err := tools[0].Execute(context.Background(), map[string]any{})
+		_, err := tools[0].Execute(withRunIdentity(context.Background(), "sess-1", "run-test"), map[string]any{})
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Execute = %v, want context.Canceled rethrown", err)
 		}
@@ -819,7 +849,7 @@ func TestCapabilityInvokeFailureClassification(t *testing.T) {
 		r.Bind("sess-1", "conn-A", []string{"sys_x"}, time.Minute, exec)
 		tools := NewClientToolProxy(r, "sess-1", specs, time.Second)
 
-		_, err := tools[0].Execute(context.Background(), map[string]any{})
+		_, err := tools[0].Execute(withRunIdentity(context.Background(), "sess-1", "run-test"), map[string]any{})
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("Execute = %v, want context.DeadlineExceeded rethrown", err)
 		}
@@ -828,21 +858,46 @@ func TestCapabilityInvokeFailureClassification(t *testing.T) {
 		}
 	})
 
-	t.Run("plain error invalidates and waits", func(t *testing.T) {
+	t.Run("Invoke error invalidates and returns without retry", func(t *testing.T) {
 		r := NewCapabilityRegistry()
-		exec := &fakeClientExecutor{err: errors.New("connection dead")}
+		callErr := errors.New("connection lost after device action")
+		exec := &fakeClientExecutor{err: callErr}
 		r.Bind("sess-1", "conn-A", []string{"sys_x"}, time.Minute, exec)
 		tools := NewClientToolProxy(r, "sess-1", specs, 80*time.Millisecond)
 
-		res, err := tools[0].Execute(context.Background(), map[string]any{})
-		if err != nil {
-			t.Fatalf("wait-exit must be a tool result, not an error: %v", err)
+		_, err := tools[0].Execute(withRunIdentity(context.Background(), "sess-1", "run-test"), map[string]any{})
+		if !errors.Is(err, callErr) {
+			t.Fatalf("Execute error = %v, want original Invoke error", err)
 		}
-		if !strings.Contains(res, "device tool sys_x unavailable: connection lost") {
-			t.Fatalf("result = %q, want explicit failure text", res)
+		if exec.calls != 1 {
+			t.Fatalf("failed executor invoked %d time(s), want 1", exec.calls)
 		}
 		if _, ok := r.Lookup("sess-1", "sys_x"); ok {
-			t.Fatal("binding kept on plain failure(通道事实不可用必须即时失效)")
+			t.Fatal("binding kept after a non-context Invoke failure")
+		}
+	})
+
+	t.Run("lost response never retries after rebind", func(t *testing.T) {
+		r := NewCapabilityRegistry()
+		var sideEffects int
+		replacement := &fakeClientExecutor{result: "must not be invoked"}
+		callErr := errors.New("response lost")
+		original := &fakeClientExecutor{err: callErr, afterCall: func() {
+			sideEffects++ // 模拟设备已执行副作用,但响应在返回途中丢失。
+			r.BindConnection("sess-1", "conn-B", []string{"sys_x"}, replacement)
+		}}
+		r.BindConnection("sess-1", "conn-A", []string{"sys_x"}, original)
+		tools := NewClientToolProxy(r, "sess-1", specs, 80*time.Millisecond)
+
+		_, err := tools[0].Execute(withRunIdentity(context.Background(), "sess-1", "run-test"), map[string]any{})
+		if !errors.Is(err, callErr) {
+			t.Fatalf("Execute error = %v, want uncertain response error", err)
+		}
+		if sideEffects != 1 {
+			t.Fatalf("device side effect count = %d, want exactly 1", sideEffects)
+		}
+		if original.calls != 1 || replacement.calls != 0 {
+			t.Fatalf("executor calls = original:%d replacement:%d, want 1 and 0", original.calls, replacement.calls)
 		}
 	})
 }
@@ -936,8 +991,8 @@ func waitToolCallUnbound(disconnect func(), toolResults *[]string) (cb RunCallba
 }
 
 // TestToolBindingDisconnect 验证解绑后 run 等待显式重绑，不会静默路由到旧连接；
-// 断连在 StartRun 前确定性完成。重绑后仅新 executor 被调用；在途 Invoke 失败后的
-// 即时失效与等待由 TestCapabilityInvokeFailureClassification 覆盖。
+// 断连在 StartRun 前确定性完成。新绑定只服务后续调用;当前已 Invoke 的失败由
+// Execute 直接返回,绝不转发到重绑连接。
 func TestToolBindingDisconnect(t *testing.T) {
 	m := NewSessionManager()
 	defer m.Close()
@@ -1101,27 +1156,29 @@ func TestRebindRequiresCapabilityMatch(t *testing.T) {
 	}
 }
 
-// TestRebindReconfirmViaHITL 验证风险 metadata 在重绑后仍触发审批。
-// 首次 Invoke 失败后失效并等待 conn-B 重绑；重试调用再次请求确认，确保危险操作
-// 不会因连接重绑绕过 HITL。
-func TestRebindReconfirmViaHITL(t *testing.T) {
+// TestInvokeFailureAfterHITLDoesNotReplayOnReplacement verifies a permission-approved
+// device call is not replayed when its response is lost during a same-connection rebind.
+func TestInvokeFailureAfterHITLDoesNotReplayOnReplacement(t *testing.T) {
 	m := NewSessionManager()
 	defer m.Close()
 
 	pv := &scriptedChatProvider{msgs: []core.Message{
 		capToolCallRound("call-cap-h1"),
-		capToolCallRound("call-cap-h2"),
 		{Role: "assistant", Content: "device work done"},
 	}}
-	fx := newEventRunRuntime(t, m, pv) // RunEvents=真 RunJournalStore:permission.requested 可回放断言
+	fx := newEventRunRuntime(t, m, pv)
 	sid := fx.sessionID
 	reg := m.Capabilities()
 
-	dead := &fakeClientExecutor{err: errors.New("connection dead")}
-	execB := &fakeClientExecutor{result: "photo-bytes-from-B"}
+	execB := &fakeClientExecutor{result: "must not be replayed"}
+	dead := &fakeClientExecutor{
+		err: errors.New("connection lost after device action"),
+		afterCall: func() {
+			reg.Bind(sid, "conn-A", []string{capToolName}, time.Minute, execB)
+		},
+	}
 	reg.Bind(sid, "conn-A", []string{capToolName}, time.Minute, dead)
-
-	tools := NewClientToolProxy(reg, sid, capToolSpecs("mode"), 5*time.Second) // normal 模式 → hitl
+	tools := NewClientToolProxy(reg, sid, capToolSpecs("mode"), 5*time.Second)
 
 	var decideMu sync.Mutex
 	decides := 0
@@ -1131,9 +1188,6 @@ func TestRebindReconfirmViaHITL(t *testing.T) {
 			decideMu.Lock()
 			decides++
 			decideMu.Unlock()
-			// 决策回执 InterruptRequest.ID(GetDecision 仅消费 InterruptID
-			// 匹配的决策,P4 评审 issue1):生产调用方(DecideViaACP/
-			// hitl_consumer)均按 ID 回执。
 			return hitl.Decision{InterruptID: req.ID, Type: hitl.DecisionApprove}
 		},
 	}
@@ -1142,29 +1196,23 @@ func TestRebindReconfirmViaHITL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
-
-	// 第 1 次调用:approve 后 conn-A Invoke 失败 → Invalidate → 等待重绑。
-	waitRunState(t, h, RunWaitingCapability)
-	reg.Bind(sid, "conn-B", []string{capToolName}, time.Minute, execB)
-
 	res := waitHandle(t, h)
 
 	decideMu.Lock()
 	gotDecides := decides
 	decideMu.Unlock()
-	if gotDecides != 2 {
-		t.Fatalf("interrupts = %d, want 2(重绑后的执行再次触发确认)", gotDecides)
+	if gotDecides != 1 {
+		t.Fatalf("interrupts = %d, want 1 for the one attempted call", gotDecides)
 	}
 	if dead.calls != 1 {
-		t.Fatalf("dead executor invoked %d time(s), want 1(第 1 次调用真实尝试过 conn-A 后失效)", dead.calls)
+		t.Fatalf("failed executor invoked %d time(s), want 1", dead.calls)
 	}
-	if execB.calls != 2 {
-		t.Fatalf("conn-B executor invoked %d time(s), want 2(重绑收敛执行 + 第 2 次调用)", execB.calls)
+	if execB.calls != 0 {
+		t.Fatalf("replacement executor invoked %d times, want 0 for uncertain operation", execB.calls)
 	}
 	if res.State != RunCompleted {
 		t.Fatalf("state = %q, want RunCompleted", res.State)
 	}
-
 	// 事件面(tee 包 Decide → permission.requested/resolved 事件对):第二次
 	// permission.requested 在事件流可回放。
 	evs, err := fx.journal.ReadEvents(0)
@@ -1180,7 +1228,7 @@ func TestRebindReconfirmViaHITL(t *testing.T) {
 			resolved++
 		}
 	}
-	if requested != 2 || resolved != 2 {
-		t.Fatalf("permission events requested=%d resolved=%d, want 2/2(第二次 permission.requested)", requested, resolved)
+	if requested != 1 || resolved != 1 {
+		t.Fatalf("permission events requested=%d resolved=%d, want 1/1 for the attempted call", requested, resolved)
 	}
 }

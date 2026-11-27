@@ -27,6 +27,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/ai-runtime/skills"
 	"github.com/tinguo/goworker/ai-sandbox"
+	aisession "github.com/tinguo/goworker/ai-session"
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
@@ -47,10 +48,13 @@ type AgentPlugin struct {
 	// manager 注册每个会话的 runtime，并提供执行 gate 与 run 生命周期管理。Stop 时
 	// 通过 manager.Close 收口全部 run。
 	manager *runtimeagent.SessionManager
-	// current 是无 binding 调用方（CLI、stdio、测试）的默认会话，也供生命周期逻辑
+	// current 是无 binding 调用方(CLI、stdio、测试)的默认会话，也供生命周期逻辑
 	// 使用；标准 ACP 请求按连接级 binding 路由。atomic.Pointer 保证跨 goroutine
-	// 换轨与读取安全。
+	// 读取安全；写入需经 lifecycleMu 原子换轨并重判被挤出的 runtime。
 	current atomic.Pointer[runtimeagent.SessionRuntime]
+	// startSessionMu serializes session-boundary construction. A /new rebuilds shared
+	// repository/dependency state as well as current, so concurrent callers cannot interleave it.
+	startSessionMu sync.Mutex
 	// deps 是 Session 的资源依赖，startSession 每次会话边界全量重建（含指令快照
 	// 与当前 store 注入），/new 经同一路径刷新后以新 deps 创建新会话。
 	deps runtimeagent.SessionDeps
@@ -58,11 +62,14 @@ type AgentPlugin struct {
 	providerFactory func(*runtimeconfig.Config) (core.Provider, error)
 	// repo caches one store instance per session across boundaries. It is initialized during
 	// Init before concurrent readers exist; nil means persistence is disabled.
-	repo       *session.Repository
-	skills     []skills.Skill        // Init 时加载的 skill 清单，注册为 skill_* 工具
-	mcpClients map[string]mcp.Client // server name → 连接，Stop 时统一关闭
-	mcpTools   []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
-	memory     *memory.Client        // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
+	repo        *session.Repository
+	aiSessions  *aisession.SessionManager
+	aiSessionMu sync.Mutex
+	runRecovery interruptedRunMarker
+	skills      []skills.Skill        // Init 时加载的 skill 清单，注册为 skill_* 工具
+	mcpClients  map[string]mcp.Client // server name → 连接，Stop 时统一关闭
+	mcpTools    []core.Tool           // 从已连接 server 拉取的工具（静态，collectTools 复用）
+	memory      *memory.Client        // 记忆组件（MTM+LTM），Init 打开 / Stop 关闭；nil = 禁用
 
 	// mu 只保护 activeTransportSession:ACP 提交方经 session/new|load 声明的会话
 	// cwd 已随状态绑定收口下沉到当前 runtime(SessionRuntime.cwd/cwdErr,
@@ -129,6 +136,68 @@ func NewPlugin(cfg *runtimeconfig.Config, paths runtimeconfig.Paths) *AgentPlugi
 // 活动会话(Init 未完成或 Init 失败回滚),调用方按约定报「no active session」。
 func (p *AgentPlugin) currentSession() *runtimeagent.SessionRuntime {
 	return p.current.Load()
+}
+
+// retireDisplacedRuntime prevents further admission to a same-ID runtime that was replaced
+// in the manager. A run that reserved the old pointer before replacement may still be active;
+// keep its hub/journal alive until finalizeRun has finished publishing terminal state.
+func (p *AgentPlugin) retireDisplacedRuntime(rt *runtimeagent.SessionRuntime) {
+	active := rt.RetireForReplacement()
+	if active == nil {
+		rt.CloseEvents()
+		return
+	}
+
+	p.bgFinalizers.Add(1)
+	go func() {
+		defer p.bgFinalizers.Done()
+		<-active.Done()
+		rt.CloseEvents()
+	}()
+}
+
+// swapCurrentRuntime registers and publishes the next default runtime under lifecycleMu, then
+// rechecks the displaced runtime before unlocking. Registration and publication must be one
+// lifecycle transaction: a disconnect cannot retire the not-yet-current runtime between them.
+func (p *AgentPlugin) swapCurrentRuntime(next *runtimeagent.SessionRuntime) error {
+	if next == nil {
+		return fmt.Errorf("agent: cannot swap to a nil runtime")
+	}
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+
+	registered := p.manager.Get(next.ID)
+	previous := p.current.Load()
+	switch {
+	case registered == nil:
+		if err := p.manager.Register(next); err != nil {
+			return err
+		}
+	case registered == next:
+		// Runtime already registered by a caller constructing it before publication.
+	case previous != nil && previous.ID == next.ID && registered == previous:
+		// In-memory fallback uses the stable ID "current"; replace by identity so a
+		// later cleanup of the displaced instance cannot remove this new runtime.
+		if err := p.manager.Replace(previous, next); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("agent: runtime %q is already registered", next.ID)
+	}
+
+	previous = p.current.Swap(next)
+	if previous == nil || previous == next {
+		return nil
+	}
+	if previous.ID == next.ID {
+		// The stable-ID fallback has no durable store to release. Retire the displaced
+		// instance immediately, but defer closing its event resources until any active run
+		// has reached terminal state.
+		p.retireDisplacedRuntime(previous)
+		return nil
+	}
+	p.tryReleaseSessionLocked(previous.ID)
+	return nil
 }
 
 // boundSession 返回当前会话本体(currentSession().Session() 的 nil 防护组合)：
@@ -395,7 +464,11 @@ func (p *AgentPlugin) Stop() error {
 	// 维护请求可能仍在 Session Gate 前排队；等它们完整返回后才可关闭其访问的
 	// MCP、memory、store 与 repo 句柄。
 	p.inFlight.wait()
-	// MCP server 是外部进程，退出时统一回收，避免残留孤儿进程。
+	// Session lifecycle mutations are drained before freezing the shared identity manager.
+	if p.aiSessions != nil {
+		p.aiSessions.Close()
+	}
+	// MCP server is an external process, exit uniformly to avoid orphaned children.
 	p.closeMCP()
 	// 等待 /new 派生的后台固化完成——固化 goroutine 是
 	// memory.Client 的最后使用方之一，先于下方 memory.Close 收敛；固化不触
@@ -529,6 +602,9 @@ func (p *AgentPlugin) persistToolAllowRule(rule sandbox.ToolAllowRule) error {
 }
 
 func (p *AgentPlugin) startSession() {
+	p.startSessionMu.Lock()
+	defer p.startSessionMu.Unlock()
+
 	// ① 打开会话持久化仓库（每会话独立目录 + legacy 兼容挂载）。失败降级
 	// 不阻塞插件启动。进程内只开一次（首个会话边界即 Init），/new 复用同一仓库：
 	// 实例唯一缓存跨边界连续，重开会被缓存清空 + 跨进程文件锁拒绝。
@@ -655,10 +731,9 @@ func (p *AgentPlugin) startSession() {
 	default:
 		rt.DeclareCWD(carriedCwd, nil)
 	}
-	if err := p.manager.Register(rt); err != nil {
+	if err := p.swapCurrentRuntime(rt); err != nil {
 		slog.Debug("session: keep previous runtime registered", "id", rt.ID, "err", err)
 	}
-	p.current.Store(rt)
 	// s 即刚注册进 current runtime 的会话本体（等价 p.currentSession().Session()）。
 	s.SetCWD(carriedCwd)
 }

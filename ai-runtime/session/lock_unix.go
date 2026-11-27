@@ -7,11 +7,16 @@
 package session
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
+
+func requireLockSupport() error { return nil }
 
 // acquireDirLock 对会话目录 dir 加排它文件锁。成功返回锁句柄（由 Store 持有，
 // Close 时经 releaseDirLock 释放）；失败（已被占用 / flock 不可用）返回包裹
@@ -29,7 +34,48 @@ func acquireDirLock(dir string) (*os.File, error) {
 	return f, nil
 }
 
-// releaseDirLock 解锁并关闭锁句柄。锁文件本身保留在目录中（见文件头 unlink 竞态）。
+// acquireDirLockContext serializes repository-level publication and lookup while honoring
+// cancellation. Nonblocking flock attempts let ctx.Done interrupt contention without a helper
+// goroutine; a successful lock is rechecked against ctx before it is returned.
+func acquireDirLockContext(ctx context.Context, dir string) (*os.File, error) {
+	if ctx == nil {
+		return nil, errors.New("session: nil lock context")
+	}
+	path := filepath.Join(dir, "lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("session: open blocking lock file %s: %w", path, err)
+	}
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, errors.Join(ctxErr, releaseDirLock(f))
+			}
+			return f, nil
+		}
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
+			_ = f.Close()
+			return nil, fmt.Errorf("session: blocking lock %s: %w", path, err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, errors.Join(ctxErr, f.Close())
+		}
+		select {
+		case <-ctx.Done():
+			return nil, errors.Join(ctx.Err(), f.Close())
+		case <-ticker.C:
+		}
+	}
+}
+
+// releaseDirLock 解锁并关闭锁句柄。
 func releaseDirLock(f *os.File) error {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
 		f.Close()

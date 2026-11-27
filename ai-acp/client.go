@@ -78,19 +78,30 @@ func (c *Client) NewSession(ctx context.Context, cwd string) (string, error) {
 	})
 }
 
-// NewSessionWithRequest creates a session using an explicit ACP request.
+// NewSessionWithRequest creates a session using an explicit ACP request and
+// returns the server-assigned ID.
 func (c *Client) NewSessionWithRequest(ctx context.Context, request protocol.NewSessionRequest) (string, error) {
+	response, err := c.NewSessionWithResponse(ctx, request)
+	if err != nil {
+		return "", err
+	}
+	return response.SessionID, nil
+}
+
+// NewSessionWithResponse creates a session and returns the complete ACP
+// response, including optional session modes.
+func (c *Client) NewSessionWithResponse(ctx context.Context, request protocol.NewSessionRequest) (protocol.NewSessionResponse, error) {
 	if request.McpServers == nil {
 		request.McpServers = []map[string]any{}
 	}
 	var response protocol.NewSessionResponse
 	if err := c.Call(ctx, protocol.MethodSessionNew, request, &response); err != nil {
-		return "", err
+		return protocol.NewSessionResponse{}, err
 	}
 	if response.SessionID == "" {
-		return "", fmt.Errorf("acp: agent %q returned empty sessionId", c.name)
+		return protocol.NewSessionResponse{}, fmt.Errorf("acp: agent %q returned empty sessionId", c.name)
 	}
-	return response.SessionID, nil
+	return response, nil
 }
 
 // ListSessions returns the sessions visible to the Agent.
@@ -114,19 +125,29 @@ func (c *Client) SessionLoad(ctx context.Context, sessionID, cwd string) (string
 	})
 }
 
-// LoadSession resumes a session using an explicit ACP request.
+// LoadSession resumes a session using an explicit ACP request and returns the
+// requested session ID after successful loading.
 func (c *Client) LoadSession(ctx context.Context, request protocol.LoadSessionRequest) (string, error) {
+	if _, err := c.LoadSessionWithResponse(ctx, request); err != nil {
+		return "", err
+	}
+	return request.SessionID, nil
+}
+
+// LoadSessionWithResponse resumes a session and returns the complete ACP
+// response, including optional session modes.
+func (c *Client) LoadSessionWithResponse(ctx context.Context, request protocol.LoadSessionRequest) (protocol.LoadSessionResponse, error) {
 	if request.SessionID == "" {
-		return "", fmt.Errorf("acp: session/load requires sessionId")
+		return protocol.LoadSessionResponse{}, fmt.Errorf("acp: session/load requires sessionId")
 	}
 	if request.McpServers == nil {
 		request.McpServers = []map[string]any{}
 	}
 	var response protocol.LoadSessionResponse
 	if err := c.Call(ctx, protocol.MethodSessionLoad, request, &response); err != nil {
-		return "", err
+		return protocol.LoadSessionResponse{}, err
 	}
-	return request.SessionID, nil
+	return response, nil
 }
 
 // Prompt submits one prompt turn and waits for its stop reason.

@@ -6,6 +6,7 @@ use (
 	./ai-dispatch
 	./ai-memory
 	./ai-runtime
+	./ai-session
 	./ai-sandbox
 	./daemon
 )

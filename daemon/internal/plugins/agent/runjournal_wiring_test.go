@@ -2,11 +2,14 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/session"
+	aisession "github.com/tinguo/goworker/ai-session"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -155,6 +159,325 @@ func TestStartSessionMarksInterruptedRuns(t *testing.T) {
 	}
 	if !bytes.Equal(completedBefore, completedAfter) {
 		t.Fatalf("%s modified by reopen scan: %d bytes before, %d after", doneID, len(completedBefore), len(completedAfter))
+	}
+}
+
+// TestLoadBoundSessionMarksInterruptedRunsAfterInitializerMountsRuntime covers the
+// non-current session path: Init only scans its current store, then Load initializes
+// and registers this persisted session before RouteSession chooses the already-mounted
+// branch. Concurrent loads must converge on one recovery marker.
+func TestLoadBoundSessionMarksInterruptedRunsAfterInitializerMountsRuntime(t *testing.T) {
+	root := t.TempDir()
+	cfg := runtimeconfig.Default()
+	cfg.Session.Dir = root
+	cfg.Session.Enabled = true
+	cfg.Memory.Enabled = false
+
+	previous := NewPlugin(cfg, runtimeconfig.Paths{})
+	if err := previous.Init(initHub(cfg)); err != nil {
+		t.Fatalf("previous Init: %v", err)
+	}
+	previousStopped := false
+	t.Cleanup(func() {
+		if !previousStopped {
+			_ = previous.Stop()
+		}
+	})
+	staleSessionID := previous.currentStore().SessionID()
+	if err := previous.Stop(); err != nil {
+		t.Fatalf("previous Stop: %v", err)
+	}
+	previousStopped = true
+
+	at := time.Now().UTC()
+	runID := fmt.Sprintf("run-%d-1", at.UnixNano())
+	runsDir := filepath.Join(root, staleSessionID, "runs")
+	if err := os.MkdirAll(runsDir, 0o700); err != nil {
+		t.Fatalf("mkdir stale runs: %v", err)
+	}
+	original := writeRunJournalFile(t, filepath.Join(runsDir, runID+".jsonl"),
+		session.RunStateRecord{Kind: "state", SessionID: staleSessionID, RunID: runID, State: "running", At: at},
+	)
+
+	// Restart creates a different current session; the stale session is recovered only
+	// when a connection loads it and the ai-session initializer mounts its runtime.
+	restarted := NewPlugin(cfg, runtimeconfig.Paths{})
+	if err := restarted.Init(initHub(cfg)); err != nil {
+		t.Fatalf("restarted Init: %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Stop() })
+	if restarted.CurrentSessionID() == staleSessionID {
+		t.Fatalf("restart reused stale session %q as current", staleSessionID)
+	}
+
+	const callers = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- restarted.LoadBoundSession(staleSessionID, "")
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent LoadBoundSession: %v", err)
+		}
+	}
+
+	journalPath := filepath.Join(runsDir, runID+".jsonl")
+	after, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatalf("read recovered journal: %v", err)
+	}
+	if !bytes.HasPrefix(after, original) {
+		t.Fatal("recovery changed original run record")
+	}
+	records := readRunJournalFile(t, journalPath)
+	if len(records) != 2 {
+		t.Fatalf("recovered records = %d, want 2 (running + exactly one interrupted)", len(records))
+	}
+	if records[0].State != "running" {
+		t.Fatalf("original run state = %q, want running", records[0].State)
+	}
+	marker := records[1]
+	if marker.Kind != "state" || marker.State != session.StateInterrupted || marker.SessionID != staleSessionID || marker.RunID != runID {
+		t.Fatalf("recovery marker = %+v, want one interrupted marker for the stale run", marker)
+	}
+}
+
+// blockingRunRecovery gates one recovery attempt so tests can observe whether a runtime
+// is published before the scan completes. It delegates to the real repository after release.
+type blockingRunRecovery struct {
+	repo    *session.Repository
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	calls   int
+}
+
+func (r *blockingRunRecovery) MarkInterruptedRuns(ctx context.Context, sessionID string) ([]string, error) {
+	r.mu.Lock()
+	r.calls++
+	call := r.calls
+	r.mu.Unlock()
+	if call == 1 {
+		r.once.Do(func() { close(r.entered) })
+		<-r.release
+	}
+	return r.repo.MarkInterruptedRuns(ctx, sessionID)
+}
+
+func (r *blockingRunRecovery) unblock() {
+	r.once.Do(func() { close(r.entered) })
+	select {
+	case <-r.release:
+	default:
+		close(r.release)
+	}
+}
+
+func (r *blockingRunRecovery) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+type failingRunRecovery struct{ err error }
+
+func (r failingRunRecovery) MarkInterruptedRuns(context.Context, string) ([]string, error) {
+	return nil, r.err
+}
+
+func TestReleasedSessionRecoveryFailureDoesNotPublishRuntime(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "unused"})
+	sessionID, err := p.CreateBoundSession("")
+	if err != nil {
+		t.Fatalf("CreateBoundSession: %v", err)
+	}
+	managedID, err := aisession.ParseID(sessionID)
+	if err != nil {
+		t.Fatalf("ParseID(%q): %v", sessionID, err)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); err != nil {
+		t.Fatalf("setup: ai-session registry lost session: %v", err)
+	}
+	p.BindConnectionSessionReference("failed-reopen", sessionID)
+	p.ReleaseConnection("failed-reopen")
+	p.runRecovery = failingRunRecovery{err: errors.New("injected recovery failure")}
+
+	if err := p.LoadBoundSession(sessionID, ""); err == nil {
+		t.Fatal("LoadBoundSession succeeded despite recovery failure")
+	}
+	if p.manager.Get(sessionID) != nil {
+		t.Fatal("runtime was published despite recovery failure")
+	}
+	if _, ok := p.repo.Peek(sessionID); ok {
+		t.Fatal("session store remained cached after failed recovery")
+	}
+}
+
+// TestReleasedSessionRecoveryPrecedesRuntimePublication serializes recovery after a
+// same-process release. While the real scan is gated, no caller may route a Run to the
+// session; concurrent loads then share one scan and publish the runtime only afterward.
+func TestReleasedSessionRecoveryPrecedesRuntimePublication(t *testing.T) {
+	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
+	defer sync.OnceFunc(func() { close(gated.release) })()
+	p := newPersistedPlugin(t, gated)
+
+	sessionID, err := p.CreateBoundSession("")
+	if err != nil {
+		t.Fatalf("CreateBoundSession: %v", err)
+	}
+	staleRunID := fmt.Sprintf("run-%d-1", time.Now().UnixNano())
+	journal, err := p.repo.OpenRunJournal(context.Background(), sessionID, staleRunID)
+	if err != nil {
+		t.Fatalf("OpenRunJournal(stale): %v", err)
+	}
+	if err := journal.Append(session.RunStateRecord{
+		Kind: "state", SessionID: sessionID, RunID: staleRunID, State: "running", At: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("append stale run state: %v", err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatalf("close stale run journal: %v", err)
+	}
+
+	managedID, err := aisession.ParseID(sessionID)
+	if err != nil {
+		t.Fatalf("ParseID(%q): %v", sessionID, err)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); err != nil {
+		t.Fatalf("setup: ai-session registry lost released session: %v", err)
+	}
+	p.BindConnectionSessionReference("released-connection", sessionID)
+	p.ReleaseConnection("released-connection")
+	if p.manager.Get(sessionID) != nil {
+		t.Fatal("setup: released runtime is still registered")
+	}
+	if _, ok := p.repo.Peek(sessionID); ok {
+		t.Fatal("setup: released session store is still cached")
+	}
+
+	recovery := &blockingRunRecovery{
+		repo: p.repo, entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	p.runRecovery = recovery
+	defer recovery.unblock()
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- p.LoadBoundSession(sessionID, "") }()
+	select {
+	case <-recovery.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery scan did not reach test gate")
+	}
+	runtimePublishedEarly := p.manager.Get(sessionID) != nil
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondDone <- p.LoadBoundSession(sessionID, "")
+	}()
+	<-secondStarted
+
+	const connectionID = "run-during-reopen"
+	p.AcquireControl(sessionID, connectionID)
+	runDuringReopenID, _, runDuringReopenErr := p.StartRun(sessionID, connectionID, "should wait for recovery", "during-reopen")
+
+	recovery.unblock()
+	for name, done := range map[string]<-chan error{"first": firstDone, "second": secondDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("%s LoadBoundSession: %v", name, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("%s LoadBoundSession did not finish", name)
+		}
+	}
+	if runtimePublishedEarly {
+		t.Fatal("runtime was published before interrupted-run recovery completed")
+	}
+	if runDuringReopenID != "" {
+		records := readRunJournalFile(t, filepath.Join(p.cfg.Session.Dir, sessionID, "runs", runDuringReopenID+".jsonl"))
+		for _, record := range records {
+			if record.Kind == "state" && record.State == session.StateInterrupted {
+				t.Fatalf("run admitted during recovery was marked interrupted: %+v", records)
+			}
+		}
+		t.Fatalf("StartRun during recovery succeeded with run %q; want ErrSessionNotFound", runDuringReopenID)
+	}
+	if !errors.Is(runDuringReopenErr, runtimeagent.ErrSessionNotFound) {
+		t.Fatalf("StartRun before recovery completion = %v, want ErrSessionNotFound", runDuringReopenErr)
+	}
+	if recovery.callCount() != 1 {
+		t.Fatalf("recovery scans = %d, want 1 for concurrent reopen", recovery.callCount())
+	}
+
+	staleRecords := readRunJournalFile(t, filepath.Join(p.cfg.Session.Dir, sessionID, "runs", staleRunID+".jsonl"))
+	if len(staleRecords) != 2 || staleRecords[1].State != session.StateInterrupted {
+		t.Fatalf("stale run records after reopen = %+v, want original + one interrupted marker", staleRecords)
+	}
+
+	liveRunID, _, err := p.StartRun(sessionID, connectionID, "run after recovery", "after-reopen")
+	if err != nil {
+		t.Fatalf("StartRun after recovery: %v", err)
+	}
+	select {
+	case <-gated.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("post-reopen run did not reach provider")
+	}
+	liveRecords := readRunJournalFile(t, filepath.Join(p.cfg.Session.Dir, sessionID, "runs", liveRunID+".jsonl"))
+	for _, record := range liveRecords {
+		if record.Kind == "state" && record.State == session.StateInterrupted {
+			t.Fatalf("post-recovery live run was marked interrupted: %+v", liveRecords)
+		}
+	}
+}
+
+// TestLoadBoundSessionDoesNotInterruptLiveRun ensures that loading a runtime already
+// attached by this process never treats its active run journal as crash residue.
+func TestLoadBoundSessionDoesNotInterruptLiveRun(t *testing.T) {
+	gated := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
+	defer close(gated.release)
+	p := newPersistedPlugin(t, gated)
+	sid := p.CurrentSessionID()
+	p.AcquireControl(sid, "connection-live")
+
+	runID, _, err := p.StartRun(sid, "connection-live", "keep running", "request-live")
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	select {
+	case <-gated.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("live run did not reach provider")
+	}
+
+	if err := p.LoadBoundSession(sid, ""); err != nil {
+		t.Fatalf("LoadBoundSession during active run: %v", err)
+	}
+
+	journalPath := filepath.Join(p.cfg.Session.Dir, sid, "runs", runID+".jsonl")
+	records := readRunJournalFile(t, journalPath)
+	var lastState string
+	for _, record := range records {
+		if record.Kind == "state" {
+			lastState = record.State
+			if record.State == session.StateInterrupted {
+				t.Fatalf("active run %q was marked interrupted: %+v", runID, records)
+			}
+		}
+	}
+	if lastState != "running" {
+		t.Fatalf("active run last journal state = %q, want running", lastState)
 	}
 }
 

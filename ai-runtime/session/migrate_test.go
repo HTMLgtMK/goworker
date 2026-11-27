@@ -224,6 +224,45 @@ func TestMigrateLegacyLayoutIdempotent(t *testing.T) {
 	}
 }
 
+// TestMigrateLegacyLayoutSkipsRepositoryPrivateDirs verifies migration leaves repository
+// coordination locks and detached deletion data untouched.
+func TestMigrateLegacyLayoutSkipsRepositoryPrivateDirs(t *testing.T) {
+	root := t.TempDir()
+	id := NewSessionID()
+	seed := `{"kind":"metadata","session_id":"` + id + `","created_at":"2024-01-01T00:00:00Z"}` + "\n"
+
+	lockDir := filepath.Join(root, ".repository-locks")
+	lockPath := filepath.Join(lockDir, "current.jsonl")
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		t.Fatalf("mkdir repository lock dir: %v", err)
+	}
+	if err := os.WriteFile(lockPath, []byte(seed), 0o600); err != nil {
+		t.Fatalf("write lock-dir sentinel: %v", err)
+	}
+
+	tombstoneDir := filepath.Join(root, ".repository-tombstones")
+	tombstonePath := filepath.Join(tombstoneDir, "current.jsonl")
+	if err := os.MkdirAll(tombstoneDir, 0o700); err != nil {
+		t.Fatalf("mkdir tombstone dir: %v", err)
+	}
+	if err := os.WriteFile(tombstonePath, []byte(seed), 0o600); err != nil {
+		t.Fatalf("write tombstone sentinel: %v", err)
+	}
+
+	stats, err := MigrateLegacyLayout(root)
+	if err != nil {
+		t.Fatalf("MigrateLegacyLayout: %v", err)
+	}
+	if stats != (LayoutMigration{}) {
+		t.Fatalf("migration stats = %+v, want no changes", stats)
+	}
+	for _, path := range []string{lockPath, tombstonePath} {
+		if data, err := os.ReadFile(path); err != nil || string(data) != seed {
+			t.Errorf("private repository data %s changed: err=%v data=%q", path, err, data)
+		}
+	}
+}
+
 // TestMigrateLegacyLayoutConflictDropsSource 验证同 id 冲突的丢弃方向（定案 #9）：
 // legacy 根槽的 metadata id 与既有 per-id 会话撞车时，根槽是重复方——连源清理，
 // 在册 per-id 正本分毫不动（rename 覆盖会毁正本，宁丢重复）。

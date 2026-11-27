@@ -106,6 +106,76 @@ func TestSessionManagerLifecycle(t *testing.T) {
 	}
 }
 
+func TestSessionManagerReplaceIsIdentitySafe(t *testing.T) {
+	m := NewSessionManager()
+	defer m.Close()
+
+	old := NewSessionRuntime("current", nil)
+	next := NewSessionRuntime("current", nil)
+	if err := m.Register(old); err != nil {
+		t.Fatalf("register old runtime: %v", err)
+	}
+	if err := m.Replace(old, next); err != nil {
+		t.Fatalf("replace runtime: %v", err)
+	}
+	if got := m.Get(next.ID); got != next {
+		t.Fatalf("Get(%q) = %p, want replacement %p", next.ID, got, next)
+	}
+	if m.RemoveRuntime(old) {
+		t.Fatal("stale runtime removed the replacement")
+	}
+	if got := m.Get(next.ID); got != next {
+		t.Fatalf("Get(%q) after stale removal = %p, want replacement %p", next.ID, got, next)
+	}
+	if !m.RemoveRuntime(next) {
+		t.Fatal("registered replacement was not removed")
+	}
+	if got := m.Get(next.ID); got != nil {
+		t.Fatalf("Get(%q) after replacement removal = %p, want nil", next.ID, got)
+	}
+}
+
+func TestSessionManagerReplaceRacesWithStaleRemoval(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		m := NewSessionManager()
+		old := NewSessionRuntime("current", nil)
+		next := NewSessionRuntime("current", nil)
+		if err := m.Register(old); err != nil {
+			t.Fatalf("register old runtime: %v", err)
+		}
+
+		start := make(chan struct{})
+		replaceResult := make(chan error, 1)
+		removeResult := make(chan bool, 1)
+		go func() {
+			<-start
+			replaceResult <- m.Replace(old, next)
+		}()
+		go func() {
+			<-start
+			removeResult <- m.RemoveRuntime(old)
+		}()
+		close(start)
+
+		replaceErr := <-replaceResult
+		removedOld := <-removeResult
+		got := m.Get(old.ID)
+		switch {
+		case replaceErr == nil:
+			if got != next || removedOld {
+				t.Fatalf("replace won but stale removal changed registry: runtime=%p removedOld=%t", got, removedOld)
+			}
+		case removedOld:
+			if got != nil {
+				t.Fatalf("stale removal won but registry retained runtime %p", got)
+			}
+		default:
+			t.Fatalf("replace failed without stale removal: err=%v runtime=%p", replaceErr, got)
+		}
+		m.Close()
+	}
+}
+
 func runtimeIDs(list []*SessionRuntime) []string {
 	ids := make([]string, 0, len(list))
 	for _, rt := range list {
@@ -295,6 +365,51 @@ func TestManagerCloseClosesEventHubs(t *testing.T) {
 	assertSealedRunJournal(t, fxB, hB.RunID, []string{string(RunQueued), string(RunRunning), string(RunCompleted)})
 	// B 的事件记录覆盖 [1..LatestSeq] 无缺口(delta flush 先于终态落盘)。
 	assertRunEventCoverage(t, fxB, hB.RunID, latestB)
+}
+
+type failingQueuedRunJournal struct{}
+
+func (failingQueuedRunJournal) AppendState(session.RunStateRecord) error {
+	return errors.New("injected queued state failure")
+}
+
+func TestManagerCloseWaitsForReservationRollbackNotification(t *testing.T) {
+	hookEntered := make(chan struct{})
+	releaseHook := make(chan struct{})
+	manager := NewSessionManager(WithRunDoneHook(func(string) {
+		close(hookEntered)
+		<-releaseHook
+	}))
+	runtime := NewSessionRuntime("session", NewSession(SessionDeps{RunJournal: failingQueuedRunJournal{}}))
+	if err := manager.Register(runtime); err != nil {
+		t.Fatalf("register runtime: %v", err)
+	}
+
+	if _, err := manager.StartRun(runtime.ID, RunRequest{Input: "rejected"}, RunCallbacks{}); !errors.Is(err, ErrRunJournalWrite) {
+		t.Fatalf("StartRun error = %v, want ErrRunJournalWrite", err)
+	}
+	select {
+	case <-hookEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reservation rollback notification was not dispatched")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		manager.Close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned before the rollback notification completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseHook)
+	select {
+	case <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return after the rollback notification completed")
+	}
 }
 
 // assertSealedRunJournal 重读磁盘文件，验证 JSON 完整、state 顺序及终态位于末行。

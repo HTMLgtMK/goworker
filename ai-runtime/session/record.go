@@ -70,8 +70,10 @@ type cursorFields struct {
 // metadataFields identifies the logical session independently from its current head.
 // It is written once at the beginning of a session JSONL file and survives archive/compact.
 type metadataFields struct {
-	SessionID string    `json:"session_id"`
-	CreatedAt time.Time `json:"created_at"`
+	SessionID string            `json:"session_id"`
+	CreatedAt time.Time         `json:"created_at"`
+	UpdatedAt *time.Time        `json:"updated_at,omitempty"`
+	Values    map[string]string `json:"metadata,omitempty"`
 }
 
 // workspaceFields 保存工作目录声明。重复追加时取最后一条，旧记录保持不变。
@@ -215,6 +217,8 @@ func (r Record) MarshalJSON() ([]byte, error) {
 		Preview      string                     `json:"preview,omitempty"`
 		MsgID        string                     `json:"msg_id,omitempty"`
 		SessionID    string                     `json:"session_id,omitempty"`
+		Metadata     map[string]string          `json:"metadata,omitempty"`
+		UpdatedAt    *time.Time                 `json:"updated_at,omitempty"`
 		Path         string                     `json:"path,omitempty"`
 		Title        string                     `json:"title,omitempty"`
 		TitleVersion uint64                     `json:"titleVersion,omitempty"`
@@ -250,6 +254,8 @@ func (r Record) MarshalJSON() ([]byte, error) {
 	case kindMetadata:
 		if r.Meta != nil {
 			f.SessionID = r.Meta.SessionID
+			f.Metadata = r.Meta.Values
+			f.UpdatedAt = r.Meta.UpdatedAt
 		}
 	case kindWorkspace:
 		if r.Ws != nil {
@@ -374,8 +380,28 @@ func newCursorRecord(msgID string, created time.Time) Record {
 }
 
 // newMetadataRecord constructs the immutable logical session identity record.
-func newMetadataRecord(sessionID string, created time.Time) Record {
-	return Record{Kind: kindMetadata, Meta: &metadataFields{SessionID: sessionID, CreatedAt: created}}
+func newMetadataRecord(sessionID string, created, updated time.Time, values map[string]string) Record {
+	var updatedAt *time.Time
+	if !updated.IsZero() {
+		updatedAt = &updated
+	}
+	return Record{Kind: kindMetadata, Meta: &metadataFields{
+		SessionID: sessionID,
+		CreatedAt: created,
+		UpdatedAt: updatedAt,
+		Values:    cloneStringMap(values),
+	}}
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 // newWorkspaceRecord 构造 workspace 声明记录；重复声明时由读取方采用最后一条。

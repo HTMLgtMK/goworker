@@ -1,13 +1,16 @@
 package aiacp
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/tinguo/goworker/ai-acp/protocol"
+	aisession "github.com/tinguo/goworker/ai-session"
 )
 
 // TestInitializeReadyRunsAfterResponseWrite checks that the ready hook issues a reverse call.
@@ -62,6 +65,163 @@ func (h *initializeReadyHandler) InitializeReady(ctx context.Context, reporter R
 	}
 	var response map[string]any
 	_ = caller.Call(ctx, "x-device/tools", struct{}{}, &response)
+}
+
+type sessionNewEventHandler struct{}
+
+func (sessionNewEventHandler) Prompt(context.Context, string, []protocol.ContentBlock, Reporter) (string, error) {
+	return protocol.StopEndTurn, nil
+}
+
+func (sessionNewEventHandler) CreateSession(_ context.Context, _ protocol.NewSessionRequest, reporter Reporter) (aisession.ID, error) {
+	id := aisession.ID("session-events")
+	reporter.Update(id.String(), protocol.SessionUpdateBody{Raw: json.RawMessage(`{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"/help"}]}`)})
+	return id, nil
+}
+
+func TestSessionNewWritesResponseBeforeCreatorUpdates(t *testing.T) {
+	serverEnd, clientEnd := net.Pipe()
+	server := ServeConn(serverEnd, sessionNewEventHandler{})
+	t.Cleanup(func() { _ = server.Close() })
+	t.Cleanup(func() { _ = clientEnd.Close() })
+	_ = clientEnd.SetDeadline(time.Now().Add(5 * time.Second))
+
+	if _, err := clientEnd.Write([]byte(`{"jsonrpc":"2.0","id":7,"method":"session/new","params":{"cwd":"/repo","mcpServers":[]}}` + "\n")); err != nil {
+		t.Fatalf("write session/new: %v", err)
+	}
+	reader := bufio.NewReader(clientEnd)
+	type frame struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Method  string          `json:"method"`
+		Result  json.RawMessage `json:"result"`
+		Params  struct {
+			SessionID string                     `json:"sessionId"`
+			Update    protocol.SessionUpdateBody `json:"update"`
+		} `json:"params"`
+	}
+	read := func() frame {
+		t.Helper()
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		var got frame
+		if err := json.Unmarshal(line, &got); err != nil {
+			t.Fatalf("decode frame %s: %v", line, err)
+		}
+		return got
+	}
+
+	response := read()
+	if string(response.ID) != "7" || response.Method != "" {
+		t.Fatalf("first frame = %+v, want session/new response before notifications", response)
+	}
+	var created protocol.NewSessionResponse
+	if err := json.Unmarshal(response.Result, &created); err != nil {
+		t.Fatalf("decode session/new result: %v", err)
+	}
+	if created.SessionID != "session-events" {
+		t.Fatalf("session/new ID = %q", created.SessionID)
+	}
+
+	update := read()
+	if update.Method != protocol.MethodSessionUpdate || update.Params.SessionID != created.SessionID ||
+		update.Params.Update.SessionUpdate != protocol.UpdateAvailableCommands {
+		t.Fatalf("second frame = %+v, want available_commands_update for returned session", update)
+	}
+}
+
+func TestSessionNewRequiresApplicationCreator(t *testing.T) {
+	serverEnd, clientEnd := net.Pipe()
+	server := ServeConn(serverEnd, &initializeReadyHandler{ready: make(chan struct{})})
+	t.Cleanup(func() { _ = server.Close() })
+	client, err := NewClient("protocol-only", clientEnd, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	if _, err := client.NewSession(context.Background(), "/repo"); err == nil {
+		t.Fatal("session/new succeeded without an application creator")
+	}
+}
+
+func TestSessionNewReporterForwardsOptionalServerInterfaces(t *testing.T) {
+	serverEnd, clientEnd := net.Pipe()
+	creator := &reporterSurfaceCreator{}
+	server := ServeConn(serverEnd, creator)
+	t.Cleanup(func() { _ = server.Close() })
+
+	client := protocol.NewConn(clientEnd)
+	client.Handle("x-test/reverse", func(_ context.Context, params json.RawMessage) (any, error) {
+		var request struct {
+			Probe string `json:"probe"`
+		}
+		if err := json.Unmarshal(params, &request); err != nil {
+			return nil, err
+		}
+		return map[string]any{"accepted": request.Probe == "from-creator"}, nil
+	})
+	t.Cleanup(func() { _ = client.Close() })
+	go func() { _ = client.Serve() }()
+
+	var clientCaps protocol.ClientCapabilities
+	if err := json.Unmarshal([]byte(`{"x-device":{"tools":true}}`), &clientCaps); err != nil {
+		t.Fatalf("decode client capabilities: %v", err)
+	}
+	var initialized protocol.InitializeResponse
+	if err := client.Call(context.Background(), protocol.MethodInitialize,
+		protocol.InitializeRequest{ProtocolVersion: protocol.Version, ClientCapabilities: clientCaps}, &initialized); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+
+	var created protocol.NewSessionResponse
+	if err := client.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: "/repo"}, &created); err != nil {
+		t.Fatalf("session/new: %v", err)
+	}
+	if created.SessionID != "reporter-surface-session" {
+		t.Fatalf("session ID = %q", created.SessionID)
+	}
+	if !creator.sawClientCapability || !creator.reverseCallAccepted {
+		t.Fatalf("creator reporter interfaces: capabilities=%v reverseCall=%v err=%v",
+			creator.sawClientCapability, creator.reverseCallAccepted, creator.err)
+	}
+}
+
+type reporterSurfaceCreator struct {
+	sawClientCapability bool
+	reverseCallAccepted bool
+	err                 error
+}
+
+func (*reporterSurfaceCreator) Prompt(context.Context, string, []protocol.ContentBlock, Reporter) (string, error) {
+	return protocol.StopEndTurn, nil
+}
+
+func (c *reporterSurfaceCreator) CreateSession(ctx context.Context, _ protocol.NewSessionRequest, reporter Reporter) (aisession.ID, error) {
+	capabilityProvider, ok := reporter.(ClientCapabilitiesProvider)
+	if !ok {
+		c.err = errors.New("reporter lost ClientCapabilities interface")
+		return "", c.err
+	}
+	c.sawClientCapability = capabilityProvider.ClientCapabilities().Has("x-device")
+
+	reverseCaller, ok := reporter.(ReverseCaller)
+	if !ok {
+		c.err = errors.New("reporter lost reverse Call interface")
+		return "", c.err
+	}
+	var response struct {
+		Accepted bool `json:"accepted"`
+	}
+	if err := reverseCaller.Call(ctx, "x-test/reverse", map[string]string{"probe": "from-creator"}, &response); err != nil {
+		c.err = err
+		return "", err
+	}
+	c.reverseCallAccepted = response.Accepted
+	return aisession.ID("reporter-surface-session"), nil
 }
 
 func TestServerStoresClientCapabilities(t *testing.T) {

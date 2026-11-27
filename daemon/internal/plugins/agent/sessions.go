@@ -182,6 +182,36 @@ func (p *AgentPlugin) CurrentSessionHistory() []model.SessionUpdate {
 	return replayUpdates(view, checkpointAnchors(store))
 }
 
+// ReloadAndReadCurrentSession pins current runtime selection across identity validation,
+// view reload, and history extraction. A changed current session is rejected without a
+// retry, so an ABA transition cannot validate a stale handler-side observation.
+func (p *AgentPlugin) ReloadAndReadCurrentSession(expectedID string) ([]model.SessionUpdate, error) {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+
+	rt := p.current.Load()
+	store := p.storeFor(rt)
+	if store == nil || store.SessionID() != expectedID {
+		actual := ""
+		if store != nil {
+			actual = store.SessionID()
+		}
+		return nil, fmt.Errorf("agent: current session changed: expected %q, got %q", expectedID, actual)
+	}
+	sess := rt.Session()
+	if sess == nil {
+		return nil, fmt.Errorf("agent: current session %q is not bound", expectedID)
+	}
+	if err := sess.ReloadFromStore(); err != nil {
+		return nil, fmt.Errorf("agent: reload current session %q: %w", expectedID, err)
+	}
+	view := store.ActiveView()
+	if len(view) == 0 {
+		return []model.SessionUpdate{}, nil
+	}
+	return replayUpdates(view, checkpointAnchors(store)), nil
+}
+
 // ArchivedSessionHistory reads an archived session and maps it to ACP replay updates.
 // It first checks legacy archive files, then opens an in-place per-ID archive through
 // the repository. A store opened for an unregistered session is closed after values are

@@ -21,6 +21,45 @@ import (
 
 // 本文件验证后台 Run 的排队、取消、持久化与事件生命周期。
 
+func TestStartRunInjectsTrustedRunIdentity(t *testing.T) {
+	m := NewSessionManager(WithRunContext(RunContextValue{
+		Key:   runIdentityContextKey{},
+		Value: RunIdentity{SessionID: "spoofed-session", RunID: "spoofed-run"},
+	}))
+	defer m.Close()
+
+	_, _, _ = newSupRuntime(t, m, "identity-session", "reply", false)
+	identityCh := make(chan RunIdentity, 1)
+	h, err := m.StartRun("identity-session", RunRequest{
+		Input: "q",
+		ToolSource: func(ctx context.Context) []core.Tool {
+			identity, ok := RunIdentityFromContext(ctx)
+			if !ok {
+				identityCh <- RunIdentity{}
+				return nil
+			}
+			identityCh <- identity
+			return nil
+		},
+	}, RunCallbacks{})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	select {
+	case identity := <-identityCh:
+		if identity.SessionID != "identity-session" {
+			t.Errorf("runtime session ID = %q, want identity-session", identity.SessionID)
+		}
+		if identity.RunID == "" || identity.RunID != h.RunID {
+			t.Errorf("runtime run ID = %q, want handle run ID %q", identity.RunID, h.RunID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ToolSource did not receive run identity")
+	}
+	waitHandle(t, h)
+}
+
 func TestStartRunRejectsArchivedRuntime(t *testing.T) {
 	m := NewSessionManager()
 	defer m.Close()

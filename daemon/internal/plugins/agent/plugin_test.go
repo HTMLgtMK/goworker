@@ -310,11 +310,7 @@ func (p *AgentPlugin) setMemory(c *memory.Client) {
 	p.refreshSession()
 }
 
-// refreshSession 用当前 deps 重建会话并接线 current runtime，对齐 startSession
-// 的会话边界构造：Register 进 manager 并置为 current。测试直接注入 deps，不读
-// 真实文件。runtime id 与生产同规则：注入了 *session.Store 时取其 SessionID，
-// 纯内存则保持 "current" 单例。重复调用（如 setMemory）等价于 /new 式重建，
-// 同 id 注册冲突时旧 runtime 保留在 manager，current 换新。
+// refreshSession routes test session reconstruction through the same lifecycle transaction as production.
 func (p *AgentPlugin) refreshSession() {
 	s := runtimeagent.NewSession(p.deps)
 	id := "current"
@@ -322,8 +318,9 @@ func (p *AgentPlugin) refreshSession() {
 		id = st.SessionID()
 	}
 	rt := runtimeagent.NewSessionRuntime(id, s)
-	_ = p.manager.Register(rt)
-	p.current.Store(rt)
+	if err := p.swapCurrentRuntime(rt); err != nil {
+		panic(err)
+	}
 }
 
 // newContext 构造带输出捕获的 model.Context。
@@ -885,6 +882,23 @@ func newMemoryPlugin(t *testing.T) *AgentPlugin {
 	return p
 }
 
+func enableTestSessionPersistence(t *testing.T, p *AgentPlugin) {
+	t.Helper()
+	root := t.TempDir()
+	repo, err := session.OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+	p.repo = repo
+	p.cfg.Session.Enabled = true
+	p.cfg.Session.Dir = root
+	t.Cleanup(func() {
+		if err := p.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+}
+
 func TestHandleMemory_AddListSearch(t *testing.T) {
 	p := newMemoryPlugin(t)
 
@@ -995,6 +1009,7 @@ func (b *lockedBuf) waitFor(t *testing.T, want string, timeout time.Duration) {
 
 func TestHandleNew_EmptyConversationSkipsCheckpoint(t *testing.T) {
 	p := newMemoryPlugin(t) // conversation 为空，不启动后台固化，不碰 LLM
+	enableTestSessionPersistence(t, p)
 
 	ctx, buf := newContext()
 	if err := p.handleNew(ctx); err != nil {
@@ -1026,10 +1041,12 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	provider := cfg.LLM.Providers[cfg.LLM.Current.Provider]
 	provider.Endpoint = srv.URL
 	cfg.LLM.Providers[cfg.LLM.Current.Provider] = provider
-	cfg.Session.Enabled = false // 避免 handleNew 走真实 store 路径，污染用户会话目录
+	cfg.Session.Enabled = true
+	cfg.Session.Dir = t.TempDir()
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
 	ms, _ := memory.NewClient(t.TempDir(), 10)
+	enableTestSessionPersistence(t, p)
 	p.setMemory(ms)
 	seedRuns(p, "q")
 
@@ -1192,6 +1209,7 @@ func TestHandleNew_LtmExtractDisabledSkipsFacts(t *testing.T) {
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
 	ms, _ := memory.NewClient(t.TempDir(), 10)
+	enableTestSessionPersistence(t, p)
 	p.setMemory(ms)
 	seedRuns(p, "q")
 
