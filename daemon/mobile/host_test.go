@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/tinguo/goworker/daemon/internal/pluginregistry"
 )
 
 // collectCB 收集 OnData 字节流并记录 OnClose，供往返断言。
@@ -60,7 +62,7 @@ func (c *collectCB) waitResponse(t *testing.T, id float64) map[string]any {
 			if err := json.Unmarshal([]byte(line), &msg); err != nil {
 				continue // 半条消息，等下一轮累积
 			}
-			if msgID, ok := msg["id"].(float64); ok && msgID == id && msg["result"] != nil {
+			if msgID, ok := msg["id"].(float64); ok && msgID == id && (msg["result"] != nil || msg["error"] != nil) {
 				return msg
 			}
 		}
@@ -116,9 +118,27 @@ func TestHostBridgeRoundTrip(t *testing.T) {
 		t.Fatalf("write session/new: %v", err)
 	}
 	newResp := cb.waitResponse(t, 2)
-	result, _ := newResp["result"].(map[string]any)
-	if result == nil || result["sessionId"] == "" {
-		t.Fatalf("session/new missing sessionId: %v", newResp)
+	descriptors, err := pluginregistry.Snapshot()
+	if err != nil {
+		t.Fatalf("plugin registry: %v", err)
+	}
+	hasAgent := false
+	for _, descriptor := range descriptors {
+		if descriptor.Name == "agent" {
+			hasAgent = true
+			break
+		}
+	}
+	if hasAgent {
+		result, _ := newResp["result"].(map[string]any)
+		if result == nil || result["sessionId"] == "" {
+			t.Fatalf("session/new missing sessionId: %v", newResp)
+		}
+	} else {
+		rpcErr, _ := newResp["error"].(map[string]any)
+		if rpcErr == nil || rpcErr["code"] != float64(-32000) || rpcErr["message"] != "acp frontend: session creation not supported" {
+			t.Fatalf("session/new without agent: want unsupported error, got %v", newResp)
+		}
 	}
 
 	// Close 后 OnClose 恰好一次，且 Close 幂等
