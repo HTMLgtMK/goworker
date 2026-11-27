@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -14,6 +15,9 @@ import (
 
 // ErrSessionArchived prevents new runs after a session reaches its terminal state.
 var ErrSessionArchived = errors.New("session: runtime is archived")
+
+// ErrSessionReadOnly prevents execution when the session's workspace is unavailable.
+var ErrSessionReadOnly = errors.New("session: runtime is read-only")
 
 // ErrSessionRetired rejects runs on a runtime instance that has been removed from
 // the SessionManager. Archived is a persisted terminal state; retired only ends
@@ -34,6 +38,7 @@ type SessionRuntime struct {
 	// admissionMu serializes run reservation with the archived transition.
 	admissionMu sync.Mutex
 	archived    bool
+	readOnlyErr error
 	// retired marks this runtime instance as removed from the manager registry.
 	// It shares admissionMu with archived so a StartRun that already holds the
 	// pointer (but has not reserved yet) cannot execute against a closed hub/store.
@@ -82,6 +87,9 @@ func (r *SessionRuntime) reserveRun(run *AgentRun) (*Session, error) {
 	if r.retired {
 		return nil, ErrSessionRetired
 	}
+	if r.readOnlyErr != nil {
+		return nil, fmt.Errorf("%w: %v", ErrSessionReadOnly, r.readOnlyErr)
+	}
 	if r.active != nil {
 		return nil, ErrRunActive
 	}
@@ -115,6 +123,22 @@ func (r *SessionRuntime) releaseRunReservation(run *AgentRun) {
 		run.finish(RunResult{State: RunCancelled})
 	}
 	completeNotification(released)
+}
+
+// SetReadOnlyReason fences future runs when the workspace is unavailable.
+func (r *SessionRuntime) SetReadOnlyReason(reason error) {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+	r.mu.Lock()
+	r.readOnlyErr = reason
+	r.mu.Unlock()
+}
+
+// ReadOnlyReason returns the current workspace-related read-only reason.
+func (r *SessionRuntime) ReadOnlyReason() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.readOnlyErr
 }
 
 // Retire rejects new reservations. It shares admissionMu with reserveRun: reservation

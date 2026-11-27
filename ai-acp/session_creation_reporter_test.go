@@ -100,6 +100,30 @@ func TestSessionCreationReporterDiscardsOnFailedResponse(t *testing.T) {
 	}
 }
 
+func TestSessionCreationReporterAbortsOnlyWhenResponseWasNotSent(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		outcome    protocol.ResponseWriteOutcome
+		wantAborts int
+	}{
+		{name: "definitely not sent", outcome: protocol.ResponseWriteNotSent, wantAborts: 1},
+		{name: "write outcome unknown", outcome: protocol.ResponseWriteOutcomeUnknown, wantAborts: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reporter := newSessionCreationReporter(context.Background(), &updateRecorder{})
+			aborts := 0
+			reporter.SetSessionCreationAbort(func() error {
+				aborts++
+				return nil
+			})
+			reporter.AfterResponseWriteFailedWithOutcome(context.Background(), test.outcome)
+			if aborts != test.wantAborts {
+				t.Fatalf("abort calls = %d, want %d", aborts, test.wantAborts)
+			}
+		})
+	}
+}
+
 func TestSessionCreationReporterDiscardsOnContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	reporter := newSessionCreationReporter(ctx, &updateRecorder{})

@@ -32,6 +32,12 @@ type ReverseCaller interface {
 	Call(ctx context.Context, method string, params, result any) error
 }
 
+// SessionCreationAbortRegistrar lets a creator attach safe cleanup for a session
+// whose session/new response is later proven not to have been sent.
+type SessionCreationAbortRegistrar interface {
+	SetSessionCreationAbort(abort func() error)
+}
+
 // SessionHandler handles session/prompt. It contains no task or daemon
 // concepts; applications decide what a prompt means.
 type SessionHandler interface {
@@ -311,6 +317,10 @@ func (r sessionNewResult) AfterResponseWritten(ctx context.Context) {
 
 func (r sessionNewResult) AfterResponseWriteFailed(ctx context.Context) {
 	r.reporter.AfterResponseWriteFailed(ctx)
+}
+
+func (r sessionNewResult) AfterResponseWriteFailedWithOutcome(ctx context.Context, outcome protocol.ResponseWriteOutcome) {
+	r.reporter.AfterResponseWriteFailedWithOutcome(ctx, outcome)
 }
 
 func (s *Server) handleSessionNew(ctx context.Context, params json.RawMessage) (any, error) {

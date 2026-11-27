@@ -20,6 +20,7 @@ import (
 // ---- /mcp 命令 ----
 
 func (p *AgentPlugin) handleMCP(ctx *model.Context) error {
+	resources := p.currentResources()
 	servers := p.cfg.MCP.Servers
 	if len(servers) == 0 {
 		ctx.Writer("(no MCP servers configured — add mcp.servers to config.yaml)\n")
@@ -28,24 +29,27 @@ func (p *AgentPlugin) handleMCP(ctx *model.Context) error {
 	ctx.Writer(fmt.Sprintf("mcp: %d configured\n\n", len(servers)))
 	for _, srv := range servers {
 		status := "❌"
-		if _, ok := p.mcpClients[srv.Name]; ok {
+		if _, ok := resources.clients[srv.Name]; ok {
 			status = "✔"
 		}
 		ctx.Writer(fmt.Sprintf("  %-14s %s  %s %s\n", srv.Name, status, srv.Command, strings.Join(srv.Args, " ")))
 	}
-	if n := len(p.mcpTools); n > 0 {
+	if n := len(resources.mcpTools); n > 0 {
 		ctx.Writer(fmt.Sprintf("\n  tools: %d loaded\n", n))
 	}
 	return nil
 }
 
-// loadMCP 连接配置的 MCP server 并拉取工具清单。
-// MCP server 是外部进程，可能没起/连不上——单个失败只降级跳过，不阻塞插件启动。
-// 每个 server 握手+列工具共限时 10s，避免坏配置卡住启动。
+// loadMCP preserves the package-level helper used by tests and diagnostics.
 func (p *AgentPlugin) loadMCP() {
+	resources := &sessionResources{clients: make(map[string]mcp.Client)}
+	p.loadMCPInto(resources)
+	p.publishResources(resources)
+}
+
+func (p *AgentPlugin) loadMCPInto(resources *sessionResources) {
 	for _, srv := range p.cfg.MCP.Servers {
-		// 重复 name：先连接的那个会被 map 覆盖成孤儿进程，直接跳过
-		if _, exists := p.mcpClients[srv.Name]; exists {
+		if _, exists := resources.clients[srv.Name]; exists {
 			slog.Warn("duplicate mcp server name, skipping", "server", srv.Name)
 			continue
 		}
@@ -61,22 +65,22 @@ func (p *AgentPlugin) loadMCP() {
 			ClientInfo:      mcp.Implementation{Name: "goworker", Version: "0.1.5"},
 		}); err != nil {
 			cancel()
-			c.Close()
+			_ = c.Close()
 			slog.Warn("mcp initialize failed, skipping", "server", srv.Name, "err", err)
 			continue
 		}
 		tools, err := c.ListTools(ctx, &mcp.ListToolsRequest{})
 		cancel()
 		if err != nil {
-			c.Close()
+			_ = c.Close()
 			slog.Warn("mcp tools/list failed, skipping", "server", srv.Name, "err", err)
 			continue
 		}
 
-		p.mcpClients[srv.Name] = c
+		resources.clients[srv.Name] = c
 		for _, t := range tools.Tools {
 			if tool, ok := p.mcpToolToCore(c, srv.Name, t); ok {
-				p.mcpTools = append(p.mcpTools, tool)
+				resources.mcpTools = append(resources.mcpTools, tool)
 			}
 		}
 		slog.Info("mcp connected", "server", srv.Name, "tools", len(tools.Tools))

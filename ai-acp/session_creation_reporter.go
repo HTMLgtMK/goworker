@@ -41,6 +41,7 @@ type sessionCreationReporter struct {
 	pendingSize int
 	stopContext func() bool
 	limitLogged bool
+	abort       func() error
 }
 
 func newSessionCreationReporter(ctx context.Context, target Reporter) *sessionCreationReporter {
@@ -128,9 +129,18 @@ func (r *sessionCreationReporter) RequestPermission(ctx context.Context, session
 	return target.RequestPermission(ctx, sessionID, req)
 }
 
+func (r *sessionCreationReporter) SetSessionCreationAbort(abort func() error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state != sessionCreationActive {
+		r.abort = abort
+	}
+}
+
 func (r *sessionCreationReporter) AfterResponseWritten(context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.abort = nil
 	if r.state != sessionCreationPending {
 		return
 	}
@@ -146,8 +156,22 @@ func (r *sessionCreationReporter) AfterResponseWritten(context.Context) {
 	r.pendingSize = 0
 }
 
-func (r *sessionCreationReporter) AfterResponseWriteFailed(context.Context) {
-	r.discard()
+func (r *sessionCreationReporter) AfterResponseWriteFailed(ctx context.Context) {
+	r.AfterResponseWriteFailedWithOutcome(ctx, protocol.ResponseWriteOutcomeUnknown)
+}
+
+func (r *sessionCreationReporter) AfterResponseWriteFailedWithOutcome(_ context.Context, outcome protocol.ResponseWriteOutcome) {
+	r.mu.Lock()
+	r.discardLocked()
+	abort := r.abort
+	r.abort = nil
+	r.mu.Unlock()
+
+	if outcome == protocol.ResponseWriteNotSent && abort != nil {
+		if err := abort(); err != nil {
+			slog.Error("acp: rollback session/new after unsent response failed", "err", err)
+		}
+	}
 }
 
 func (r *sessionCreationReporter) discard() {

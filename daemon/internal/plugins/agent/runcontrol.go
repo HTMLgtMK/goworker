@@ -57,6 +57,41 @@ func (p *AgentPlugin) RouteSession(sessionID string) *runtimeagent.SessionRuntim
 	return p.manager.Get(sessionID)
 }
 
+// SessionReadOnlyReason reports why an attached session cannot be modified.
+func (p *AgentPlugin) SessionReadOnlyReason(sessionID string) error {
+	if rt := p.RouteSession(sessionID); rt != nil {
+		return p.runtimeWorkspaceReadOnlyReason(rt)
+	}
+	return nil
+}
+
+// runtimeWorkspaceReadOnlyReason revalidates the pinned workspace declaration. A workspace
+// can disappear after session/load, so the runtime's load-time read-only snapshot is not enough.
+func (p *AgentPlugin) runtimeWorkspaceReadOnlyReason(rt *runtimeagent.SessionRuntime) error {
+	if rt == nil {
+		return nil
+	}
+	if reason := rt.ReadOnlyReason(); reason != nil {
+		return reason
+	}
+	cwd, err := rt.DeclaredCWD()
+	if err != nil {
+		return err
+	}
+	if reason := p.workspaceReadOnlyReason(cwd); reason != nil {
+		rt.SetReadOnlyReason(reason)
+		return reason
+	}
+	return nil
+}
+
+func (p *AgentPlugin) requireWritableSessionWorkspace(sessionID string) error {
+	if reason := p.SessionReadOnlyReason(sessionID); reason != nil {
+		return fmt.Errorf("agent: session %q is read-only: %w", sessionID, reason)
+	}
+	return nil
+}
+
 // RunJournal returns the routed runtime's read-only journal. The current session's
 // dependencies may not describe another runtime, so journal lookup follows routing.
 func (p *AgentPlugin) RunJournal(rt *runtimeagent.SessionRuntime) agentcontrol.RunStatusJournal {
@@ -73,17 +108,13 @@ func sessionNotFoundErr(sessionID string) error {
 	return fmt.Errorf("agent: session %q: %w", sessionID, runtimeagent.ErrSessionNotFound)
 }
 
-// sessionJournalStore resolves the routed runtime's journal. The current runtime
-// reuses its existing instance; other persistent sessions get a read-only store view.
+// sessionJournalStore resolves the journal from the routed runtime's store.
 func (p *AgentPlugin) sessionJournalStore(rt *runtimeagent.SessionRuntime) *session.RunJournalStore {
-	if p.currentSession() == rt {
-		return p.runJournalStore()
-	}
-	if p.repo == nil {
+	if rt == nil || p.repo == nil {
 		return nil
 	}
-	st, err := p.repo.Open(rt.ID)
-	if err != nil {
+	st := p.storeFor(rt)
+	if st == nil {
 		return nil
 	}
 	return session.NewRunJournalStore(p.repo, st)
@@ -110,6 +141,9 @@ func (p *AgentPlugin) StartRun(sessionID, connectionID, input, requestID string)
 // StartRunWithTools freezes the negotiated device-tool source into the initial run
 // submission. The idempotency registry ignores sources on replays by construction.
 func (p *AgentPlugin) StartRunWithTools(sessionID, connectionID, input, requestID string, toolSource func(context.Context) []core.Tool) (string, string, error) {
+	if err := p.requireWritableSessionWorkspace(sessionID); err != nil {
+		return "", "", err
+	}
 	// RunCallbacks stays frontend-only; title proposals ride the AfterAgent middleware,
 	// which the runtime mounts from SessionDeps.TitleStore for every run.
 	runID, state, err := p.control.StartRunWithTools(sessionID, connectionID, input, requestID, runtimeagent.RunCallbacks{}, toolSource)
@@ -122,6 +156,9 @@ func (p *AgentPlugin) StartRunWithTools(sessionID, connectionID, input, requestI
 // StartRunSync submits an internal synchronous run without connection fencing or
 // idempotency. Run admission, quotas, journal writes, and finalization remain in the manager.
 func (p *AgentPlugin) StartRunSync(sessionID string, req runtimeagent.RunRequest, cb runtimeagent.RunCallbacks) (runtimeagent.RunHandle, error) {
+	if err := p.requireWritableSessionWorkspace(sessionID); err != nil {
+		return runtimeagent.RunHandle{}, err
+	}
 	h, err := p.control.StartRunSync(sessionID, req, cb)
 	if errors.Is(err, runtimeagent.ErrSessionArchived) {
 		return runtimeagent.RunHandle{}, fmt.Errorf("agent: session %q is archived and read-only", sessionID)

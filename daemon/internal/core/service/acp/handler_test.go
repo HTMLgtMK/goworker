@@ -79,6 +79,7 @@ type fakeSessionSource struct {
 	archived        map[string][]model.SessionUpdate
 	list            []model.SessionSummary
 	modes           *model.SessionModeState
+	readOnlyReason  error
 }
 
 func (f *fakeSessionSource) ListSessions() []model.SessionSummary {
@@ -104,6 +105,12 @@ func (f *fakeSessionSource) ActiveSessionID() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.activeID
+}
+
+func (f *fakeSessionSource) SessionReadOnlyReason(string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.readOnlyReason
 }
 
 func (f *fakeSessionSource) ReloadCurrentSession() error {
@@ -367,6 +374,135 @@ func (f *lifecycleRaceSessionSource) cleanupCalls() int {
 	return f.cleanupCount
 }
 
+func TestCreateSessionResponseAbortUsesConnectionScopedTransaction(t *testing.T) {
+	source := &lifecycleRaceSessionSource{
+		createStarted: make(chan struct{}), finishCreate: make(chan struct{}),
+		loadStarted: make(chan struct{}), finishLoad: make(chan struct{}),
+	}
+	reporter := &rollbackRegistrarReporter{}
+	handler := &FrontendHandler{sessions: source, multi: source, binder: source, gate: NewSessionGate(), connectionID: "conn"}
+	result := make(chan error, 1)
+	go func() {
+		_, err := handler.CreateManagedSession(context.Background(), protocol.NewSessionRequest{}, reporter)
+		result <- err
+	}()
+	<-source.createStarted
+	close(source.finishCreate)
+	if err := <-result; err != nil {
+		t.Fatalf("CreateManagedSession: %v", err)
+	}
+	if reporter.abort == nil {
+		t.Fatal("session creation response did not register its safe abort")
+	}
+	if err := reporter.abort(); err != nil {
+		t.Fatalf("abort unsent response: %v", err)
+	}
+	if got := source.binding("conn"); got != "" {
+		t.Fatalf("connection binding after abort = %q, want none", got)
+	}
+	if route, _, _ := handler.routeFor("runtime-session"); route != nil {
+		t.Fatal("aborted session remained promptable")
+	}
+}
+
+type rollbackRegistrarReporter struct {
+	recordingReporter
+	abort func() error
+}
+
+func (r *rollbackRegistrarReporter) SetSessionCreationAbort(abort func() error) {
+	r.abort = abort
+}
+
+func (f *lifecycleRaceSessionSource) CreateBoundSessionWithRollbackForConnection(cwd, connectionID string) (string, func() error, error) {
+	id, _, err := f.CreateBoundSessionWithRollback(cwd)
+	if err != nil {
+		return "", nil, err
+	}
+	return id, func() error {
+		f.muBindings.Lock()
+		defer f.muBindings.Unlock()
+		delete(f.bindings, connectionID)
+		f.rollbackCount++
+		return nil
+	}, nil
+}
+
+func TestCreateSessionAlreadyCanceledDoesNotStartCreation(t *testing.T) {
+	source := &lifecycleRaceSessionSource{
+		createStarted: make(chan struct{}), finishCreate: make(chan struct{}),
+		loadStarted: make(chan struct{}), finishLoad: make(chan struct{}),
+	}
+	handler := &FrontendHandler{sessions: source, multi: source, binder: source, gate: NewSessionGate(), connectionID: "conn"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := handler.CreateManagedSession(ctx, protocol.NewSessionRequest{}, &recordingReporter{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("CreateManagedSession error = %v, want context canceled", err)
+	}
+	select {
+	case <-source.createStarted:
+		t.Fatal("session creator ran despite an already-canceled request")
+	default:
+	}
+}
+
+func TestCreateSessionCancellationAfterBindingUsesSafeAbort(t *testing.T) {
+	source := &lifecycleRaceSessionSource{
+		createStarted: make(chan struct{}), finishCreate: make(chan struct{}),
+		loadStarted: make(chan struct{}), finishLoad: make(chan struct{}),
+	}
+	close(source.finishCreate)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handler := &FrontendHandler{sessions: source, multi: source, binder: source, gate: NewSessionGate(), connectionID: "conn"}
+	handler.selectionCommitHook = func(string) { cancel() }
+	_, err := handler.CreateManagedSession(ctx, protocol.NewSessionRequest{}, &rollbackRegistrarReporter{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CreateManagedSession error = %v, want context canceled", err)
+	}
+	if got := source.binding("conn"); got != "" {
+		t.Fatalf("connection binding after canceled create = %q, want none", got)
+	}
+	if route, _, _ := handler.routeFor("runtime-session"); route != nil {
+		t.Fatal("canceled session remained promptable")
+	}
+	source.muBindings.Lock()
+	rollbacks := source.rollbackCount
+	source.muBindings.Unlock()
+	if rollbacks != 1 {
+		t.Fatalf("rollback calls = %d, want 1", rollbacks)
+	}
+}
+
+func TestCreateSessionCanceledBeforeBindingRollsBack(t *testing.T) {
+	source := &lifecycleRaceSessionSource{
+		createStarted: make(chan struct{}), finishCreate: make(chan struct{}),
+		loadStarted: make(chan struct{}), finishLoad: make(chan struct{}),
+	}
+	handler := &FrontendHandler{sessions: source, multi: source, binder: source, gate: NewSessionGate(), connectionID: "conn"}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := handler.CreateManagedSession(ctx, protocol.NewSessionRequest{}, &recordingReporter{})
+		result <- err
+	}()
+	<-source.createStarted
+	cancel()
+	close(source.finishCreate)
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("create error = %v, want context canceled", err)
+	}
+	if got := source.binding("conn"); got != "" {
+		t.Fatalf("canceled create retained connection binding %q", got)
+	}
+	source.muBindings.Lock()
+	rollbacks := source.rollbackCount
+	source.muBindings.Unlock()
+	if rollbacks != 1 {
+		t.Fatalf("rollbacks = %d, want 1", rollbacks)
+	}
+}
+
 func TestCreateSessionCloseWinsBeforeLifecycleRegistration(t *testing.T) {
 	source := &lifecycleRaceSessionSource{
 		createStarted: make(chan struct{}), finishCreate: make(chan struct{}),
@@ -507,6 +643,22 @@ func TestLoadSessionArchivedIsReadOnly(t *testing.T) {
 	_, err := handler.Prompt(context.Background(), "old", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter)
 	if err == nil || !strings.Contains(err.Error(), "read-only") {
 		t.Fatalf("Prompt archived = %v, want read-only error", err)
+	}
+}
+
+func TestPromptRejectsWorkspaceReadOnlySession(t *testing.T) {
+	sessions := &fakeSessionSource{readOnlyReason: errors.New("workspace is unavailable")}
+	handler := &FrontendHandler{
+		evaluate: func(*model.Context, string) error {
+			t.Fatal("workspace-read-only prompt reached evaluation")
+			return nil
+		},
+		sessions:     sessions,
+		promptRoutes: map[string]*sessionRoute{"historical": {}},
+	}
+	_, err := handler.Prompt(context.Background(), "historical", []protocol.ContentBlock{protocol.TextBlock("hello")}, &recordingReporter{})
+	if err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("Prompt on workspace-read-only session = %v, want read-only error", err)
 	}
 }
 

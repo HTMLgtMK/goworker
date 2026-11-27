@@ -477,7 +477,13 @@ func sessionBusyError() *protocol.RPCError {
 // CreateManagedSession is the canonical session/new path for embedded adapters.
 // The returned identity is the same stable ID used for persistence and routing.
 func (h *FrontendHandler) CreateManagedSession(ctx context.Context, req protocol.NewSessionRequest, reporter aiacp.Reporter) (aisession.ID, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if !h.waitDeviceTools(ctx) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		return "", protocol.ErrClosed
 	}
 	if h.multi == nil {
@@ -487,14 +493,23 @@ func (h *FrontendHandler) CreateManagedSession(ctx context.Context, req protocol
 		return "", sessionBusyError()
 	}
 	defer h.gate.release()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	var id string
 	var rollback func() error
+	var responseAbort func() error
 	var err error
-	creator, ok := h.multi.(model.TransactionalBoundSessionCreator)
-	if !ok {
-		return "", &protocol.RPCError{Code: -32000, Message: "acp frontend: backend does not support transactional session creation"}
+	if creator, ok := h.multi.(model.ConnectionScopedTransactionalBoundSessionCreator); ok {
+		id, rollback, err = creator.CreateBoundSessionWithRollbackForConnection(req.Cwd, h.connectionID)
+		responseAbort = rollback
+	} else {
+		creator, ok := h.multi.(model.TransactionalBoundSessionCreator)
+		if !ok {
+			return "", &protocol.RPCError{Code: -32000, Message: "acp frontend: backend does not support transactional session creation"}
+		}
+		id, rollback, err = creator.CreateBoundSessionWithRollback(req.Cwd)
 	}
-	id, rollback, err = creator.CreateBoundSessionWithRollback(req.Cwd)
 	if err != nil {
 		return "", &protocol.RPCError{Code: -32000, Message: fmt.Sprintf("acp frontend: create session: %v", err)}
 	}
@@ -507,10 +522,14 @@ func (h *FrontendHandler) CreateManagedSession(ctx context.Context, req protocol
 		}
 		return cause
 	}
+	if err := ctx.Err(); err != nil {
+		return "", rollbackOnError(err)
+	}
 	sessionID, err := aisession.ParseID(id)
 	if err != nil {
 		return "", rollbackOnError(fmt.Errorf("acp frontend: backend returned invalid session ID %q: %w", id, err))
 	}
+	previousActive, previousBinding := h.sessionSelectionSnapshot()
 	committed, err := h.commitSessionSelection(id, true, false)
 	if err != nil {
 		return "", rollbackOnError(err)
@@ -518,13 +537,71 @@ func (h *FrontendHandler) CreateManagedSession(ctx context.Context, req protocol
 	if !committed {
 		return "", rollbackOnError(protocol.ErrClosed)
 	}
+	createdRoute := h.sessionRoute(id)
+	abortCreatedSelection := func() error {
+		if err := responseAbort(); err != nil {
+			return err
+		}
+		h.forgetCreatedSessionSelection(id, createdRoute, previousActive, previousBinding)
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		if responseAbort != nil {
+			if cleanupErr := abortCreatedSelection(); cleanupErr != nil {
+				return "", errors.Join(err, fmt.Errorf("acp frontend: abort canceled session creation %q: %w", id, cleanupErr))
+			}
+		}
+		return "", err
+	}
 	h.bindDeviceTools(id)
 	if h.commands != nil {
 		if body := availableCommandsUpdateBody(h.commands()); body.Raw != nil {
 			reporter.Update(id, body)
 		}
 	}
+	if responseAbort != nil {
+		if registrar, ok := reporter.(aiacp.SessionCreationAbortRegistrar); ok {
+			registrar.SetSessionCreationAbort(abortCreatedSelection)
+		}
+	}
 	return sessionID, nil
+}
+
+func (h *FrontendHandler) sessionSelectionSnapshot() (active, binding string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.active, h.binding.Get()
+}
+
+func (h *FrontendHandler) sessionRoute(sessionID string) *sessionRoute {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.promptRoutes[sessionID]
+}
+
+func (h *FrontendHandler) forgetCreatedSessionSelection(sessionID string, route *sessionRoute, previousActive, previousBinding string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.promptRoutes[sessionID] == route {
+		delete(h.promptRoutes, sessionID)
+	}
+	if h.closed {
+		return
+	}
+	if h.active == sessionID {
+		if _, ok := h.promptRoutes[previousActive]; ok {
+			h.active = previousActive
+		} else {
+			h.active = ""
+		}
+	}
+	if h.binding.Get() == sessionID {
+		if _, ok := h.promptRoutes[previousBinding]; ok {
+			h.binding.Set(previousBinding)
+		} else {
+			h.binding.Set("")
+		}
+	}
 }
 
 // deviceToolSource reuses the initialize-time snapshot. Prompt execution must not
@@ -560,6 +637,11 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 	}
 	if !promptable || route == nil {
 		return "", &protocol.RPCError{Code: -32000, Message: fmt.Sprintf("acp frontend: unknown or invalidated session %q", sessionID)}
+	}
+	if source, ok := h.sessions.(interface{ SessionReadOnlyReason(string) error }); ok {
+		if reason := source.SessionReadOnlyReason(sessionID); reason != nil {
+			return "", &protocol.RPCError{Code: -32000, Message: fmt.Sprintf("acp frontend: session %q is read-only: %v", sessionID, reason)}
+		}
 	}
 	requestBinding := &agentcontrol.SessionBinding{}
 	requestBinding.Set(sessionID)

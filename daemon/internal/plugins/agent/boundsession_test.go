@@ -11,6 +11,7 @@ import (
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	aisession "github.com/tinguo/goworker/ai-session"
@@ -782,5 +783,117 @@ func TestACPManagementOpsConcurrentCreateSerializes(t *testing.T) {
 		if got := p.control.SessionBindings(id); len(got) != 1 {
 			t.Fatalf("bindings(%s) = %v, want exactly one connection", id, got)
 		}
+	}
+}
+
+func TestConnectionScopedSessionRollbackPreservesOtherReferences(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "ack"})
+	creator, ok := any(p).(model.ConnectionScopedTransactionalBoundSessionCreator)
+	if !ok {
+		t.Fatal("AgentPlugin does not implement connection-scoped transactional creation")
+	}
+
+	id, rollback, err := creator.CreateBoundSessionWithRollbackForConnection("", "creator")
+	if err != nil {
+		t.Fatalf("CreateBoundSessionWithRollbackForConnection: %v", err)
+	}
+	if got := p.control.SessionBindings(id); len(got) != 1 || got[0] != "creator" {
+		t.Fatalf("initial bindings = %v, want creator reference", got)
+	}
+	p.BindConnectionSessionReference("observer", id)
+
+	if err := rollback(); err == nil || !strings.Contains(err.Error(), "connection references remain") {
+		t.Fatalf("rollback with another connection reference = %v, want refusal", err)
+	}
+	if got := p.control.SessionBindings(id); len(got) != 1 || got[0] != "observer" {
+		t.Fatalf("bindings after refusal = %v, want only observer reference", got)
+	}
+	if p.manager.Get(id) == nil {
+		t.Fatalf("runtime %q was removed despite another connection reference", id)
+	}
+	managedID, err := aisession.ParseID(id)
+	if err != nil {
+		t.Fatalf("ParseID(%q): %v", id, err)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); err != nil {
+		t.Fatalf("created ai-session disappeared despite another reference: %v", err)
+	}
+
+	p.UnbindConnectionSession("observer", id)
+	if err := rollback(); err != nil {
+		t.Fatalf("retry rollback after final reference was removed: %v", err)
+	}
+	if p.manager.Get(id) != nil {
+		t.Fatalf("runtime %q remains after successful retry", id)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); !errors.Is(err, aisession.ErrNotFound) {
+		t.Fatalf("ai-session after rollback = %v, want ErrNotFound", err)
+	}
+}
+
+func TestConnectionScopedSessionRollbackRefusesActiveRunAndCanRetry(t *testing.T) {
+	provider := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
+	p := newPersistedPlugin(t, fixedProvider{content: "ack"})
+	p.deps.NewProvider = func(*runtimeconfig.Config) (core.Provider, error) { return provider, nil }
+	id, rollback, err := p.CreateBoundSessionWithRollbackForConnection("", "creator")
+	if err != nil {
+		t.Fatalf("CreateBoundSessionWithRollbackForConnection: %v", err)
+	}
+
+	handle, err := p.manager.StartRun(id, runtimeagent.RunRequest{Input: "run while rollback races"}, runtimeagent.RunCallbacks{})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	select {
+	case <-provider.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not reach provider")
+	}
+
+	if err := rollback(); err == nil || !strings.Contains(err.Error(), "runtime is active") {
+		t.Fatalf("rollback during active run = %v, want active-run refusal", err)
+	}
+	if got := p.control.SessionBindings(id); len(got) != 0 {
+		t.Fatalf("provisional creator reference after rollback attempt = %v, want removed", got)
+	}
+	if p.manager.Get(id) == nil {
+		t.Fatalf("runtime %q was removed while its run was active", id)
+	}
+	managedID, err := aisession.ParseID(id)
+	if err != nil {
+		t.Fatalf("ParseID(%q): %v", id, err)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); err != nil {
+		t.Fatalf("ai-session disappeared while its run was active: %v", err)
+	}
+	stored, err := p.repo.List(context.Background())
+	if err != nil {
+		t.Fatalf("Repository.List during active run: %v", err)
+	}
+	persisted := false
+	for _, item := range stored {
+		if item.SessionID == id {
+			persisted = true
+			break
+		}
+	}
+	if !persisted {
+		t.Fatalf("persistent session %q was deleted while its run was active", id)
+	}
+
+	close(provider.release)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := handle.Wait(ctx); err != nil {
+		t.Fatalf("wait for active run: %v", err)
+	}
+	if err := rollback(); err != nil {
+		t.Fatalf("retry rollback after run completion: %v", err)
+	}
+	if p.manager.Get(id) != nil {
+		t.Fatalf("runtime %q remains after successful rollback", id)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); !errors.Is(err, aisession.ErrNotFound) {
+		t.Fatalf("ai-session after rollback = %v, want ErrNotFound", err)
 	}
 }

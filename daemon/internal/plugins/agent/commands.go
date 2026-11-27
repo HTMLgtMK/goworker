@@ -253,7 +253,8 @@ func (p *AgentPlugin) handleNew(ctx *model.Context) error {
 				cwd = declared
 			}
 		}
-		newID, rollback, err := p.CreateBoundSessionWithRollback(cwd)
+		resources := p.refreshResources()
+		newID, rollback, err := p.createBoundSessionWithResources(cwd, resources)
 		if err != nil {
 			return fmt.Errorf("agent: /new create session: %w", err)
 		}
@@ -643,12 +644,18 @@ func (p *AgentPlugin) handleCompact(ctx *model.Context) error {
 // ---- /skills 命令 ----
 
 func (p *AgentPlugin) handleSkills(ctx *model.Context) error {
-	if len(p.skills) == 0 {
+	resources := p.currentResources()
+	if ctx != nil && ctx.Ctx != nil {
+		if rt, err := p.sessionRuntimeIn(ctx.Ctx); err == nil && rt != nil {
+			resources = p.resourcesForSession(rt.ID)
+		}
+	}
+	if len(resources.skills) == 0 {
 		ctx.Writer("(no skills loaded — drop SKILL.md files in ~/.config/goworker/skills/ or .goworker/skills/)\n")
 		return nil
 	}
-	ctx.Writer(fmt.Sprintf("skills: %d loaded\n\n", len(p.skills)))
-	for _, s := range p.skills {
+	ctx.Writer(fmt.Sprintf("skills: %d loaded\n\n", len(resources.skills)))
+	for _, s := range resources.skills {
 		ctx.Writer(fmt.Sprintf("  - %s: %s\n", s.Name, s.Description))
 	}
 	return nil
@@ -681,11 +688,21 @@ func (p *AgentPlugin) handleHistory(ctx *model.Context) error {
 // handleRules 只读展示当前生效的指令快照 —— 与注入 system prompt 的内容一致，
 // 方便核对"agent 到底被灌了什么规矩"。
 func (p *AgentPlugin) handleRules(ctx *model.Context) error {
-	if p.deps.Instruction == nil {
+	resources := p.currentResources()
+	if ctx != nil && ctx.Ctx != nil {
+		if rt, err := p.sessionRuntimeIn(ctx.Ctx); err == nil && rt != nil {
+			resources = p.resourcesForSession(rt.ID)
+		}
+	}
+	var instructions *memory.InstructionSet
+	if resources != nil {
+		instructions = resources.instruction
+	}
+	if instructions == nil {
 		ctx.Writer("declarative instructions disabled (memory.enabled=false or load failed)\n")
 		return nil
 	}
-	snap := p.deps.Instruction.Snapshot()
+	snap := instructions.Snapshot()
 	if snap == "" {
 		ctx.Writer("(no active instructions — global AGENTS.md/USER.md go in ~/.config/goworker/, project AGENTS.md in the project root)\n")
 		return nil

@@ -52,12 +52,19 @@ type AgentPlugin struct {
 	// 使用；标准 ACP 请求按连接级 binding 路由。atomic.Pointer 保证跨 goroutine
 	// 读取安全；写入需经 lifecycleMu 原子换轨并重判被挤出的 runtime。
 	current atomic.Pointer[runtimeagent.SessionRuntime]
-	// startSessionMu serializes session-boundary construction. A /new rebuilds shared
-	// repository/dependency state as well as current, so concurrent callers cannot interleave it.
+	// startSessionMu serializes startup session-boundary construction. CLI /new creates an
+	// independent runtime and resource snapshot without mutating this shared baseline.
 	startSessionMu sync.Mutex
-	// deps 是 Session 的资源依赖，startSession 每次会话边界全量重建（含指令快照
-	// 与当前 store 注入），/new 经同一路径刷新后以新 deps 创建新会话。
+	// deps holds the plugin-level defaults; runtime construction copies it and binds the
+	// selected immutable resource generation plus session-specific store dependencies.
 	deps runtimeagent.SessionDeps
+	// Resources are immutable per session generation. Old generations stay alive until
+	// Stop so registered runtimes and already-collected tools keep their MCP clients.
+	resourceMu        sync.RWMutex
+	resourceSeq       uint64
+	resourcesByID     map[string]*sessionResources
+	resourceBySession map[string]*sessionResources
+	currentResource   *sessionResources
 	// providerFactory is initialized once and shared across session rebuilds.
 	providerFactory func(*runtimeconfig.Config) (core.Provider, error)
 	// repo caches one store instance per session across boundaries. It is initialized during
@@ -275,8 +282,7 @@ func (p *AgentPlugin) sessionCWDErrorIn(ctx context.Context) error {
 		return err
 	}
 	if rt != nil {
-		_, err := rt.DeclaredCWD()
-		return err
+		return p.runtimeWorkspaceReadOnlyReason(rt)
 	}
 	return nil
 }
@@ -511,12 +517,7 @@ func (p *AgentPlugin) Stop() error {
 
 // closeMCP 关闭所有已连接的 MCP client。Stop 和 Init 失败回滚共用。
 func (p *AgentPlugin) closeMCP() {
-	for name, c := range p.mcpClients {
-		if err := c.Close(); err != nil {
-			slog.Warn("mcp close error", "server", name, "err", err)
-		}
-	}
-	p.mcpClients = make(map[string]mcp.Client)
+	p.closeResourceClients()
 }
 
 func (p *AgentPlugin) persistAllowRule(rule sandbox.AllowRule) error {
@@ -651,18 +652,9 @@ func (p *AgentPlugin) startSession() {
 		}
 	}
 
-	// 加载 skill：用户级 + 项目级（后者覆盖前者）。坏 skill 跳过并记录，不拖垮其他加载流程。
-	discovered, skillErrs := skills.Discover(
-		p.paths.SkillsUser,
-		p.paths.SkillsProject,
-	)
-	for _, err := range skillErrs {
-		slog.Warn("skill load error, skipping", "err", err)
-	}
-	p.skills = discovered
-
-	// 连接 MCP server 并拉取工具清单。坏 server 只降级不阻塞插件启动。
-	p.loadMCP()
+	// Refresh immutable session resources at the session boundary. Previous generations
+	// remain retained so older runtimes and already-collected MCP tools stay valid.
+	resources := p.refreshResources()
 
 	// 会话层组装：资源就绪后构造 deps 与首会话。
 	p.deps = runtimeagent.SessionDeps{
@@ -673,10 +665,13 @@ func (p *AgentPlugin) startSession() {
 			}
 			return p.cfg
 		},
-		ValidateCWD:          p.validateSessionCWDWithConfig,
-		AuditDir:             p.paths.AuditDir,
-		Memory:               p.memory,
-		CollectTools:         p.collectTools,
+		ValidateCWD: p.validateSessionCWDWithConfig,
+		AuditDir:    p.paths.AuditDir,
+		Memory:      p.memory,
+		Instruction: resources.instruction,
+		CollectTools: func(cfg *sandbox.Config) []core.Tool {
+			return p.collectToolsWithResources(cfg, resources)
+		},
 		NewProvider:          p.providerFactory,
 		PersistAllowRule:     p.persistAllowRule,
 		PersistToolAllowRule: p.persistToolAllowRule,
@@ -693,11 +688,6 @@ func (p *AgentPlugin) startSession() {
 		p.deps.RunJournal = journalStore
 		p.deps.RunEvents = journalStore
 	}
-	// 指令快照与记忆组件同开关：memory disabled 时留 nil，buildSystemPrompt 跳过指令段。
-	// 会话边界（Init / /new）经 startSession 重载 —— system prompt 在会话创建前就绪。
-	if p.cfg.Memory.Enabled {
-		p.deps.Instruction = p.loadInstructions()
-	}
 	// 多会话内核接线：每会话一个 SessionRuntime，构造后注册进 manager 并置为
 	// current。id 取 store 的真实 SessionID——它是 currentStore() 经 repo 实例
 	// 唯一缓存解析取数的键，新旧 runtime 以不同 id 共存（旧 runtime 保留在册，
@@ -709,6 +699,7 @@ func (p *AgentPlugin) startSession() {
 		id = st.SessionID()
 	}
 	rt := runtimeagent.NewSessionRuntime(id, s)
+	p.associateResources(id, resources)
 
 	// Preserve a valid explicit cwd across the new session boundary, but do not carry a
 	// previous tmp workspace because its path is scoped to the old session ID. With no
@@ -927,8 +918,7 @@ func (p *AgentPlugin) injectTmpWorkspace(sessionID string) (string, error) {
 // 标记随旧 runtime 作废，不会毒化新会话。
 func (p *AgentPlugin) sessionCWDError() error {
 	if rt := p.currentSession(); rt != nil {
-		_, err := rt.DeclaredCWD()
-		return err
+		return p.runtimeWorkspaceReadOnlyReason(rt)
 	}
 	return nil
 }

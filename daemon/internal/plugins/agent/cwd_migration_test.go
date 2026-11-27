@@ -237,9 +237,8 @@ func TestLoadKeepsSolidifiedWorkspace(t *testing.T) {
 		}
 	}
 
-	// 固化值是 tmp 域时客户端 cwd 迁入本次执行域（tmp 域随旧会话 id 失效，不是
-	// 持久事实）；且 load 的 cwd 只作执行域、不落持久记录——workspace 记录保持
-	// 原 tmp 值，别把宿主根钉成永久 workspace。
+	// A recorded tmp workspace that no longer exists is also an unavailable
+	// historical workspace; loading must not silently select another directory.
 	p2 := newPersistedPlugin(t, fixedProvider{content: "ok"})
 	id2 := makeSideSession(t, p2, "", "tmp 域会话")
 	st2, err := p2.repo.Open(id2)
@@ -261,8 +260,8 @@ func TestLoadKeepsSolidifiedWorkspace(t *testing.T) {
 	if rt2 == nil {
 		t.Fatal("tmp session runtime not registered")
 	}
-	if cwd, err := rt2.DeclaredCWD(); err != nil || cwd != stored {
-		t.Errorf("tmp-session DeclaredCWD after load = (%q, %v), want client %q", cwd, err, stored)
+	if cwd, err := rt2.DeclaredCWD(); err == nil || cwd != "" || rt2.ReadOnlyReason() == nil {
+		t.Errorf("tmp-session DeclaredCWD after load = (%q, %v), read-only = %v; want unavailable workspace", cwd, err, rt2.ReadOnlyReason())
 	}
 	if got := p2.storeFor(rt2); got != nil && got.Workspace() != tmpWs {
 		t.Errorf("tmp-session workspace record after load = %q, want unchanged %q (load cwd 不落持久记录)", got.Workspace(), tmpWs)

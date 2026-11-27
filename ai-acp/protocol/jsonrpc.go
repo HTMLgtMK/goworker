@@ -87,6 +87,25 @@ type PostWriteFailureHook interface {
 	AfterResponseWriteFailed(ctx context.Context)
 }
 
+// ResponseWriteOutcome describes whether a failed response may have reached the peer.
+type ResponseWriteOutcome uint8
+
+const (
+	// ResponseWriteNotSent means no response bytes were written to the transport.
+	ResponseWriteNotSent ResponseWriteOutcome = iota
+	// ResponseWriteOutcomeUnknown means some response bytes may have reached the peer.
+	ResponseWriteOutcomeUnknown
+	// ResponseWriteSent means the complete response was written successfully.
+	ResponseWriteSent
+)
+
+// PostWriteFailureOutcomeHook receives whether a failed response was definitely
+// not sent or may have been partially written. Unknown outcomes must be treated
+// conservatively because the peer may have observed the response.
+type PostWriteFailureOutcomeHook interface {
+	AfterResponseWriteFailedWithOutcome(ctx context.Context, outcome ResponseWriteOutcome)
+}
+
 // ConnOptions 配置一条 JSON-RPC 连接。
 type ConnOptions struct {
 	// MaxMessageBytes 是 JSON payload 的最大字节数，不包含末尾换行符。
@@ -308,7 +327,7 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 		defer func() {
 			if r := recover(); r != nil {
 				if postWriteFailureHook != nil {
-					callPostWriteFailureHook(method, ctx, postWriteFailureHook)
+					callPostWriteFailureHook(method, ctx, postWriteFailureHook, ResponseWriteOutcomeUnknown)
 				}
 				slog.Error("acp: request handler panic", "method", method, "panic", r, "stack", string(debug.Stack()))
 				_ = c.write(Response{
@@ -353,10 +372,13 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 			}
 		}
 
-		writeErr := c.write(response)
+		writeOutcome, writeErr := c.writeWithOutcome(response)
 		if writeErr != nil || response.Error != nil {
 			if postWriteFailureHook != nil {
-				callPostWriteFailureHook(method, ctx, postWriteFailureHook)
+				if writeErr == nil {
+					writeOutcome = ResponseWriteNotSent
+				}
+				callPostWriteFailureHook(method, ctx, postWriteFailureHook, writeOutcome)
 			}
 			return
 		}
@@ -373,12 +395,16 @@ func (c *Conn) dispatchRequest(id json.RawMessage, method string, params json.Ra
 	}()
 }
 
-func callPostWriteFailureHook(method string, ctx context.Context, hook PostWriteFailureHook) {
+func callPostWriteFailureHook(method string, ctx context.Context, hook PostWriteFailureHook, outcome ResponseWriteOutcome) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("acp: post-write failure hook panic", "method", method, "panic", r, "stack", string(debug.Stack()))
 		}
 	}()
+	if detailed, ok := hook.(PostWriteFailureOutcomeHook); ok {
+		detailed.AfterResponseWriteFailedWithOutcome(ctx, outcome)
+		return
+	}
 	hook.AfterResponseWriteFailed(ctx)
 }
 
@@ -519,36 +545,49 @@ func (c *Conn) Notify(method string, params any) error {
 }
 
 func (c *Conn) write(v any) error {
+	_, err := c.writeWithOutcome(v)
+	return err
+}
+
+func (c *Conn) writeWithOutcome(v any) (ResponseWriteOutcome, error) {
 	data, err := json.Marshal(v)
 	if err != nil {
-		return fmt.Errorf("marshal message: %w", err)
+		return ResponseWriteNotSent, fmt.Errorf("marshal message: %w", err)
 	}
 	if len(data) > c.maxMessageBytes {
 		err = fmt.Errorf("%w: payload exceeds %d bytes", ErrMessageTooLarge, c.maxMessageBytes)
 		c.closeWith(err)
 		_ = c.closeTransport()
-		return err
+		return ResponseWriteNotSent, err
 	}
 	data = append(data, '\n')
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if c.isClosed() {
-		return ErrClosed
+		return ResponseWriteNotSent, ErrClosed
 	}
 	n, err := c.rwc.Write(data)
 	if err != nil {
+		outcome := ResponseWriteNotSent
+		if n > 0 {
+			outcome = ResponseWriteOutcomeUnknown
+		}
 		c.closeWith(err)
 		_ = c.closeTransport()
-		return err
+		return outcome, err
 	}
 	if n != len(data) {
 		err = io.ErrShortWrite
+		outcome := ResponseWriteNotSent
+		if n > 0 {
+			outcome = ResponseWriteOutcomeUnknown
+		}
 		c.closeWith(err)
 		_ = c.closeTransport()
-		return err
+		return outcome, err
 	}
-	return nil
+	return ResponseWriteSent, nil
 }
 
 // Close 关闭底层连接；所有挂起 Call 与 request handler 立即收到关闭信号。

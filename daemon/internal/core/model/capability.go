@@ -227,6 +227,16 @@ type TransactionalBoundSessionCreator interface {
 	CreateBoundSessionWithRollback(cwd string) (sessionID string, rollback func() error, err error)
 }
 
+// ConnectionScopedTransactionalBoundSessionCreator extends transactional creation with an
+// abort that owns this connection's provisional lifecycle reference. The abort must remove
+// only that reference and connection-scoped session capabilities, and refuse deletion while
+// another reference or active run exists. Callers invoke it only after the protocol layer
+// confirms that the creation response sent zero bytes; a partial or unknown write must leave
+// the session intact.
+type ConnectionScopedTransactionalBoundSessionCreator interface {
+	CreateBoundSessionWithRollbackForConnection(cwd, connectionID string) (sessionID string, rollback func() error, err error)
+}
+
 // BoundSessionSource is an optional capability for connection-bound session
 // creation, loading, history, and archival. Implementations without it retain the
 // single-session fallback. ConnectionBinder separately records lifecycle references.
