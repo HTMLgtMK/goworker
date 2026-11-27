@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"sync"
 
@@ -72,9 +73,13 @@ type SessionManager struct {
 	// 一次写入,此后只读——无运行期写者,无锁(并发论证见 WithRunContext)。
 	runCtxValues []RunContextValue
 	// runDoneHook is injected into each runtime and invoked after active is cleared.
-	// It is set once and read-only thereafter; nil disables notification. It must not
-	// block or reacquire the runtime gate.
+	// Normal run completion invokes it synchronously, so it must not block or reacquire
+	// the runtime gate. Reservation rollback dispatches it asynchronously.
 	runDoneHook func(sessionID string)
+	// reservationDone tracks asynchronous rollback notifications. Add is serialized
+	// with reservationNotificationsClosed under mu so Close can safely wait.
+	reservationDone                sync.WaitGroup
+	reservationNotificationsClosed bool
 }
 
 // ManagerOption 是 NewSessionManager 的配置选项。
@@ -111,9 +116,10 @@ func WithRunContext(values ...RunContextValue) ManagerOption {
 	}
 }
 
-// WithRunDoneHook 为每个新 runtime 设置 Run 终态通知回调。finalizeRun 在清除
-// active、关闭 done 后于锁外调用，供宿主在运行结束后执行延迟收口。回调须避免阻塞
-// 或重新获取该 runtime 的 gate。
+// WithRunDoneHook 为每个新 runtime 设置 Run 终态通知。正常 finalizeRun 在清除 active、
+// 关闭 done 后于锁外同步调用，供宿主执行延迟收口；预执行 reservation rollback
+// 则异步派发同一通知，以免阻塞仍持有外层控制租约的 StartRun。回调须避免阻塞或
+// 重新获取该 runtime 的 gate。
 func WithRunDoneHook(hook func(sessionID string)) ManagerOption {
 	return func(m *SessionManager) {
 		m.runDoneHook = hook
@@ -138,6 +144,38 @@ func NewSessionManager(opts ...ManagerOption) *SessionManager {
 	return m
 }
 
+// prepareReservationRelease registers a rollback notification before the runtime
+// clears active, allowing Close to wait for it without racing WaitGroup.Add.
+func (m *SessionManager) prepareReservationRelease(sessionID string) func(bool) {
+	m.mu.Lock()
+	if m.runDoneHook == nil || m.reservationNotificationsClosed {
+		m.mu.Unlock()
+		return func(bool) {}
+	}
+	hook := m.runDoneHook
+	m.reservationDone.Add(1)
+	m.mu.Unlock()
+
+	var once sync.Once
+	return func(released bool) {
+		once.Do(func() {
+			if !released {
+				m.reservationDone.Done()
+				return
+			}
+			go func() {
+				defer m.reservationDone.Done()
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						slog.Error("session: reservation release hook panicked", "session", sessionID, "panic", recovered)
+					}
+				}()
+				hook(sessionID)
+			}()
+		})
+	}
+}
+
 // Register 注册 runtime，拒绝重复 ID、已关闭的 manager 和已退役的 runtime。
 func (m *SessionManager) Register(rt *SessionRuntime) error {
 	if rt == nil {
@@ -159,9 +197,60 @@ func (m *SessionManager) Register(rt *SessionRuntime) error {
 	// 的发布对后续 finalizeRun 的读取可见。
 	if m.runDoneHook != nil {
 		rt.onRunDone = m.runDoneHook
+		rt.onRunReservationReleased = m.prepareReservationRelease
 	}
 	m.runtimes[rt.ID] = rt
 	return nil
+}
+
+// Replace atomically swaps a registered runtime for another instance with the same ID.
+// The expected pointer protects a newer runtime from stale lifecycle cleanup.
+func (m *SessionManager) Replace(expected, next *SessionRuntime) error {
+	if expected == nil {
+		return errors.New("session: replace nil expected runtime")
+	}
+	if next == nil {
+		return errors.New("session: replace nil runtime")
+	}
+	if expected.ID != next.ID {
+		return fmt.Errorf("session: replace runtime ID mismatch %q != %q", expected.ID, next.ID)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrManagerClosed
+	}
+	if m.runtimes[expected.ID] != expected {
+		return fmt.Errorf("session: runtime %q is no longer registered", expected.ID)
+	}
+	if expected == next {
+		return nil
+	}
+	if next.Retired() {
+		return fmt.Errorf("session: register retired runtime %q: %w", next.ID, ErrSessionRetired)
+	}
+	if m.runDoneHook != nil {
+		next.onRunDone = m.runDoneHook
+		next.onRunReservationReleased = m.prepareReservationRelease
+	}
+	m.runtimes[next.ID] = next
+	return nil
+}
+
+// RemoveRuntime removes rt only if it is still the registered instance for its ID.
+// Use this when cleanup was decided from a runtime pointer that may have been replaced.
+func (m *SessionManager) RemoveRuntime(rt *SessionRuntime) bool {
+	if rt == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.runtimes[rt.ID] != rt {
+		return false
+	}
+	delete(m.runtimes, rt.ID)
+	return true
 }
 
 // Get 返回 id 对应的 runtime;不存在返回 nil。
@@ -251,6 +340,13 @@ func (m *SessionManager) Close() {
 			<-run.done
 		}
 	}
+
+	// A reservation rollback registers its notification before clearing Active, so all
+	// callbacks accepted before this barrier are drained before event/store teardown.
+	m.mu.Lock()
+	m.reservationNotificationsClosed = true
+	m.mu.Unlock()
+	m.reservationDone.Wait()
 
 	// 事件面收口:逐 runtime EndRun+Close 其 EventHub(均幂等;events
 	// 为 nil 的 runtime——同步路径/未启用 RunEvents——是空操作)。必须落在

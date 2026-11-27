@@ -451,6 +451,13 @@ func newClientToolProxy(reg *CapabilityRegistry, sessionID string, specs []Clien
 			Parameters:  schema,
 			Metadata:    metadata,
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
+				identity, ok := RunIdentityFromContext(ctx)
+				if !ok {
+					return "", fmt.Errorf("capability tool %s: managed run identity is required", spec.Name)
+				}
+				if identity.SessionID != sessionID {
+					return "", fmt.Errorf("capability tool %s: run session %q does not match proxy session %q", spec.Name, identity.SessionID, sessionID)
+				}
 				onWait := capabilityWaitObserver(ctx)
 				if onWait == nil {
 					onWait = func(bool) {}
@@ -466,8 +473,8 @@ func newClientToolProxy(reg *CapabilityRegistry, sessionID string, specs []Clien
 	return tools
 }
 
-// executeCapabilityTool 先解析并调用当前绑定；无绑定或普通调用失败时等待重绑。
-// 就绪通知仅用于唤醒，之后必须重查绑定；等待总预算不重置，超时/取消返回失败文本。
+// executeCapabilityTool 先解析当前绑定；未绑定时等待重绑。Invoke 一旦失败就不重试，
+// 因通道错误无法判断设备端是否已执行；就绪通知只用于等待前的绑定重查。
 func executeCapabilityTool(ctx context.Context, reg *CapabilityRegistry, sessionID, toolName string, argsJSON []byte, wait time.Duration, onWait capabilityWaitFunc) (string, error) {
 	return executeCapabilityToolForSpec(ctx, reg, sessionID, toolName, argsJSON, wait, onWait, nil, true)
 }
@@ -513,9 +520,10 @@ func executeCapabilityToolForSpec(ctx context.Context, reg *CapabilityRegistry, 
 				// error channel instead.
 				return result, err
 			}
-			// Invoke 失败 = 通道事实不可用:即时失效「该绑定」,转入等待——
-			// 绝不静默吞掉失败后路由到其他连接。
+			// Invoke failures can mean the device acted but its response was lost.
+			// Invalidate the old binding, but never resend this call to a replacement.
 			reg.invalidateIfCurrent(sessionID, connID, binding)
+			return result, err
 		}
 		if !waiting {
 			waiting = true

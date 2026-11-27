@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/tinguo/goworker/ai-core/core"
 	"github.com/tinguo/goworker/ai-memory"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
@@ -24,9 +26,21 @@ func (c deviceToolCaller) Call(ctx context.Context, method string, params, resul
 }
 
 func TestNegotiatedClientToolSpecs(t *testing.T) {
-	cfg := runtimeconfig.Default()
-	cfg.Session.CapabilityWaitTimeout = 1
-	p := NewPlugin(cfg, runtimeconfig.Paths{})
+	p := newDeviceToolPlugin(t, 1, &scriptedToolProvider{msgs: []core.Message{
+		{
+			Role: "assistant",
+			ToolCalls: []core.ToolCall{{
+				ID:   "call-echo",
+				Type: "function",
+				Function: core.ToolCallFunction{
+					Name:      "sys_echo",
+					Arguments: `{"text":"hello"}`,
+				},
+			}},
+		},
+		{Role: "assistant", Content: "device reply"},
+	}})
+	sessionID := p.currentSession().ID
 	caller := deviceToolCaller{call: func(_ context.Context, method string, params, result any) error {
 		if method != "x-device/call" {
 			return errors.New("unexpected device method: " + method)
@@ -48,7 +62,7 @@ func TestNegotiatedClientToolSpecs(t *testing.T) {
 		return json.Unmarshal([]byte(`{"result":"device reply"}`), result)
 	}}
 
-	if p.BindClientToolSpecs("session", "connection", nil, caller) {
+	if p.BindClientToolSpecs(sessionID, "connection", nil, caller) {
 		t.Fatal("empty spec snapshot should not bind")
 	}
 	specs := []runtimeagent.ClientToolSpec{{
@@ -57,20 +71,20 @@ func TestNegotiatedClientToolSpecs(t *testing.T) {
 		Schema:      `{"type":"object","properties":{"text":{"type":"string"}}}`,
 		Metadata:    map[string]string{"risk_level": "low", "requires_permission": "true"},
 	}}
-	if p.BindClientToolSpecs("session", "connection", specs, nil) {
+	if p.BindClientToolSpecs(sessionID, "connection", specs, nil) {
 		t.Fatal("nil caller should not bind")
 	}
-	if p.BindClientToolSpecs("session", "connection", specs, caller) {
+	if p.BindClientToolSpecs(sessionID, "connection", specs, caller) {
 		t.Fatal("first negotiated binding should not report a refresh")
 	}
-	if _, ok := p.manager.Capabilities().Lookup("session", "sys_echo"); !ok {
+	if _, ok := p.manager.Capabilities().Lookup(sessionID, "sys_echo"); !ok {
 		t.Fatal("valid negotiated descriptor was not registered")
 	}
-	if source := p.ClientToolSourceForSpecs("session", nil); source != nil {
+	if source := p.ClientToolSourceForSpecs(sessionID, nil); source != nil {
 		t.Fatal("empty specs should produce no source")
 	}
 
-	source := p.ClientToolSourceForSpecs("session", specs)
+	source := p.ClientToolSourceForSpecs(sessionID, specs)
 	// The source must retain the initialize-time contract, not caller-owned mutable maps.
 	specs[0].Name = "changed"
 	specs[0].Metadata["risk_level"] = "critical"
@@ -81,12 +95,31 @@ func TestNegotiatedClientToolSpecs(t *testing.T) {
 	if tools[0].Metadata["risk_level"] != "low" || tools[0].Metadata["requires_permission"] != "true" {
 		t.Fatalf("proxy metadata = %#v, want frozen policy metadata", tools[0].Metadata)
 	}
-	got, err := tools[0].Execute(context.Background(), map[string]any{"text": "hello"})
+	var toolResults []string
+	h, err := p.manager.StartRun(sessionID, runtimeagent.RunRequest{
+		Input:      "echo hello",
+		ToolSource: func(context.Context) []core.Tool { return tools },
+	}, runtimeagent.RunCallbacks{
+		EmitToken: func(tok core.Token) {
+			if tok.Type == core.TokenTypeToolResult {
+				toolResults = append(toolResults, tok.Content)
+			}
+		},
+	})
 	if err != nil {
-		t.Fatalf("execute negotiated device tool: %v", err)
+		t.Fatalf("start negotiated client tool run: %v", err)
 	}
-	if got != "device reply" {
-		t.Fatalf("device tool result = %q, want %q", got, "device reply")
+	wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res, err := h.Wait(wctx)
+	if err != nil {
+		t.Fatalf("wait for negotiated client tool run: %v", err)
+	}
+	if res.State != runtimeagent.RunCompleted {
+		t.Fatalf("run state = %q, want %q", res.State, runtimeagent.RunCompleted)
+	}
+	if len(toolResults) != 1 || toolResults[0] != "device reply" {
+		t.Fatalf("tool results = %v, want [device reply]", toolResults)
 	}
 }
 

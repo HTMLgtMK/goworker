@@ -3,10 +3,12 @@ package dispatch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
+	aisession "github.com/tinguo/goworker/ai-session"
 )
 
 // ErrPermissionUnsupported distinguishes an agent that cannot answer a
@@ -27,8 +29,10 @@ type SessionAware interface {
 	SetSession(sessionID, cwd string)
 }
 
-// SessionServerAware additionally receives the dispatch wrapper so task code
-// can issue application-defined reverse calls over the ACP connection.
+// SessionServerAware receives the dispatch wrapper as well as session context
+// so task code can issue reverse calls over the ACP connection. When a handler
+// implements both awareness interfaces, this one takes precedence to avoid
+// initializing the same worker twice.
 type SessionServerAware interface {
 	SetSessionServer(sessionID, cwd string, server *Server)
 }
@@ -48,6 +52,27 @@ type SessionModesProvider interface {
 	SessionModes() *protocol.SessionModeState
 }
 
+type SessionCreator = aiacp.SessionCreator
+
+// ServerOption customizes dispatch lifecycle composition.
+type ServerOption func(*serverConfig)
+
+type serverConfig struct {
+	sessionCreator    SessionCreator
+	sessionCreatorSet bool
+}
+
+// WithSessionCreator injects the application's shared session creator. The
+// adapter uses its returned canonical ID to initialize SessionAware or
+// SessionServerAware handlers exactly once. Without it, the standalone adapter
+// generates one protocol-local ID before initializing the handler.
+func WithSessionCreator(creator SessionCreator) ServerOption {
+	return func(config *serverConfig) {
+		config.sessionCreator = creator
+		config.sessionCreatorSet = true
+	}
+}
+
 // Server is a compatibility adapter for task-oriented dispatch handlers. The
 // actual ACP lifecycle and JSON-RPC implementation live in ai-acp.Server.
 type Server struct {
@@ -55,8 +80,10 @@ type Server struct {
 }
 
 type taskAdapter struct {
-	handler TaskHandler
-	server  *Server
+	handler               TaskHandler
+	applicationCreator    SessionCreator
+	applicationCreatorSet bool
+	server                *Server
 }
 
 func (a *taskAdapter) Prompt(ctx context.Context, sessionID string, prompt []protocol.ContentBlock, _ aiacp.Reporter) (string, error) {
@@ -73,23 +100,46 @@ func (a *taskAdapter) Prompt(ctx context.Context, sessionID string, prompt []pro
 	return a.handler.Run(ctx, sessionID, text, a.server)
 }
 
-func (a *taskAdapter) CreateSession(_ context.Context, sessionID string, req protocol.NewSessionRequest, _ aiacp.Reporter) error {
+func (a *taskAdapter) CreateSession(ctx context.Context, req protocol.NewSessionRequest, reporter aiacp.Reporter) (aisession.ID, error) {
+	var sessionID aisession.ID
+	if a.applicationCreatorSet {
+		if a.applicationCreator == nil {
+			return "", errors.New("dispatch: injected session creator is nil")
+		}
+		id, err := a.applicationCreator.CreateSession(ctx, req, reporter)
+		if err != nil {
+			return "", err
+		}
+		sessionID = id
+	} else {
+		id, err := aisession.NewID()
+		if err != nil {
+			return "", err
+		}
+		sessionID = id
+	}
+	if err := sessionID.Validate(); err != nil {
+		return "", fmt.Errorf("dispatch: session creator returned invalid ID: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if aware, ok := a.handler.(SessionServerAware); ok {
-		aware.SetSessionServer(sessionID, req.Cwd, a.server)
-		return nil
+		aware.SetSessionServer(sessionID.String(), req.Cwd, a.server)
+		return sessionID, nil
 	}
 	if aware, ok := a.handler.(SessionAware); ok {
-		aware.SetSession(sessionID, req.Cwd)
+		aware.SetSession(sessionID.String(), req.Cwd)
 	}
-	return nil
+	return sessionID, nil
 }
 
-func (a *taskAdapter) LoadSession(_ context.Context, req protocol.LoadSessionRequest, _ aiacp.Reporter) error {
+func (a *taskAdapter) LoadSession(_ context.Context, sessionID aisession.ID, req protocol.LoadSessionRequest, _ aiacp.Reporter) error {
 	loader, ok := a.handler.(SessionLoader)
 	if !ok {
 		return &protocol.RPCError{Code: -32000, Message: "dispatch: session load not supported"}
 	}
-	return loader.LoadSession(req.SessionID, req.Cwd, a.server)
+	return loader.LoadSession(sessionID.String(), req.Cwd, a.server)
 }
 
 type sessionListAdapter struct{ handler TaskHandler }
@@ -110,31 +160,42 @@ func (a *taskAdapter) SessionModes() *protocol.SessionModeState {
 }
 
 // NewServer constructs a dispatch adapter without starting its read loop.
-// ServeConn is the normal convenience API.
-func NewServer(rwc io.ReadWriteCloser, handler TaskHandler) (*Server, error) {
+// In standalone use it allocates protocol-local IDs; embedded applications
+// should pass WithSessionCreator with their shared canonical identity owner.
+func NewServer(rwc io.ReadWriteCloser, handler TaskHandler, options ...ServerOption) (*Server, error) {
 	if handler == nil {
 		return nil, errors.New("dispatch: nil task handler")
 	}
 	adapter := &taskAdapter{handler: handler}
-	options := []aiacp.ServerOption{
+	config := serverConfig{}
+	for _, option := range options {
+		if option != nil {
+			option(&config)
+		}
+	}
+	if config.sessionCreatorSet {
+		adapter.applicationCreator = config.sessionCreator
+		adapter.applicationCreatorSet = true
+	}
+	acpOptions := []aiacp.ServerOption{
 		aiacp.WithSessionCreator(adapter),
 	}
 	if _, ok := handler.(SessionLoader); ok {
-		options = append(options, aiacp.WithSessionLoader(adapter))
+		acpOptions = append(acpOptions, aiacp.WithSessionLoader(adapter))
 	} else {
-		options = append(options, aiacp.WithSessionLoader(nil))
+		acpOptions = append(acpOptions, aiacp.WithSessionLoader(nil))
 	}
 	if _, ok := handler.(SessionLister); ok {
-		options = append(options, aiacp.WithSessionLister(&sessionListAdapter{handler: handler}))
+		acpOptions = append(acpOptions, aiacp.WithSessionLister(&sessionListAdapter{handler: handler}))
 	} else {
-		options = append(options, aiacp.WithSessionLister(nil))
+		acpOptions = append(acpOptions, aiacp.WithSessionLister(nil))
 	}
 	if _, ok := handler.(SessionModesProvider); ok {
-		options = append(options, aiacp.WithSessionModesProvider(adapter))
+		acpOptions = append(acpOptions, aiacp.WithSessionModesProvider(adapter))
 	} else {
-		options = append(options, aiacp.WithSessionModesProvider(nil))
+		acpOptions = append(acpOptions, aiacp.WithSessionModesProvider(nil))
 	}
-	core, err := aiacp.NewServer(rwc, adapter, options...)
+	core, err := aiacp.NewServer(rwc, adapter, acpOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -144,8 +205,8 @@ func NewServer(rwc io.ReadWriteCloser, handler TaskHandler) (*Server, error) {
 }
 
 // ServeConn starts an ACP server on an existing transport.
-func ServeConn(rwc io.ReadWriteCloser, handler TaskHandler) *Server {
-	server, err := NewServer(rwc, handler)
+func ServeConn(rwc io.ReadWriteCloser, handler TaskHandler, options ...ServerOption) *Server {
+	server, err := NewServer(rwc, handler, options...)
 	if err != nil {
 		panic(err)
 	}

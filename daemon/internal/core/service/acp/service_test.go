@@ -15,11 +15,16 @@ import (
 
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
+	aisession "github.com/tinguo/goworker/ai-session"
 )
 
 type recordingHandler struct {
 	prompted chan struct{}
 	once     sync.Once
+}
+
+func (h *recordingHandler) CreateSession(context.Context, protocol.NewSessionRequest, aiacp.Reporter) (aisession.ID, error) {
+	return aisession.NewID()
 }
 
 func (h *recordingHandler) Prompt(context.Context, string, []protocol.ContentBlock, aiacp.Reporter) (string, error) {
@@ -32,6 +37,10 @@ type blockingHandler struct {
 	cancelled  chan struct{}
 	startOnce  sync.Once
 	cancelOnce sync.Once
+}
+
+func (h *blockingHandler) CreateSession(context.Context, protocol.NewSessionRequest, aiacp.Reporter) (aisession.ID, error) {
+	return aisession.NewID()
 }
 
 func (h *blockingHandler) Prompt(ctx context.Context, _ string, _ []protocol.ContentBlock, _ aiacp.Reporter) (string, error) {

@@ -6,8 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +25,7 @@ import (
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
 	"github.com/tinguo/goworker/daemon/internal/core/acpworker"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
+	agentplugin "github.com/tinguo/goworker/daemon/internal/plugins/agent"
 )
 
 // This net.Pipe integration test exercises the real ai-acp client/server, handler, session
@@ -125,6 +129,15 @@ func (f *xgwLiveControl) SetSession(sessionID, cwd string) {
 // 本 shim 的用例都是单会话编排便签)。cwd 不落任何状态(shim 无持久化事实)。
 func (f *xgwLiveControl) CreateBoundSession(cwd string) (string, error) {
 	return f.sid, nil
+}
+
+func (f *xgwLiveControl) CreateBoundSessionWithRollback(cwd string) (string, func() error, error) {
+	id, err := f.CreateBoundSession(cwd)
+	if err != nil {
+		return "", nil, err
+	}
+	// This test shim creates no session resource; it exposes its pre-registered runtime.
+	return id, func() error { return nil }, nil
 }
 
 // LoadBoundSession mirror 生产二分支(单 runtime 形态):已注册(runtime id 命中)
@@ -492,7 +505,7 @@ func newXGWLiveStack(t *testing.T, evaluate Evaluator, src *xgwLiveControl) *xgw
 	}
 	serverEnd, clientEnd := net.Pipe()
 	handler := NewFrontendHandlerFactory(evaluate, nil, src, NewSessionGate())().(*FrontendHandler)
-	server, err := aiacp.NewServer(serverEnd, handler)
+	server, err := aiacp.NewServer(serverEnd, handler, frontendSessionLifecycleOptions(handler)...)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -1166,9 +1179,100 @@ func TestXGWIntegrationTokenEventWireShapesRealChain(t *testing.T) {
 	}
 }
 
+func TestXGWJSONRPCRejectsSessionAfterWorkspaceRemoval(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "prompt-workspace")
+	runWorkspace := filepath.Join(root, "run-workspace")
+	for _, dir := range []string{workspace, runWorkspace} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := runtimeconfig.Default()
+	cfg.Session.Enabled = true
+	cfg.Session.Dir = t.TempDir()
+	cfg.Memory.Enabled = false
+	cfg.Sandbox.AllowedWorkDir = root
+	plugin := agentplugin.NewPlugin(cfg, runtimeconfig.Paths{})
+	hub := &model.Hub{
+		Config:               cfg,
+		RegisterCommand:      func(model.Command) error { return nil },
+		SetFallbackHandler:   func(func(*model.Context) error) {},
+		Tools:                func() []model.Tool { return nil },
+		RegisterCapability:   func(string, any) error { return nil },
+		UnregisterCapability: func(string) {},
+	}
+	if err := plugin.Init(hub); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = plugin.Stop() })
+	promptSessionID, err := plugin.CreateBoundSession(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSessionID, err := plugin.CreateBoundSession(runWorkspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var promptCalls atomic.Int32
+	serverEnd, clientEnd := net.Pipe()
+	handler := NewFrontendHandlerFactory(func(*model.Context, string) error {
+		promptCalls.Add(1)
+		return nil
+	}, nil, plugin, NewSessionGate())().(*FrontendHandler)
+	server, err := aiacp.NewServer(serverEnd, handler, frontendSessionLifecycleOptions(handler)...)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	registerXGWMethods(server, handler)
+	server.Start()
+	t.Cleanup(func() { _ = server.Close() })
+	client, err := aiacp.NewClient("workspace-readonly", clientEnd, nil)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	if _, err := client.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if _, err := client.SessionLoad(context.Background(), promptSessionID, workspace); err != nil {
+		t.Fatalf("session/load prompt session: %v", err)
+	}
+	if _, err := client.SessionLoad(context.Background(), runSessionID, runWorkspace); err != nil {
+		t.Fatalf("session/load run session: %v", err)
+	}
+	plugin.AcquireControl(runSessionID, handler.connectionID)
+	if !plugin.HoldControl(runSessionID, handler.connectionID) {
+		t.Fatal("test setup: failed to acquire session control")
+	}
+	for _, dir := range []string{workspace, runWorkspace} {
+		if err := os.Remove(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := client.Prompt(context.Background(), promptSessionID, []protocol.ContentBlock{protocol.TextBlock("hello")}); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("session/prompt after workspace removal = %v, want unavailable-workspace rejection", err)
+	}
+	if got := promptCalls.Load(); got != 0 {
+		t.Fatalf("prompt evaluator called %d times after workspace removal, want 0", got)
+	}
+
+	var result json.RawMessage
+	err = client.Call(context.Background(), XMethodRunStart, XRunStartParams{
+		SessionID: runSessionID, Input: "hello", RequestID: "workspace-removed",
+	}, &result)
+	if err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("%s after workspace removal = %v, want read-only rejection", XMethodRunStart, err)
+	}
+	if rt := plugin.RouteSession(runSessionID); rt == nil || rt.Active() != nil {
+		t.Fatalf("%s admitted a run after workspace removal: runtime=%v", XMethodRunStart, rt)
+	}
+}
+
 // This case verifies standard ACP method responses remain unchanged when x-goworker extensions
 // are registered alongside the live session source.
-
 func TestXGWIntegrationStandardMethodShapes(t *testing.T) {
 	src := newXGWLiveControl(t, "xgw-proto-std", &xgwScriptedProvider{}, nil)
 	src.mu.Lock()
@@ -1282,24 +1386,28 @@ func TestXGWIntegrationDeviceToolBinderProbeAndDisconnectUnbind(t *testing.T) {
 	}}
 	src := newXGWLiveControl(t, "xgw-proto-dev", pv, nil)
 
-	// evaluate mirror 插件的同步 prompt 路径(commands.go handleAgent):持
-	// handler 门禁的请求 goroutine 上经 RecordRun 跑真实会话,ToolSource 用
-	// handler 注入的 binder 工具源(④ 的被测接缝)。
+	// Mirror the production synchronous prompt path: submit through SessionManager so the
+	// run receives its manager-issued identity before negotiated device tools execute.
 	evaluate := func(ctx *model.Context, input string) error {
-		rt := src.m.Get(src.sid)
-		if rt == nil {
-			return errors.New("xgw integration: no runtime")
+		reqCtx := ctx.Ctx
+		if reqCtx == nil {
+			reqCtx = context.Background()
 		}
 		cb := runtimeagent.RunCallbacks{Write: ctx.Writer, Decide: ctx.Decide}
 		if ctx.FrontendContext.EmitToken != nil {
 			cb.EmitToken = ctx.FrontendContext.EmitToken
 		}
-		res := rt.RecordRun(func(s *runtimeagent.Session) (runtimeagent.RunResult, error) {
-			return s.Run(ctx.Ctx, runtimeagent.RunRequest{
-				Input:      input,
-				ToolSource: ctx.FrontendContext.ToolSource,
-			}, cb)
-		})
+		h, err := src.m.StartRun(src.sid, runtimeagent.RunRequest{
+			Input:      input,
+			ToolSource: ctx.FrontendContext.ToolSource,
+		}, cb)
+		if err != nil {
+			return err
+		}
+		res, err := h.Wait(reqCtx)
+		if err != nil {
+			return err
+		}
 		return res.Err
 	}
 	l := newXGWLiveStack(t, evaluate, src)

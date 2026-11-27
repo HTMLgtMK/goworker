@@ -56,6 +56,8 @@ type deviceToolsResponse struct {
 }
 
 type deviceCallRequest struct {
+	SessionID string          `json:"sessionId"`
+	RunID     string          `json:"runId"`
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
 }
@@ -131,18 +133,39 @@ func clientToolMetadata(d DeviceToolDescriptor) map[string]string {
 // CallDeviceTool forwards a call using the client-side tool name. Registered sys_
 // names are normalized before sending the request.
 func CallDeviceTool(ctx context.Context, caller DeviceCaller, toolName string, argsJSON []byte) (string, error) {
+	identity, ok := runtimeagent.RunIdentityFromContext(ctx)
+	if !ok {
+		return "", fmt.Errorf("device call %s: managed run identity is required", strings.TrimPrefix(toolName, sysToolPrefix))
+	}
+	if caller == nil {
+		return "", fmt.Errorf("device call %s: client caller is unavailable", strings.TrimPrefix(toolName, sysToolPrefix))
+	}
 	name := strings.TrimPrefix(toolName, sysToolPrefix)
 	var resp deviceCallResponse
-	if err := caller.Call(ctx, MethodDeviceCall, deviceCallRequest{Name: name, Arguments: argsJSON}, &resp); err != nil {
+	request := deviceCallRequest{
+		SessionID: identity.SessionID,
+		RunID:     identity.RunID,
+		Name:      name,
+		Arguments: argsJSON,
+	}
+	if err := caller.Call(ctx, MethodDeviceCall, request, &resp); err != nil {
 		return "", fmt.Errorf("device call %s: %w", name, err)
 	}
 	return resp.Result, nil
 }
 
-// RelayDeviceTools wraps client descriptors as agent tools. Metadata is kept
-// on the core.Tool boundary so policy middleware can inspect it without
-// leaking policy fields into the provider schema.
+// RelayDeviceTools wraps client descriptors as agent tools without an authenticated
+// upstream runtime identity. It is kept for callers that cannot bind an identity and
+// deliberately fails closed at execution time.
 func RelayDeviceTools(caller DeviceCaller, descriptors []DeviceToolDescriptor) []core.Tool {
+	return RelayDeviceToolsForSession(caller, descriptors, "")
+}
+
+// RelayDeviceToolsForSession binds each raw relay to the trusted upstream runtime
+// session that owns its DeviceCaller. A caller-provided ACP transport session ID is
+// not sufficient; callers without an authenticated runtime mapping must pass empty,
+// which makes every execution fail closed.
+func RelayDeviceToolsForSession(caller DeviceCaller, descriptors []DeviceToolDescriptor, expectedRuntimeID string) []core.Tool {
 	tools := make([]core.Tool, 0, len(descriptors))
 	for _, raw := range descriptors {
 		d := normalizeDeviceToolDescriptor(raw)
@@ -158,6 +181,10 @@ func RelayDeviceTools(caller DeviceCaller, descriptors []DeviceToolDescriptor) [
 			Parameters:  schema,
 			Metadata:    clientToolMetadata(d),
 			Execute: func(ctx context.Context, args map[string]any) (string, error) {
+				identity, ok := runtimeagent.RunIdentityFromContext(ctx)
+				if expectedRuntimeID == "" || !ok || identity.SessionID != expectedRuntimeID {
+					return "", fmt.Errorf("device call %s: managed runtime identity does not match relay binding", d.Name)
+				}
 				argsJSON, err := json.Marshal(args)
 				if err != nil {
 					return "", fmt.Errorf("encode args: %w", err)

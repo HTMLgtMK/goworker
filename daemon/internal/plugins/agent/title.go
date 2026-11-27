@@ -70,6 +70,12 @@ func (s *generatedTitleStore) AppendTitle(title string) (session.TitleState, err
 			}
 		}()
 	}
+	if reason := p.SessionReadOnlyReason(s.sessionID); reason != nil {
+		return session.TitleState{}, fmt.Errorf("agent: session %q is read-only: %w", s.sessionID, reason)
+	}
+	if reason := p.workspaceReadOnlyReason(store.Workspace()); reason != nil {
+		return session.TitleState{}, fmt.Errorf("agent: session %q is read-only: %w", s.sessionID, reason)
+	}
 	return store.AppendTitle(title)
 }
 
@@ -88,6 +94,14 @@ func (p *AgentPlugin) GenerateSessionTitle(sessionID, clientID string) (string, 
 			return err
 		}
 		defer release()
+		if rt := p.RouteSession(sessionID); rt != nil {
+			if reason := rt.ReadOnlyReason(); reason != nil {
+				return fmt.Errorf("agent: session %q is read-only: %w", sessionID, reason)
+			}
+		}
+		if reason := p.workspaceReadOnlyReason(store.Workspace()); reason != nil {
+			return fmt.Errorf("agent: session %q is read-only: %w", sessionID, reason)
+		}
 		firstUser, assistant = titleMaterial(store.OriginalMessages())
 		return nil
 	})
@@ -222,6 +236,14 @@ func (p *AgentPlugin) SetSessionTitle(sessionID, clientID, title string) error {
 		return err
 	}
 	defer release()
+	if rt := p.RouteSession(sessionID); rt != nil {
+		if reason := rt.ReadOnlyReason(); reason != nil {
+			return fmt.Errorf("agent: session %q is read-only: %w", sessionID, reason)
+		}
+	}
+	if reason := p.workspaceReadOnlyReason(st.Workspace()); reason != nil {
+		return fmt.Errorf("agent: session %q is read-only: %w", sessionID, reason)
+	}
 	var state session.TitleState
 	if err := p.control.WithControl(sessionID, clientID, func() error {
 		var err error

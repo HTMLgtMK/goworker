@@ -132,11 +132,17 @@ func (p *AgentPlugin) handleMemory(ctx *model.Context) error {
 		ctx.Writer(fmt.Sprintf("✔ forgot %d\n", len(args)-1))
 
 	case "profile":
-		if p.deps.Instruction == nil || p.deps.Instruction.Profile() == nil {
+		resources := p.currentResources()
+		if ctx != nil && ctx.Ctx != nil {
+			if rt, err := p.sessionRuntimeIn(ctx.Ctx); err == nil && rt != nil {
+				resources = p.resourcesForSession(rt.ID)
+			}
+		}
+		if resources == nil || resources.instruction == nil || resources.instruction.Profile() == nil {
 			ctx.Writer("declarative instructions disabled (memory.enabled=false or load failed)\n")
 			return nil
 		}
-		prof := p.deps.Instruction.Profile()
+		prof := resources.instruction.Profile()
 		used, max := prof.Capacity()
 		ctx.Writer(fmt.Sprintf("USER.md capacity: %d/%d chars\n", used, max))
 		if strings.TrimSpace(prof.Content()) == "" {

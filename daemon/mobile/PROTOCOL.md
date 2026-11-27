@@ -30,8 +30,8 @@ ZCode dispatcher 共享同一套协议语义（`ai-dispatch/protocol`），区�
 | 方法 | 说明 |
 |---|---|
 | `initialize` | 能力协商，首条必发；params 带 `clientCapabilities`（见下节），响应含 `agentCapabilities`（loadSession 等） |
-| `session/new` | **真新建**会话，params `{cwd, mcpServers}`；响应 `{sessionId, modes?}`。新会话只是发起连接的路由目标，不影响其他连接 |
-| `session/load` | 回放历史会话（checkpoint 锚定，update 先于响应到达）；对已归档（archived）会话是**只读重放**，不产生可 prompt 的会话；仅当 agentCapabilities 声明 `loadSession` 时可用 |
+| `session/new` | **真新建**会话，params `{cwd, mcpServers}`；响应 `{sessionId, modes?}`。返回的 `sessionId` 是 `ai-session.SessionManager` 的 canonical ID，同时用于持久化、runtime、标准 ACP 和扩展协议；新会话只新增本连接的绑定，不影响既有会话或其他连接 |
+| `session/load` | 按请求中的 canonical `sessionId` 恢复/重开历史会话，响应可带 `{modes?}`；归档会话只读重放；仅当 agentCapabilities 声明 `loadSession` 时可用 |
 | `session/list` | 会话清单（全仓并集扫描，`updatedAt` 降序，条目含三态 `state`，见下） |
 | `session/prompt` | 提交一轮对话，阻塞到回合结束返回 stop reason |
 | `session/cancel` | **通知**（无响应）：取消进行中的 prompt —— Android 停止按钮发这个 |
@@ -39,31 +39,25 @@ ZCode dispatcher 共享同一套协议语义（`ai-dispatch/protocol`），区�
 
 **会话三态（session/list 条目的 `state` 字段，Plan A3）**：
 
-- `active` = 事实活跃：有连接绑定（attach control / session/new|load 声明）或
-  run 在飞（后台 Run 未到终态）。字段 omitempty 兼容旧客户端（不识别的实现按
-  无字段组收下）。
+- `active` = 后端仍视为 live：有连接绑定、有在飞 run/待完成的延迟收口，或是
+  当前 session。`x-goworker/session/attach` 的 control lease 本身不构成清单活跃引用。
+  字段 omitempty 兼容旧客户端（不识别的实现按无字段组收下）。
 - `idle` = 无引用无在飞（收口前后过渡态）。
 - `archived` = 显式归档终态（见 x-goworker/session/archive），只读保留。
 - `cwd`：会话最近一次声明的执行目录——active 会话以运行时声明为最新事实；
   idle/archived 会话从持久化 workspace 记录读（重启后仍有值）。
 
-**多会话并行语义（取代旧版「单活动会话」）**：daemon 支持多会话并行，每个
-会话独立的执行权（同一会话 prompt 串行，跨会话 prompt 并行互不阻塞）。
+**多会话并行语义**：ACP `sessionId` 就是 canonical session ID，不存在 transport→runtime ID 映射。同一连接可持有多个不同会话；多个连接也可绑定同一 canonical 会话。不同 session 可并行执行，单个 session 同时只接受一个 run（标准 prompt 与后台 Run 共用该执行权）。
 
-- **superseded 守卫只看本连接**：连接 B 的 `session/new` / `session/load` 不再
-  影响连接 A；A 的 prompt 路由由 A 自己最近一次声明决定。A 对「本连接曾声明
-  后又改绑」的旧 id 发 prompt → -32000（消息含 "no longer active"），prompt
-  绝不静默串到别的会话工作区。
-- **管理门禁**：`session/new` / `session/load`（可 prompt 分支）/
+- **按 canonical ID 路由**：`session/prompt`、`session/load` 和 `x-goworker/*` 使用请求中的同一个 `sessionId` 寻址，不使用连接级「最近活动会话」或全局 current。`session/new` 返回 manager 分配的 canonical ID，并只新增该连接对它的绑定；不会改写 ID、顶掉或解绑已有会话。对未知或已收口 ID 的 prompt 明确失败，不会悄悄路由到 current；成功 `session/load` 可重新建立可写绑定。
+- **管理门禁**：`session/new` / `session/load`（可写 load 分支）/
   `x-goworker/session/archive` 是管理操作，全局互斥——并发管理操作返回
-  -32000 "session busy"（瞬态，稍后重试）。管理操作**不再被在飞 prompt 阻塞**
-  （prompt 已退出全局门禁）。
-- **`/new` 旧会话收口**：`session/new` 纯新建，旧会话在引用归零后由 daemon
-  自动收口（注销 + 关闭存储句柄），**数据不删、不自动归档**——切回旧会话走
-  `session/load` 重开。连接断开即解除该连接的绑定，最后一条绑定解除（且无
-  在飞 run）时同样收口。
-- 各会话的 prompt 在 daemon 侧按会话串行执行，连接断开时排队中的 prompt 以
-  错误退出。
+  -32000 "session busy"（瞬态，稍后重试）。管理操作不与 prompt 共用此门禁，
+  因此在飞 prompt 不会阻塞新建或加载；归档只读重放不需要管理门禁。
+- **CLI `/new` 与 ACP `session/new` 共用同一 `ai-session.SessionManager` 创建会话，但选择行为不同**：CLI `/new` 创建并选择新会话作为 CLI current；ACP `session/new` 创建新会话并将新 ID 绑定到响应连接，旧 ID 和其他连接绑定原样保留。
+- 在 ACP `session/prompt` 中执行 `/new` 会明确报错并提示调用标准 ACP `session/new`。它不会创建会话、修改 CLI current、清空绑定或使旧 session 失效；客户端应通过 `session/new` 获得新 ID。
+- 同一 runtime 的并发 prompt/后台 Run 不排队：先成功预留执行权的 run 执行，另一
+  个请求失败；不同 runtime 可并行，但仍受后台 Run 的全局并发/排队限额约束。
 
 **缺省执行域（tmp workspace，Plan A4 已知语义）**：从未声明 cwd 的会话
 （`session/new` 不带 cwd、`session/load` 无声明可恢复、CLI `/new`），daemon 自动
@@ -222,10 +216,11 @@ control lease **按会话记账**（拍板②原文「每会话至多一个 cont
   组合键保证绝不误返他会话的 run）。
 - 同连接重复 attach 同一会话 = **换代**：旧订阅收掉、按本次 afterSeq 重建，
   每连接每会话至多一条事件流；`detach` 或断连收掉订阅。
-- **与标准方法的共存语义**：后台 Run 运行期间，任何连接的标准
-  `session/prompt` 会阻塞等待该 Run 结束（排队，不报 busy 错误）；反之标准
-  prompt 在飞时 run/start 返回 -32000（同会话单活动 Run）。同步入口与后台
-  入口靠同一把会话执行权互斥，不存在并发写会话。
+- **与标准方法的共存语义**：`x-goworker/run/start` 与标准
+  `session/prompt` 最终都通过同一 runtime 的 SessionManager 预留执行权。该
+  runtime 已有活动 run 时，竞争的 prompt 或 run/start 会被拒绝，不会等待/排队；
+  反之先进入的 prompt 或后台 Run 也不会被后来的同会话请求并发执行。它们不共享
+  ACP 前端的 session 管理门禁，但共享 per-runtime 单活动 run 限制。
 
 ### 事件语义（逐事件投递与断点恢复）
 
@@ -330,17 +325,18 @@ per-seq 事件后逐条下行，与实时流形状完全一致。
 
 **clientCapabilities（client 声明）**
 
-- key 存在性即门控，value 当前不解析 —— `{"x-device":{"tools":true}}` 里的
-  `tools` 字段是给未来留的形状，写了不亏。
-- 声明 `x-device` = 本客户端实现 `x-device/tools` / `x-device/call`
-  （设备能力注册表见「系统能力工具」一节）。发送 initialize **之前**必须完成
-  反向请求 handler 注册：服务端写出 initialize 响应后即可发起探测，客户端
-  应用层可能尚未处理该响应。
+- `x-device` key 存在性即门控，value 当前不解析。`{"x-device":{"tools":true}}`
+  是现行声明形状；服务端不会检查嵌套的协议版本或 `sessionRunIdentity`。
+- 声明 `x-device` 等同于承诺完整实现 `x-device/tools` 和当前版本的 `x-device/call`
+  （含 `sessionId` / `runId` 必填字段及不确定结果不重试语义）。只支持旧
+  `{name, arguments}` 形状的客户端已不兼容，必须先更新处理器再声明该 key。
+  发送 initialize **之前**必须完成反向请求 handler 注册：服务端写出 initialize
+  响应后即可发起探测，客户端应用层可能尚未处理该响应。
 - **不声明的后果（app-service 路径）**：agent 不发探测请求，设备工具静默为零
   —— 不报错、不降级提示，LLM 只是看不到任何 `sys_*` 工具。这是能力协商的
-  预期行为（VS Code 等标准客户端就是这条路），但实现了 DeviceTools 的客户端
-  忘了声明就是纯丢功能。
-- 旧 AAR（ServeACPWorker 路径）不检查此字段：声明了无害、被忽略。
+  预期行为（VS Code 等标准客户端就是这条路）。
+- 旧 AAR（ServeACPWorker 路径）不检查此字段；但没有 managed runtime identity 的
+  worker relay 会在发出 `x-device/call` 前 fail closed。
 
 **agentCapabilities（agent 声明）**
 
@@ -354,14 +350,10 @@ per-seq 事件后逐条下行，与实时流形状完全一致。
 
 **客户端迁移清单（旧 AAR → capability 门控版 AAR）**
 
-1. initialize params 补 `clientCapabilities: {"x-device": {"tools": true}}`。
-2. 在发送 initialize 前注册 `x-device/tools` / `x-device/call` handler，
-   不要等到 initialize 返回后才注册。
-3. 保存 initialize 响应的 `agentCapabilities`，UI 按能力降级；保留 -32601 兜底、
-   权限对话框语义。
-4. 新 AAR（app-service 路径）要求客户端声明 `clientCapabilities`（见上节），
-   未声明时设备工具静默为零；Host 侧已强制启用 ACP service —— 显式注入连接时
-   `frontend.acp.enabled` 开关无效，装配层无视该开关注册 service。
+1. initialize params 补 `clientCapabilities: {"x-device": {"tools": true}}`；仅在客户端已实现本节的新 `x-device/call` wire contract 后声明该 key。现有服务端不解析嵌套版本字段。
+2. 在发送 initialize 前注册 `x-device/tools` / `x-device/call` handler，处理 `sessionId`、`runId`；设备调用的 `sessionId` 是 canonical session ID，可据此关联该会话的 workspace。
+3. 保存 initialize 响应的 `agentCapabilities`，UI 按能力降级；保留 -32601 兜底、权限对话框语义。对已发出但结果不确定的设备调用不得自动重试。
+4. 新 AAR（app-service 路径）要求客户端声明 `clientCapabilities`（见上节），未声明时设备工具静默为零；Host 侧已强制启用 ACP service —— 显式注入连接时 `frontend.acp.enabled` 开关无效，装配层无视该开关注册 service。
 
 ## agent → client
 
@@ -406,7 +398,7 @@ session store 落 JSONL，同一 configDir 重建 Host 后 `session/load` 可恢
 
 设备能力只有 client（app 进程）可调用，走 **client-ward 扩展方法**（Zed `fs/*` 模式）。
 方法名带 `x-` 前缀 = goworker 应用层扩展，**不进 `ai-dispatch/protocol` 标准面**；
-VS Code/ZCode 等标准客户端不认识 → 自动 method-not-found → 无设备工具，零兼容负担。
+不支持该扩展的标准 ACP 客户端会对探测返回 method-not-found，agent 不会注册设备工具。
 
 ```
 initialize 响应写入 transport 后（app-service 路径）：
@@ -415,21 +407,41 @@ initialize 响应写入 transport 后（app-service 路径）：
                  （method-not-found / 超时 → 无设备工具；非法条目跳过）
 
 LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下）→ 通过后：
-                 agent ── x-device/call {name, arguments} ──→ client 执行
+                 agent ── x-device/call ──→ client 执行
                  ← {result: "<文本结果回给 LLM>"}
 ```
 
+### Canonical session identity
+
+`session/new` returns the ID created by `ai-session.SessionManager`. That exact canonical ID is the ACP `sessionId`, persisted session ID, runtime ID, and ID accepted by x-goworker and x-device. `session/load` addresses the same ID; no `_meta` alias or transport-to-runtime mapping is used.
+
+Clients use the canonical `sessionId` for ACP prompts and x-goworker calls. For device workspace selection, clients may maintain an explicit canonical-session-ID-to-workspace association; they must not infer a session identity from cwd, recent selection, or process-global current. Archived read-only sessions have no executable runtime and cannot invoke device tools.
+
+### `x-device/call` wire contract
+
+实际 JSON 字段使用 camelCase；Go 结构体字段名分别是 `SessionID` / `RunID`：
+
+```json
+{
+  "sessionId": "session_0123456789abcdef0123456789abcdef",
+  "runId": "run-opaque-123",
+  "name": "read_file",
+  "arguments": {"path": "src/main.go"}
+}
+```
+
+- `sessionId` 和 `runId` 均为必填、非空的顶层字符串；旧 `{name, arguments}` 形状不兼容。身份来自 Go 侧 managed Run 的可信 context，不是模型可填写的 `arguments`。
+- `sessionId` 是本次调用所属的 canonical ACP/persisted/runtime session ID；没有独立的 transport ID 映射。`runId` 是该 managed Run 的执行 ID；同一 Run 的所有设备工具调用复用该值。
+- Go 在没有有效 managed Run identity 时会在 client 调用前失败，不会发送缺字段或空字段请求。`acpWorker`/raw relay 若没有可信 session/run identity，设备调用 fail closed；不能把 cwd 或 process-global current 冒充 session identity。
+- 这是 wire 破坏性变更：旧客户端若只理解 `{name, arguments}` 不兼容，必须先升级 handler，再声明 `clientCapabilities.x-device`。现有 initialize 门控只检查 `x-device` key 是否存在，嵌套值不解析；当前没有单独的 `sessionRunIdentity` 版本门控。不要让旧客户端与新 agent 执行设备工具。
+- 客户端按 canonical `sessionId` 查找该会话关联的 workspace，再应用原有 workspace/path 边界；未知、空值或有歧义的关联必须拒绝。`runId` 只用于执行关联，不是授权凭证。
+
+**调用结果不确定时禁止自动重试**：能力代理在 Invoke 前找不到绑定时，可以按现有等待策略等待同一 runtime session 的兼容绑定；但一旦 `x-device/call` 已发出，返回错误/超时无法证明设备端没有执行。托管 capability proxy 会使当前失败绑定失效并将错误交回工具调用；raw relay 也只返回调用错误。两条路径都不会把同一请求重发到替换连接。客户端和宿主不得因结果不确定而自动重放副作用调用；由上层决定是否以新的用户/模型操作重试。
+
 - **工具名强制 `sys_` 前缀**（worker 添加）：与 bash/mcp 命名空间隔离。
-- **能力门控（app-service 路径）**：门控规则与报文见「能力协商（initialize）」一节
-  —— 客户端在 initialize 的 clientCapabilities 里声明 `x-device` 才会被探测。
-- **探测与绑定**：app-service 在每条连接的 initialize 响应写出后探测一次并缓存
-  工具清单；`session/new`、`session/load`、`x-goworker/session/attach` 和
-  `x-goworker/run/start` 在 Session 确定后使用该清单绑定。探测失败时会话仍可用，
-  只是没有设备工具；设备清单变化需重连。连接关闭时清除该连接的绑定；detach
-  只移除订阅并按 mode 释放控制权，不解除仍存活连接的设备工具绑定。
-  旧 ServeACPWorker 在 session/new 后探测；兼容旧 binder 的后端仍可能每轮探测。
+- **能力门控（app-service 路径）**：客户端在 initialize 的 `clientCapabilities` 中声明 `x-device` 才会探测；value 当前不解析。设备工具清单只在连接 initialize 后探测，按 runtime session 绑定；`session/new`、`session/load`、`x-goworker/session/attach` 和 `x-goworker/run/start` 在会话确定后使用该清单。探测失败时会话仍可用，只是没有已绑定能力；连接关闭时清理该连接绑定。
 - **metadata 声明**：客户端应发送 `risk_level: benign..reserved`；需要统一门控的工具还应发送 `requires_permission: true`。worker 为 gated 工具补充稳定的 `allow_always_key: sys_<name>`。
-- **兼容旧客户端**：`never → low`（直通）、`mode → unclassified`、`always → critical + permission_policy=always_hitl`；旧值只在 relay 边界转换，runtime 内部统一使用 benign-reserved。
+- **兼容旧描述符值**：`never → low`（直通）、`mode → unclassified`、`always → critical + permission_policy=always_hitl`；旧值只在 relay 边界转换，runtime 内部统一使用 benign-reserved。
 
   | mode | benign/low | medium-reserved |
   |---|---|---|
@@ -438,38 +450,13 @@ LLM 调 sys_<name> → 统一 HITL 门控（risk_level × 沙箱模式，见下�
   | strict / readonly | 放行 | 拒绝 |
   | off | 放行（`always_hitl` 仍询问） | 放行（`always_hitl` 仍询问） |
 
-- **断连等待（P5 行为变化，声明 x-device 的客户端必须知晓）**：设备工具调用
-  时发现执行通道已断（连接退出/`x-device/call` 失败）→ 不再「立即把错误交给
-  模型」，而是**等待重绑**（默认 45s）：
-  - 预算内新连接完成探测并绑定同一会话，且工具 schema 和权限策略兼容
-    → 工具在新连接上执行完成；后续调用照常走统一 HITL 门控；
-  - **审批语义边界（P4 评审 issue6）**：统一 HITL 门控在每次工具调用前裁决
-    （ai-core OnBeforeTool，一次调用一次审批）。**单次工具调用内的审批随重绑
-    转移到新连接执行**——调用获批后连接断开、预算内重绑成功的，本次调用以
-    既有授权直接在新连接上执行完成，不重复弹审批；**再裁决发生在下一次调用**
-    （重绑后的新一次工具调用照常走门控，危险操作仍需确认，见上条）；
-  - **能力等待总预算受 ai-core toolCtx 60s 约束（预算钳 55s）**：等待发生在
-    ai-core 工具执行预算（toolCtx 60s）之内，重绑后再失败回到等待也不复位
-    计时（总等待 ≤ 预算）；daemon 把显式配置 >55s 的预算**钳到 55s** 并记
-    warn（给 Invoke 留 5s 余量）——超配不生效，否则等待会被 60s 掐断、呈现
-    为普通工具超时而非下面的明确失败文案；
-  - 预算耗尽 → 返回**明确失败文本**（`device tool sys_<name> unavailable:
-    connection lost, waited Ns`）交给模型决定下一步，run 正常继续；
-  - 同一 Session 有多个兼容绑定时，registry 当前按 connection ID 字典序选择；
-    它不保证优先选择原连接或当前控制连接。当前使用约定是一个 Session 只对应
-    一个设备，代码不强制该约定。
-  - 等待期间 run 状态为 `waiting_capability`（x-goworker 的 run/get /
-    session/events 可观测）。
-- **`capability_wait_timeout` 配置**：上述等待预算，秒为单位，`config.yaml`
-  的 `session.capability_wait_timeout`，默认 45；**daemon 侧钳制（P4 评审
-  issue6）**：显式配置 >55 被钳到 55 并记 slog.Warn（硬约束：等待发生在
-  ai-core 工具执行 60s 预算内，55s 给 Invoke 留余量——配置方无需自律，超配
-  只是无效而非错误）；<=0 回落 45s 兜底。
-- **实现位置**：worker 中继 `daemon/internal/core/acpworker/sys_relay.go`；统一裁决 `ai-runtime/middlewares/hitl.go`；执行器在 Kotlin `DeviceTools` 注册表
-- **每加一个能力的成本 = Kotlin 一处**（注册描述符 + handler），Go/协议零改动、无需重绑 AAR 之外的任何东西
+- **等待重绑与不确定结果边界**：Invoke 前查不到会话对应的能力绑定时，设备工具可等待重绑（默认 45s）；新绑定必须属于同一个 runtime session 且工具 schema/policy 兼容。等待期间 run 状态为 `waiting_capability`。一旦 Invoke 已调用，任何传输错误都不重发，哪怕刚好有新连接绑定；设备可能已完成副作用但响应丢失。
+- **单次调用权限语义**：正常工具策略仍在每次工具调用前裁决。一次已获批的调用在 Invoke 前等待重绑时沿用本次裁决，不会再弹一次；重绑后的下一次调用重新裁决。身份字段不绕过权限策略。
+- **等待预算**：`config.yaml` 的 `session.capability_wait_timeout`，默认 45 秒；显式值 >55 秒钳到 55 秒并记录 warning，给 ai-core 60 秒工具执行预算中的 Invoke 留 5 秒；<=0 回落到默认值。等待预算只覆盖尚未进入 Invoke 的能力等待，不是失败后的自动重试预算。
+- **多绑定选择**：同一 runtime session 有多个兼容绑定时，registry 当前按 connection ID 字典序选择；不保证优先选择原连接或当前控制连接。实际使用约定仍是一个 Session 对应一个设备。
+- **实现位置**：中继 `daemon/internal/core/acpworker/sys_relay.go`；托管 identity `ai-runtime/agent`；能力绑定 `ai-runtime/agent/capability.go`；客户端执行器在 Android `DeviceTools`。
 
-**客户端义务**：对不认识的带 id 请求必须自动回 -32601（JSON-RPC 标准行为）——
-worker 的探测靠这个快速失败；沉默客户端会把探测拖到超时（2s）。
+**客户端义务**：对不认识的带 id 请求必须自动回 `-32601`（JSON-RPC 标准行为），避免探测无谓等待；支持 `x-device` 的客户端还必须实现上述新 `x-device/call` 字段和失败语义。
 
 ## Android 构建与 Host 适配
 

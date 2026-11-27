@@ -165,10 +165,13 @@ func waitToolResultCollect(disconnect func(), toolResults *[]string) (cb runtime
 // TestDeviceToolSourceBindsProxyAndExecutes(P5-9 构造面):binder 闭包经
 // SpecDeviceTools 探测 → Bind(rt.ID, connID, 注册名, ttl=2*wait, x-device/call
 // 执行通道) → NewClientToolProxy;注册名与门控元数据与原始中继同面(sys_ 前缀
-// + benign 透传),另带 goworker.capability_wait 内部标记;直通执行(绑定在)经
-// x-device/call 返回客户端结果。
+// + benign 透传),另带 goworker.capability_wait 内部标记;通过 SessionManager.StartRun
+// 执行(绑定在),以有效 run identity 调用 x-device/call 并返回客户端结果。
 func TestDeviceToolSourceBindsProxyAndExecutes(t *testing.T) {
-	p := newDeviceToolPlugin(t, 0, fixedProvider{content: "unused"})
+	p := newDeviceToolPlugin(t, 0, &scriptedToolProvider{msgs: []core.Message{
+		deviceToolCallRound("call-dev-source"),
+		{Role: "assistant", Content: "buzzed the device"},
+	}})
 	sid := p.currentSession().ID // 纯内存形态 = "current"(Bind/Lookup 同键)
 
 	caller := &scriptedDeviceCaller{toolsJSON: deviceToolsPayload, callRes: `{"result":"buzzed"}`}
@@ -196,12 +199,31 @@ func TestDeviceToolSourceBindsProxyAndExecutes(t *testing.T) {
 		t.Fatalf("binding for (%q, %q) must be registered after a successful probe", sid, deviceToolName)
 	}
 
-	out, err := tool.Execute(context.Background(), map[string]any{"duration": 1.0})
+	var toolResults []string
+	h, err := p.manager.StartRun(sid, runtimeagent.RunRequest{
+		Input:      "vibrate the device",
+		ToolSource: func(context.Context) []core.Tool { return tools },
+	}, runtimeagent.RunCallbacks{
+		EmitToken: func(tok core.Token) {
+			if tok.Type == core.TokenTypeToolResult {
+				toolResults = append(toolResults, tok.Content)
+			}
+		},
+	})
 	if err != nil {
-		t.Fatalf("Execute: %v", err)
+		t.Fatalf("StartRun: %v", err)
 	}
-	if out != "buzzed" {
-		t.Fatalf("Execute = %q, want %q (结果来自 x-device/call)", out, "buzzed")
+	wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res, err := h.Wait(wctx)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if res.State != runtimeagent.RunCompleted {
+		t.Fatalf("state = %q, want RunCompleted", res.State)
+	}
+	if len(toolResults) != 1 || toolResults[0] != "buzzed" {
+		t.Fatalf("tool results = %v, want [buzzed] (结果来自 x-device/call)", toolResults)
 	}
 	if got := caller.callCount(); got != 1 {
 		t.Fatalf("x-device/call forwarded %d time(s), want 1", got)

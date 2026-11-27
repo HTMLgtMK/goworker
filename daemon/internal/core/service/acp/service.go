@@ -23,6 +23,14 @@ type connectionCloser interface {
 
 var _ connectionCloser = (*FrontendHandler)(nil)
 
+func frontendSessionLifecycleOptions(handler *FrontendHandler) []aiacp.ServerOption {
+	lifecycle := &frontendSessionLifecycle{handler: handler}
+	return []aiacp.ServerOption{
+		aiacp.WithSessionCreator(lifecycle),
+		aiacp.WithSessionLoader(lifecycle),
+	}
+}
+
 // Service is a reusable ACP daemon adapter. It owns the listener returned by
 // listenerFactory and all connected peers; callers supply factories for both the
 // transport and the per-connection protocol handler. Daemon task/session routing
@@ -193,7 +201,14 @@ func (s *Service) accept(conn io.ReadWriteCloser) {
 		slog.Error("acp: handler factory returned nil")
 		return
 	}
-	server, err := aiacp.NewServer(conn, handler, s.serverOptions...)
+	var serverOptions []aiacp.ServerOption
+	if frontend, ok := handler.(*FrontendHandler); ok {
+		serverOptions = append(serverOptions, frontendSessionLifecycleOptions(frontend)...)
+	}
+	// Caller options run last so an explicit nil adapter can disable a
+	// capability that the handler's static interface would otherwise expose.
+	serverOptions = append(serverOptions, s.serverOptions...)
+	server, err := aiacp.NewServer(conn, handler, serverOptions...)
 	if err != nil {
 		_ = conn.Close()
 		slog.Error("failed to create ACP server", "error", err)

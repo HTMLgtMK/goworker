@@ -152,6 +152,25 @@ func (f *pr2DualControl) CreateBoundSession(cwd string) (string, error) {
 	return spec.id, nil
 }
 
+func (f *pr2DualControl) CreateBoundSessionWithRollback(cwd string) (string, func() error, error) {
+	id, err := f.CreateBoundSession(cwd)
+	if err != nil {
+		return "", nil, err
+	}
+	return id, func() error {
+		runtime := f.m.Get(id)
+		if runtime == nil {
+			return nil
+		}
+		if err := runtime.Retire(); err != nil {
+			return err
+		}
+		f.m.RemoveRuntime(runtime)
+		runtime.CloseEvents()
+		return nil
+	}, nil
+}
+
 // LoadBoundSession mirror 生产二分支(纯内存形态):已注册 → reload no-op
 // (store 无,ReloadFromStore 本身 no-op);不在册 → 诚实未知(ErrSessionUnknown
 // 契约,handler 映射 -32000)。cwd 不动声明(shim 无 cwd 面可声明)。
@@ -355,7 +374,11 @@ func newPR2Stack(t *testing.T, evaluate Evaluator, src model.SessionSource, gate
 	}
 	serverEnd, clientEnd := net.Pipe()
 	handler := NewFrontendHandlerFactory(evaluate, nil, src, gate)().(*FrontendHandler)
-	server, err := aiacp.NewServer(serverEnd, handler)
+	lifecycle := &frontendSessionLifecycle{handler: handler}
+	server, err := aiacp.NewServer(serverEnd, handler,
+		aiacp.WithSessionCreator(lifecycle),
+		aiacp.WithSessionLoader(lifecycle),
+	)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -469,8 +492,7 @@ func TestPR2TwoConnectionsEachOperateOwnSession(t *testing.T) {
 		}
 	}
 
-	// 连接 1 session/new:真新建会话 A,Binding 指向声明落地会话(创建队列第
-	// 一项的确定性 id);wire 返回的 transport id 只进 promptable/active。
+	// 连接 1 session/new:真新建会话 A,Binding 与 wire sessionId 都使用同一 canonical ID。
 	sid1 := func() string {
 		sid, err := client1.NewSession(context.Background(), "/repo-a")
 		if err != nil || sid == "" {

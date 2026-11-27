@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -14,6 +15,9 @@ import (
 
 // ErrSessionArchived prevents new runs after a session reaches its terminal state.
 var ErrSessionArchived = errors.New("session: runtime is archived")
+
+// ErrSessionReadOnly prevents execution when the session's workspace is unavailable.
+var ErrSessionReadOnly = errors.New("session: runtime is read-only")
 
 // ErrSessionRetired rejects runs on a runtime instance that has been removed from
 // the SessionManager. Archived is a persisted terminal state; retired only ends
@@ -34,6 +38,7 @@ type SessionRuntime struct {
 	// admissionMu serializes run reservation with the archived transition.
 	admissionMu sync.Mutex
 	archived    bool
+	readOnlyErr error
 	// retired marks this runtime instance as removed from the manager registry.
 	// It shares admissionMu with archived so a StartRun that already holds the
 	// pointer (but has not reserved yet) cannot execute against a closed hub/store.
@@ -53,9 +58,11 @@ type SessionRuntime struct {
 	eventsClosed    bool
 	events          *EventHub
 	// onRunDone is injected at Register and called after finalizeRun clears active.
-	// It is the shared completion hook for synchronous and background runs; invoke
-	// it outside rt.mu because the host may close stores or inspect the manager.
+	// It is invoked outside rt.mu because the host may close stores or inspect the manager.
 	onRunDone func(sessionID string)
+	// onRunReservationReleased reserves a manager-tracked callback before active is cleared.
+	// Its completion closure dispatches only after a successful rollback.
+	onRunReservationReleased func(sessionID string) func(released bool)
 }
 
 // NewSessionRuntime 创建运行时。s 允许 nil,由 BindSession 后置绑定。
@@ -80,6 +87,9 @@ func (r *SessionRuntime) reserveRun(run *AgentRun) (*Session, error) {
 	if r.retired {
 		return nil, ErrSessionRetired
 	}
+	if r.readOnlyErr != nil {
+		return nil, fmt.Errorf("%w: %v", ErrSessionReadOnly, r.readOnlyErr)
+	}
 	if r.active != nil {
 		return nil, ErrRunActive
 	}
@@ -90,21 +100,50 @@ func (r *SessionRuntime) reserveRun(run *AgentRun) (*Session, error) {
 	return r.session, nil
 }
 
-// releaseRunReservation removes a run that failed before execution started.
+// releaseRunReservation removes and terminalizes a run that failed before execution started.
+// The done signal is required by replacement cleanup when it captured this reservation first.
 func (r *SessionRuntime) releaseRunReservation(run *AgentRun) {
-	r.admissionMu.Lock()
-	defer r.admissionMu.Unlock()
+	completeNotification := func(bool) {}
+	if prepare := r.onRunReservationReleased; prepare != nil {
+		completeNotification = prepare(r.ID)
+	}
 
+	r.admissionMu.Lock()
 	r.mu.Lock()
-	if r.active == run {
+	released := r.active == run
+	if released {
 		r.active = nil
 	}
 	r.mu.Unlock()
+	r.admissionMu.Unlock()
+
+	// Do not close done under runtime locks: waiters may immediately submit another run,
+	// and replacement cleanup may close this runtime's event resources after the signal.
+	if released {
+		run.finish(RunResult{State: RunCancelled})
+	}
+	completeNotification(released)
 }
 
-// Retire irreversibly rejects new reservations. It shares admissionMu with
-// reserveRun: reservation wins and returns ErrRunActive, or retirement wins and
-// StartRun returns ErrSessionRetired. The caller closes hub/store after retirement.
+// SetReadOnlyReason fences future runs when the workspace is unavailable.
+func (r *SessionRuntime) SetReadOnlyReason(reason error) {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+	r.mu.Lock()
+	r.readOnlyErr = reason
+	r.mu.Unlock()
+}
+
+// ReadOnlyReason returns the current workspace-related read-only reason.
+func (r *SessionRuntime) ReadOnlyReason() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.readOnlyErr
+}
+
+// Retire rejects new reservations. It shares admissionMu with reserveRun: reservation
+// wins and returns ErrRunActive, or retirement wins and StartRun returns ErrSessionRetired.
+// A lifecycle transaction may restore admission only before registry/resources are removed.
 func (r *SessionRuntime) Retire() error {
 	r.admissionMu.Lock()
 	defer r.admissionMu.Unlock()
@@ -116,6 +155,38 @@ func (r *SessionRuntime) Retire() error {
 	}
 	r.retired = true
 	return nil
+}
+
+// RestoreAdmission reopens a runtime whose retirement was rolled back before
+// its registry entry or event resources were removed. It is safe only while no
+// run is active; reservation and restoration share admissionMu.
+func (r *SessionRuntime) RestoreAdmission() error {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.active != nil {
+		return ErrRunActive
+	}
+	if !r.retired {
+		return nil
+	}
+	r.retired = false
+	return nil
+}
+
+// RetireForReplacement closes admission even when a run is active and returns that run
+// so the owner can defer resource cleanup until it reaches a terminal state. Use only
+// after another runtime has atomically replaced this one in the manager.
+func (r *SessionRuntime) RetireForReplacement() *AgentRun {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.retired = true
+	return r.active
 }
 
 // Retired reports whether this instance has been removed from admission. A

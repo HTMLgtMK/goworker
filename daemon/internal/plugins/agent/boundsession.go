@@ -5,11 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
+	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	"github.com/tinguo/goworker/ai-runtime/session"
+	"github.com/tinguo/goworker/ai-sandbox"
+	aisession "github.com/tinguo/goworker/ai-session"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
@@ -17,6 +22,7 @@ import (
 // 创建和加载的管理操作由调用方经 SessionGate 串行化；历史和归档探测不要求该门禁。
 // 绑定登记与 runtime 收口还由 lifecycleMu 协调。
 var _ model.BoundSessionSource = (*AgentPlugin)(nil)
+var _ model.TransactionalBoundSessionCreator = (*AgentPlugin)(nil)
 var _ model.BoundSessionLoader = (*AgentPlugin)(nil)
 
 // boundSessionUnknownErr preserves both daemon and runtime not-found sentinels so
@@ -25,41 +31,276 @@ func boundSessionUnknownErr(sessionID string) error {
 	return fmt.Errorf("agent: session %q: %w (%w)", sessionID, model.ErrSessionUnknown, runtimeagent.ErrSessionNotFound)
 }
 
-// CreateBoundSession runs under the caller's SessionGate. It validates cwd before
-// creating persistent state and closes the new store if runtime mounting fails.
-func (p *AgentPlugin) CreateBoundSession(cwd string) (string, error) {
+type interruptedRunMarker interface {
+	MarkInterruptedRuns(context.Context, string) ([]string, error)
+}
+
+func (p *AgentPlugin) markInterruptedRuns(ctx context.Context, sessionID string) ([]string, error) {
+	if p.runRecovery != nil {
+		return p.runRecovery.MarkInterruptedRuns(ctx, sessionID)
+	}
+	return p.repo.MarkInterruptedRuns(ctx, sessionID)
+}
+
+func (p *AgentPlugin) ensureAISessionManager() error {
+	p.aiSessionMu.Lock()
+	defer p.aiSessionMu.Unlock()
+	if p.aiSessions != nil {
+		return nil
+	}
 	if p.repo == nil {
-		return "", fmt.Errorf("agent: session persistence disabled")
+		return fmt.Errorf("agent: session persistence disabled")
+	}
+	manager, err := aisession.NewSessionManager(
+		session.NewAIStorageAdapter(p.repo),
+		aisession.WithInitializer(p.initializeAISession),
+	)
+	if err != nil {
+		return fmt.Errorf("agent: create ai-session manager: %w", err)
+	}
+	p.aiSessions = manager
+	return nil
+}
+
+func (p *AgentPlugin) initializeAISession(ctx context.Context, managed aisession.Session) (func() error, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	id := managed.ID().String()
+	if p.manager.Get(id) != nil {
+		return nil, nil
+	}
+	st, err := p.repo.Open(id)
+	if err != nil {
+		return nil, fmt.Errorf("agent: open managed session %s: %w", id, err)
+	}
+	if st.Archived() {
+		_ = p.repo.CloseSession(id)
+		return nil, boundSessionUnknownErr(id)
+	}
+	// The initializer runs only when ai-session attaches this runtime for the first
+	// time in this process. Recover before publishing it so another load cannot mark
+	// a run that has already started here as crash residue.
+	if marked, err := p.markInterruptedRuns(ctx, id); err != nil {
+		_ = p.repo.CloseSession(id)
+		return nil, fmt.Errorf("agent: recover interrupted runs for managed session %s: %w", id, err)
+	} else if len(marked) > 0 {
+		slog.Warn("agent: marked interrupted runs from previous process on managed session attach", "count", len(marked), "session", id, "runs", strings.Join(marked, ","))
+	}
+	resources := p.resourcesForID(managed.Metadata()[resourceSnapshotMetadataKey])
+	rt, err := p.buildRuntimeWithResources(st, resources)
+	if err != nil {
+		_ = p.repo.CloseSession(id)
+		return nil, err
+	}
+	cwd := managed.Metadata()["cwd"]
+	if cwd == "" {
+		cwd = st.Workspace()
+	}
+	if reason := p.workspaceReadOnlyReason(cwd); reason != nil {
+		rt.SetReadOnlyReason(reason)
+		rt.DeclareCWD("", reason)
+	} else {
+		p.declareSessionCWD(rt, normalizeSessionCWDSilent(cwd))
+	}
+	if err := p.manager.Register(rt); err != nil {
+		rt.CloseEvents()
+		return nil, errors.Join(fmt.Errorf("agent: register session runtime %s: %w", rt.ID, err), p.repo.CloseSession(id))
+	}
+	p.associateResources(rt.ID, resources)
+	rollback := func() error {
+		p.manager.RemoveRuntime(rt)
+		rt.CloseEvents()
+		return p.repo.CloseSession(id)
+	}
+	return rollback, nil
+}
+
+// CreateBoundSession uses the shared ai-session manager. Workspace authorization is
+// completed before Create persists anything; the initializer only performs attachment.
+func (p *AgentPlugin) CreateBoundSession(cwd string) (string, error) {
+	id, _, err := p.CreateBoundSessionWithRollback(cwd)
+	return id, err
+}
+
+// CreateBoundSessionWithRollback returns a retryable rollback bound to the exact
+// immutable ai-session snapshot created by this call. It is safe against concurrent
+// loads/binds because rollback and connection lifecycle changes share lifecycleMu.
+func (p *AgentPlugin) CreateBoundSessionWithRollback(cwd string) (string, func() error, error) {
+	return p.createBoundSessionWithResources(cwd, p.currentResources())
+}
+
+var _ model.ConnectionScopedTransactionalBoundSessionCreator = (*AgentPlugin)(nil)
+
+// CreateBoundSessionWithRollbackForConnection scopes rollback to the ACP connection that
+// requested creation. The handler adds the lifecycle reference after committing its route;
+// rollback removes only that connection's reference and capability registration.
+func (p *AgentPlugin) CreateBoundSessionWithRollbackForConnection(cwd, connectionID string) (string, func() error, error) {
+	if connectionID == "" {
+		return "", nil, fmt.Errorf("agent: connection ID is required for scoped session creation")
+	}
+	return p.createBoundSessionWithConnection(cwd, p.currentResources(), connectionID)
+}
+
+func (p *AgentPlugin) createBoundSessionWithResources(cwd string, resources *sessionResources) (string, func() error, error) {
+	return p.createBoundSessionWithConnection(cwd, resources, "")
+}
+
+func (p *AgentPlugin) createBoundSessionWithConnection(cwd string, resources *sessionResources, connectionID string) (string, func() error, error) {
+	if p.repo == nil {
+		return "", nil, fmt.Errorf("agent: session persistence disabled")
+	}
+	if connectionID != "" && p.control == nil {
+		return "", nil, fmt.Errorf("agent: connection-scoped session creation requires lifecycle control")
 	}
 	declared, err := normalizeSessionCWD(cwd)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	if err := p.validateSessionCWD(declared); err != nil {
-		return "", err
+	if err := p.workspaceReadOnlyReason(declared); err != nil {
+		return "", nil, err
 	}
-	st, err := p.repo.Create(context.Background(), session.CreateOptions{CWD: declared})
+	if err := p.ensureAISessionManager(); err != nil {
+		return "", nil, err
+	}
+	metadata := map[string]string{"cwd": declared}
+	if resources != nil {
+		metadata[resourceSnapshotMetadataKey] = resources.id
+	}
+	if connectionID != "" {
+		// Publish the connection reference in the same lifecycle transaction as the
+		// managed-session initializer. A concurrent load/rollback cannot observe a
+		// created-but-unreferenced session in the gap before the handler commits routing.
+		p.lifecycleMu.Lock()
+		defer p.lifecycleMu.Unlock()
+	}
+	created, err := p.aiSessions.Create(context.Background(), aisession.CreateOptions{Metadata: metadata})
 	if err != nil {
-		return "", fmt.Errorf("agent: create session: %w", err)
+		return "", nil, fmt.Errorf("agent: create session: %w", err)
 	}
-	rt, err := p.mountRuntime(st)
-	if err != nil {
-		// 注册失败（同 id 冲突仅理论可达——Create 的 id 是 128-bit 随机数）：
-		// 回收刚建好的 store，不留孤儿缓存条目。失败只 warn：创建已失败，收口
-		// 是尽力而为的卫生动作。
-		if cerr := p.repo.CloseSession(st.SessionID()); cerr != nil {
-			slog.Warn("agent: discard created session store failed", "session", st.SessionID(), "err", cerr)
+	if connectionID != "" && p.control != nil {
+		p.control.BindSessionReference(connectionID, created.ID().String())
+	}
+	var rollbackMu sync.Mutex
+	rolledBack := false
+	rollback := func() error {
+		rollbackMu.Lock()
+		defer rollbackMu.Unlock()
+		if rolledBack {
+			return nil
 		}
-		return "", err
+		var abandonErr error
+		if connectionID == "" {
+			abandonErr = p.abandonCreatedSession(created)
+		} else {
+			abandonErr = p.abandonCreatedSessionForConnection(created, connectionID)
+		}
+		if abandonErr != nil {
+			return abandonErr
+		}
+		rolledBack = true
+		return nil
 	}
-	p.declareSessionCWD(rt, declared)
-	return st.SessionID(), nil
+	return created.ID().String(), rollback, nil
+}
+
+func (p *AgentPlugin) abandonCreatedSession(created aisession.Session) error {
+	id := created.ID().String()
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.control != nil && len(p.control.SessionBindings(id)) != 0 {
+		return fmt.Errorf("agent: refuse to abandon session %s: connection references remain", id)
+	}
+	return p.abandonCreatedSessionLocked(created)
+}
+
+// abandonCreatedSessionForConnection retracts only the reference and device capability owned
+// by connectionID. lifecycleMu keeps attach/detach transactions out until the reference check,
+// run-admission fence, and possible store deletion have reached one outcome.
+func (p *AgentPlugin) abandonCreatedSessionForConnection(created aisession.Session, connectionID string) error {
+	id := created.ID().String()
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+
+	if p.control != nil {
+		p.control.UnbindSessionReference(connectionID, id)
+	}
+	p.manager.Capabilities().Invalidate(id, connectionID)
+	if p.control != nil && len(p.control.SessionBindings(id)) != 0 {
+		return fmt.Errorf("agent: refuse to abandon session %s: connection references remain", id)
+	}
+	return p.abandonCreatedSessionLocked(created)
+}
+
+// abandonCreatedSessionLocked assumes lifecycleMu is held and performs the active-run check
+// before touching durable session state. Retire shares admission with run reservation, so a
+// concurrent run either prevents deletion or observes retirement and never reaches the store.
+func (p *AgentPlugin) abandonCreatedSessionLocked(created aisession.Session) error {
+	id := created.ID().String()
+	runtime := p.manager.Get(id)
+	if runtime != nil {
+		if p.currentSession() == runtime {
+			return fmt.Errorf("agent: refuse to abandon current session %s", id)
+		}
+		if err := runtime.Retire(); err != nil {
+			// The scoped rollback already removed its connection reference. Defer resource
+			// release until the active run reaches terminal state rather than leaking an
+			// unreachable session or closing resources beneath the run.
+			p.markSuspendedRelease(id)
+			return fmt.Errorf("agent: refuse to abandon session %s: runtime is active: %w", id, err)
+		}
+	}
+	if err := p.aiSessions.AbandonCreated(context.Background(), created); err != nil {
+		if runtime != nil {
+			if p.storeFor(runtime) == nil {
+				// The storage adapter may have closed/evicted its Store before Delete
+				// failed. Drop this stale runtime so a later session/load can reopen
+				// the still-persisted session, and keep the rollback callable for retry.
+				if p.manager.RemoveRuntime(runtime) {
+					runtime.CloseEvents()
+				}
+			} else if restoreErr := runtime.RestoreAdmission(); restoreErr != nil {
+				return errors.Join(
+					fmt.Errorf("agent: abandon newly created session %s: %w", id, err),
+					fmt.Errorf("agent: restore runtime admission for session %s: %w", id, restoreErr),
+				)
+			}
+		}
+		return fmt.Errorf("agent: abandon newly created session %s: %w", id, err)
+	}
+	if runtime != nil && p.manager.RemoveRuntime(runtime) {
+		runtime.CloseEvents()
+	}
+	return nil
 }
 
 // LoadBoundSession reloads a registered session or opens and mounts a persisted one.
 // Invalid cwd is recorded rather than blocking access to existing history. Reopened
 // stores also mark non-terminal runs left by the previous process as interrupted.
 func (p *AgentPlugin) LoadBoundSession(sessionID, cwd string) error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	return p.loadBoundSessionLocked(sessionID, cwd)
+}
+
+func (p *AgentPlugin) loadBoundSessionLocked(sessionID, cwd string) error {
+	if p.repo == nil {
+		return boundSessionUnknownErr(sessionID)
+	}
+	if err := p.ensureAISessionManager(); err != nil {
+		return err
+	}
+	managedID, err := aisession.ParseID(sessionID)
+	if err != nil {
+		return boundSessionUnknownErr(sessionID)
+	}
+	managed, err := p.aiSessions.Load(context.Background(), managedID)
+	if err != nil {
+		if errors.Is(err, aisession.ErrNotFound) {
+			return boundSessionUnknownErr(sessionID)
+		}
+		return fmt.Errorf("agent: load managed session %s: %w", sessionID, err)
+	}
 	if rt := p.RouteSession(sessionID); rt != nil {
 		// 分支 1：reload 已注册会话的视图。
 		if s := rt.Session(); s != nil {
@@ -76,6 +317,15 @@ func (p *AgentPlugin) LoadBoundSession(sessionID, cwd string) error {
 		if st := p.storeFor(rt); st != nil {
 			stored = st.Workspace()
 		}
+		if stored == "" {
+			stored = managed.Metadata()["cwd"]
+		}
+		if reason := p.workspaceReadOnlyReason(stored); reason != nil {
+			rt.SetReadOnlyReason(reason)
+			rt.DeclareCWD("", reason)
+			return nil
+		}
+		rt.SetReadOnlyReason(nil)
 		if restore, record := p.resolveReopenCWD(sessionID, stored, cwd); restore == "" {
 			p.declareSessionCWD(rt, "")
 		} else {
@@ -95,28 +345,42 @@ func (p *AgentPlugin) LoadBoundSession(sessionID, cwd string) error {
 		}
 		return fmt.Errorf("agent: reopen session %s: %w", sessionID, err)
 	}
-	rt, err := p.mountRuntime(st)
-	if err != nil {
-		return err
-	}
-	// P2-7 恢复扫描（startSession 同款）：重开边界的 store 若挂着上一进程遗留
-	// 的非终态 run journal，追加 interrupted 标记。失败仅 warn 不阻塞重开。
-	if marked, err := p.repo.MarkInterruptedRuns(context.Background(), st.SessionID()); err != nil {
-		slog.Warn("agent: mark interrupted runs failed on reopen", "err", err, "session", st.SessionID())
+	// Recover before publishing this runtime. runtime registration stays unavailable
+	// while recovery is in progress.
+	if marked, err := p.markInterruptedRuns(context.Background(), st.SessionID()); err != nil {
+		closeErr := p.repo.CloseSession(sessionID)
+		return errors.Join(fmt.Errorf("agent: recover interrupted runs for reopened session %s: %w", sessionID, err), closeErr)
 	} else if len(marked) > 0 {
 		slog.Warn("agent: marked interrupted runs from previous process on reopen", "count", len(marked), "session", st.SessionID(), "runs", strings.Join(marked, ","))
+	}
+	resources := p.resourcesForID(managed.Metadata()[resourceSnapshotMetadataKey])
+	rt, err := p.buildRuntimeWithResources(st, resources)
+	if err != nil {
+		closeErr := p.repo.CloseSession(sessionID)
+		return errors.Join(err, closeErr)
 	}
 	// cwd 恢复：已固化的非 tmp workspace 是持久事实（A1 记录，「load 恢复持久
 	// 事实源」A7 设计点 5），优先于客户端重申——session/load 的 cwd 是宿主环境
 	// 根，重申只该补空位/迁出 tmp；都无则维持未声明（A4 的 tmp 注入接管空 cwd）。
 	// 固化的持久事实本身可能已失效（目录删除/沙箱收紧），失效时回退客户端 cwd
 	// 而非把会话钉死（resolveReopenCWD 内做校验 + 告警）。
-	restore, record := p.resolveReopenCWD(sessionID, st.Workspace(), cwd)
-	if restore == "" {
+	stored := st.Workspace()
+	if stored == "" {
+		stored = managed.Metadata()["cwd"]
+	}
+	if reason := p.workspaceReadOnlyReason(stored); reason != nil {
+		rt.SetReadOnlyReason(reason)
+		rt.DeclareCWD("", reason)
+	} else if restore, record := p.resolveReopenCWD(sessionID, stored, cwd); restore == "" {
 		p.declareSessionCWD(rt, "")
 	} else {
 		p.applySessionCWD(rt, restore, record)
 	}
+	if err := p.manager.Register(rt); err != nil {
+		rt.CloseEvents()
+		return errors.Join(fmt.Errorf("agent: register session runtime %s: %w", rt.ID, err), p.repo.CloseSession(sessionID))
+	}
+	p.associateResources(rt.ID, resources)
 	return nil
 }
 
@@ -137,7 +401,7 @@ func (p *AgentPlugin) LoadBoundSessionForConnectionGuarded(sessionID, cwd, conne
 	p.lifecycleMu.Lock()
 	defer p.lifecycleMu.Unlock()
 
-	if err := p.LoadBoundSession(sessionID, cwd); err != nil {
+	if err := p.loadBoundSessionLocked(sessionID, cwd); err != nil {
 		return nil, false, err
 	}
 	history, err := p.SessionHistory(sessionID)
@@ -184,10 +448,19 @@ func (p *AgentPlugin) SessionArchived(sessionID string) bool {
 	return st.Archived()
 }
 
-// mountRuntime builds a runtime with session-specific store and journal dependencies,
-// restores archived state, then registers it with the manager.
-func (p *AgentPlugin) mountRuntime(st *session.Store) (*runtimeagent.SessionRuntime, error) {
+// buildRuntime constructs a runtime without making it visible to other callers.
+func (p *AgentPlugin) buildRuntime(st *session.Store) (*runtimeagent.SessionRuntime, error) {
+	return p.buildRuntimeWithResources(st, p.currentResources())
+}
+
+func (p *AgentPlugin) buildRuntimeWithResources(st *session.Store, resources *sessionResources) (*runtimeagent.SessionRuntime, error) {
 	deps := p.deps
+	if resources != nil && resources.id != "" {
+		deps.Instruction = resources.instruction
+		deps.CollectTools = func(cfg *sandbox.Config) []core.Tool {
+			return p.collectToolsWithResources(cfg, resources)
+		}
+	}
 	deps.Store = st
 	deps.TitleStore = &generatedTitleStore{plugin: p, sessionID: st.SessionID()}
 	deps.TitleOnce = p.titleOnceFor(st.SessionID())
@@ -201,9 +474,20 @@ func (p *AgentPlugin) mountRuntime(st *session.Store) (*runtimeagent.SessionRunt
 			return nil, fmt.Errorf("agent: restore archived runtime %s: %w", rt.ID, err)
 		}
 	}
+	return rt, nil
+}
+
+// mountRuntime preserves the registered-runtime behavior for existing callers.
+func (p *AgentPlugin) mountRuntime(st *session.Store) (*runtimeagent.SessionRuntime, error) {
+	resources := p.currentResources()
+	rt, err := p.buildRuntimeWithResources(st, resources)
+	if err != nil {
+		return nil, err
+	}
 	if err := p.manager.Register(rt); err != nil {
 		return nil, fmt.Errorf("agent: register session runtime %s: %w", rt.ID, err)
 	}
+	p.associateResources(rt.ID, p.resourcesForSession(rt.ID))
 	return rt, nil
 }
 
@@ -275,6 +559,30 @@ func normalizeSessionCWDSilent(cwd string) string {
 // 沙箱边界收紧）则回退客户端重申——session/load 的 cwd 是宿主环境根，只作
 // 本次执行域、不落持久记录（避免 Projects 凭空长出宿主根条目，A7 设计点 5）。
 // 返回空串表示无可用声明，交由 declareSessionCWD 走 tmp 注入兜底。
+// workspaceReadOnlyReason distinguishes an unavailable persisted workspace from
+// an empty declaration. The returned error is retained as the read-only reason.
+func (p *AgentPlugin) workspaceReadOnlyReason(workspace string) error {
+	if workspace == "" {
+		return nil
+	}
+	normalized, err := normalizeSessionCWD(workspace)
+	if err != nil {
+		return fmt.Errorf("agent: workspace %q is invalid: %w", workspace, err)
+	}
+	info, err := os.Stat(normalized)
+	if err != nil {
+		return fmt.Errorf("agent: workspace %q is unavailable: %w", workspace, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("agent: workspace %q is not a directory", workspace)
+	}
+	err = p.validateSessionCWD(normalized)
+	if err != nil {
+		return fmt.Errorf("agent: workspace %q is invalid: %w", workspace, err)
+	}
+	return nil
+}
+
 func (p *AgentPlugin) resolveReopenCWD(sessionID, stored, client string) (string, bool) {
 	if stored == "" || isTmpWorkspacePath(stored) {
 		return normalizeSessionCWDSilent(client), false
@@ -328,6 +636,14 @@ func (p *AgentPlugin) ArchiveSession(sessionID, clientID string) error {
 	// 临界区内完成。Runtime 先进入只读状态，任何后续 Run 提交都会被拒绝；store
 	// 写失败则回滚 admission，避免出现内存只读但持久化未归档的半状态。
 	err := p.control.WithControl(sessionID, clientID, func() error {
+		if rt != nil {
+			if reason := rt.ReadOnlyReason(); reason != nil {
+				return fmt.Errorf("agent: session %q is read-only: %w", sessionID, reason)
+			}
+		}
+		if reason := p.workspaceReadOnlyReason(st.Workspace()); reason != nil {
+			return fmt.Errorf("agent: session %q is read-only: %w", sessionID, reason)
+		}
 		if rt != nil {
 			if p.isSuspendedRelease(sessionID) {
 				return fmt.Errorf("agent: session %q is busy: pending release after a run just finished (retry once the session settles)", sessionID)

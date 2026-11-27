@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/tinguo/goworker/ai-acp/protocol"
+	aisession "github.com/tinguo/goworker/ai-session"
 )
 
 type lifecycleHandler struct {
@@ -20,18 +22,21 @@ type lifecycleHandler struct {
 	loaded   string
 	blocking bool
 	entered  chan struct{}
+	createdN int
 }
 
-func (h *lifecycleHandler) CreateSession(_ context.Context, sessionID string, req protocol.NewSessionRequest, _ Reporter) error {
+func (h *lifecycleHandler) CreateSession(_ context.Context, req protocol.NewSessionRequest, _ Reporter) (aisession.ID, error) {
 	h.mu.Lock()
-	h.created, h.cwd = sessionID, req.Cwd
-	h.mu.Unlock()
-	return nil
+	defer h.mu.Unlock()
+	h.createdN++
+	sessionID := aisession.ID("managed-" + strconv.Itoa(h.createdN))
+	h.created, h.cwd = sessionID.String(), req.Cwd
+	return sessionID, nil
 }
 
-func (h *lifecycleHandler) LoadSession(_ context.Context, req protocol.LoadSessionRequest, _ Reporter) error {
+func (h *lifecycleHandler) LoadSession(_ context.Context, sessionID aisession.ID, req protocol.LoadSessionRequest, _ Reporter) error {
 	h.mu.Lock()
-	h.loaded = req.SessionID
+	h.loaded = sessionID.String()
 	h.mu.Unlock()
 	return nil
 }
@@ -163,6 +168,36 @@ func TestClientServerSessionLifecycleAndPermission(t *testing.T) {
 	defer updateMu.Unlock()
 	if update.SessionID != sessionID || update.Update.Content == nil || update.Update.Content.Text != "working" {
 		t.Fatalf("update = %+v", update)
+	}
+}
+
+func TestSessionResponsesUseApplicationCanonicalIDWithoutRuntimeMetadata(t *testing.T) {
+	handler := &lifecycleHandler{}
+	client := newTestClientServer(t, handler)
+
+	response, err := client.NewSessionWithResponse(context.Background(), protocol.NewSessionRequest{Cwd: "/repo"})
+	if err != nil {
+		t.Fatalf("NewSessionWithResponse: %v", err)
+	}
+	created, _, _, _ := handler.sessionValues()
+	if response.SessionID != created || response.SessionID != "managed-1" {
+		t.Fatalf("session/new ID = %q, creator returned %q", response.SessionID, created)
+	}
+	if value, exists := response.Meta["x-goworker.runtimeSessionId"]; exists {
+		t.Fatalf("session/new unexpectedly returned a second runtime ID: %#v", value)
+	}
+
+	requestedID := "persisted-session"
+	loaded, err := client.LoadSessionWithResponse(context.Background(), protocol.LoadSessionRequest{SessionID: requestedID})
+	if err != nil {
+		t.Fatalf("LoadSessionWithResponse: %v", err)
+	}
+	_, _, loadedID, _ := handler.sessionValues()
+	if loadedID != requestedID {
+		t.Fatalf("session/load passed ID %q to creator, want exact requested ID %q", loadedID, requestedID)
+	}
+	if value, exists := loaded.Meta["x-goworker.runtimeSessionId"]; exists {
+		t.Fatalf("session/load unexpectedly returned a second runtime ID: %#v", value)
 	}
 }
 

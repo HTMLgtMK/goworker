@@ -23,7 +23,7 @@ func repositoryRootDirs(t *testing.T, root string) []string {
 	}
 	var dirs []string
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && e.Name() != ".repository-locks" && e.Name() != ".repository-tombstones" {
 			dirs = append(dirs, e.Name())
 		}
 	}

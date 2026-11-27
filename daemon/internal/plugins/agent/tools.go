@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/tinguo/goworker/ai-core/core"
+	memory "github.com/tinguo/goworker/ai-memory"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	"github.com/tinguo/goworker/ai-sandbox"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
@@ -21,39 +22,50 @@ func (p *AgentPlugin) sandboxConfig() sandbox.Config {
 }
 
 func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
+	return p.collectToolsWithResources(cfg, p.currentResources())
+}
+
+func (p *AgentPlugin) collectToolsWithResources(cfg *sandbox.Config, resources *sessionResources) []core.Tool {
 	var tools []core.Tool
 	tools = append(tools, runtimeagent.DefaultTools(cfg)...)
 
-	for _, t := range p.hub.Tools() {
-		tool := t
-		tools = append(tools, core.Tool{
-			Name:        tool.Name,
-			Description: tool.Description,
-			Parameters:  parseSchema(tool.Schema),
-			Metadata:    cloneToolMetadata(tool.Metadata),
-			Execute: func(ctx context.Context, args map[string]any) (string, error) {
-				var buf strings.Builder
-				err := p.hub.Eval(model.NewContext(ctx, func(s string) { buf.WriteString(s) }, nil, nil), "/"+tool.Name)
-				if err != nil {
-					return buf.String(), err
-				}
-				return strings.TrimSpace(buf.String()), nil
-			},
-		})
+	if p.hub != nil && p.hub.Tools != nil {
+		for _, t := range p.hub.Tools() {
+			tool := t
+			tools = append(tools, core.Tool{
+				Name:        tool.Name,
+				Description: tool.Description,
+				Parameters:  parseSchema(tool.Schema),
+				Metadata:    cloneToolMetadata(tool.Metadata),
+				Execute: func(ctx context.Context, args map[string]any) (string, error) {
+					if p.hub == nil || p.hub.Eval == nil {
+						return "", fmt.Errorf("tool %s: plugin evaluation is unavailable", tool.Name)
+					}
+					var buf strings.Builder
+					err := p.hub.Eval(model.NewContext(ctx, func(s string) { buf.WriteString(s) }, nil, nil), "/"+tool.Name)
+					if err != nil {
+						return buf.String(), err
+					}
+					return strings.TrimSpace(buf.String()), nil
+				},
+			})
+		}
 	}
 
 	// skill 注册成工具：LLM 自己判断何时加载，调用即把指令正文取回上下文。
 	// 内容不常驻 system prompt，按需进上下文，省 token。
-	for _, s := range p.skills {
-		skill := s
-		tools = append(tools, core.Tool{
-			Name:        "skill_" + skill.Name,
-			Description: fmt.Sprintf("Load the %s skill. Call it when you need to: %s", skill.Name, skill.Description),
-			Parameters:  runtimeagent.NormalizeSchema(nil),
-			Execute: func(ctx context.Context, args map[string]any) (string, error) {
-				return skill.Content, nil
-			},
-		})
+	if resources != nil {
+		for _, s := range resources.skills {
+			skill := s
+			tools = append(tools, core.Tool{
+				Name:        "skill_" + skill.Name,
+				Description: fmt.Sprintf("Load the %s skill. Call it when you need to: %s", skill.Name, skill.Description),
+				Parameters:  runtimeagent.NormalizeSchema(nil),
+				Execute: func(ctx context.Context, args map[string]any) (string, error) {
+					return skill.Content, nil
+				},
+			})
+		}
 	}
 
 	// memory_search：agent 主动回顾历史的结构化入口。不依赖 agent 猜档案路径 ——
@@ -115,13 +127,15 @@ func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
 
 	// profile：agent 写入用户画像 USER.md 的结构化入口。声明式指令层在，
 	// 才给 agent 写自己档案的能力 —— 写入即持久化，语义与 memory_search 的只读相对。
-	if p.deps.Instruction != nil {
-		tools = append(tools, p.profileTool())
+	if resources != nil && resources.instruction != nil {
+		tools = append(tools, p.profileToolFor(resources.instruction))
 	}
 
-	// MCP 工具：Init 时已从 server 拉取定义，这里是静态复用。
-	// 工具是外部进程执行，桥接层默认附加 unclassified + requires_permission，统一交给 HITL 门控。
-	tools = append(tools, p.mcpTools...)
+	// MCP tool closures retain the snapshot's clients; a refresh never invalidates a
+	// runtime's collected tool definitions.
+	if resources != nil {
+		tools = append(tools, resources.mcpTools...)
+	}
 	return tools
 }
 
@@ -136,6 +150,10 @@ func cloneToolMetadata(metadata map[string]string) map[string]string {
 // replace/remove 用唯一子串定位（Hermes 式），写多命中直接报错防误伤。
 // 写入语义：落盘持久化，但注入快照冻结 —— 本次会话不生效，/new 或重启后可见。
 func (p *AgentPlugin) profileTool() core.Tool {
+	return p.profileToolFor(p.deps.Instruction)
+}
+
+func (p *AgentPlugin) profileToolFor(instruction *memory.InstructionSet) core.Tool {
 	return core.Tool{
 		Name: "profile",
 		Description: "Update the user profile (USER.md): durable facts about the user's " +
@@ -153,16 +171,20 @@ func (p *AgentPlugin) profileTool() core.Tool {
 			"required": []string{"action"},
 		},
 		Execute: func(ctx context.Context, args map[string]any) (string, error) {
-			return p.execProfileTool(args)
+			return p.execProfileToolWithInstruction(args, instruction)
 		},
 	}
 }
 
 func (p *AgentPlugin) execProfileTool(args map[string]any) (string, error) {
+	return p.execProfileToolWithInstruction(args, p.deps.Instruction)
+}
+
+func (p *AgentPlugin) execProfileToolWithInstruction(args map[string]any, instruction *memory.InstructionSet) (string, error) {
 	action, _ := args["action"].(string)
 	content, _ := args["content"].(string)
 	oldText, _ := args["old_text"].(string)
-	if p.deps.Instruction == nil || p.deps.Instruction.Profile() == nil {
+	if instruction == nil || instruction.Profile() == nil {
 		return "", fmt.Errorf("profile: instructions not loaded")
 	}
 	switch action {
@@ -183,18 +205,22 @@ func (p *AgentPlugin) execProfileTool(args map[string]any) (string, error) {
 		return "", fmt.Errorf("profile: unknown action %q (add|replace|remove)", action)
 	}
 
-	res, err := p.applyProfileAction(action, content, oldText)
+	res, err := p.applyProfileActionWithInstruction(instruction, action, content, oldText)
 	if err != nil {
 		return "", err
 	}
-	used, max := p.deps.Instruction.Profile().Capacity()
+	used, max := instruction.Profile().Capacity()
 	return fmt.Sprintf("%s (USER.md %d/%d chars). Saved to disk; takes effect next session (/new or restart).", res, used, max), nil
 }
 
 // applyProfileAction 把一次画像写操作落到 Profile。add/replace/remove 的参数约定：
 // add/replace 用 content，replace/remove 用 oldText 定位。
 func (p *AgentPlugin) applyProfileAction(action, content, oldText string) (string, error) {
-	prof := p.deps.Instruction.Profile()
+	return p.applyProfileActionWithInstruction(p.deps.Instruction, action, content, oldText)
+}
+
+func (p *AgentPlugin) applyProfileActionWithInstruction(instruction *memory.InstructionSet, action, content, oldText string) (string, error) {
+	prof := instruction.Profile()
 	switch action {
 	case "add":
 		return prof.AddEntry(content)

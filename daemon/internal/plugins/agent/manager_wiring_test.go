@@ -29,8 +29,10 @@ import (
 // 外部依赖）——这是唯一一次注册；随后真实 handleNew → startSession 重建，会话
 // 切换后的 current/manager 状态即生产接线形态。
 func TestCurrentSessionSwapsOnNew(t *testing.T) {
-	p := NewPlugin(&runtimeconfig.Config{}, runtimeconfig.Paths{})
+	cfg := &runtimeconfig.Config{Session: runtimeconfig.SessionConfig{Enabled: true, Dir: t.TempDir()}}
+	p := NewPlugin(cfg, runtimeconfig.Paths{})
 	p.startSession()
+	t.Cleanup(func() { _ = p.Stop() })
 	old := p.currentSession()
 	if old == nil {
 		t.Fatal("no current runtime after startSession")
@@ -62,11 +64,12 @@ func TestCurrentSessionSwapsOnNew(t *testing.T) {
 		t.Fatal("fresh runtime did not bind a new session object")
 	}
 
-	// P5-5 收口：旧 runtime 已注销出 manager。纯内存（无 store）下新旧 runtime
-	// 同 id "current"、startSession 的 Register 冲突旧条目保留，handleNew 尾部
-	// Remove("current") 移除的正是旧条目——新 runtime 本就不在册，Get 返回 nil。
-	if got := p.manager.Get(old.ID); got != nil {
-		t.Fatalf("manager.Get(%q) = %v, want nil after /new (P5-5 removed the old runtime)", old.ID, got)
+	// The in-memory fallback reuses "current", so registry identity must be checked too.
+	if !old.Retired() {
+		t.Fatal("displaced in-memory runtime was not retired")
+	}
+	if got := p.manager.Get(fresh.ID); got != fresh {
+		t.Fatalf("manager.Get(%q) = %v, want the fresh current runtime", fresh.ID, got)
 	}
 }
 

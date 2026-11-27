@@ -1,14 +1,17 @@
 package service
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/tinguo/goworker/ai-core/core"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/session"
+	aisession "github.com/tinguo/goworker/ai-session"
 )
 
 // repo_wiring_test.go 验证 repository 持久化接线：/new 创建独立会话，旧会话数据
@@ -104,7 +107,150 @@ func TestNewCreatesIndependentStore(t *testing.T) {
 	}
 }
 
-// TestCurrentStoreTracksSession：ReloadCurrentSession / CurrentSessionHistory 在
+func TestNewUsesSharedAISessionManagerWithACP(t *testing.T) {
+	p, newStack := newACPStack(t, fixedProvider{content: "ack"})
+	oldID := p.CurrentSessionID()
+	stack := newStack()
+
+	ctx, _ := newContext()
+	if err := p.handleNew(ctx); err != nil {
+		t.Fatalf("CLI /new: %v", err)
+	}
+	cliID := p.CurrentSessionID()
+	if cliID == "" || cliID == oldID {
+		t.Fatalf("CLI /new current ID = %q, want a distinct session from %q", cliID, oldID)
+	}
+	manager := p.aiSessions
+	if manager == nil {
+		t.Fatal("CLI /new did not initialize the shared ai-session manager")
+	}
+	if _, err := manager.Get(context.Background(), aisession.ID(cliID)); err != nil {
+		t.Fatalf("ai-session manager does not own CLI-created ID %q: %v", cliID, err)
+	}
+
+	acpID := stack.create(t, "ignored-transport")
+	if acpID == cliID || acpID == oldID {
+		t.Fatalf("ACP session/new ID = %q, want an independent ID", acpID)
+	}
+	if p.aiSessions != manager {
+		t.Fatal("ACP session/new replaced the shared ai-session manager")
+	}
+	if p.manager.Get(acpID) == nil {
+		t.Fatalf("ACP runtime %q was not mounted", acpID)
+	}
+	if p.CurrentSessionID() != cliID {
+		t.Fatalf("ACP session/new changed CLI current ID to %q, want %q", p.CurrentSessionID(), cliID)
+	}
+	if _, err := manager.Get(context.Background(), aisession.ID(acpID)); err != nil {
+		t.Fatalf("ai-session manager does not own ACP-created ID %q: %v", acpID, err)
+	}
+
+	items, err := p.repo.List(context.Background())
+	if err != nil {
+		t.Fatalf("Repository.List: %v", err)
+	}
+	persisted := make(map[string]bool, len(items))
+	for _, item := range items {
+		persisted[item.SessionID] = true
+	}
+	for _, id := range []string{oldID, cliID, acpID} {
+		if !persisted[id] {
+			t.Errorf("session %q was not preserved in repository", id)
+		}
+	}
+	if p.SessionArchived(oldID) {
+		t.Errorf("/new archived the previous session %q", oldID)
+	}
+}
+
+func TestNewWithoutPersistenceFailsWithoutSwitching(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	cfg.Session.Enabled = false
+	p := NewPlugin(cfg, runtimeconfig.Paths{})
+	p.startSession()
+	t.Cleanup(func() { _ = p.Stop() })
+	oldID := p.CurrentSessionID()
+	ctx, output := newContext()
+
+	if err := p.handleNew(ctx); err == nil || !strings.Contains(err.Error(), "session persistence disabled") {
+		t.Fatalf("handleNew without repository = %v, want explicit persistence error", err)
+	}
+	if p.CurrentSessionID() != oldID {
+		t.Fatalf("current ID after rejected /new = %q, want unchanged %q", p.CurrentSessionID(), oldID)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("rejected /new emitted success output: %q", output.String())
+	}
+	if p.aiSessions != nil {
+		t.Fatal("/new without persistence unexpectedly initialized a session manager")
+	}
+}
+
+func TestNewCreationFailureDoesNotSwitchCurrentSession(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "ack"})
+	oldID := p.CurrentSessionID()
+	if err := p.ensureAISessionManager(); err != nil {
+		t.Fatalf("ensure ai-session manager: %v", err)
+	}
+	p.aiSessions.Close()
+
+	ctx, output := newContext()
+	err := p.handleNew(ctx)
+	if err == nil {
+		t.Fatal("CLI /new succeeded after the shared ai-session manager was closed")
+	}
+	if got := p.CurrentSessionID(); got != oldID {
+		t.Fatalf("current ID after failed /new = %q, want unchanged %q", got, oldID)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("failed /new emitted success output: %q", output.String())
+	}
+	if p.manager.Get(oldID) == nil {
+		t.Fatalf("old runtime %q was lost after failed /new", oldID)
+	}
+}
+
+func TestConcurrentNewCreatesDistinctManagedSessions(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "ack"})
+	oldID := p.CurrentSessionID()
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, _ := newContext()
+			results <- p.handleNew(ctx)
+		}()
+	}
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Errorf("concurrent CLI /new: %v", err)
+		}
+	}
+
+	if got := p.CurrentSessionID(); got == "" || got == oldID {
+		t.Fatalf("current ID after concurrent /new = %q, want a fresh session", got)
+	}
+	managed, err := p.aiSessions.List(context.Background())
+	if err != nil {
+		t.Fatalf("ai-session manager List: %v", err)
+	}
+	if len(managed) < 3 {
+		t.Fatalf("managed sessions = %d, want initial + two newly created sessions", len(managed))
+	}
+	seen := make(map[string]bool, len(managed))
+	for _, item := range managed {
+		seen[item.ID().String()] = true
+	}
+	if !seen[oldID] {
+		t.Errorf("original session %q disappeared from the manager's storage-backed list", oldID)
+	}
+}
+
+// TestCurrentStoreTracksSession: ReloadCurrentSession / CurrentSessionHistory 在
 // /new 前后返回各自会话的数据——取数随 current 换轨，新会话写入只落新 store。
 // Plan A4 起首周期不再挂载 legacy 槽（迁移退役该行为），首会话是 Create 的新
 // 会话：夹具改为对 current store 直接造数（迁移本身由 migrate_test 与

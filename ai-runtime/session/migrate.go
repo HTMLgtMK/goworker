@@ -26,6 +26,9 @@ type LayoutMigration struct {
 // are returned, while individual entry failures are logged and retried on a later run.
 func MigrateLegacyLayout(root string) (LayoutMigration, error) {
 	var stats LayoutMigration
+	if err := requireLockSupport(); err != nil {
+		return stats, fmt.Errorf("session: migrate layout %s: %w", root, err)
+	}
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return stats, fmt.Errorf("session: migrate layout %s: %w", root, err)
@@ -40,8 +43,8 @@ func MigrateLegacyLayout(root string) (LayoutMigration, error) {
 
 	// 阶段 ③：per-id 目录对齐（v1 文件名、目录名 ≠ 内部 id、空壳删除）。
 	for _, e := range entries {
-		if !e.IsDir() {
-			continue // 杂散文件不碰（非会话数据，不在迁移职责内）
+		if !e.IsDir() || e.Name() == ".repository-locks" || e.Name() == ".repository-tombstones" {
+			continue // Repository coordination data and retired stores are not session directories.
 		}
 		migrateSessionDir(filepath.Join(root, e.Name()), &stats)
 	}

@@ -11,9 +11,10 @@ import (
 	aiacp "github.com/tinguo/goworker/ai-acp"
 	"github.com/tinguo/goworker/ai-acp/protocol"
 	"github.com/tinguo/goworker/ai-core/core"
+	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	runtimeconfig "github.com/tinguo/goworker/ai-runtime/config"
 	"github.com/tinguo/goworker/ai-runtime/session"
-	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
+	aisession "github.com/tinguo/goworker/ai-session"
 	"github.com/tinguo/goworker/daemon/internal/core/model"
 	acpservice "github.com/tinguo/goworker/daemon/internal/core/service/acp"
 )
@@ -77,8 +78,11 @@ func newACPStack(t *testing.T, pv core.Provider) (*AgentPlugin, func() *acpStack
 	t.Helper()
 	p := newPersistedPlugin(t, pv)
 	evaluate := func(ctx *model.Context, input string) error {
-		// Engine.Eval 的 fallback 形态:未匹配输入直通 /agent(生产同型)。
+		// Engine.Eval routes registered commands before falling back to /agent.
 		ctx.Args = []string{input}
+		if input == "/new" {
+			return p.handleNew(ctx)
+		}
 		return p.handleAgent(ctx)
 	}
 	factory := acpservice.NewFrontendHandlerFactory(evaluate, nil, p, acpservice.NewSessionGate())
@@ -120,15 +124,193 @@ func newestSessionID(t *testing.T, before, after map[string]bool) string {
 	return fresh
 }
 
-// create 走 handler.CreateSession(transport id 自造,与服务端签发同位),返回
-// 新会话的 store 稳定 id(经注册表集合差观测)。
-func (s *acpStack) create(t *testing.T, transportID string) string {
+// create calls the lifecycle adapter and returns the one canonical ID used on every surface.
+func (s *acpStack) create(t *testing.T, _ string) string {
 	t.Helper()
-	before := registeredSessionIDs(s.p)
-	if err := s.handler.CreateSession(context.Background(), transportID, protocol.NewSessionRequest{}, s.rep); err != nil {
-		t.Fatalf("CreateSession(%s): %v", transportID, err)
+	id, err := s.handler.CreateManagedSession(context.Background(), protocol.NewSessionRequest{}, s.rep)
+	if err != nil {
+		t.Fatalf("CreateManagedSession: %v", err)
 	}
-	return newestSessionID(t, before, registeredSessionIDs(s.p))
+	return id.String()
+}
+
+func TestACPPromptNewRequiresStandardSessionNew(t *testing.T) {
+	p, newStack := newACPStack(t, fixedProvider{content: "ack"})
+	stack := newStack()
+	sessionID := stack.create(t, "ignored-transport")
+	currentID := p.CurrentSessionID()
+	before := registeredSessionIDs(p)
+
+	_, err := stack.handler.Prompt(context.Background(), sessionID, []protocol.ContentBlock{protocol.TextBlock("/new")}, stack.rep)
+	if err == nil || !strings.Contains(err.Error(), "session/new") {
+		t.Fatalf("ACP prompt /new error = %v, want explicit session/new guidance", err)
+	}
+	if got := p.CurrentSessionID(); got != currentID {
+		t.Fatalf("current session after ACP /new = %q, want unchanged %q", got, currentID)
+	}
+	after := registeredSessionIDs(p)
+	if len(after) != len(before) {
+		t.Fatalf("registered session count after ACP /new = %d, want unchanged %d", len(after), len(before))
+	}
+	for id := range before {
+		if !after[id] {
+			t.Fatalf("session %q was removed by ACP /new", id)
+		}
+	}
+	if p.manager.Get(sessionID) == nil {
+		t.Fatalf("ACP /new removed old session %q from runtime manager", sessionID)
+	}
+	if _, err := stack.handler.Prompt(context.Background(), sessionID, []protocol.ContentBlock{protocol.TextBlock("still usable")}, stack.rep); err != nil {
+		t.Fatalf("prompt old session after rejected ACP /new: %v", err)
+	}
+}
+
+func TestAbandonCreatedBoundSessionRemovesAllRegistriesAndStore(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "ack"})
+	id, rollback, err := p.CreateBoundSessionWithRollback("")
+	if err != nil {
+		t.Fatalf("CreateBoundSessionWithRollback: %v", err)
+	}
+	if p.manager.Get(id) == nil {
+		t.Fatalf("runtime %q was not registered before rollback", id)
+	}
+	managedID, err := aisession.ParseID(id)
+	if err != nil {
+		t.Fatalf("ParseID(%q): %v", id, err)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); err != nil {
+		t.Fatalf("ai-session registry missing created session: %v", err)
+	}
+
+	if err := rollback(); err != nil {
+		t.Fatalf("rollback created session: %v", err)
+	}
+	if p.manager.Get(id) != nil {
+		t.Fatalf("runtime %q remains registered after rollback", id)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); !errors.Is(err, aisession.ErrNotFound) {
+		t.Fatalf("ai-session Get after rollback = %v, want ErrNotFound", err)
+	}
+	stored, err := p.repo.List(context.Background())
+	if err != nil {
+		t.Fatalf("Repository.List after rollback: %v", err)
+	}
+	for _, item := range stored {
+		if item.SessionID == id {
+			t.Fatalf("persistent session %q remains after rollback", id)
+		}
+	}
+}
+
+func TestAbandonCreatedBoundSessionRestoresRuntimeAfterDeleteFailure(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "ack"})
+	storage := &failDeleteOnceStorage{delegate: session.NewAIStorageAdapter(p.repo), err: errors.New("injected storage delete failure")}
+	manager, err := aisession.NewSessionManager(storage, aisession.WithInitializer(p.initializeAISession))
+	if err != nil {
+		t.Fatalf("NewSessionManager: %v", err)
+	}
+	p.aiSessions = manager
+
+	id, rollback, err := p.CreateBoundSessionWithRollback("")
+	if err != nil {
+		t.Fatalf("CreateBoundSessionWithRollback: %v", err)
+	}
+	runtime := p.manager.Get(id)
+	if runtime == nil {
+		t.Fatalf("runtime %q was not registered before rollback", id)
+	}
+	managedID, err := aisession.ParseID(id)
+	if err != nil {
+		t.Fatalf("ParseID(%q): %v", id, err)
+	}
+
+	if err := rollback(); err == nil || !strings.Contains(err.Error(), "injected storage delete failure") {
+		t.Fatalf("rollback with storage failure = %v, want injected failure", err)
+	}
+	if got := p.manager.Get(id); got != runtime {
+		t.Fatalf("runtime after failed rollback = %p, want original runtime %p", got, runtime)
+	}
+	if runtime.Retired() {
+		t.Fatal("runtime remains retired after failed storage deletion")
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); err != nil {
+		t.Fatalf("ai-session registry after failed rollback: %v", err)
+	}
+	if _, err := p.repo.Open(id); err != nil {
+		t.Fatalf("persistent store after failed rollback: %v", err)
+	}
+
+	if err := rollback(); err != nil {
+		t.Fatalf("rollback retry: %v", err)
+	}
+	if p.manager.Get(id) != nil {
+		t.Fatalf("runtime %q remains registered after successful retry", id)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); !errors.Is(err, aisession.ErrNotFound) {
+		t.Fatalf("ai-session after successful retry = %v, want ErrNotFound", err)
+	}
+}
+
+type failDeleteOnceStorage struct {
+	delegate aisession.Storage
+	mu       sync.Mutex
+	err      error
+	failed   bool
+}
+
+func (s *failDeleteOnceStorage) Create(ctx context.Context, value aisession.Session) error {
+	return s.delegate.Create(ctx, value)
+}
+
+func (s *failDeleteOnceStorage) Load(ctx context.Context, id aisession.ID) (aisession.Session, error) {
+	return s.delegate.Load(ctx, id)
+}
+
+func (s *failDeleteOnceStorage) Get(ctx context.Context, id aisession.ID) (aisession.Session, error) {
+	return s.delegate.Get(ctx, id)
+}
+
+func (s *failDeleteOnceStorage) List(ctx context.Context) ([]aisession.Session, error) {
+	return s.delegate.List(ctx)
+}
+
+func (s *failDeleteOnceStorage) Delete(ctx context.Context, id aisession.ID) error {
+	s.mu.Lock()
+	if !s.failed {
+		s.failed = true
+		err := s.err
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Unlock()
+	return s.delegate.Delete(ctx, id)
+}
+
+func TestAbandonCreatedBoundSessionRefusesConnectionReference(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "ack"})
+	id, rollback, err := p.CreateBoundSessionWithRollback("")
+	if err != nil {
+		t.Fatalf("CreateBoundSessionWithRollback: %v", err)
+	}
+	p.BindConnectionSessionReference("another-connection", id)
+
+	if err := rollback(); err == nil || !strings.Contains(err.Error(), "connection references remain") {
+		t.Fatalf("rollback with another connection reference = %v, want refusal", err)
+	}
+	if p.manager.Get(id) == nil {
+		t.Fatalf("referenced runtime %q was removed", id)
+	}
+	managedID, err := aisession.ParseID(id)
+	if err != nil {
+		t.Fatalf("ParseID(%q): %v", id, err)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); err != nil {
+		t.Fatalf("referenced ai-session disappeared: %v", err)
+	}
+	if _, err := p.repo.Open(id); err != nil {
+		t.Fatalf("referenced persistent store disappeared: %v", err)
+	}
+	p.UnbindConnectionSession("another-connection", id)
 }
 
 // load 走 handler.LoadSession。
@@ -167,10 +349,8 @@ func TestACPConnectionsCreateDistinctSessions(t *testing.T) {
 	currentID := p.CurrentSessionID() // Init 创建的首会话 = current(CLI 便利指针)
 
 	conn1, conn2 := newStack(), newStack()
-	sidT1 := "transport-conn1"
-	sidT2 := "transport-conn2"
-	sid1 := conn1.create(t, sidT1)
-	sid2 := conn2.create(t, sidT2)
+	sid1 := conn1.create(t, "ignored-conn1")
+	sid2 := conn2.create(t, "ignored-conn2")
 
 	// 各自绑定不同新会话:store 稳定 id(注册表里的新条目),与 transport id
 	// 无关。
@@ -192,8 +372,8 @@ func TestACPConnectionsCreateDistinctSessions(t *testing.T) {
 
 	// prompt 各自路由(此步 SessionGate 仍串行,跨会话不并行——A2b2 收缩):
 	// 执行链经连接级 Binding 路由到各自会话,历史互不串扰。
-	conn1.prompt(t, sidT1, "hello-one")
-	conn2.prompt(t, sidT2, "hello-two")
+	conn1.prompt(t, sid1, "hello-one")
+	conn2.prompt(t, sid2, "hello-two")
 
 	conv1 := p.manager.Get(sid1).Session().Conversation()
 	if len(conv1) == 0 || conv1[0].Role != "user" || conv1[0].Content != "hello-one" {
@@ -217,17 +397,20 @@ func TestACPConnectionsCreateDistinctSessions(t *testing.T) {
 		t.Fatalf("history(two) = %+v, want only its own round", sessionHistory(t, p, sid2))
 	}
 
-	// 连接 1 的下一次 CreateSession 改绑:prev(sid1) 失去唯一引用 → A2a 引用
-	// 计数收口(runtime 注销 + store 逐出),连接 2 的会话不受牵连。
+	// 连接 1 新建另一会话不会丢弃它此前加载的 session 1 引用；显式 /new
+	// 才精确解除被替换会话，断连则一次清掉该连接的所有引用。
 	sid3 := conn1.create(t, "transport-conn3")
 	if sid3 == sid1 {
 		t.Fatalf("conn1 re-create reused session %q", sid1)
 	}
-	if p.manager.Get(sid1) != nil {
-		t.Fatal("session one must be released after its last binding dropped (A2a 收口)")
+	if p.manager.Get(sid1) == nil {
+		t.Fatal("session one must remain registered while conn1 still references it")
+	}
+	if got := p.control.SessionBindings(sid1); len(got) != 1 {
+		t.Fatalf("session one bindings after conn1 creates another session = %v, want conn1's reference", got)
 	}
 	if p.manager.Get(sid2) == nil {
-		t.Fatal("session two must survive conn1's re-create (旁观连接仍持引用)")
+		t.Fatal("session two must survive conn1's create (another connection still references it)")
 	}
 }
 
@@ -239,20 +422,8 @@ func TestACPLoadSessionReopensReleasedSession(t *testing.T) {
 	conn := newStack()
 
 	// 会话 X:真新建 + prompt 写历史(落 store + checkpoint)。
-	conn.create(t, "transport-x")
-	sidX := ""
-	for id := range registeredSessionIDs(p) {
-		if id != p.CurrentSessionID() {
-			if sidX != "" {
-				t.Fatal("ambiguous created session id")
-			}
-			sidX = id
-		}
-	}
-	if sidX == "" {
-		t.Fatal("created session X not found in registry")
-	}
-	conn.prompt(t, "transport-x", "question-x")
+	sidX := conn.create(t, "ignored-transport-x")
+	conn.prompt(t, sidX, "question-x")
 	rtX1 := p.manager.Get(sidX)
 	if rtX1 == nil {
 		t.Fatal("session X runtime missing after create+prompt")
@@ -262,22 +433,13 @@ func TestACPLoadSessionReopensReleasedSession(t *testing.T) {
 		t.Fatal("session X store missing before release")
 	}
 
-	// /new 收口:发起连接对 X 发起 /new → 摘其绑定登记 → X 引用归零 → 收口
-	// (这正是重开路径的前置形态 A2.1①)。handler 的 SessionBinding/connectionID
-	// 是连接私有(跨包不可达),/new 从插件侧以同构 ctx 驱动:binding 指向 X 的
-	// 会话选择、clientID 用注册表里的事实连接身份(与 handler 登记的键一致,
-	// UnbindSession 摘到的正是那条登记)。
+	// Closing the last connection reference exercises the same runtime/store teardown
+	// without relying on the now-rejected ACP prompt /new shortcut.
 	bound := p.control.SessionBindings(sidX)
 	if len(bound) != 1 {
 		t.Fatalf("setup: bindings(%s) = %v, want exactly the creating connection", sidX, bound)
 	}
-	bx := &agentcontrol.SessionBinding{}
-	bx.Set(sidX)
-	mctx, _ := newContext()
-	mctx.Ctx = agentcontrol.WithClientID(agentcontrol.WithBinding(context.Background(), bx), bound[0])
-	if err := p.handleNew(mctx); err != nil {
-		t.Fatalf("handleNew: %v", err)
-	}
+	p.ReleaseConnection(bound[0])
 	if p.manager.Get(sidX) != nil {
 		t.Fatal("session X must be released after /new teardown (引用归零收口)")
 	}
@@ -317,20 +479,8 @@ func TestACPLoadSessionSharesSessionAcrossConnections(t *testing.T) {
 	connA, connB := newStack(), newStack()
 
 	// A 真新建 X 并写一轮历史。
-	connA.create(t, "transport-a")
-	sidX := ""
-	for id := range registeredSessionIDs(p) {
-		if id != p.CurrentSessionID() {
-			if sidX != "" {
-				t.Fatal("ambiguous created session id")
-			}
-			sidX = id
-		}
-	}
-	if sidX == "" {
-		t.Fatal("created session X not found in registry")
-	}
-	connA.prompt(t, "transport-a", "from-a")
+	sidX := connA.create(t, "ignored-transport-a")
+	connA.prompt(t, sidX, "from-a")
 
 	// B load 同一 X(未绑过):命中已注册 runtime → 只 reload 视图 + 改绑登记
 	// (共享会话,不重建);历史重放把 A 的轮次带给 B。
@@ -344,7 +494,7 @@ func TestACPLoadSessionSharesSessionAcrossConnections(t *testing.T) {
 	}
 
 	// 双方 prompt 都可路由到 X(此步仍串行执行,A2b2 收缩后并行)。
-	connA.prompt(t, "transport-a", "again-from-a")
+	connA.prompt(t, sidX, "again-from-a")
 	connB.prompt(t, sidX, "from-b")
 	conv := p.manager.Get(sidX).Session().Conversation()
 	for _, want := range []string{"from-a", "again-from-a", "from-b"} {
@@ -353,14 +503,14 @@ func TestACPLoadSessionSharesSessionAcrossConnections(t *testing.T) {
 		}
 	}
 
-	// A 改绑新会话:X 失去 A 的引用但 B 仍绑着 → 保留(A2a 引用计数),B 可
-	// 继续 prompt。
+	// A 创建另一个会话后仍持有 X 的生命周期引用；B 也仍绑定 X，因此会话
+	// 保留且可继续 prompt。路由选择已换轨，但历史引用不会因选择器变化而消失。
 	connA.create(t, "transport-c")
 	if p.manager.Get(sidX) == nil {
-		t.Fatal("shared session must survive one connection's rebind (B 仍持引用)")
+		t.Fatal("shared session must survive A creating another session")
 	}
-	if got := p.control.SessionBindings(sidX); len(got) != 1 {
-		t.Fatalf("SessionBindings after A rebinds = %v, want only B's", got)
+	if got := p.control.SessionBindings(sidX); len(got) != 2 {
+		t.Fatalf("SessionBindings after A creates another session = %v, want both references", got)
 	}
 	connB.prompt(t, sidX, "still-here")
 	if !historyHasUserText(sessionHistory(t, p, sidX), "still-here") {
@@ -503,7 +653,7 @@ func TestACPCrossSessionPromptsRunInParallel(t *testing.T) {
 	}
 
 	// 连接 1 的长 prompt:阻塞在 provider(started 关闭 = 已推进到模型调用)。
-	p1 := conn1.promptAsync(t, "transport-1", "slow-one")
+	p1 := conn1.promptAsync(t, sid1, "slow-one")
 	select {
 	case <-gated.started:
 	case <-time.After(5 * time.Second):
@@ -511,7 +661,7 @@ func TestACPCrossSessionPromptsRunInParallel(t *testing.T) {
 	}
 
 	// 连接 2 的 prompt:必须在 A 阻塞期间完成(旧全局门禁下此处排队到 A 释放)。
-	p2 := conn2.promptAsync(t, "transport-2", "fast-two")
+	p2 := conn2.promptAsync(t, sid2, "fast-two")
 	select {
 	case err := <-p2:
 		if err != nil {
@@ -549,7 +699,7 @@ func TestACPCreateSessionImmediateWhilePromptInFlight(t *testing.T) {
 	p.deps.NewProvider = func(*runtimeconfig.Config) (core.Provider, error) { return gated, nil }
 	sid1 := conn1.create(t, "transport-1")
 
-	p1 := conn1.promptAsync(t, "transport-1", "long-running")
+	p1 := conn1.promptAsync(t, sid1, "long-running")
 	select {
 	case <-gated.started:
 	case <-time.After(5 * time.Second):
@@ -593,7 +743,7 @@ func TestACPManagementOpsConcurrentCreateSerializes(t *testing.T) {
 		t.Helper()
 		deadline := time.Now().Add(2 * time.Second)
 		for {
-			err := s.handler.CreateSession(context.Background(), transportID, protocol.NewSessionRequest{}, s.rep)
+			_, err := s.handler.CreateManagedSession(context.Background(), protocol.NewSessionRequest{}, s.rep)
 			if err == nil {
 				return
 			}
@@ -633,5 +783,117 @@ func TestACPManagementOpsConcurrentCreateSerializes(t *testing.T) {
 		if got := p.control.SessionBindings(id); len(got) != 1 {
 			t.Fatalf("bindings(%s) = %v, want exactly one connection", id, got)
 		}
+	}
+}
+
+func TestConnectionScopedSessionRollbackPreservesOtherReferences(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "ack"})
+	creator, ok := any(p).(model.ConnectionScopedTransactionalBoundSessionCreator)
+	if !ok {
+		t.Fatal("AgentPlugin does not implement connection-scoped transactional creation")
+	}
+
+	id, rollback, err := creator.CreateBoundSessionWithRollbackForConnection("", "creator")
+	if err != nil {
+		t.Fatalf("CreateBoundSessionWithRollbackForConnection: %v", err)
+	}
+	if got := p.control.SessionBindings(id); len(got) != 1 || got[0] != "creator" {
+		t.Fatalf("initial bindings = %v, want creator reference", got)
+	}
+	p.BindConnectionSessionReference("observer", id)
+
+	if err := rollback(); err == nil || !strings.Contains(err.Error(), "connection references remain") {
+		t.Fatalf("rollback with another connection reference = %v, want refusal", err)
+	}
+	if got := p.control.SessionBindings(id); len(got) != 1 || got[0] != "observer" {
+		t.Fatalf("bindings after refusal = %v, want only observer reference", got)
+	}
+	if p.manager.Get(id) == nil {
+		t.Fatalf("runtime %q was removed despite another connection reference", id)
+	}
+	managedID, err := aisession.ParseID(id)
+	if err != nil {
+		t.Fatalf("ParseID(%q): %v", id, err)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); err != nil {
+		t.Fatalf("created ai-session disappeared despite another reference: %v", err)
+	}
+
+	p.UnbindConnectionSession("observer", id)
+	if err := rollback(); err != nil {
+		t.Fatalf("retry rollback after final reference was removed: %v", err)
+	}
+	if p.manager.Get(id) != nil {
+		t.Fatalf("runtime %q remains after successful retry", id)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); !errors.Is(err, aisession.ErrNotFound) {
+		t.Fatalf("ai-session after rollback = %v, want ErrNotFound", err)
+	}
+}
+
+func TestConnectionScopedSessionRollbackRefusesActiveRunAndCanRetry(t *testing.T) {
+	provider := &gatedProvider{started: make(chan struct{}), release: make(chan struct{})}
+	p := newPersistedPlugin(t, fixedProvider{content: "ack"})
+	p.deps.NewProvider = func(*runtimeconfig.Config) (core.Provider, error) { return provider, nil }
+	id, rollback, err := p.CreateBoundSessionWithRollbackForConnection("", "creator")
+	if err != nil {
+		t.Fatalf("CreateBoundSessionWithRollbackForConnection: %v", err)
+	}
+
+	handle, err := p.manager.StartRun(id, runtimeagent.RunRequest{Input: "run while rollback races"}, runtimeagent.RunCallbacks{})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	select {
+	case <-provider.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not reach provider")
+	}
+
+	if err := rollback(); err == nil || !strings.Contains(err.Error(), "runtime is active") {
+		t.Fatalf("rollback during active run = %v, want active-run refusal", err)
+	}
+	if got := p.control.SessionBindings(id); len(got) != 0 {
+		t.Fatalf("provisional creator reference after rollback attempt = %v, want removed", got)
+	}
+	if p.manager.Get(id) == nil {
+		t.Fatalf("runtime %q was removed while its run was active", id)
+	}
+	managedID, err := aisession.ParseID(id)
+	if err != nil {
+		t.Fatalf("ParseID(%q): %v", id, err)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); err != nil {
+		t.Fatalf("ai-session disappeared while its run was active: %v", err)
+	}
+	stored, err := p.repo.List(context.Background())
+	if err != nil {
+		t.Fatalf("Repository.List during active run: %v", err)
+	}
+	persisted := false
+	for _, item := range stored {
+		if item.SessionID == id {
+			persisted = true
+			break
+		}
+	}
+	if !persisted {
+		t.Fatalf("persistent session %q was deleted while its run was active", id)
+	}
+
+	close(provider.release)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := handle.Wait(ctx); err != nil {
+		t.Fatalf("wait for active run: %v", err)
+	}
+	if err := rollback(); err != nil {
+		t.Fatalf("retry rollback after run completion: %v", err)
+	}
+	if p.manager.Get(id) != nil {
+		t.Fatalf("runtime %q remains after successful rollback", id)
+	}
+	if _, err := p.aiSessions.Get(context.Background(), managedID); !errors.Is(err, aisession.ErrNotFound) {
+		t.Fatalf("ai-session after rollback = %v, want ErrNotFound", err)
 	}
 }

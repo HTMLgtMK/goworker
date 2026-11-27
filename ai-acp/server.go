@@ -2,7 +2,6 @@ package aiacp
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,14 +9,33 @@ import (
 	"sync"
 
 	"github.com/tinguo/goworker/ai-acp/protocol"
+	aisession "github.com/tinguo/goworker/ai-session"
 )
 
 // Reporter is the transport-independent way a session handler emits ACP
-// events or asks the client for a permission decision.
+// events or asks the client for a permission decision. During session/new,
+// updates are buffered until the new-session response is written; permission
+// requests before that point fail with ErrSessionNotPublished.
 type Reporter interface {
 	Update(sessionID string, body protocol.SessionUpdateBody)
 	MessageChunk(sessionID, text string)
 	RequestPermission(ctx context.Context, sessionID string, req protocol.PermissionRequest) (string, error)
+}
+
+// ClientCapabilitiesProvider exposes capabilities declared by the ACP client.
+type ClientCapabilitiesProvider interface {
+	ClientCapabilities() protocol.ClientCapabilities
+}
+
+// ReverseCaller issues an application-defined reverse request to the ACP peer.
+type ReverseCaller interface {
+	Call(ctx context.Context, method string, params, result any) error
+}
+
+// SessionCreationAbortRegistrar lets a creator attach safe cleanup for a session
+// whose session/new response is later proven not to have been sent.
+type SessionCreationAbortRegistrar interface {
+	SetSessionCreationAbort(abort func() error)
 }
 
 // SessionHandler handles session/prompt. It contains no task or daemon
@@ -33,15 +51,19 @@ type InitializeReady interface {
 	InitializeReady(ctx context.Context, reporter Reporter)
 }
 
-// SessionCreator is optional. The server allocates the ACP session ID and
-// gives it to the adapter so it can attach application state to that ID.
+// SessionCreator is the application-owned session/new lifecycle adapter. It
+// returns the canonical identity selected by the application; ACP never mints
+// or translates session IDs. During creation, Reporter.Update calls are buffered
+// until the response is published. RequestPermission is intentionally rejected
+// before publication with ErrSessionNotPublished to avoid creation/client wait deadlocks.
 type SessionCreator interface {
-	CreateSession(ctx context.Context, sessionID string, req protocol.NewSessionRequest, reporter Reporter) error
+	CreateSession(ctx context.Context, req protocol.NewSessionRequest, reporter Reporter) (aisession.ID, error)
 }
 
 // SessionLoader is optional and is advertised during initialize when present.
+// It receives the exact canonical ID requested on the wire.
 type SessionLoader interface {
-	LoadSession(ctx context.Context, req protocol.LoadSessionRequest, reporter Reporter) error
+	LoadSession(ctx context.Context, sessionID aisession.ID, req protocol.LoadSessionRequest, reporter Reporter) error
 }
 
 // SessionLister is optional. A missing implementation makes session/list
@@ -284,18 +306,45 @@ func (s *Server) ClientCapabilities() protocol.ClientCapabilities {
 	return s.clientCaps
 }
 
+type sessionNewResult struct {
+	protocol.NewSessionResponse
+	reporter *sessionCreationReporter `json:"-"`
+}
+
+func (r sessionNewResult) AfterResponseWritten(ctx context.Context) {
+	r.reporter.AfterResponseWritten(ctx)
+}
+
+func (r sessionNewResult) AfterResponseWriteFailed(ctx context.Context) {
+	r.reporter.AfterResponseWriteFailed(ctx)
+}
+
+func (r sessionNewResult) AfterResponseWriteFailedWithOutcome(ctx context.Context, outcome protocol.ResponseWriteOutcome) {
+	r.reporter.AfterResponseWriteFailedWithOutcome(ctx, outcome)
+}
+
 func (s *Server) handleSessionNew(ctx context.Context, params json.RawMessage) (any, error) {
 	var req protocol.NewSessionRequest
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, fmt.Errorf("acp: decode session/new: %w", err)
 	}
-	sessionID := newSessionID()
-	if s.config.creator != nil {
-		if err := s.config.creator.CreateSession(ctx, sessionID, req, s); err != nil {
-			return nil, err
-		}
+	if s.config.creator == nil {
+		return nil, &protocol.RPCError{Code: -32000, Message: "acp: session creation not supported"}
 	}
-	response := protocol.NewSessionResponse{SessionID: sessionID}
+	reporter := newSessionCreationReporter(ctx, s)
+	sessionID, err := s.config.creator.CreateSession(ctx, req, reporter)
+	if err != nil {
+		reporter.discard()
+		return nil, err
+	}
+	if err := sessionID.Validate(); err != nil {
+		reporter.discard()
+		return nil, fmt.Errorf("acp: session creator returned invalid session ID: %w", err)
+	}
+	response := sessionNewResult{
+		NewSessionResponse: protocol.NewSessionResponse{SessionID: sessionID.String()},
+		reporter:           reporter,
+	}
 	if s.config.modes != nil {
 		response.Modes = s.config.modes.SessionModes()
 	}
@@ -330,10 +379,14 @@ func (s *Server) handleSessionLoad(ctx context.Context, params json.RawMessage) 
 	if req.SessionID == "" {
 		return nil, errors.New("acp: session/load requires sessionId")
 	}
+	sessionID, err := aisession.ParseID(req.SessionID)
+	if err != nil {
+		return nil, fmt.Errorf("acp: session/load requires a valid sessionId: %w", err)
+	}
 	if s.config.loader == nil {
 		return nil, &protocol.RPCError{Code: -32000, Message: "acp: session load not supported"}
 	}
-	if err := s.config.loader.LoadSession(ctx, req, s); err != nil {
+	if err := s.config.loader.LoadSession(ctx, sessionID, req, s); err != nil {
 		return nil, err
 	}
 	response := protocol.LoadSessionResponse{}
@@ -463,16 +516,13 @@ func (s *Server) Call(ctx context.Context, method string, params, result any) er
 	return s.Peer.Call(ctx, method, params, result)
 }
 
+// ErrPermissionUnsupported distinguishes an agent that cannot answer a
+// permission request from a client that explicitly denied it.
 var ErrPermissionUnsupported = errors.New("acp: peer does not support session/request_permission")
 
-func newSessionID() string {
-	return fmt.Sprintf("sess_%x", randomBytes(8))
-}
+// ErrSessionNotPublished means a creator attempted a permission request before
+// the session/new response identified the session to the client.
+var ErrSessionNotPublished = errors.New("acp: session/new response has not been written")
 
-func randomBytes(size int) []byte {
-	value := make([]byte, size)
-	if _, err := rand.Read(value); err != nil {
-		panic("acp: generate session id: " + err.Error())
-	}
-	return value
-}
+// ErrReverseCallUnsupported means a reporter target cannot issue peer requests.
+var ErrReverseCallUnsupported = errors.New("acp: reporter target does not support reverse calls")

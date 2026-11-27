@@ -6,8 +6,8 @@ import (
 )
 
 // bindings_test.go 是 BindingRegistry 的单元测试(Plan A2 生命周期半边,对齐
-// lease_test.go 的注册表层风格):登记/改绑替换、断连清账、计数取数与空 clientID
-// 语义。全链路(登记 → 引用归零判定 → CloseSession/Remove 收口)的用例由
+// lease_test.go 的注册表层风格):多会话登记、精确解绑、断连全量清账与旧单选
+// API 语义。全链路(登记 → 引用归零判定 → CloseSession/Remove 收口)的用例由
 // plugin 包的 lifecycle_test.go 覆盖,本文件锁死注册表自身的契约。
 
 // TestBindingRegistryBindReplaceAndCount:登记/改绑/解绑对「绑定集合」的影响
@@ -93,7 +93,7 @@ func TestServiceReleaseConnectionClearsBinding(t *testing.T) {
 	s.AcquireControl("sess-2", "conn-C")
 
 	if prev := s.ReleaseConnection("conn-B"); prev != "sess-1" {
-		t.Fatalf("ReleaseConnection prev = %q, want sess-1", prev)
+		t.Fatalf("ReleaseConnection session = %q, want sess-1", prev)
 	}
 	if got := s.SessionBindings("sess-1"); !reflect.DeepEqual(got, []string{"conn-A"}) {
 		t.Fatalf("SessionBindings(sess-1) after disconnect = %v, want [conn-A]", got)
@@ -107,7 +107,7 @@ func TestServiceReleaseConnectionClearsBinding(t *testing.T) {
 
 	// 未登记连接的断连:幂等空操作,prev 为空。
 	if prev := s.ReleaseConnection("conn-404"); prev != "" {
-		t.Fatalf("ReleaseConnection(unknown) prev = %q, want empty", prev)
+		t.Fatalf("ReleaseConnection(unknown) session = %q, want empty", prev)
 	}
 }
 
@@ -138,5 +138,76 @@ func TestServiceSessionBindingsCount(t *testing.T) {
 	}
 	if got := len(s.SessionBindings("sess-X")); got != 1 {
 		t.Fatalf("bindings count after unbind = %d, want 1", got)
+	}
+}
+
+func TestBindingRegistryTracksMultipleSessionsPerConnection(t *testing.T) {
+	r := NewBindingRegistry()
+
+	if !r.BindReference("conn-A", "sess-1") || !r.BindReference("conn-A", "sess-2") {
+		t.Fatal("new session references must be recorded")
+	}
+	if r.BindReference("conn-A", "sess-1") {
+		t.Fatal("duplicate session reference must be idempotent")
+	}
+	if got := r.Bindings("sess-1"); !reflect.DeepEqual(got, []string{"conn-A"}) {
+		t.Fatalf("Bindings(sess-1) = %v, want [conn-A]", got)
+	}
+	if got := r.Bindings("sess-2"); !reflect.DeepEqual(got, []string{"conn-A"}) {
+		t.Fatalf("Bindings(sess-2) = %v, want [conn-A]", got)
+	}
+
+	if !r.UnbindReference("conn-A", "sess-1") {
+		t.Fatal("exact unbind must remove the requested reference")
+	}
+	if got := r.Bindings("sess-1"); len(got) != 0 {
+		t.Fatalf("Bindings(sess-1) after exact unbind = %v, want empty", got)
+	}
+	if got := r.Bindings("sess-2"); !reflect.DeepEqual(got, []string{"conn-A"}) {
+		t.Fatalf("exact unbind disturbed another session: %v", got)
+	}
+
+	if got := r.UnbindAll("conn-A"); !reflect.DeepEqual(got, []string{"sess-2"}) {
+		t.Fatalf("UnbindAll = %v, want [sess-2]", got)
+	}
+	if got := r.Bindings("sess-2"); len(got) != 0 {
+		t.Fatalf("Bindings(sess-2) after UnbindAll = %v, want empty", got)
+	}
+}
+
+func TestBindingRegistryReplaceReferencesReturnsAllPreviousSessions(t *testing.T) {
+	r := NewBindingRegistry()
+	r.BindReference("conn-A", "sess-2")
+	r.BindReference("conn-A", "sess-1")
+	r.BindReference("conn-B", "sess-2")
+
+	if got := r.ReplaceReferences("conn-A", "sess-3"); !reflect.DeepEqual(got, []string{"sess-1", "sess-2"}) {
+		t.Fatalf("ReplaceReferences previous = %v, want sorted [sess-1 sess-2]", got)
+	}
+	if got := r.Bindings("sess-1"); len(got) != 0 {
+		t.Fatalf("sess-1 bindings after replacement = %v, want empty", got)
+	}
+	if got := r.Bindings("sess-2"); !reflect.DeepEqual(got, []string{"conn-B"}) {
+		t.Fatalf("sess-2 bindings after replacement = %v, want [conn-B]", got)
+	}
+	if got := r.Bindings("sess-3"); !reflect.DeepEqual(got, []string{"conn-A"}) {
+		t.Fatalf("sess-3 bindings after replacement = %v, want [conn-A]", got)
+	}
+}
+
+func TestServiceReleaseConnectionClearsEveryBinding(t *testing.T) {
+	s := NewService(nil, &fakeRouter{}, nil)
+	s.BindSessionReference("conn-A", "sess-1")
+	s.BindSessionReference("conn-A", "sess-2")
+	s.BindSessionReference("conn-B", "sess-2")
+
+	if got := s.ReleaseConnectionSessions("conn-A"); !reflect.DeepEqual(got, []string{"sess-1", "sess-2"}) {
+		t.Fatalf("ReleaseConnectionSessions = %v, want [sess-1 sess-2]", got)
+	}
+	if got := s.SessionBindings("sess-1"); len(got) != 0 {
+		t.Fatalf("sess-1 bindings after disconnect = %v, want empty", got)
+	}
+	if got := s.SessionBindings("sess-2"); !reflect.DeepEqual(got, []string{"conn-B"}) {
+		t.Fatalf("sess-2 bindings after disconnect = %v, want [conn-B]", got)
 	}
 }

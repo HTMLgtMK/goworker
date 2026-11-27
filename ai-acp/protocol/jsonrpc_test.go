@@ -63,6 +63,92 @@ func TestNewConnNilTransportPanics(t *testing.T) {
 	NewConn(nil)
 }
 
+type failingMarshalHookResult struct {
+	failed chan struct{}
+}
+
+func (failingMarshalHookResult) MarshalJSON() ([]byte, error) {
+	return nil, errors.New("marshal failure")
+}
+
+func (failingMarshalHookResult) AfterResponseWritten(context.Context) {}
+
+func (r failingMarshalHookResult) AfterResponseWriteFailed(context.Context) {
+	close(r.failed)
+}
+
+func TestConn_PostWriteFailureHookRunsWhenResultEncodingFails(t *testing.T) {
+	server, client := pipeConns(t)
+	failed := make(chan struct{})
+	server.Handle("fail-marshal", func(context.Context, json.RawMessage) (any, error) {
+		return failingMarshalHookResult{failed: failed}, nil
+	})
+
+	var rpcErr *RPCError
+	if err := client.Call(context.Background(), "fail-marshal", nil, nil); !errors.As(err, &rpcErr) || rpcErr.Code != CodeInternalError {
+		t.Fatalf("Call error = %v, want internal error", err)
+	}
+	select {
+	case <-failed:
+	case <-time.After(time.Second):
+		t.Fatal("response failure hook was not called")
+	}
+}
+
+type outcomeRWC struct {
+	writeN   int
+	writeErr error
+}
+
+func (r *outcomeRWC) Read([]byte) (int, error) { return 0, io.EOF }
+func (r *outcomeRWC) Write(data []byte) (int, error) {
+	if r.writeN < 0 {
+		return len(data), nil
+	}
+	return r.writeN, r.writeErr
+}
+func (*outcomeRWC) Close() error { return nil }
+
+type outcomeHookResult struct {
+	called chan ResponseWriteOutcome
+}
+
+func (r outcomeHookResult) AfterResponseWriteFailed(context.Context) {}
+func (r outcomeHookResult) AfterResponseWriteFailedWithOutcome(_ context.Context, outcome ResponseWriteOutcome) {
+	r.called <- outcome
+}
+
+func TestConn_PostWriteFailureHookDistinguishesUnsentFromUnknown(t *testing.T) {
+	writeErr := errors.New("write failed")
+	for _, test := range []struct {
+		name     string
+		n        int
+		want     ResponseWriteOutcome
+		writeErr error
+	}{
+		{name: "zero bytes", n: 0, want: ResponseWriteNotSent, writeErr: writeErr},
+		{name: "partial bytes", n: 1, want: ResponseWriteOutcomeUnknown, writeErr: writeErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rwc := &outcomeRWC{writeN: test.n, writeErr: test.writeErr}
+			conn := NewConn(rwc)
+			called := make(chan ResponseWriteOutcome, 1)
+			conn.Handle("create", func(context.Context, json.RawMessage) (any, error) {
+				return outcomeHookResult{called: called}, nil
+			})
+			conn.dispatchRequest(json.RawMessage(`1`), "create", nil)
+			select {
+			case got := <-called:
+				if got != test.want {
+					t.Fatalf("write outcome = %v, want %v", got, test.want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("post-write failure hook was not called")
+			}
+		})
+	}
+}
+
 func TestConn_CallRoundtrip(t *testing.T) {
 	server, client := pipeConns(t)
 	server.Handle("echo", func(_ context.Context, params json.RawMessage) (any, error) {

@@ -89,25 +89,56 @@ func (s *Service) HoldControl(sessionID, clientID string) bool {
 	return s.leases.Hold(sessionID, clientID)
 }
 
-// ReleaseConnection releases all leases held by clientID and removes its connection binding.
-// It returns the previously bound session ID so the caller can recheck lifecycle release
-// outside the control-plane locks; clients without leases or bindings are no-ops.
+// ReleaseConnection preserves the legacy single-ID result while clearing every lease and
+// reference. New lifecycle code should use ReleaseConnectionSessions to recheck all affected IDs.
 func (s *Service) ReleaseConnection(clientID string) string {
-	s.leases.ReleaseConnection(clientID)
-	return s.bindings.Unbind(clientID)
+	sessions := s.ReleaseConnectionSessions(clientID)
+	if len(sessions) > 0 {
+		return sessions[0]
+	}
+	return ""
 }
 
-// BindSession 把 clientID 的会话绑定登记到 sessionID,返回改绑前的会话 id
-// (bindings.go Bind 语义:空 sessionID = 解除绑定;空 clientID 无操作)。登记
-// 只是记账——改绑/解绑导致的引用变化由调用方拿返回值评估收口(「切换」
-// 触发点),本方法不执行任何生命周期动作。
+// ReleaseConnectionSessions releases every lease held by clientID and removes all of its
+// session references. The returned IDs are sorted; lifecycle cleanup runs after this method
+// returns.
+func (s *Service) ReleaseConnectionSessions(clientID string) []string {
+	s.leases.ReleaseConnection(clientID)
+	return s.bindings.UnbindAll(clientID)
+}
+
+// BindSessionReference adds a lifecycle reference without changing the caller's other
+// session references. Session selection remains the responsibility of SessionBinding.
+func (s *Service) BindSessionReference(clientID, sessionID string) bool {
+	return s.bindings.BindReference(clientID, sessionID)
+}
+
+// UnbindSessionReference removes precisely one session reference, used when /new detaches
+// the session being replaced without dropping older sessions loaded by the same connection.
+func (s *Service) UnbindSessionReference(clientID, sessionID string) bool {
+	return s.bindings.UnbindReference(clientID, sessionID)
+}
+
+// UnbindSessionReferences removes all lifecycle references held by a client and returns the
+// affected session IDs in sorted order. New lifecycle code should prefer exact unbinds when it
+// is releasing one session rather than clearing a connection's full ledger.
+func (s *Service) UnbindSessionReferences(clientID string) []string {
+	return s.bindings.UnbindAll(clientID)
+}
+
+// BindSession preserves the legacy single-selected-session replacement behavior.
+// Lifecycle registration for multi-session connections uses BindSessionReference.
 func (s *Service) BindSession(clientID, sessionID string) string {
 	return s.bindings.Bind(clientID, sessionID)
 }
 
-// UnbindSession 解除 clientID 的绑定登记(bindings.go Unbind),返回被解除的
-// 会话 id。/new 收口「摘发起方绑定」的登记侧调用点;生命周期评估由调用方以
-// 返回值驱动,本方法不执行任何收口动作。
+// ReplaceSessionReferences preserves the legacy replacement behavior and returns every
+// session reference it removed. Lifecycle owners must recheck those sessions after this call.
+func (s *Service) ReplaceSessionReferences(clientID, sessionID string) []string {
+	return s.bindings.ReplaceReferences(clientID, sessionID)
+}
+
+// UnbindSession preserves the legacy operation that clears all references for a client.
 func (s *Service) UnbindSession(clientID string) string {
 	return s.bindings.Unbind(clientID)
 }

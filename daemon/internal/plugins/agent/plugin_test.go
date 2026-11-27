@@ -310,11 +310,7 @@ func (p *AgentPlugin) setMemory(c *memory.Client) {
 	p.refreshSession()
 }
 
-// refreshSession 用当前 deps 重建会话并接线 current runtime，对齐 startSession
-// 的会话边界构造：Register 进 manager 并置为 current。测试直接注入 deps，不读
-// 真实文件。runtime id 与生产同规则：注入了 *session.Store 时取其 SessionID，
-// 纯内存则保持 "current" 单例。重复调用（如 setMemory）等价于 /new 式重建，
-// 同 id 注册冲突时旧 runtime 保留在 manager，current 换新。
+// refreshSession routes test session reconstruction through the same lifecycle transaction as production.
 func (p *AgentPlugin) refreshSession() {
 	s := runtimeagent.NewSession(p.deps)
 	id := "current"
@@ -322,8 +318,9 @@ func (p *AgentPlugin) refreshSession() {
 		id = st.SessionID()
 	}
 	rt := runtimeagent.NewSessionRuntime(id, s)
-	_ = p.manager.Register(rt)
-	p.current.Store(rt)
+	if err := p.swapCurrentRuntime(rt); err != nil {
+		panic(err)
+	}
 }
 
 // newContext 构造带输出捕获的 model.Context。
@@ -766,6 +763,195 @@ func TestLoadMCP_UnreachableServerSkips(t *testing.T) {
 	}
 }
 
+func TestNewRefreshesRealResourcesWithoutChangingOldSession(t *testing.T) {
+	serverPath := buildFakeMCPServer(t)
+	configDir := t.TempDir()
+	skillsDir := t.TempDir()
+	write := func(path, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(configDir, "AGENTS.md"), "global instruction generation one")
+	write(filepath.Join(configDir, "USER.md"), "profile generation one")
+	write(filepath.Join(skillsDir, "lookup", "SKILL.md"), "---\nname: lookup\ndescription: lookup data\n---\nskill generation one")
+
+	cfg := runtimeconfig.Default()
+	cfg.Session.Enabled = true
+	cfg.Session.Dir = t.TempDir()
+	cfg.Memory.Enabled = true
+	cfg.MCP.Servers = []runtimeconfig.MCPServer{{Name: "first", Command: serverPath}}
+	paths := runtimeconfig.Paths{ConfigDir: configDir, SkillsUser: skillsDir}
+	p := NewPlugin(cfg, paths)
+	if err := p.Init(initHub(cfg)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := p.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	oldID := p.currentSession().ID
+	oldResources := p.resourcesForSession(oldID)
+	if oldResources == nil || len(oldResources.skills) != 1 || !strings.Contains(oldResources.instruction.Snapshot(), "generation one") {
+		t.Fatalf("initial session resources = %+v", oldResources)
+	}
+
+	write(filepath.Join(configDir, "AGENTS.md"), "global instruction generation two")
+	write(filepath.Join(configDir, "USER.md"), "profile generation two")
+	write(filepath.Join(skillsDir, "lookup", "SKILL.md"), "---\nname: lookup\ndescription: lookup data\n---\nskill generation two")
+	cfg.MCP.Servers = []runtimeconfig.MCPServer{{Name: "second", Command: serverPath}}
+
+	ctx, _ := newContext("")
+	if err := p.handleNew(ctx); err != nil {
+		t.Fatalf("/new: %v", err)
+	}
+	newID := p.currentSession().ID
+	if newID == oldID {
+		t.Fatal("/new retained the old session ID")
+	}
+	newResources := p.resourcesForSession(newID)
+	if newResources == nil || newResources == oldResources {
+		t.Fatal("/new did not bind a fresh resource snapshot")
+	}
+	if got := oldResources.skills[0].Content; got != "skill generation one" {
+		t.Fatalf("old skill snapshot changed to %q", got)
+	}
+	if got := newResources.skills[0].Content; got != "skill generation two" {
+		t.Fatalf("new skill content = %q, want refreshed discovery", got)
+	}
+	if !strings.Contains(oldResources.instruction.Snapshot(), "generation one") || strings.Contains(oldResources.instruction.Snapshot(), "generation two") {
+		t.Fatalf("old instruction snapshot changed: %q", oldResources.instruction.Snapshot())
+	}
+	if !strings.Contains(newResources.instruction.Snapshot(), "generation two") || strings.Contains(newResources.instruction.Snapshot(), "generation one") {
+		t.Fatalf("new instruction snapshot = %q, want refreshed files", newResources.instruction.Snapshot())
+	}
+	if _, ok := oldResources.clients["first"]; !ok {
+		t.Fatal("old session lost its discovered MCP client")
+	}
+	if _, ok := newResources.clients["second"]; !ok {
+		t.Fatal("new session did not discover the updated MCP server")
+	}
+	if len(oldResources.mcpTools) != 1 || oldResources.mcpTools[0].Name != "mcp_first_echo" {
+		t.Fatalf("old MCP tools = %+v", oldResources.mcpTools)
+	}
+	if len(newResources.mcpTools) != 1 || newResources.mcpTools[0].Name != "mcp_second_echo" {
+		t.Fatalf("new MCP tools = %+v", newResources.mcpTools)
+	}
+	if got, err := oldResources.mcpTools[0].Execute(context.Background(), map[string]any{"text": "old"}); err != nil || !strings.Contains(got, "old") {
+		t.Fatalf("old session MCP tool after /new = (%q, %v)", got, err)
+	}
+	if got, err := newResources.mcpTools[0].Execute(context.Background(), map[string]any{"text": "new"}); err != nil || !strings.Contains(got, "new") {
+		t.Fatalf("new session MCP tool = (%q, %v)", got, err)
+	}
+}
+
+func TestResourceSnapshotsKeepOldMCPCallsAliveAcrossRefresh(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	hub, _ := testHub(cfg)
+	p := newAgentPlugin(hub)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	oldClient := &blockingMCPClient{started: started, release: release}
+	oldResources := &sessionResources{
+		id:       "old",
+		skills:   []skills.Skill{{Name: "old_skill", Content: "old skill body"}},
+		clients:  map[string]mcp.Client{"server": oldClient},
+		mcpTools: []core.Tool{},
+	}
+	oldTool, ok := p.mcpToolToCore(oldClient, "server", mcp.Tool{Name: "call"})
+	if !ok {
+		t.Fatal("could not create old snapshot MCP tool")
+	}
+	oldResources.mcpTools = []core.Tool{oldTool}
+	p.publishResources(oldResources)
+	oldTools := p.collectToolsWithResources(nil, oldResources)
+	foundOldSkill := false
+	for _, tool := range oldTools {
+		if tool.Name == "skill_old_skill" {
+			foundOldSkill = true
+			break
+		}
+	}
+	if !foundOldSkill {
+		t.Fatal("old snapshot lost its skill tool")
+	}
+
+	newClient := &fakeMCPClient{callRes: &mcp.CallToolResult{Content: []mcp.ContentBlock{{Text: "new"}}}}
+	newTool, ok := p.mcpToolToCore(newClient, "server", mcp.Tool{Name: "call"})
+	if !ok {
+		t.Fatal("could not create new snapshot MCP tool")
+	}
+	newResources := &sessionResources{
+		id:       "new",
+		clients:  map[string]mcp.Client{"server": newClient},
+		mcpTools: []core.Tool{newTool},
+	}
+
+	oldResult := make(chan error, 1)
+	go func() {
+		got, err := oldTool.Execute(context.Background(), nil)
+		if err == nil && got != "old" {
+			err = fmt.Errorf("old MCP result = %q, want old", got)
+		}
+		oldResult <- err
+	}()
+	<-started
+	p.publishResources(newResources)
+	if got, err := newTool.Execute(context.Background(), nil); err != nil || got != "new" {
+		t.Fatalf("new MCP tool returned (%q, %v), want (new, nil)", got, err)
+	}
+	select {
+	case err := <-oldResult:
+		t.Fatalf("old MCP call finished before release: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-oldResult; err != nil {
+		t.Fatalf("old MCP call after refresh: %v", err)
+	}
+	if oldClient.closed {
+		t.Fatal("refresh closed the old MCP client")
+	}
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if !oldClient.closed {
+		t.Fatal("Stop did not close the retained old MCP client")
+	}
+}
+
+type blockingMCPClient struct {
+	started chan struct{}
+	release chan struct{}
+	closed  bool
+}
+
+func (c *blockingMCPClient) Initialize(context.Context, *mcp.InitializeRequest) (*mcp.InitializeResult, error) {
+	return &mcp.InitializeResult{}, nil
+}
+func (c *blockingMCPClient) ListTools(context.Context, *mcp.ListToolsRequest) (*mcp.ListToolsResult, error) {
+	return &mcp.ListToolsResult{}, nil
+}
+func (c *blockingMCPClient) CallTool(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	close(c.started)
+	select {
+	case <-c.release:
+		return &mcp.CallToolResult{Content: []mcp.ContentBlock{{Text: "old"}}}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (c *blockingMCPClient) Close() error {
+	c.closed = true
+	return nil
+}
+
 func TestMCPToolToCore_ExecuteCallsServer(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	hub, _ := testHub(cfg)
@@ -885,6 +1071,159 @@ func newMemoryPlugin(t *testing.T) *AgentPlugin {
 	return p
 }
 
+func enableTestSessionPersistence(t *testing.T, p *AgentPlugin) {
+	t.Helper()
+	root := t.TempDir()
+	repo, err := session.OpenRepository(root)
+	if err != nil {
+		t.Fatalf("OpenRepository: %v", err)
+	}
+	p.repo = repo
+	p.cfg.Session.Enabled = true
+	p.cfg.Session.Dir = root
+	t.Cleanup(func() {
+		if err := p.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+}
+
+type testCapabilityExecutor struct {
+	value string
+}
+
+func (e testCapabilityExecutor) Invoke(context.Context, string, []byte) (string, error) {
+	return e.value, nil
+}
+
+type blockingTestProvider struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (p *blockingTestProvider) Name() string  { return "blocking-test" }
+func (p *blockingTestProvider) Model() string { return "test-model" }
+func (p *blockingTestProvider) Chat(context.Context, *core.ChatRequest) (*core.ChatResponse, error) {
+	return nil, errors.New("unexpected non-streaming call")
+}
+func (p *blockingTestProvider) ChatStream(ctx context.Context, _ *core.ChatRequest) (<-chan core.Token, error) {
+	p.once.Do(func() { close(p.started) })
+	ch := make(chan core.Token)
+	go func() {
+		defer close(ch)
+		select {
+		case <-p.release:
+		case <-ctx.Done():
+			return
+		}
+		ch <- core.Token{Type: core.TokenTypeText, Done: true, Response: &core.ChatResponse{
+			Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: "done"}}},
+		}}
+	}()
+	return ch, nil
+}
+
+func TestCreateBoundSessionRollbackDoesNotDeleteDuringActiveRun(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	cfg.Session.Enabled = false
+	hub, _ := testHub(cfg)
+	p := newAgentPlugin(hub)
+	enableTestSessionPersistence(t, p)
+	provider := &blockingTestProvider{started: make(chan struct{}), release: make(chan struct{})}
+	p.deps.NewProvider = func(*runtimeconfig.Config) (core.Provider, error) { return provider, nil }
+
+	sessionID, rollback, err := p.CreateBoundSessionWithRollbackForConnection(t.TempDir(), "creator-connection")
+	if err != nil {
+		t.Fatalf("CreateBoundSessionWithRollbackForConnection: %v", err)
+	}
+	if got := p.control.SessionBindings(sessionID); len(got) != 1 || got[0] != "creator-connection" {
+		t.Fatalf("created session references = %v, want creator connection", got)
+	}
+	handle, err := p.manager.StartRun(sessionID, runtimeagent.RunRequest{Input: "run"}, runtimeagent.RunCallbacks{})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	select {
+	case <-provider.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider did not start")
+	}
+
+	if err := rollback(); err == nil {
+		t.Fatal("rollback deleted a session with an active run")
+	}
+	if p.manager.Get(sessionID) == nil {
+		t.Fatal("rollback removed the active runtime")
+	}
+	if got := p.control.SessionBindings(sessionID); len(got) != 0 {
+		t.Fatalf("creator reference remains after scoped rollback: %v", got)
+	}
+
+	close(provider.release)
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := handle.Wait(waitCtx); err != nil {
+		t.Fatalf("wait for active run: %v", err)
+	}
+	if err := rollback(); err != nil {
+		t.Fatalf("retry rollback after run completed: %v", err)
+	}
+	if p.manager.Get(sessionID) != nil {
+		t.Fatal("retry rollback left runtime registered")
+	}
+}
+
+func TestCreateBoundSessionRollbackIsConnectionScoped(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	cfg.Session.Enabled = false
+	hub, _ := testHub(cfg)
+	p := newAgentPlugin(hub)
+	enableTestSessionPersistence(t, p)
+
+	workspace := t.TempDir()
+	const creator, other = "creator-connection", "other-connection"
+	sessionID, rollback, err := p.CreateBoundSessionWithRollbackForConnection(workspace, creator)
+	if err != nil {
+		t.Fatalf("CreateBoundSessionWithRollbackForConnection: %v", err)
+	}
+	if sessionID == "" || rollback == nil {
+		t.Fatalf("creator returned sessionID=%q rollback=%v", sessionID, rollback != nil)
+	}
+
+	p.control.BindSessionReference(other, sessionID)
+	capabilities := p.manager.Capabilities()
+	capabilities.BindConnection(sessionID, creator, []string{"device_call"}, testCapabilityExecutor{value: creator})
+	capabilities.BindConnection(sessionID, other, []string{"device_call"}, testCapabilityExecutor{value: other})
+
+	if err := rollback(); err == nil {
+		t.Fatal("rollback deleted a session still referenced by another connection")
+	}
+	bindings := p.control.SessionBindings(sessionID)
+	if len(bindings) != 1 || bindings[0] != other {
+		t.Fatalf("session bindings after scoped rollback = %v, want only %q", bindings, other)
+	}
+	executor, ok := capabilities.Lookup(sessionID, "device_call")
+	if !ok {
+		t.Fatal("scoped rollback removed the other connection's capability")
+	}
+	if got, err := executor.Invoke(context.Background(), "device_call", nil); err != nil || got != other {
+		t.Fatalf("remaining capability = (%q, %v), want owner %q", got, err, other)
+	}
+	if p.manager.Get(sessionID) == nil {
+		t.Fatal("scoped rollback removed a session retained by another connection")
+	}
+
+	p.control.UnbindSessionReference(other, sessionID)
+	capabilities.Invalidate(sessionID, other)
+	if err := rollback(); err != nil {
+		t.Fatalf("retry rollback after remaining reference was removed: %v", err)
+	}
+	if p.manager.Get(sessionID) != nil {
+		t.Fatal("successful retry left the created runtime registered")
+	}
+}
+
 func TestHandleMemory_AddListSearch(t *testing.T) {
 	p := newMemoryPlugin(t)
 
@@ -995,6 +1334,7 @@ func (b *lockedBuf) waitFor(t *testing.T, want string, timeout time.Duration) {
 
 func TestHandleNew_EmptyConversationSkipsCheckpoint(t *testing.T) {
 	p := newMemoryPlugin(t) // conversation 为空，不启动后台固化，不碰 LLM
+	enableTestSessionPersistence(t, p)
 
 	ctx, buf := newContext()
 	if err := p.handleNew(ctx); err != nil {
@@ -1026,10 +1366,12 @@ func TestHandleNew_CheckpointsConversation(t *testing.T) {
 	provider := cfg.LLM.Providers[cfg.LLM.Current.Provider]
 	provider.Endpoint = srv.URL
 	cfg.LLM.Providers[cfg.LLM.Current.Provider] = provider
-	cfg.Session.Enabled = false // 避免 handleNew 走真实 store 路径，污染用户会话目录
+	cfg.Session.Enabled = true
+	cfg.Session.Dir = t.TempDir()
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
 	ms, _ := memory.NewClient(t.TempDir(), 10)
+	enableTestSessionPersistence(t, p)
 	p.setMemory(ms)
 	seedRuns(p, "q")
 
@@ -1192,6 +1534,7 @@ func TestHandleNew_LtmExtractDisabledSkipsFacts(t *testing.T) {
 	hub, _ := testHub(cfg)
 	p := newAgentPlugin(hub)
 	ms, _ := memory.NewClient(t.TempDir(), 10)
+	enableTestSessionPersistence(t, p)
 	p.setMemory(ms)
 	seedRuns(p, "q")
 

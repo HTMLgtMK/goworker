@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/tinguo/goworker/ai-acp/protocol"
+	aisession "github.com/tinguo/goworker/ai-session"
 )
 
 // listingHandler 实现 TaskHandler + SessionLoader + SessionLister：具备 load/list 能力。
@@ -51,7 +53,129 @@ func (plainHandler) Run(_ context.Context, _, _ string, _ Reporter) (string, err
 	return protocol.StopEndTurn, nil
 }
 
-// modesHandler 在 listingHandler 之上实现 SessionModesProvider：new/load 响应携带 modes。
+type awareHandler struct {
+	mu        sync.Mutex
+	createdID string
+	runID     string
+}
+
+func (h *awareHandler) Run(_ context.Context, sessionID, _ string, _ Reporter) (string, error) {
+	h.mu.Lock()
+	h.runID = sessionID
+	h.mu.Unlock()
+	return protocol.StopEndTurn, nil
+}
+
+func (h *awareHandler) SetSession(sessionID, _ string) {
+	h.mu.Lock()
+	h.createdID = sessionID
+	h.mu.Unlock()
+}
+
+func (h *awareHandler) sessionSnapshot() (string, string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.createdID, h.runID
+}
+
+type fixedSessionCreator struct {
+	mu    sync.Mutex
+	id    aisession.ID
+	calls int
+}
+
+func (c *fixedSessionCreator) CreateSession(context.Context, protocol.NewSessionRequest, Reporter) (aisession.ID, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	return c.id, nil
+}
+
+func (c *fixedSessionCreator) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+type cancelingSessionCreator struct {
+	cancel context.CancelFunc
+	id     aisession.ID
+}
+
+func (c cancelingSessionCreator) CreateSession(context.Context, protocol.NewSessionRequest, Reporter) (aisession.ID, error) {
+	c.cancel()
+	return c.id, nil
+}
+
+type lifecycleAwareHandler struct {
+	mu          sync.Mutex
+	createErr   error
+	nextID      int
+	events      []string
+	initialized map[string]string
+	serverCalls map[string]int
+	plainCalls  map[string]int
+}
+
+func newLifecycleAwareHandler() *lifecycleAwareHandler {
+	return &lifecycleAwareHandler{
+		initialized: make(map[string]string),
+		serverCalls: make(map[string]int),
+		plainCalls:  make(map[string]int),
+	}
+}
+
+func (h *lifecycleAwareHandler) CreateSession(context.Context, protocol.NewSessionRequest, Reporter) (aisession.ID, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.createErr != nil {
+		return "", h.createErr
+	}
+	h.nextID++
+	id := aisession.ID(fmt.Sprintf("shared-session-%d", h.nextID))
+	h.events = append(h.events, "create:"+id.String())
+	return id, nil
+}
+
+func (h *lifecycleAwareHandler) Run(_ context.Context, sessionID, _ string, _ Reporter) (string, error) {
+	return protocol.StopEndTurn, nil
+}
+
+func (h *lifecycleAwareHandler) SetSession(sessionID, cwd string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.plainCalls[sessionID]++
+	h.initialized[sessionID] = cwd
+	h.events = append(h.events, "session:"+sessionID)
+}
+
+func (h *lifecycleAwareHandler) SetSessionServer(sessionID, cwd string, server *Server) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.serverCalls[sessionID]++
+	h.initialized[sessionID] = cwd
+	h.events = append(h.events, "server:"+sessionID)
+}
+
+func (h *lifecycleAwareHandler) lifecycleSnapshot() ([]string, map[string]string, map[string]int, map[string]int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	events := append([]string(nil), h.events...)
+	initialized := make(map[string]string, len(h.initialized))
+	for id, cwd := range h.initialized {
+		initialized[id] = cwd
+	}
+	serverCalls := make(map[string]int, len(h.serverCalls))
+	for id, count := range h.serverCalls {
+		serverCalls[id] = count
+	}
+	plainCalls := make(map[string]int, len(h.plainCalls))
+	for id, count := range h.plainCalls {
+		plainCalls[id] = count
+	}
+	return events, initialized, serverCalls, plainCalls
+}
+
 type modesHandler struct{ listingHandler }
 
 func (modesHandler) SessionModes() *protocol.SessionModeState {
@@ -64,10 +188,10 @@ func (modesHandler) SessionModes() *protocol.SessionModeState {
 }
 
 // serveWith 在 net.Pipe 上启动 Server，返回已开始 Serve 的客户端侧 Conn。
-func serveWith(t *testing.T, handler TaskHandler) *protocol.Conn {
+func serveWith(t *testing.T, handler TaskHandler, options ...ServerOption) *protocol.Conn {
 	t.Helper()
 	serverEnd, clientEnd := net.Pipe()
-	server := ServeConn(serverEnd, handler)
+	server := ServeConn(serverEnd, handler, options...)
 	t.Cleanup(func() { _ = server.Close() })
 	conn := protocol.NewConn(clientEnd)
 	t.Cleanup(func() { _ = conn.Close() })
@@ -84,6 +208,174 @@ func initialize(t *testing.T, conn *protocol.Conn) protocol.InitializeResponse {
 		t.Fatalf("Initialize: %v", err)
 	}
 	return resp
+}
+
+func TestTaskAdapterSkipsAwarenessWhenCreatorCancelsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	handler := &awareHandler{}
+	adapter := &taskAdapter{
+		handler:               handler,
+		applicationCreator:    cancelingSessionCreator{cancel: cancel, id: aisession.ID("canonical-session")},
+		applicationCreatorSet: true,
+	}
+
+	_, err := adapter.CreateSession(ctx, protocol.NewSessionRequest{Cwd: "/workspace"}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CreateSession error = %v, want %v", err, context.Canceled)
+	}
+	createdID, _ := handler.sessionSnapshot()
+	if createdID != "" {
+		t.Fatalf("canceled creator initialized handler as %q", createdID)
+	}
+}
+
+func TestServerUsesInjectedApplicationSessionCreator(t *testing.T) {
+	handler := &awareHandler{}
+	creator := &fixedSessionCreator{id: aisession.ID("application-session")}
+	conn := serveWith(t, handler, WithSessionCreator(creator))
+	initialize(t, conn)
+
+	var created protocol.NewSessionResponse
+	if err := conn.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: "/repo"}, &created); err != nil {
+		t.Fatalf("session/new: %v", err)
+	}
+	if created.SessionID != creator.id.String() || creator.callCount() != 1 {
+		t.Fatalf("session/new ID = %q, creator ID = %q, calls = %d", created.SessionID, creator.id, creator.callCount())
+	}
+	createdID, _ := handler.sessionSnapshot()
+	if createdID != created.SessionID {
+		t.Fatalf("SessionAware initialized ID %q, want injected ID %q", createdID, created.SessionID)
+	}
+
+	var prompt protocol.PromptResponse
+	if err := conn.Call(context.Background(), protocol.MethodSessionPrompt,
+		protocol.PromptRequest{SessionID: created.SessionID, Prompt: []protocol.ContentBlock{protocol.TextBlock("hello")}}, &prompt); err != nil {
+		t.Fatalf("session/prompt: %v", err)
+	}
+	_, runID := handler.sessionSnapshot()
+	if runID != created.SessionID {
+		t.Fatalf("prompt routed to %q, want injected canonical ID %q", runID, created.SessionID)
+	}
+}
+
+func TestInjectedCreatorInitializesBothAwareHandlerOnceConcurrently(t *testing.T) {
+	handler := newLifecycleAwareHandler()
+	conn := serveWith(t, handler, WithSessionCreator(handler))
+	initialize(t, conn)
+
+	const count = 8
+	results := make(chan string, count)
+	for i := 0; i < count; i++ {
+		go func() {
+			var response protocol.NewSessionResponse
+			err := conn.Call(context.Background(), protocol.MethodSessionNew,
+				protocol.NewSessionRequest{Cwd: "/workspace"}, &response)
+			if err != nil {
+				results <- "error: " + err.Error()
+				return
+			}
+			results <- response.SessionID
+		}()
+	}
+
+	ids := make(map[string]struct{}, count)
+	for i := 0; i < count; i++ {
+		id := <-results
+		if strings.HasPrefix(id, "error: ") {
+			t.Fatal(id)
+		}
+		ids[id] = struct{}{}
+	}
+	if len(ids) != count {
+		t.Fatalf("created %d unique IDs, want %d", len(ids), count)
+	}
+
+	events, initialized, serverCalls, plainCalls := handler.lifecycleSnapshot()
+	if len(events) != count*2 || len(initialized) != count {
+		t.Fatalf("events=%v initialized=%v, want one creator and one init event per session", events, initialized)
+	}
+	createdAt := make(map[string]int, count)
+	initializedAt := make(map[string]int, count)
+	for index, event := range events {
+		kind, id, ok := strings.Cut(event, ":")
+		if !ok {
+			t.Fatalf("malformed lifecycle event %q", event)
+		}
+		switch kind {
+		case "create":
+			createdAt[id] = index
+		case "server":
+			initializedAt[id] = index
+		case "session":
+			t.Fatalf("SessionAware was also called for SessionServerAware handler: %v", events)
+		default:
+			t.Fatalf("unexpected lifecycle event %q", event)
+		}
+	}
+	for id := range ids {
+		if initialized[id] != "/workspace" || serverCalls[id] != 1 || plainCalls[id] != 0 {
+			t.Fatalf("session %q initialization cwd=%q serverCalls=%d plainCalls=%d", id, initialized[id], serverCalls[id], plainCalls[id])
+		}
+		createIndex, created := createdAt[id]
+		initIndex, initializedOnce := initializedAt[id]
+		if !created || !initializedOnce || initIndex <= createIndex {
+			t.Fatalf("session %q creator/init order missing or reversed: %v", id, events)
+		}
+	}
+}
+
+func TestInjectedCreatorFailureDoesNotInitializeAwareHandler(t *testing.T) {
+	creatorErr := errors.New("creator failed")
+	handler := newLifecycleAwareHandler()
+	handler.createErr = creatorErr
+	conn := serveWith(t, handler, WithSessionCreator(handler))
+	initialize(t, conn)
+
+	var response protocol.NewSessionResponse
+	err := conn.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: "/workspace"}, &response)
+	var rpcErr *protocol.RPCError
+	if !errors.As(err, &rpcErr) || !strings.Contains(rpcErr.Message, creatorErr.Error()) {
+		t.Fatalf("session/new error = %v, want creator failure", err)
+	}
+	events, initialized, _, _ := handler.lifecycleSnapshot()
+	if len(events) != 0 || len(initialized) != 0 {
+		t.Fatalf("failed creator initialized handler: events=%v initialized=%v", events, initialized)
+	}
+}
+
+func TestNilInjectedCreatorDoesNotFallbackToLocalID(t *testing.T) {
+	handler := &awareHandler{}
+	conn := serveWith(t, handler, WithSessionCreator(nil))
+	initialize(t, conn)
+
+	var response protocol.NewSessionResponse
+	if err := conn.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: "/workspace"}, &response); err == nil {
+		t.Fatalf("session/new generated fallback ID %q despite explicit nil creator", response.SessionID)
+	}
+	createdID, _ := handler.sessionSnapshot()
+	if createdID != "" {
+		t.Fatalf("nil injected creator initialized handler as %q", createdID)
+	}
+}
+
+func TestInvalidInjectedIDDoesNotInitializeAwareHandler(t *testing.T) {
+	handler := &awareHandler{}
+	creator := &fixedSessionCreator{id: aisession.ID("invalid/id")}
+	conn := serveWith(t, handler, WithSessionCreator(creator))
+	initialize(t, conn)
+
+	var response protocol.NewSessionResponse
+	if err := conn.Call(context.Background(), protocol.MethodSessionNew,
+		protocol.NewSessionRequest{Cwd: "/workspace"}, &response); err == nil {
+		t.Fatal("session/new succeeded with invalid creator ID")
+	}
+	createdID, _ := handler.sessionSnapshot()
+	if createdID != "" {
+		t.Fatalf("invalid ID initialized handler as %q", createdID)
+	}
 }
 
 func TestServer_AdvertisesLoadSessionOnlyWhenHandlerImplementsLoader(t *testing.T) {

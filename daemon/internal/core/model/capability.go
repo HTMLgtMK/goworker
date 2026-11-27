@@ -95,6 +95,13 @@ type SessionSource interface {
 	SessionModes() *SessionModeState
 }
 
+// CurrentSessionHistoryLoader atomically verifies and snapshots the legacy backend's current
+// session. Implementations must bind the expected logical ID, reload, and history read to one
+// stable backend session; callers must fail closed when this capability is unavailable.
+type CurrentSessionHistoryLoader interface {
+	ReloadAndReadCurrentSession(expectedSessionID string) ([]SessionUpdate, error)
+}
+
 // PendingApprovalInfo is a protocol-neutral summary of a pending approval.
 type PendingApprovalInfo struct {
 	RequestID string
@@ -213,6 +220,23 @@ type SessionTitleGeneratorSource interface {
 	GenerateSessionTitle(sessionID, clientID string) (string, error)
 }
 
+// TransactionalBoundSessionCreator returns a retryable rollback for the exact session
+// it created. Implementations must refuse rollback once another connection has
+// retained the session or a run has started; callers must not infer ownership from ID.
+type TransactionalBoundSessionCreator interface {
+	CreateBoundSessionWithRollback(cwd string) (sessionID string, rollback func() error, err error)
+}
+
+// ConnectionScopedTransactionalBoundSessionCreator extends transactional creation with an
+// abort that owns this connection's provisional lifecycle reference. The abort must remove
+// only that reference and connection-scoped session capabilities, and refuse deletion while
+// another reference or active run exists. Callers invoke it only after the protocol layer
+// confirms that the creation response sent zero bytes; a partial or unknown write must leave
+// the session intact.
+type ConnectionScopedTransactionalBoundSessionCreator interface {
+	CreateBoundSessionWithRollbackForConnection(cwd, connectionID string) (sessionID string, rollback func() error, err error)
+}
+
 // BoundSessionSource is an optional capability for connection-bound session
 // creation, loading, history, and archival. Implementations without it retain the
 // single-session fallback. ConnectionBinder separately records lifecycle references.
@@ -252,19 +276,28 @@ type GuardedBoundSessionLoader interface {
 	LoadBoundSessionForConnectionGuarded(sessionID, cwd, connectionID string, allowBind func() bool) ([]SessionUpdate, bool, error)
 }
 
-// ConnectionBinder optionally records connection-to-session bindings for lifecycle reference
-// counting and active-state reporting. SessionBinding remains the routing source; registration
-// itself has no side effects. Implementations evaluate cleanup after rebinding, but must not
-// delete sessions, cancel runs, or alter control leases as part of registration.
+// ConnectionBinder optionally records lifecycle references for sessions loaded by a connection.
+// ConnectionBinder preserves the legacy single-session replacement contract. A multi-session
+// frontend must use MultiSessionBinder instead of changing the meaning of this interface.
 type ConnectionBinder interface {
-	// BindConnectionSession 登记 clientID 当前绑定的会话（改绑即替换；空
-	// sessionID = 解除绑定）。connectionID 与 RunControlSource 的连接句柄同源
-	// （handler 工厂生成的 connectionID），断连收口经 ReleaseConnection 清账。
+	// BindConnectionSession replaces this connection's lifecycle session reference; an empty
+	// sessionID clears all references. Routing selection remains frontend-owned.
 	BindConnectionSession(connectionID, sessionID string)
 }
 
-// GuardedConnectionBinder commits a session reference only while the connection
-// remains open. allowBind must be a fast state check with no lifecycle lock acquisition.
+// MultiSessionBinder adds a lifecycle reference without removing references to other sessions.
+type MultiSessionBinder interface {
+	BindConnectionSessionReference(connectionID, sessionID string)
+}
+
+// GuardedConnectionBinder preserves legacy replacement semantics while linearizing a bind
+// against disconnect. allowBind must be a fast state check with no lifecycle lock acquisition.
 type GuardedConnectionBinder interface {
 	BindConnectionSessionGuarded(connectionID, sessionID string, allowBind func() bool) bool
+}
+
+// GuardedMultiSessionBinder atomically adds a session reference only while the connection
+// remains open. It is the guarded multi-session counterpart to MultiSessionBinder.
+type GuardedMultiSessionBinder interface {
+	BindConnectionSessionReferenceGuarded(connectionID, sessionID string, allowBind func() bool) bool
 }

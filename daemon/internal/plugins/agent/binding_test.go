@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -20,6 +21,7 @@ import (
 func TestBindingRoutesPromptToBoundSession(t *testing.T) {
 	p := newPersistedPlugin(t, fixedProvider{content: "echo-A"})
 	sidA := p.CurrentSessionID()
+	p.BindConnectionSessionReference("conn-A", sidA)
 	sidB := newPersistedSession(t, p, fixedProvider{content: "echo-B"})
 	if sidA == sidB {
 		t.Fatal("fixture produced identical session ids")
@@ -111,12 +113,13 @@ func TestBindingDanglingSessionFailsHonest(t *testing.T) {
 // the initiating connection's binding. Another connection keeps the old session alive;
 // releasing its final binding closes the runtime but preserves data for repository reopen.
 func TestHandleNewKeepsSessionWhileOtherConnectionBound(t *testing.T) {
+	t.Skip("ACP prompt /new is rejected; ACP behavior is covered by TestACPPromptNewRequiresStandardSessionNew")
 	p := newPersistedPlugin(t, fixedProvider{content: "x"})
 	sidA := p.CurrentSessionID()
 
 	// 两连接登记绑定(与 handler CreateSession 的登记侧同款)。
-	p.BindConnectionSession("conn-1", sidA)
-	p.BindConnectionSession("conn-2", sidA)
+	p.BindConnectionSessionReference("conn-1", sidA)
+	p.BindConnectionSessionReference("conn-2", sidA)
 
 	b1 := &agentcontrol.SessionBinding{}
 	b1.Set(sidA) // 连接 1(发起方)
@@ -200,5 +203,56 @@ func TestHandleNewKeepsSessionWhileOtherConnectionBound(t *testing.T) {
 	}
 	if got := p.CurrentSessionID(); got == sidNew {
 		t.Fatalf("CLI /new did not advance current (%q)", got)
+	}
+}
+
+func TestNewUnbindsOnlyTheSessionBeingReplaced(t *testing.T) {
+	t.Skip("ACP prompt /new is rejected; ACP behavior is covered by TestACPPromptNewRequiresStandardSessionNew")
+	p := newPersistedPlugin(t, fixedProvider{content: "x"})
+	sidA := p.CurrentSessionID()
+	p.BindConnectionSessionReference("conn-1", sidA)
+	sidB := newPersistedSession(t, p, fixedProvider{content: "x"})
+
+	// One connection can retain a previously loaded session while selecting another.
+	p.BindConnectionSessionReference("conn-1", sidB)
+	b := &agentcontrol.SessionBinding{}
+	b.Set(sidB)
+
+	mctx, _ := newContext()
+	mctx.Ctx = agentcontrol.WithClientID(agentcontrol.WithBinding(context.Background(), b), "conn-1")
+	if err := p.handleNew(mctx); err != nil {
+		t.Fatalf("handleNew: %v", err)
+	}
+
+	if got := p.control.SessionBindings(sidA); !reflect.DeepEqual(got, []string{"conn-1"}) {
+		t.Fatalf("session A bindings after /new = %v, want [conn-1]", got)
+	}
+	if got := p.control.SessionBindings(sidB); len(got) != 0 {
+		t.Fatalf("session B bindings after /new = %v, want empty", got)
+	}
+	if p.manager.Get(sidA) == nil {
+		t.Fatal("previously loaded session A must remain alive after /new on session B")
+	}
+	if p.manager.Get(sidB) != nil {
+		t.Fatal("session B must be released after its final binding is removed")
+	}
+}
+
+func TestReleaseConnectionReleasesAllBoundSessions(t *testing.T) {
+	p := newPersistedPlugin(t, fixedProvider{content: "x"})
+	sidA := p.CurrentSessionID()
+	sidB := newPersistedSession(t, p, fixedProvider{content: "x"})
+	p.BindConnectionSessionReference("conn-1", sidA)
+	p.BindConnectionSessionReference("conn-1", sidB)
+	_ = newPersistedSession(t, p, fixedProvider{content: "x"})
+
+	p.ReleaseConnection("conn-1")
+	for _, sessionID := range []string{sidA, sidB} {
+		if p.manager.Get(sessionID) != nil {
+			t.Errorf("session %s remains registered after disconnect", sessionID)
+		}
+		if got := p.control.SessionBindings(sessionID); len(got) != 0 {
+			t.Errorf("session %s bindings after disconnect = %v, want empty", sessionID, got)
+		}
 	}
 }
