@@ -73,11 +73,19 @@ func (w *acpWorker) setSession(sessionID, cwd string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	collectTools := runtimeagent.DefaultTools
+	collectTools := func(cfg *sandbox.Config, options runtimeagent.ToolCollectionOptions) []core.Tool {
+		if options.DisableDefaultTools {
+			return nil
+		}
+		return runtimeagent.DefaultTools(cfg)
+	}
 	if w.caller != nil && len(w.deviceTools) > 0 {
 		relayed := RelayDeviceTools(w.caller, w.deviceTools)
-		collectTools = func(cfg *sandbox.Config) []core.Tool {
-			tools := runtimeagent.DefaultTools(cfg)
+		collectTools = func(cfg *sandbox.Config, options runtimeagent.ToolCollectionOptions) []core.Tool {
+			tools := make([]core.Tool, 0, len(relayed)+3)
+			if !options.DisableDefaultTools {
+				tools = append(tools, runtimeagent.DefaultTools(cfg)...)
+			}
 			return append(tools, relayed...)
 		}
 	}

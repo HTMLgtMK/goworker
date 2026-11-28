@@ -19,10 +19,8 @@ import (
 // AgentPlugin 将控制操作委托给 agentcontrol，并适配宿主的会话、journal 和设备能力。
 // 控制面职责与依赖边界见 ../../../docs/README.md。
 
-// RunControlSource 编译期断言:AgentPlugin 满足可选能力接口,handler
-// 以 type-assert 获取(SessionSource 先例,capability.go:61-78)。
+// RunControlSource 编译期断言:AgentPlugin 提供唯一的连接级后台 Run 提交入口。
 var _ model.RunControlSource = (*AgentPlugin)(nil)
-var _ model.NegotiatedRunControlSource = (*AgentPlugin)(nil)
 var _ model.SessionTitleSource = (*AgentPlugin)(nil)
 
 // InternalRunner 编译期断言：AgentPlugin 实现受限的同步宿主入口。该接口只隔离静态方法集，
@@ -132,21 +130,20 @@ func (p *AgentPlugin) runJournalStore() *session.RunJournalStore {
 // RunControlSource methods. Control orchestration, lease fencing, idempotency, and
 // approval ownership live in agentcontrol.Service; this plugin supplies runtime access.
 
-// StartRun submits a background run after routing the session. The Service performs
-// lease fencing and per-(session, request) idempotency before committing to the manager.
-func (p *AgentPlugin) StartRun(sessionID, connectionID, input, requestID string) (string, string, error) {
-	return p.StartRunWithTools(sessionID, connectionID, input, requestID, nil)
-}
-
-// StartRunWithTools freezes the negotiated device-tool source into the initial run
-// submission. The idempotency registry ignores sources on replays by construction.
-func (p *AgentPlugin) StartRunWithTools(sessionID, connectionID, input, requestID string, toolSource func(context.Context) []core.Tool) (string, string, error) {
+// StartRun submits a background run. The connection's tool source and default-tool policy
+// are captured with the first idempotent submission and cannot be replaced by retries.
+func (p *AgentPlugin) StartRun(sessionID, connectionID, input, requestID string, options model.RunToolOptions) (string, string, error) {
 	if err := p.requireWritableSessionWorkspace(sessionID); err != nil {
 		return "", "", err
 	}
 	// RunCallbacks stays frontend-only; title proposals ride the AfterAgent middleware,
 	// which the runtime mounts from SessionDeps.TitleStore for every run.
-	runID, state, err := p.control.StartRunWithTools(sessionID, connectionID, input, requestID, runtimeagent.RunCallbacks{}, toolSource)
+	req := runtimeagent.RunRequest{
+		Input:       input,
+		ToolOptions: options.ToolOptions,
+		ToolSource:  options.ToolSource,
+	}
+	runID, state, err := p.control.StartRun(sessionID, connectionID, requestID, req, runtimeagent.RunCallbacks{})
 	if errors.Is(err, runtimeagent.ErrSessionArchived) {
 		return "", "", fmt.Errorf("agent: session %q is archived and read-only", sessionID)
 	}

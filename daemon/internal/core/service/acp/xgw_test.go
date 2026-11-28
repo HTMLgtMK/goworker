@@ -58,6 +58,33 @@ func fakeLeaseLostErr(sessionID, connectionID string) error {
 	return fmt.Errorf("fakeRunControl: session %q: connection %q: %w", sessionID, connectionID, errFakeLeaseLost)
 }
 
+type policyRunControl struct {
+	*fakeRunControl
+	disableDefaultTools bool
+}
+
+func (f *policyRunControl) StartRun(sessionID, connectionID, input, requestID string, options model.RunToolOptions) (string, string, error) {
+	f.disableDefaultTools = options.ToolOptions.DisableDefaultTools
+	return f.fakeRunControl.StartRun(sessionID, connectionID, input, requestID, options)
+}
+
+func TestXGWRunStartAppliesMobileDefaultToolPolicy(t *testing.T) {
+	base := newFakeRunControl()
+	base.leases["s1"] = "conn-mobile"
+	runs := &policyRunControl{fakeRunControl: base}
+	handler := &FrontendHandler{runs: runs, connectionID: "conn-mobile", mobileClient: true}
+	params, err := json.Marshal(XRunStartParams{SessionID: "s1", Input: "run", RequestID: "request-1"})
+	if err != nil {
+		t.Fatalf("marshal params: %v", err)
+	}
+	if _, err := handler.xgwRunStart(context.Background(), params); err != nil {
+		t.Fatalf("xgwRunStart: %v", err)
+	}
+	if !runs.disableDefaultTools {
+		t.Fatal("mobile x-goworker/run/start did not disable default tools")
+	}
+}
+
 // fakeRunControl scripts RunControlSource behavior, including idempotent retries, server-side
 // approval ownership, and lease fencing. Its mutex keeps validation and submission atomic with
 // takeover, matching the production contract.
@@ -139,7 +166,7 @@ func (s *xgwStack) canonicalSessionID(t *testing.T, sessionID string) string {
 	return sessionID
 }
 
-func (f *fakeRunControl) StartRun(sessionID, connectionID, input, requestID string) (string, string, error) {
+func (f *fakeRunControl) StartRun(sessionID, connectionID, input, requestID string, _ model.RunToolOptions) (string, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// fencing mirror:lease 校验先行,未持有一律拒绝(见 fakeRunControl 注释)。

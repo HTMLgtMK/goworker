@@ -96,6 +96,7 @@ type FrontendHandler struct {
 	deviceCaller      model.DeviceCaller
 	deviceDescriptors []acpworker.DeviceToolDescriptor
 	deviceProbeCancel context.CancelFunc
+	mobileClient      bool
 
 	// selectionCommitHook 仅供测试，在管理门禁释放后、会话路由提交前注入并发交错。
 	selectionCommitHook func(sessionID string)
@@ -188,7 +189,20 @@ func NewFrontendHandlerFactory(evaluate Evaluator, commands func() []model.Comma
 // InitializeReady negotiates x-device/tools exactly once after initialize's
 // response has reached the transport. No authentication is implied by this state.
 func (h *FrontendHandler) InitializeReady(ctx context.Context, reporter aiacp.Reporter) {
+	if capable, ok := reporter.(interface {
+		ClientCapabilities() protocol.ClientCapabilities
+	}); ok {
+		h.mu.Lock()
+		h.mobileClient = isMobileClient(capable.ClientCapabilities())
+		h.mu.Unlock()
+	}
 	h.initializeOnce.Do(func() { h.initializeDeviceTools(ctx, reporter) })
+}
+
+func (h *FrontendHandler) mobileClientEnabled() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.mobileClient
 }
 
 func (h *FrontendHandler) initializeDeviceTools(ctx context.Context, reporter aiacp.Reporter) {
@@ -674,8 +688,9 @@ func (h *FrontendHandler) Prompt(ctx context.Context, sessionID string, prompt [
 			EmitToken: func(token core.Token) {
 				reporter.Update(sessionID, TokenToUpdate(token))
 			},
-			Decide:     model.DecideViaACP(ctx, reporter, sessionID),
-			ToolSource: h.deviceToolSource(sessionID),
+			Decide:      model.DecideViaACP(ctx, reporter, sessionID),
+			ToolSource:  h.deviceToolSource(sessionID),
+			ToolOptions: model.ToolCollectionOptions{DisableDefaultTools: h.mobileClientEnabled()},
 		},
 		Values: make(map[string]any),
 	}

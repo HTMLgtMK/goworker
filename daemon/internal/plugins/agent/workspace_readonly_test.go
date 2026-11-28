@@ -59,7 +59,7 @@ func TestMissingWorkspaceAllowsHistoryButRejectsMutations(t *testing.T) {
 	if !p.HoldControl(id, "client") {
 		t.Fatal("historical session control was not acquired")
 	}
-	if _, _, err := p.StartRun(id, "client", "hello", "request-1"); err == nil || !strings.Contains(err.Error(), "read-only") {
+	if _, _, err := p.StartRun(id, "client", "hello", "request-1", model.RunToolOptions{}); err == nil || !strings.Contains(err.Error(), "read-only") {
 		t.Fatalf("x-goworker run on unavailable workspace = %v, want read-only error", err)
 	}
 	binding := &agentcontrol.SessionBinding{}
@@ -141,7 +141,7 @@ func TestWorkspaceRemovedAfterLoadFencesPromptAndRunStarts(t *testing.T) {
 	if !p.HoldControl(id, "client") {
 		t.Fatal("session control was not acquired")
 	}
-	if _, _, err := p.StartRun(id, "client", "hello", "request-removed-workspace"); err == nil || !strings.Contains(err.Error(), "read-only") {
+	if _, _, err := p.StartRun(id, "client", "hello", "request-removed-workspace", model.RunToolOptions{}); err == nil || !strings.Contains(err.Error(), "read-only") {
 		t.Fatalf("background start after workspace removal = %v, want read-only error", err)
 	}
 	if rt := p.RouteSession(id); rt == nil || rt.Active() != nil {

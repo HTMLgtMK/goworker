@@ -760,7 +760,7 @@ func TestReservationFailureRechecksSuspendedReleaseWithoutLeaseLifecycleDeadlock
 
 	startResult := make(chan error, 1)
 	go func() {
-		_, _, err := p.StartRun(sessionID, connectionID, "never executed", "request")
+		_, _, err := p.StartRun(sessionID, connectionID, "never executed", "request", model.RunToolOptions{})
 		startResult <- err
 	}()
 	select {

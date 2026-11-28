@@ -159,7 +159,7 @@ func (s *Session) Run(ctx context.Context, req RunRequest, cb RunCallbacks) (Run
 		}
 		sandboxCfg.AllowedWorkDir = cwd
 	}
-	tools := s.deps.CollectTools(&sandboxCfg)
+	tools := s.deps.CollectTools(&sandboxCfg, req.ToolOptions)
 	// 连接级工具源惰性合并：probe 只在本轮确实收集工具时发生一次，probe 失败
 	// 返回空切片，不影响 bash/mcp 工具。
 	if req.ToolSource != nil {

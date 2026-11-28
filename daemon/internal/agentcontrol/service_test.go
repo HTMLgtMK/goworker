@@ -51,7 +51,7 @@ func newTestService(t *testing.T, pv core.Provider) (*Service, *runtimeagent.Ses
 	cfg := runtimeconfig.Default()
 	deps := runtimeagent.SessionDeps{
 		Config: cfg,
-		CollectTools: func(*sandbox.Config) []core.Tool {
+		CollectTools: func(*sandbox.Config, runtimeagent.ToolCollectionOptions) []core.Tool {
 			return nil
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
@@ -114,7 +114,7 @@ func TestServiceStartRunFencing(t *testing.T) {
 	s, _ := newTestService(t, fixedProvider{content: "svc-done"})
 
 	// fencing:未持有的连接一律拒绝,且不入幂等表。
-	if _, _, err := s.StartRun("current", "conn-other", "hello", "req-fenced", runtimeagent.RunCallbacks{}); !errors.Is(err, ErrControlLeaseLost) {
+	if _, _, err := s.StartRun("current", "conn-other", "req-fenced", runtimeagent.RunRequest{Input: "hello"}, runtimeagent.RunCallbacks{}); !errors.Is(err, ErrControlLeaseLost) {
 		t.Fatalf("StartRun without lease err = %v, want ErrControlLeaseLost", err)
 	}
 	if _, tracked := s.TrackedRequest("current", "req-fenced"); tracked {
@@ -124,7 +124,7 @@ func TestServiceStartRunFencing(t *testing.T) {
 		t.Fatal("test setup: fresh acquire must not report takeover")
 	}
 
-	runID, state, err := s.StartRun("current", "conn-A", "hello", "req-1", runtimeagent.RunCallbacks{})
+	runID, state, err := s.StartRun("current", "conn-A", "req-1", runtimeagent.RunRequest{Input: "hello"}, runtimeagent.RunCallbacks{})
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestServiceStartRunFencing(t *testing.T) {
 	waitForRunStatus(t, s, "current", runID, string(runtimeagent.RunCompleted))
 
 	// 未注册会话:路由先于 lease 校验,ErrSessionNotFound 语义。
-	if _, _, err := s.StartRun("bogus", "conn-A", "x", "req-2", runtimeagent.RunCallbacks{}); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
+	if _, _, err := s.StartRun("bogus", "conn-A", "req-2", runtimeagent.RunRequest{Input: "x"}, runtimeagent.RunCallbacks{}); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
 		t.Fatalf("StartRun with unknown session err = %v, want ErrSessionNotFound", err)
 	}
 }
@@ -151,11 +151,11 @@ func TestServiceStartRunIdempotency(t *testing.T) {
 	if s.AcquireControl("current", "conn-A") {
 		t.Fatal("test setup: fresh acquire must not report takeover")
 	}
-	id1, _, err := s.StartRun("current", "conn-A", "q", "req-dup", runtimeagent.RunCallbacks{})
+	id1, _, err := s.StartRun("current", "conn-A", "req-dup", runtimeagent.RunRequest{Input: "q"}, runtimeagent.RunCallbacks{})
 	if err != nil {
 		t.Fatalf("StartRun #1: %v", err)
 	}
-	id2, _, err := s.StartRun("current", "conn-A", "q", "req-dup", runtimeagent.RunCallbacks{})
+	id2, _, err := s.StartRun("current", "conn-A", "req-dup", runtimeagent.RunRequest{Input: "q"}, runtimeagent.RunCallbacks{})
 	if err != nil {
 		t.Fatalf("StartRun retry: %v", err)
 	}
@@ -163,12 +163,12 @@ func TestServiceStartRunIdempotency(t *testing.T) {
 		t.Fatalf("retry runID = %q, want original %q", id2, id1)
 	}
 
-	if _, _, err := s.StartRun("current", "conn-A", "q-changed", "req-dup", runtimeagent.RunCallbacks{}); !errors.Is(err, ErrRequestConflict) {
+	if _, _, err := s.StartRun("current", "conn-A", "req-dup", runtimeagent.RunRequest{Input: "q-changed"}, runtimeagent.RunCallbacks{}); !errors.Is(err, ErrRequestConflict) {
 		t.Fatalf("different-input retry err = %v, want ErrRequestConflict", err)
 	}
 
 	waitForRunStatus(t, s, "current", id1, string(runtimeagent.RunCompleted))
-	id3, _, err := s.StartRun("current", "conn-A", "q", "req-other", runtimeagent.RunCallbacks{})
+	id3, _, err := s.StartRun("current", "conn-A", "req-other", runtimeagent.RunRequest{Input: "q"}, runtimeagent.RunCallbacks{})
 	if err != nil {
 		t.Fatalf("StartRun #3: %v", err)
 	}

@@ -83,7 +83,7 @@ func TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles(t *testing.T) {
 	// 在飞后台 Run：持 lease 提交（fencing），等 run 真实开工（RunStatus 的
 	// active 分支报 running）。
 	p.AcquireControl(sid, "conn-e2e")
-	runID, _, err := p.StartRun(sid, "conn-e2e", "hello", "req-e2e-stop")
+	runID, _, err := p.StartRun(sid, "conn-e2e", "hello", "req-e2e-stop", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestE2E_PluginStopConvergesInFlightRunAndReleasesHandles(t *testing.T) {
 
 	// ② manager 停机：提交面拒绝（经 Service 委托链的 closed 检查——route 的
 	// 「current 优先」停机后仍可解析，拒绝语义由 manager 的 closed 检查给出）。
-	if _, _, err := p.StartRun(sid, "conn-e2e", "x", "req-post-stop"); !errors.Is(err, runtimeagent.ErrManagerClosed) {
+	if _, _, err := p.StartRun(sid, "conn-e2e", "x", "req-post-stop", model.RunToolOptions{}); !errors.Is(err, runtimeagent.ErrManagerClosed) {
 		t.Fatalf("StartRun after Stop = %v, want ErrManagerClosed", err)
 	}
 	// 读侧观测面在停机后仍可用：RunStatus 经 journal 权威分支（磁盘事实源）

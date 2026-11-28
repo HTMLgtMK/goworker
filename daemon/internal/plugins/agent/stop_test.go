@@ -11,6 +11,7 @@ import (
 	"github.com/tinguo/goworker/ai-core/core"
 	runtimeagent "github.com/tinguo/goworker/ai-runtime/agent"
 	"github.com/tinguo/goworker/ai-runtime/session"
+	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
 // stop_test.go 验证插件停止时 run、维护请求、后台固化、事件订阅和 store 均正确收口。
@@ -25,7 +26,7 @@ func TestPluginStopClosesManager(t *testing.T) {
 	// 在飞后台 Run：提交后等真实开工（started 关闭 ⇒ run.started 已发布），
 	// 不释放闸门——Stop 的 manager.Close 依赖 runCtx 取消收敛它。
 	p.AcquireControl(sid, "conn-stop")
-	runID, _, err := p.StartRun(sid, "conn-stop", "hello", "req-stop")
+	runID, _, err := p.StartRun(sid, "conn-stop", "hello", "req-stop", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
@@ -87,7 +88,7 @@ func TestPluginStopClosesManager(t *testing.T) {
 	// 拒绝（route 的「current 优先」在停机后仍可解析——p.current 不随注册表
 	// 清空，拒绝语义由 manager 的 closed 检查给出，诚实且不含糊）。停机后无
 	// 「看似健康」的提交面。
-	if _, _, err := p.StartRun(sid, "conn-stop", "x", "req-post-stop"); !errors.Is(err, runtimeagent.ErrManagerClosed) {
+	if _, _, err := p.StartRun(sid, "conn-stop", "x", "req-post-stop", model.RunToolOptions{}); !errors.Is(err, runtimeagent.ErrManagerClosed) {
 		t.Fatalf("StartRun after Stop = %v, want ErrManagerClosed", err)
 	}
 
@@ -177,7 +178,7 @@ func TestStopClosesMaintenanceAdmissionBeforeManagerClose(t *testing.T) {
 	t.Cleanup(releaseRun)
 	sid := p.CurrentSessionID()
 	p.AcquireControl(sid, "conn-stop-admission")
-	if _, _, err := p.StartRun(sid, "conn-stop-admission", "hello", "req-stop-admission"); err != nil {
+	if _, _, err := p.StartRun(sid, "conn-stop-admission", "hello", "req-stop-admission", model.RunToolOptions{}); err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
 	select {
@@ -249,7 +250,7 @@ func TestStopDrainsMaintenanceWaitingBehindRunGate(t *testing.T) {
 	p := newPersistedPlugin(t, gated)
 	sid := p.CurrentSessionID()
 	p.AcquireControl(sid, "conn-gate-drain")
-	if _, _, err := p.StartRun(sid, "conn-gate-drain", "hello", "req-gate-drain"); err != nil {
+	if _, _, err := p.StartRun(sid, "conn-gate-drain", "hello", "req-gate-drain", model.RunToolOptions{}); err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
 	select {

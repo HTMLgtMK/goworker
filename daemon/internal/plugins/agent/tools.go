@@ -21,13 +21,15 @@ func (p *AgentPlugin) sandboxConfig() sandbox.Config {
 	return *sandbox.NewFromConfig(&p.cfg.Sandbox)
 }
 
-func (p *AgentPlugin) collectTools(cfg *sandbox.Config) []core.Tool {
-	return p.collectToolsWithResources(cfg, p.currentResources())
+func (p *AgentPlugin) collectTools(cfg *sandbox.Config, options runtimeagent.ToolCollectionOptions) []core.Tool {
+	return p.collectToolsWithResources(cfg, p.currentResources(), options)
 }
 
-func (p *AgentPlugin) collectToolsWithResources(cfg *sandbox.Config, resources *sessionResources) []core.Tool {
+func (p *AgentPlugin) collectToolsWithResources(cfg *sandbox.Config, resources *sessionResources, options runtimeagent.ToolCollectionOptions) []core.Tool {
 	var tools []core.Tool
-	tools = append(tools, runtimeagent.DefaultTools(cfg)...)
+	if !options.DisableDefaultTools {
+		tools = append(tools, runtimeagent.DefaultTools(cfg)...)
+	}
 
 	if p.hub != nil && p.hub.Tools != nil {
 		for _, t := range p.hub.Tools() {

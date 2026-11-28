@@ -315,7 +315,7 @@ per-seq 事件后逐条下行，与实时流形状完全一致。
 ```json
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
      "protocolVersion":1,
-     "clientCapabilities":{"x-device":{"tools":true}}
+     "clientCapabilities":{"mobile":true,"x-device":{"tools":true}}
    }}
 ← {"jsonrpc":"2.0","id":1,"result":{
      "protocolVersion":1,
@@ -325,6 +325,13 @@ per-seq 事件后逐条下行，与实时流形状完全一致。
 
 **clientCapabilities（client 声明）**
 
+- `mobile: true` 表示该 ACP 连接运行在受限移动端环境。该连接的 `session/prompt` 与
+  `x-goworker/run/start` 不注册 runtime 默认的 `bash`、`read_file`、`write_file` 工具；
+  其他连接不受影响。插件工具、MCP 工具及 `x-device` 设备工具仍按原能力协商提供，
+  即使它们与默认工具同名也不会被误过滤。仅 JSON boolean `true` 生效，缺失、false
+  或其他 JSON 类型均按普通客户端处理。每次建立 ACP 连接都要重新声明；这是客户端
+  能力声明，不是授权凭证或安全隔离机制。`mobile` 与 `x-device` 相互独立：不需要
+  设备工具的客户端可以只声明 `{"mobile":true}`。
 - `x-device` key 存在性即门控，value 当前不解析。`{"x-device":{"tools":true}}`
   是现行声明形状；服务端不会检查嵌套的协议版本或 `sessionRunIdentity`。
 - 声明 `x-device` 等同于承诺完整实现 `x-device/tools` 和当前版本的 `x-device/call`
@@ -350,7 +357,7 @@ per-seq 事件后逐条下行，与实时流形状完全一致。
 
 **客户端迁移清单（旧 AAR → capability 门控版 AAR）**
 
-1. initialize params 补 `clientCapabilities: {"x-device": {"tools": true}}`；仅在客户端已实现本节的新 `x-device/call` wire contract 后声明该 key。现有服务端不解析嵌套版本字段。
+1. 纯移动端在 initialize params 声明 `clientCapabilities: {"mobile": true}`，避免默认桌面工具进入模型工具集。需要设备工具时，再同时声明 `"x-device": {"tools": true}`；仅在客户端已实现本节的新 `x-device/call` wire contract 后声明该 key。现有服务端不解析 `x-device` 的嵌套版本字段。
 2. 在发送 initialize 前注册 `x-device/tools` / `x-device/call` handler，处理 `sessionId`、`runId`；设备调用的 `sessionId` 是 canonical session ID，可据此关联该会话的 workspace。
 3. 保存 initialize 响应的 `agentCapabilities`，UI 按能力降级；保留 -32601 兜底、权限对话框语义。对已发出但结果不确定的设备调用不得自动重试。
 4. 新 AAR（app-service 路径）要求客户端声明 `clientCapabilities`（见上节），未声明时设备工具静默为零；Host 侧已强制启用 ACP service —— 显式注入连接时 `frontend.acp.enabled` 开关无效，装配层无视该开关注册 service。
@@ -393,6 +400,27 @@ NewHost(configDir, callbacks)   只存 configDir 与回调，不校验配置
 预置（app 首启引导生成），或后续经 agent 的命令通道设置。**会话持久化现在真的
 生效**：旧 worker 路径 Store=nil 纯内存，重启进程即丢；app-service 路径经
 session store 落 JSONL，同一 configDir 重建 Host 后 `session/load` 可恢复。
+
+### 应用层管理用户画像与指令
+
+应用可直接编辑传给 `NewHost(configDir, callbacks)` 的目录下两个 UTF-8 文件：
+
+- `<configDir>/USER.md`：用户画像与偏好。文件名是单数 `USER.md`，不是 `USERS.md`。
+- `<configDir>/AGENTS.md`：全局 agent 行为指令。两者缺失时对应内容为空，不阻止启动。
+
+`config.yaml` 中 `memory.enabled` 必须为 `true`，否则两个文件都不会注入。默认
+`memory.user_max_chars` 为 1500、`memory.agents_max_chars` 为 4096，单位都是
+Unicode 字符；手写内容超限时注入内容会被截断。agent 的 `profile` 工具仍可能修改
+`USER.md`，应用保存时应考虑与 agent 写入发生冲突，不能假设文件只由 UI 修改。
+
+指令在资源加载时形成不可变快照，**编辑文件不会实时更新现有快照**。ACP
+`session/new` 当前复用已有资源快照，不能依靠新建会话刷新。移动端要确保新内容
+生效，应保存文件后关闭并重新创建 Host，再重新连接；需要继续历史会话时使用
+`session/load`。可在目标会话发送 `/rules` 查看其实际指令快照。
+
+全局 `AGENTS.md` 之外，后端还会从进程当前工作目录向上查找最近的项目级
+`AGENTS.md` 并合并；这个查找不以 ACP `session/new` 的 `cwd` 为起点。移动端
+需要全局一致的配置时，应编辑上述 `<configDir>/AGENTS.md`。
 
 ## 系统能力工具：x-device 扩展（已实现）
 

@@ -14,6 +14,7 @@ import (
 	"github.com/tinguo/goworker/ai-runtime/hitl"
 	"github.com/tinguo/goworker/ai-runtime/session"
 	"github.com/tinguo/goworker/daemon/internal/agentcontrol"
+	"github.com/tinguo/goworker/daemon/internal/core/model"
 )
 
 // runcontrol_test.go 验证 AgentPlugin 对 RunControlSource 的委托，包括 lease fencing、
@@ -54,14 +55,14 @@ func TestStartRunThroughPlugin(t *testing.T) {
 	sid := p.CurrentSessionID() // 纯内存形态为空串,经 RouteSession 的 current 回退寻址当前会话
 
 	// fencing(第三轮评审 I4):未持有 lease 的连接一律拒绝。
-	if _, _, err := p.StartRun(sid, "conn-other", "hello", "req-fenced"); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
+	if _, _, err := p.StartRun(sid, "conn-other", "hello", "req-fenced", model.RunToolOptions{}); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
 		t.Fatalf("StartRun without lease err = %v, want agentcontrol.ErrControlLeaseLost", err)
 	}
 	if p.AcquireControl(sid, "conn-A") {
 		t.Fatal("test setup: fresh acquire must not report takeover")
 	}
 
-	runID, state, err := p.StartRun(sid, "conn-A", "hello", "req-start-1")
+	runID, state, err := p.StartRun(sid, "conn-A", "hello", "req-start-1", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
@@ -84,7 +85,7 @@ func TestStartRunThroughPlugin(t *testing.T) {
 
 	// 未注册的 sessionID → 明确错误(非 current-only 拒绝:同 id 或空串仍可达;
 	// 路由先于 lease 校验,ErrSessionNotFound 语义不受 fencing 影响)。
-	if _, _, err := p.StartRun("not-a-registered-session", "conn-A", "x", "req-start-2"); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
+	if _, _, err := p.StartRun("not-a-registered-session", "conn-A", "x", "req-start-2", model.RunToolOptions{}); !errors.Is(err, runtimeagent.ErrSessionNotFound) {
 		t.Fatalf("StartRun with unknown sessionID err = %v, want ErrSessionNotFound", err)
 	}
 }
@@ -123,7 +124,7 @@ func TestRequestIdempotency(t *testing.T) {
 	sid := p.CurrentSessionID()
 	p.AcquireControl(sid, "conn-A") // fencing(第三轮评审 I4):控制操作须持 lease
 
-	id1, st1, err := p.StartRun(sid, "conn-A", "q", "req-dup")
+	id1, st1, err := p.StartRun(sid, "conn-A", "q", "req-dup", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun #1: %v", err)
 	}
@@ -133,7 +134,7 @@ func TestRequestIdempotency(t *testing.T) {
 
 	// 同 requestID 重试:首个 run 可能仍在跑(返回原 runID 幂等短路)或已完成
 	// (返回原 runID + 终态快照)——两种时序都必须同 runID、无错误。
-	id2, st2, err := p.StartRun(sid, "conn-A", "q", "req-dup")
+	id2, st2, err := p.StartRun(sid, "conn-A", "q", "req-dup", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun retry: %v", err)
 	}
@@ -148,7 +149,7 @@ func TestRequestIdempotency(t *testing.T) {
 
 	// 等首个 run 终态后再用不同 requestID:必须起新 run,不复用。
 	waitForRunStatus(t, p, sid, id1, string(runtimeagent.RunCompleted))
-	id3, _, err := p.StartRun(sid, "conn-A", "q", "req-other")
+	id3, _, err := p.StartRun(sid, "conn-A", "q", "req-other", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun #3: %v", err)
 	}
@@ -328,7 +329,7 @@ func TestAttachEnsureHubAndJournalStatus(t *testing.T) {
 
 	// ② 后台 Run 完成 → RunStatus 经 journal 路径返回 completed + latestSeq>0。
 	p.AcquireControl(sid, "conn-A") // fencing(第三轮评审 I4):控制操作须持 lease
-	runID, _, err := p.StartRun(sid, "conn-A", "hello", "req-journal")
+	runID, _, err := p.StartRun(sid, "conn-A", "hello", "req-journal", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}
@@ -442,7 +443,7 @@ func TestEnsureHubSeedErrorPropagates(t *testing.T) {
 	// StartRun:lease 照常(fencing 校验与播种无关),manager.StartRun ⑥ 接线
 	// 失败 → 拒绝 + 空 runID。
 	p.AcquireControl(sid, "conn-A")
-	runID, _, err := p.StartRun(sid, "conn-A", "hello", "req-i3-seed")
+	runID, _, err := p.StartRun(sid, "conn-A", "hello", "req-i3-seed", model.RunToolOptions{})
 	if err == nil {
 		t.Fatal("StartRun with failing SeqRange = nil error, want error(I3)")
 	}
@@ -465,7 +466,7 @@ func TestEnsureHubSeedErrorPropagates(t *testing.T) {
 	// 恢复播种后重提成功 = active 清退与 pending 令牌归还没有残留的联合证明;
 	// 随后走完正常生命周期。
 	ej.seedErr = nil
-	runID2, _, err := p.StartRun(sid, "conn-A", "hello-2", "req-i3-retry")
+	runID2, _, err := p.StartRun(sid, "conn-A", "hello-2", "req-i3-retry", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun after seeding recovery = %v, want nil(failed wiring left residue)", err)
 	}
@@ -567,7 +568,7 @@ func TestCrossSessionRunControl(t *testing.T) {
 	p.AcquireControl(sidA, "conn-A")
 
 	// A 的后台 run 提交并等它真实开工(started 关闭 ⇒ run.started 事件已发布)。
-	runA, _, err := p.StartRun(sidA, "conn-A", "hello-A", "req-cross-A")
+	runA, _, err := p.StartRun(sidA, "conn-A", "hello-A", "req-cross-A", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun(A): %v", err)
 	}
@@ -629,7 +630,7 @@ func TestCrossSessionRunControl(t *testing.T) {
 
 	// B 的控制面不受影响:B 正常起跑并完成(持自己的 lease)。
 	p.AcquireControl(sidB, "conn-B")
-	runB, _, err := p.StartRun(sidB, "conn-B", "world-B", "req-cross-B")
+	runB, _, err := p.StartRun(sidB, "conn-B", "world-B", "req-cross-B", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun(B): %v", err)
 	}
@@ -647,7 +648,7 @@ func TestCrossSessionRequestIdempotency(t *testing.T) {
 	p.AcquireControl(sidA, "conn-A") // fencing(第三轮评审 I4):控制操作须持 lease
 
 	// A 用 req-x 提交并等终态:后续判定不被 queued/running 时序干扰。
-	runA, _, err := p.StartRun(sidA, "conn-A", "payload-A", "req-x")
+	runA, _, err := p.StartRun(sidA, "conn-A", "payload-A", "req-x", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun(A): %v", err)
 	}
@@ -659,7 +660,7 @@ func TestCrossSessionRequestIdempotency(t *testing.T) {
 	// 第二轮评审 I5:B 用同 requestId、不同 Input → 独立起跑成功(幂等作用域
 	// 是会话),拿到自己的新 run,绝不误返 A 的 run。
 	p.AcquireControl(sidB, "conn-B")
-	runB, _, err := p.StartRun(sidB, "conn-B", "payload-B", "req-x")
+	runB, _, err := p.StartRun(sidB, "conn-B", "payload-B", "req-x", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun(B, same requestID, different input): %v", err)
 	}
@@ -669,7 +670,7 @@ func TestCrossSessionRequestIdempotency(t *testing.T) {
 	waitForRunStatus(t, p, sidB, runB, string(runtimeagent.RunCompleted))
 
 	// A 的 run 不受 B 提交影响:同键同 Input 幂等返回原 runID 与终态快照。
-	id2, st2, err := p.StartRun(sidA, "conn-A", "payload-A", "req-x")
+	id2, st2, err := p.StartRun(sidA, "conn-A", "payload-A", "req-x", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun(A, same requestID, same input): %v", err)
 	}
@@ -679,11 +680,11 @@ func TestCrossSessionRequestIdempotency(t *testing.T) {
 
 	// 同会话(B)同 requestID(req-x):同 Input 幂等返回原 runID;不同 Input →
 	// agentcontrol.ErrRequestConflict(上轮 I5 的 Input 指纹校验收窄到同键范围)。
-	id3, _, err := p.StartRun(sidB, "conn-B", "payload-B", "req-x")
+	id3, _, err := p.StartRun(sidB, "conn-B", "payload-B", "req-x", model.RunToolOptions{})
 	if err != nil || id3 != runB {
 		t.Fatalf("same-key retry = (%q, %v), want (%q, nil)", id3, err, runB)
 	}
-	if _, _, err := p.StartRun(sidB, "conn-B", "payload-B-changed", "req-x"); !errors.Is(err, agentcontrol.ErrRequestConflict) {
+	if _, _, err := p.StartRun(sidB, "conn-B", "payload-B-changed", "req-x", model.RunToolOptions{}); !errors.Is(err, agentcontrol.ErrRequestConflict) {
 		t.Fatalf("same-session same-key different-input err = %v, want agentcontrol.ErrRequestConflict", err)
 	}
 }
@@ -783,7 +784,7 @@ func TestActiveRunNonCurrentSession(t *testing.T) {
 	p.AcquireControl(sidA, "conn-A") // fencing(第三轮评审 I4):控制操作须持 lease
 
 	// A 的后台 run 提交并等它真实开工(started 关闭 ⇒ run 已 running)。
-	runA, _, err := p.StartRun(sidA, "conn-A", "hello-A", "req-active-A")
+	runA, _, err := p.StartRun(sidA, "conn-A", "hello-A", "req-active-A", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun(A): %v", err)
 	}
@@ -885,7 +886,7 @@ func TestControlFencingTakeoverStorm(t *testing.T) {
 	}
 
 	// —— 接管前基线:三类控制操作各成功一次,审批决策恰好送达一次 ——
-	runID, _, err := p.StartRun(sid, "conn-A", "storm", "req-storm-run")
+	runID, _, err := p.StartRun(sid, "conn-A", "storm", "req-storm-run", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("pre-takeover StartRun: %v", err)
 	}
@@ -940,7 +941,7 @@ func TestControlFencingTakeoverStorm(t *testing.T) {
 		}
 		for i := 0; i < iters; i++ {
 			over := takenOver.Load()
-			_, _, errS := p.StartRun(sid, "conn-A", "storm", "req-storm-run")
+			_, _, errS := p.StartRun(sid, "conn-A", "storm", "req-storm-run", model.RunToolOptions{})
 			assertFenced("StartRun", over, errS)
 
 			over = takenOver.Load()
@@ -956,7 +957,7 @@ func TestControlFencingTakeoverStorm(t *testing.T) {
 
 	// —— 终态断言(风暴落定,B 的末次操作是释放 ⇒ lease 空闲,A 非持有者):
 	// fencing 的确定性收束,A 的全部控制操作一律明确错误 ——
-	if _, _, err := p.StartRun(sid, "conn-A", "storm", "req-storm-run"); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
+	if _, _, err := p.StartRun(sid, "conn-A", "storm", "req-storm-run", model.RunToolOptions{}); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
 		t.Fatalf("post-storm StartRun err = %v, want agentcontrol.ErrControlLeaseLost", err)
 	}
 	if err := p.ResolveApproval(sid, "conn-A", "req-storm-2", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
@@ -1015,7 +1016,7 @@ func TestControlFencingDeterministicTakeover(t *testing.T) {
 	}
 
 	// ③ A 的三类控制操作全部 agentcontrol.ErrControlLeaseLost:守卫拒绝先于一切提交判定。
-	if _, _, err := p.StartRun(sid, "conn-A", "fenced", "req-det"); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
+	if _, _, err := p.StartRun(sid, "conn-A", "fenced", "req-det", model.RunToolOptions{}); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
 		t.Fatalf("fenced StartRun err = %v, want agentcontrol.ErrControlLeaseLost", err)
 	}
 	if err := p.ResolveApproval(sid, "conn-A", "req-det-approval", hitl.Decision{Type: hitl.DecisionApprove}); !errors.Is(err, agentcontrol.ErrControlLeaseLost) {
@@ -1088,7 +1089,7 @@ func TestCrossSessionStartRunNotBlockedByFsync(t *testing.T) {
 	var startErrA error
 	var runA string
 	go func() {
-		id, _, err := p.StartRun(sidA, "conn-A", "slow-A", "req-fsync-A")
+		id, _, err := p.StartRun(sidA, "conn-A", "slow-A", "req-fsync-A", model.RunToolOptions{})
 		runA, startErrA = id, err
 		close(startedA)
 	}()
@@ -1105,7 +1106,7 @@ func TestCrossSessionStartRunNotBlockedByFsync(t *testing.T) {
 	if p.AcquireControl(sidB, "conn-B") {
 		t.Fatal("acquire on idle session B must not report takeover (A 的慢 fsync 不得牵连 B)")
 	}
-	runB, _, err := p.StartRun(sidB, "conn-B", "fast-B", "req-fsync-B")
+	runB, _, err := p.StartRun(sidB, "conn-B", "fast-B", "req-fsync-B", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun(B) while A's fsync is stuck: %v (跨会话控制操作被串行化,DE2-I1 回归)", err)
 	}

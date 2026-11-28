@@ -113,6 +113,17 @@ type PendingApprovalInfo struct {
 	ExpiresAt time.Time
 }
 
+// ToolCollectionOptions is shared with the runtime so frontend, protocol, and run requests
+// carry one collection-policy value without translating individual fields.
+type ToolCollectionOptions = runtimeagent.ToolCollectionOptions
+
+// RunToolOptions carries request-scoped tool policy into a background run.
+// A nil ToolSource means this connection contributes no additional tools.
+type RunToolOptions struct {
+	ToolOptions ToolCollectionOptions
+	ToolSource  func(context.Context) []core.Tool
+}
+
 // RunControlSource exposes per-session control leases and fenced asynchronous operations.
 // Implementations atomically validate the lease with each control operation; connection close
 // releases its leases. Synchronous host-only methods are intentionally excluded.
@@ -121,7 +132,7 @@ type RunControlSource interface {
 	// must atomically validate the session lease and submit under the same guard used by
 	// AcquireControl. (sessionID, requestID) is the idempotency key: identical retries reuse
 	// the run; a different input for that key returns a conflict.
-	StartRun(sessionID, connectionID, input, requestID string) (runID, state string, err error)
+	StartRun(sessionID, connectionID, input, requestID string, options RunToolOptions) (runID, state string, err error)
 	// CancelRun 取消一个后台 Run(connectionID fencing 同 StartRun:lease 校验与
 	// 取消提交在同一受保护临界区内原子完成,接管后旧持有者一律拒绝)。
 	CancelRun(sessionID, connectionID, runID string) error
@@ -187,13 +198,6 @@ type ClientToolBinder interface {
 type NegotiatedClientToolBinder interface {
 	BindClientToolSpecs(sessionID, connectionID string, specs []runtimeagent.ClientToolSpec, caller DeviceCaller) bool
 	ClientToolSourceForSpecs(sessionID string, specs []runtimeagent.ClientToolSpec) func(ctx context.Context) []core.Tool
-}
-
-// NegotiatedRunControlSource submits an idempotent background run with the
-// connection's initialize-time device-tool snapshot. Implementations must capture
-// the source only in the first submission closure; retries reuse the existing run.
-type NegotiatedRunControlSource interface {
-	StartRunWithTools(sessionID, connectionID, input, requestID string, toolSource func(context.Context) []core.Tool) (runID, state string, err error)
 }
 
 // ErrSessionUnknown is the protocol-neutral missing-session sentinel used by session/load

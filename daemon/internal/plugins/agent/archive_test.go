@@ -235,7 +235,7 @@ func TestStartRunArchivedSessionRejected(t *testing.T) {
 		t.Fatalf("ArchiveSession: %v", err)
 	}
 
-	_, _, err := p.StartRun(sid, "conn-A", "hello", "req-arch-run-1")
+	_, _, err := p.StartRun(sid, "conn-A", "hello", "req-arch-run-1", model.RunToolOptions{})
 	if err == nil || !strings.Contains(err.Error(), "archived and read-only") {
 		t.Fatalf("StartRun on archived session = %v, want archived and read-only", err)
 	}

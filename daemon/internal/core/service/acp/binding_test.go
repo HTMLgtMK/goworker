@@ -141,7 +141,7 @@ func (f *pr2DualControl) CreateBoundSession(cwd string) (string, error) {
 	}
 	deps := runtimeagent.SessionDeps{
 		Config:       f.cfg,
-		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		CollectTools: func(*sandbox.Config, runtimeagent.ToolCollectionOptions) []core.Tool { return nil },
 		NewProvider:  func(*runtimeconfig.Config) (core.Provider, error) { return pv, nil },
 		RunEvents:    &memEventJournal{},
 	}
@@ -236,8 +236,12 @@ func (f *pr2DualControl) SessionModes() *model.SessionModeState { return nil }
 
 // ---- RunControlSource 面(薄委托真实 agentcontrol.Service) ----
 
-func (f *pr2DualControl) StartRun(sessionID, connectionID, input, requestID string) (string, string, error) {
-	return f.control.StartRun(sessionID, connectionID, input, requestID, runtimeagent.RunCallbacks{})
+func (f *pr2DualControl) StartRun(sessionID, connectionID, input, requestID string, options model.RunToolOptions) (string, string, error) {
+	return f.control.StartRun(sessionID, connectionID, requestID, runtimeagent.RunRequest{
+		Input:       input,
+		ToolOptions: options.ToolOptions,
+		ToolSource:  options.ToolSource,
+	}, runtimeagent.RunCallbacks{})
 }
 
 func (f *pr2DualControl) CancelRun(sessionID, connectionID, runID string) error {

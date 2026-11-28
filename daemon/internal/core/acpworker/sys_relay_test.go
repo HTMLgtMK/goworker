@@ -126,7 +126,7 @@ func TestRelayDeviceToolsForSessionWritesManagedIdentityToWire(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	sess := runtimeagent.NewSession(runtimeagent.SessionDeps{
 		Config: cfg,
-		CollectTools: func(*sandbox.Config) []core.Tool {
+		CollectTools: func(*sandbox.Config, runtimeagent.ToolCollectionOptions) []core.Tool {
 			return RelayDeviceToolsForSession(caller, []DeviceToolDescriptor{{Name: "vibrate", RiskLevel: "never"}}, runtimeID)
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) { return provider, nil },
@@ -187,7 +187,7 @@ func TestRelayDeviceToolsForSessionRejectsMismatchedManagedIdentity(t *testing.T
 	cfg := runtimeconfig.Default()
 	sess := runtimeagent.NewSession(runtimeagent.SessionDeps{
 		Config: cfg,
-		CollectTools: func(*sandbox.Config) []core.Tool {
+		CollectTools: func(*sandbox.Config, runtimeagent.ToolCollectionOptions) []core.Tool {
 			return RelayDeviceToolsForSession(caller, []DeviceToolDescriptor{{Name: "vibrate", RiskLevel: "never"}}, "runtime-B")
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) { return provider, nil },

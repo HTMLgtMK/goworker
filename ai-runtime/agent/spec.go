@@ -21,9 +21,18 @@ type RunRequest struct {
 	Input string
 	// Config is captured when a run is accepted; callers normally leave it nil.
 	Config *runtimeconfig.Config
+	// ToolOptions controls runtime default-tool collection for this run. The zero value
+	// preserves the normal tool set; request-scoped tools are independent.
+	ToolOptions ToolCollectionOptions
 	// ToolSource 是本轮请求的连接级工具源（nil = 无）。
 	// 惰性调用：probe 发生在 Session.Run 收集工具的时机。
 	ToolSource func(ctx context.Context) []core.Tool
+}
+
+// ToolCollectionOptions controls which built-in tools are collected for a run.
+// The zero value preserves the normal tool set; request-scoped tools are independent.
+type ToolCollectionOptions struct {
+	DisableDefaultTools bool
 }
 
 type RenderKind string
@@ -81,13 +90,14 @@ type RunStateJournal interface {
 // SessionDeps 是会话构造输入包：插件级资源 + 本会话参数，Init 组装后每次 NewSession 复用。
 // 其余字段跨会话不变。可变资源（instructions）的装载在 plugin 层，这里只收最终值。
 type SessionDeps struct {
-	Config               *runtimeconfig.Config                                  // Initial runtime configuration.
-	ConfigSnapshot       func() *runtimeconfig.Config                           // Current global config; called once for each accepted run.
-	ValidateCWD          func(cwd string, cfg *runtimeconfig.Config) error      // Revalidates an existing CWD against the immutable config snapshot used by this run.
-	AuditDir             string                                                 // sandbox 审计落盘目录
-	CWD                  string                                                 // 会话工作目录（client 经 wire 声明、宿主校验后注入）；空 = 未声明，工具回退 cfg.AllowedWorkDir
-	Memory               *memory.Client                                         // nil = 禁用
-	CollectTools         func(cfg *sandbox.Config) []core.Tool                  // 方法值捕获 p，按需收集工具
+	Config         *runtimeconfig.Config                             // Initial runtime configuration.
+	ConfigSnapshot func() *runtimeconfig.Config                      // Current global config; called once for each accepted run.
+	ValidateCWD    func(cwd string, cfg *runtimeconfig.Config) error // Revalidates an existing CWD against the immutable config snapshot used by this run.
+	AuditDir       string                                            // sandbox 审计落盘目录
+	CWD            string                                            // 会话工作目录（client 经 wire 声明、宿主校验后注入）；空 = 未声明，工具回退 cfg.AllowedWorkDir
+	Memory         *memory.Client                                    // nil = 禁用
+	// CollectTools assembles built-in, plugin, and session resources for each run.
+	CollectTools         func(cfg *sandbox.Config, options ToolCollectionOptions) []core.Tool
 	NewProvider          func(cfg *runtimeconfig.Config) (core.Provider, error) // 按当前 default_provider 构造协议适配器
 	Instruction          *memory.InstructionSet                                 // 会话边界刷新（Init / /new 经 startSession 重载）
 	Store                ConversationStore                                      // nil = 持久化禁用（接口字段必须真 nil，typed-nil 会让禁用判断失效）

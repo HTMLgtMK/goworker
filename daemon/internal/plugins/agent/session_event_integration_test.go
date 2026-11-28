@@ -33,7 +33,7 @@ func TestGeneratedTitleReachesReattachedPluginSubscriber(t *testing.T) {
 	})
 	p.deps = runtimeagent.SessionDeps{
 		Config:       runtimeconfig.Default(),
-		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		CollectTools: func(*sandbox.Config, runtimeagent.ToolCollectionOptions) []core.Tool { return nil },
 		NewProvider:  func(*runtimeconfig.Config) (core.Provider, error) { return provider, nil },
 	}
 	if _, err := p.mountRuntime(store); err != nil {

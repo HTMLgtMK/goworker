@@ -669,8 +669,8 @@ func (p *AgentPlugin) startSession() {
 		AuditDir:    p.paths.AuditDir,
 		Memory:      p.memory,
 		Instruction: resources.instruction,
-		CollectTools: func(cfg *sandbox.Config) []core.Tool {
-			return p.collectToolsWithResources(cfg, resources)
+		CollectTools: func(cfg *sandbox.Config, options runtimeagent.ToolCollectionOptions) []core.Tool {
+			return p.collectToolsWithResources(cfg, resources, options)
 		},
 		NewProvider:          p.providerFactory,
 		PersistAllowRule:     p.persistAllowRule,
