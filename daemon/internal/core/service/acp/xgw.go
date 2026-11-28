@@ -191,13 +191,11 @@ func (h *FrontendHandler) xgwRunStart(ctx context.Context, params json.RawMessag
 		return nil, protocol.ErrClosed
 	}
 	h.bindDeviceTools(req.SessionID)
-	var runID, state string
-	var err error
-	if runs, ok := h.runs.(model.NegotiatedRunControlSource); ok {
-		runID, state, err = runs.StartRunWithTools(req.SessionID, h.connectionID, req.Input, req.RequestID, h.deviceToolSource(req.SessionID))
-	} else {
-		runID, state, err = h.runs.StartRun(req.SessionID, h.connectionID, req.Input, req.RequestID)
+	options := model.RunToolOptions{
+		ToolOptions: model.ToolCollectionOptions{DisableDefaultTools: h.mobileClientEnabled()},
+		ToolSource:  h.deviceToolSource(req.SessionID),
 	}
+	runID, state, err := h.runs.StartRun(req.SessionID, h.connectionID, req.Input, req.RequestID, options)
 	if err != nil {
 		return nil, xgwError("%s: %v", XMethodRunStart, err)
 	}

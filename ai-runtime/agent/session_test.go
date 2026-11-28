@@ -25,7 +25,7 @@ func testSession(pv core.Provider) (*Session, *runtimeconfig.Config) {
 		Config:       cfg,
 		AuditDir:     "",
 		Memory:       nil,
-		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool { return nil },
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
 			return pv, nil
 		},

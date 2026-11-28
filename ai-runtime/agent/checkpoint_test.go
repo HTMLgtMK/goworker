@@ -53,7 +53,7 @@ func TestCheckpoint_FiltersToolMessages(t *testing.T) {
 		Config:       cfg,
 		AuditDir:     "",
 		Memory:       ms,
-		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool { return nil },
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
 			return runtimeopenai.NewProvider("mock", srv.URL, "", "mock", srv.Client()), nil
 		},
@@ -93,7 +93,7 @@ func newCheckpointSession(t *testing.T, response string) *Session {
 		Config:       cfg,
 		AuditDir:     "",
 		Memory:       ms,
-		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool { return nil },
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
 			return runtimeopenai.NewProvider("mock", srv.URL, "", "mock", srv.Client()), nil
 		},
@@ -165,7 +165,7 @@ func TestCheckpointSync_SkipsWhenNoop(t *testing.T) {
 	// memory 禁用：同样静默
 	noMem := NewSession(SessionDeps{
 		Config:       runtimeconfig.Default(),
-		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool { return nil },
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
 			return nil, fmt.Errorf("should not be called")
 		},

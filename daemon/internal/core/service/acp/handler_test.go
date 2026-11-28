@@ -646,6 +646,37 @@ func TestLoadSessionArchivedIsReadOnly(t *testing.T) {
 	}
 }
 
+func TestMobileCapabilityScopesDefaultToolPolicyToConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		caps     string
+		wantSkip bool
+	}{
+		{name: "mobile", caps: `{"mobile":true}`, wantSkip: true},
+		{name: "ordinary", caps: `{}`, wantSkip: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reporter := &capsReporter{caps: decodeCaps(t, tc.caps)}
+			var gotDisable bool
+			handler := &FrontendHandler{
+				evaluate: func(ctx *model.Context, _ string) error {
+					gotDisable = ctx.ToolOptions.DisableDefaultTools
+					return nil
+				},
+				gate: NewSessionGate(),
+			}
+			handler.InitializeReady(context.Background(), reporter)
+			handler.remember("s1")
+			if _, err := handler.Prompt(context.Background(), "s1", []protocol.ContentBlock{protocol.TextBlock("hi")}, reporter); err != nil {
+				t.Fatalf("Prompt: %v", err)
+			}
+			if gotDisable != tc.wantSkip {
+				t.Fatalf("DisableDefaultTools = %v, want %v", gotDisable, tc.wantSkip)
+			}
+		})
+	}
+}
+
 func TestPromptRejectsWorkspaceReadOnlySession(t *testing.T) {
 	sessions := &fakeSessionSource{readOnlyReason: errors.New("workspace is unavailable")}
 	handler := &FrontendHandler{

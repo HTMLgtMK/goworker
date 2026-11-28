@@ -47,7 +47,7 @@ func (s *workspaceSessionSource) CreateBoundSession(cwd string) (string, error) 
 
 	deps := runtimeagent.SessionDeps{
 		Config: s.cfg,
-		CollectTools: func(*sandbox.Config) []core.Tool {
+		CollectTools: func(*sandbox.Config, runtimeagent.ToolCollectionOptions) []core.Tool {
 			return nil
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {

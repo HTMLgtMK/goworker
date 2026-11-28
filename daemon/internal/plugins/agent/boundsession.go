@@ -457,8 +457,8 @@ func (p *AgentPlugin) buildRuntimeWithResources(st *session.Store, resources *se
 	deps := p.deps
 	if resources != nil && resources.id != "" {
 		deps.Instruction = resources.instruction
-		deps.CollectTools = func(cfg *sandbox.Config) []core.Tool {
-			return p.collectToolsWithResources(cfg, resources)
+		deps.CollectTools = func(cfg *sandbox.Config, options runtimeagent.ToolCollectionOptions) []core.Tool {
+			return p.collectToolsWithResources(cfg, resources, options)
 		}
 	}
 	deps.Store = st

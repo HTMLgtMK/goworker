@@ -55,7 +55,7 @@ func TestE2E_SessionPersistFullChain(t *testing.T) {
 		Config:       runtimeCfg,
 		AuditDir:     filepath.Join(dir, "audit"),
 		Memory:       nil,
-		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		CollectTools: func(*sandbox.Config, agent.ToolCollectionOptions) []core.Tool { return nil },
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
 			return runtimeopenai.NewProvider("mock", srv.URL, "", "mock", srv.Client()), nil
 		},

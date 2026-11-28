@@ -388,7 +388,7 @@ func TestReleasedSessionRecoveryPrecedesRuntimePublication(t *testing.T) {
 
 	const connectionID = "run-during-reopen"
 	p.AcquireControl(sessionID, connectionID)
-	runDuringReopenID, _, runDuringReopenErr := p.StartRun(sessionID, connectionID, "should wait for recovery", "during-reopen")
+	runDuringReopenID, _, runDuringReopenErr := p.StartRun(sessionID, connectionID, "should wait for recovery", "during-reopen", model.RunToolOptions{})
 
 	recovery.unblock()
 	for name, done := range map[string]<-chan error{"first": firstDone, "second": secondDone} {
@@ -425,7 +425,7 @@ func TestReleasedSessionRecoveryPrecedesRuntimePublication(t *testing.T) {
 		t.Fatalf("stale run records after reopen = %+v, want original + one interrupted marker", staleRecords)
 	}
 
-	liveRunID, _, err := p.StartRun(sessionID, connectionID, "run after recovery", "after-reopen")
+	liveRunID, _, err := p.StartRun(sessionID, connectionID, "run after recovery", "after-reopen", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun after recovery: %v", err)
 	}
@@ -451,7 +451,7 @@ func TestLoadBoundSessionDoesNotInterruptLiveRun(t *testing.T) {
 	sid := p.CurrentSessionID()
 	p.AcquireControl(sid, "connection-live")
 
-	runID, _, err := p.StartRun(sid, "connection-live", "keep running", "request-live")
+	runID, _, err := p.StartRun(sid, "connection-live", "keep running", "request-live", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("StartRun: %v", err)
 	}

@@ -35,7 +35,7 @@ func TestSessionRunRevalidatesExistingCWDAgainstRunSnapshot(t *testing.T) {
 			}
 			return sentinel
 		},
-		CollectTools: func(*sandbox.Config) []core.Tool {
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool {
 			collected++
 			return nil
 		},

@@ -938,7 +938,7 @@ func newCapabilityRunRuntime(t *testing.T, m *SessionManager, id string, pv core
 	t.Helper()
 	deps := SessionDeps{
 		Config:       runtimeconfig.Default(),
-		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool { return nil },
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
 			return pv, nil
 		},

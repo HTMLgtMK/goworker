@@ -152,8 +152,9 @@ func (p *AgentPlugin) handleAgent(ctx *model.Context) error {
 		return fmt.Errorf("agent: session %q is archived and read-only", rt.ID)
 	}
 	handle, err := p.StartRunSync(rt.ID, runtimeagent.RunRequest{
-		Input:      strings.Join(ctx.Args, " "),
-		ToolSource: ctx.ToolSource,
+		Input:       strings.Join(ctx.Args, " "),
+		ToolSource:  ctx.ToolSource,
+		ToolOptions: ctx.ToolOptions,
 	}, callbacksFromPlugin(ctx))
 	if err != nil {
 		return err

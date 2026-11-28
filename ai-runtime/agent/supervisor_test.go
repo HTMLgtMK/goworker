@@ -473,7 +473,7 @@ func TestStartRunJournalsQueuedBeforeReturn(t *testing.T) {
 	s := NewSession(SessionDeps{
 		Config:   runtimeconfig.Default(),
 		AuditDir: "",
-		CollectTools: func(*sandbox.Config) []core.Tool {
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool {
 			return nil
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
@@ -541,7 +541,7 @@ func TestStartRunRejectsWhenQueuedJournalFails(t *testing.T) {
 	s := NewSession(SessionDeps{
 		Config:   runtimeconfig.Default(),
 		AuditDir: "",
-		CollectTools: func(*sandbox.Config) []core.Tool {
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool {
 			return nil
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
@@ -610,7 +610,7 @@ func TestStartRunRejectsWhenEventHubSeedingFails(t *testing.T) {
 	s := NewSession(SessionDeps{
 		Config:   runtimeconfig.Default(),
 		AuditDir: "",
-		CollectTools: func(*sandbox.Config) []core.Tool {
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool {
 			return nil
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
@@ -785,7 +785,7 @@ func TestCancelRunningRun(t *testing.T) {
 	s := NewSession(SessionDeps{
 		Config:   runtimeconfig.Default(),
 		AuditDir: "",
-		CollectTools: func(*sandbox.Config) []core.Tool {
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool {
 			return nil
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
@@ -961,7 +961,7 @@ func newEventRunRuntime(t *testing.T, m *SessionManager, pv core.Provider) event
 	s := NewSession(SessionDeps{
 		Config:   runtimeconfig.Default(),
 		AuditDir: "",
-		CollectTools: func(*sandbox.Config) []core.Tool {
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool {
 			return nil
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
@@ -1457,7 +1457,7 @@ func TestStartRunInjectsRunContextValues(t *testing.T) {
 	s := NewSession(SessionDeps{
 		Config:   runtimeconfig.Default(),
 		AuditDir: "",
-		CollectTools: func(*sandbox.Config) []core.Tool {
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool {
 			return nil
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
@@ -1753,7 +1753,7 @@ func TestTitleMiddlewareProposesFirstTurn(t *testing.T) {
 	titles := make(chan string, 1)
 	s := NewSession(SessionDeps{
 		Config:       runtimeconfig.Default(),
-		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool { return nil },
 		NewProvider:  func(*runtimeconfig.Config) (core.Provider, error) { return pv, nil },
 		Store:        st, RunJournal: jr, RunEvents: jr, TitleStore: st,
 		SessionEvent: func(event string, data any) { titles <- event },

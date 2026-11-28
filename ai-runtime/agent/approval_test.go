@@ -362,7 +362,7 @@ func newHitlRunRuntime(t *testing.T, m *SessionManager, id string, pv core.Provi
 	cfg.Sandbox.AllowedWorkDir = t.TempDir()
 	deps := SessionDeps{
 		Config: cfg,
-		CollectTools: func(sb *sandbox.Config) []core.Tool {
+		CollectTools: func(sb *sandbox.Config, _ ToolCollectionOptions) []core.Tool {
 			return DefaultTools(sb)
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {

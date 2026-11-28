@@ -40,7 +40,7 @@ func TestAutomaticTitleOnceAcrossRuntimeReap(t *testing.T) {
 	p.current.Store(runtimeagent.NewSessionRuntime("other", nil))
 	provider := &reapTitleProvider{calls: make(chan struct{}, 2), release: make(chan struct{})}
 	defer close(provider.release)
-	p.deps = runtimeagent.SessionDeps{Config: runtimeconfig.Default(), CollectTools: func(*sandbox.Config) []core.Tool { return nil }, NewProvider: func(*runtimeconfig.Config) (core.Provider, error) { return provider, nil }}
+	p.deps = runtimeagent.SessionDeps{Config: runtimeconfig.Default(), CollectTools: func(*sandbox.Config, runtimeagent.ToolCollectionOptions) []core.Tool { return nil }, NewProvider: func(*runtimeconfig.Config) (core.Provider, error) { return provider, nil }}
 	if _, err := p.mountRuntime(store); err != nil {
 		t.Fatal(err)
 	}

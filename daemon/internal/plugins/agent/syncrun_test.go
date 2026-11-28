@@ -234,7 +234,7 @@ func TestHandleAgentBusyRejectedWhileRunInFlight(t *testing.T) {
 
 	// xgw 后台提交(持 lease):同一门禁,同样拒绝。
 	p.AcquireControl(sid, "conn-x")
-	_, _, err = p.StartRun(sid, "conn-x", "bg", "req-busy")
+	_, _, err = p.StartRun(sid, "conn-x", "bg", "req-busy", model.RunToolOptions{})
 	if !errors.Is(err, runtimeagent.ErrRunActive) {
 		t.Fatalf("xgw StartRun while sync run in flight = %v, want ErrRunActive", err)
 	}
@@ -251,7 +251,7 @@ func TestHandleAgentBusyRejectedWhileRunInFlight(t *testing.T) {
 	waitActiveCleared(t, p)
 
 	// 释放后 xgw 后台提交恢复:queued 接受,随后跑完(后台 Run 不受影响)。
-	runID, state, err := p.StartRun(sid, "conn-x", "bg2", "req-busy-2")
+	runID, state, err := p.StartRun(sid, "conn-x", "bg2", "req-busy-2", model.RunToolOptions{})
 	if err != nil {
 		t.Fatalf("xgw StartRun after release: %v", err)
 	}

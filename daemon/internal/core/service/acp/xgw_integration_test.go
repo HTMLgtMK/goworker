@@ -89,7 +89,7 @@ type xgwLiveControl struct {
 // newXGWLiveControl registers a real runtime with a scripted provider and in-memory event
 // journal. HITL uses the real default tools and normal sandbox; leaving RunJournal nil exercises
 // the in-memory RunStatus path.
-func newXGWLiveControl(t *testing.T, id string, pv core.Provider, collect func(*sandbox.Config) []core.Tool) *xgwLiveControl {
+func newXGWLiveControl(t *testing.T, id string, pv core.Provider, collect func(*sandbox.Config, runtimeagent.ToolCollectionOptions) []core.Tool) *xgwLiveControl {
 	t.Helper()
 	m := runtimeagent.NewSessionManager()
 	t.Cleanup(func() { m.Close() })
@@ -97,11 +97,11 @@ func newXGWLiveControl(t *testing.T, id string, pv core.Provider, collect func(*
 	cfg.Sandbox.AllowedWorkDir = t.TempDir()
 	deps := runtimeagent.SessionDeps{
 		Config: cfg,
-		CollectTools: func(sb *sandbox.Config) []core.Tool {
+		CollectTools: func(sb *sandbox.Config, options runtimeagent.ToolCollectionOptions) []core.Tool {
 			if collect == nil {
 				return nil
 			}
-			return collect(sb)
+			return collect(sb, options)
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) { return pv, nil },
 		RunEvents:   &memEventJournal{},
@@ -201,10 +201,8 @@ func (f *xgwLiveControl) requireCurrent(sessionID string) error {
 	return nil
 }
 
-// StartRun mirror runcontrol.go(current 校验 → fencing:lease 校验与提交同锁,
-// 第三轮评审 I4):幂等表命中短路(返回原 runID 与当前状态快照)→
-// manager.StartRun(空回调后台提交)→ 记账。
-func (f *xgwLiveControl) StartRun(sessionID, connectionID, input, requestID string) (string, string, error) {
+// StartRun mirrors runcontrol.go: lease validation, idempotency, and submission are one operation.
+func (f *xgwLiveControl) StartRun(sessionID, connectionID, input, requestID string, options model.RunToolOptions) (string, string, error) {
 	if err := f.requireCurrent(sessionID); err != nil {
 		return "", "", err
 	}
@@ -221,7 +219,11 @@ func (f *xgwLiveControl) StartRun(sessionID, connectionID, input, requestID stri
 		}
 	}
 	f.startRuns++
-	h, err := f.m.StartRun(f.sid, runtimeagent.RunRequest{Input: input}, runtimeagent.RunCallbacks{})
+	h, err := f.m.StartRun(f.sid, runtimeagent.RunRequest{
+		Input:       input,
+		ToolSource:  options.ToolSource,
+		ToolOptions: options.ToolOptions,
+	}, runtimeagent.RunCallbacks{})
 	if err != nil {
 		return "", "", err
 	}
@@ -231,9 +233,6 @@ func (f *xgwLiveControl) StartRun(sessionID, connectionID, input, requestID stri
 		}
 		f.runByReq[requestID] = h
 	}
-	// fresh 提交返回接受时刻快照(SubmitState,恒 queued),镜像生产的
-	// runcontrol.StartRun;活快照 State() 在 fast provider 下可能是 completed,
-	// 会让 wire 契约断言变成调度竞争。
 	return h.RunID, string(h.SubmitState()), nil
 }
 
@@ -479,6 +478,100 @@ func (f *xgwLiveControl) ClientToolSourceForSpecs(sessionID string, specs []runt
 	wait := f.CapabilityWaitTimeout()
 	return func(context.Context) []core.Tool {
 		return runtimeagent.NewSpecAwareClientToolProxy(reg, sessionID, specs, wait)
+	}
+}
+
+func newXGWToolPolicyControl(t *testing.T, id string, pv core.Provider) *xgwLiveControl {
+	t.Helper()
+	m := runtimeagent.NewSessionManager()
+	t.Cleanup(func() { m.Close() })
+	cfg := runtimeconfig.Default()
+	cfg.Sandbox.AllowedWorkDir = t.TempDir()
+	deps := runtimeagent.SessionDeps{
+		Config: cfg,
+		CollectTools: func(sb *sandbox.Config, options runtimeagent.ToolCollectionOptions) []core.Tool {
+			if options.DisableDefaultTools {
+				return nil
+			}
+			return runtimeagent.DefaultTools(sb)
+		},
+		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) { return pv, nil },
+		RunEvents:   &memEventJournal{},
+	}
+	rt := runtimeagent.NewSessionRuntime(id, runtimeagent.NewSession(deps))
+	if err := m.Register(rt); err != nil {
+		t.Fatalf("register runtime: %v", err)
+	}
+	return &xgwLiveControl{fakeSessionSource: &fakeSessionSource{}, m: m, sid: id, leases: map[string]string{}}
+}
+
+type xgwToolCaptureProvider struct {
+	tools chan []string
+}
+
+func (p *xgwToolCaptureProvider) Name() string  { return "xgw-tool-capture" }
+func (p *xgwToolCaptureProvider) Model() string { return "m" }
+func (p *xgwToolCaptureProvider) Chat(_ context.Context, req *core.ChatRequest) (*core.ChatResponse, error) {
+	names := make([]string, 0, len(req.Tools))
+	for _, tool := range req.Tools {
+		names = append(names, tool.Name)
+	}
+	p.tools <- names
+	return &core.ChatResponse{Choices: []core.ResponseChoice{{Message: core.Message{Role: "assistant", Content: "done"}}}}, nil
+}
+func (p *xgwToolCaptureProvider) ChatStream(context.Context, *core.ChatRequest) (<-chan core.Token, error) {
+	return nil, errors.New("not implemented")
+}
+
+type xgwToolPolicyTest struct {
+	name            string
+	caps            string
+	disableDefaults bool
+}
+
+func TestXGWRunStartInitializeControlsProviderDefaultTools(t *testing.T) {
+	for _, tc := range []xgwToolPolicyTest{
+		{name: "mobile", caps: `{"mobile":true}`, disableDefaults: true},
+		{name: "ordinary", caps: `{}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &xgwToolCaptureProvider{tools: make(chan []string, 1)}
+			src := newXGWToolPolicyControl(t, "xgw-mobile-tools-"+tc.name, provider)
+			stack := newXGWLiveStack(t, nil, src)
+			_, err := stack.client.InitializeWithRequest(context.Background(), protocol.InitializeRequest{
+				ProtocolVersion:    protocol.Version,
+				ClientCapabilities: decodeCaps(t, tc.caps),
+			})
+			if err != nil {
+				t.Fatalf("Initialize: %v", err)
+			}
+			sid := stack.liveNewSession(t)
+			if _, err := stack.liveAttachRaw(t, map[string]any{"sessionId": sid, "mode": "control"}); err != nil {
+				t.Fatalf("attach control: %v", err)
+			}
+			if _, err := stack.liveCallRaw(t, XMethodRunStart, map[string]any{
+				"sessionId": sid,
+				"input":     "inspect the runtime tools",
+				"requestId": "mobile-tools-" + tc.name,
+			}); err != nil {
+				t.Fatalf("run/start: %v", err)
+			}
+
+			select {
+			case names := <-provider.tools:
+				got := make(map[string]bool, len(names))
+				for _, name := range names {
+					got[name] = true
+				}
+				for _, name := range []string{"bash", "read_file", "write_file"} {
+					if got[name] == tc.disableDefaults {
+						t.Errorf("provider tools %v: default tool %q present=%v, disableDefaultTools=%v", names, name, got[name], tc.disableDefaults)
+					}
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("provider did not receive the run request")
+			}
+		})
 	}
 }
 
@@ -813,7 +906,9 @@ func TestXGWIntegrationApprovalAfterReconnect(t *testing.T) {
 		}}},
 		{Role: "assistant", Content: "approved run done"},
 	}}
-	src := newXGWLiveControl(t, "xgw-proto-hitl", pv, runtimeagent.DefaultTools)
+	src := newXGWLiveControl(t, "xgw-proto-hitl", pv, func(cfg *sandbox.Config, _ runtimeagent.ToolCollectionOptions) []core.Tool {
+		return runtimeagent.DefaultTools(cfg)
+	})
 
 	stackA := newXGWLiveStack(t, nil, src)
 	stackA.liveInitialize(t)
@@ -1398,8 +1493,9 @@ func TestXGWIntegrationDeviceToolBinderProbeAndDisconnectUnbind(t *testing.T) {
 			cb.EmitToken = ctx.FrontendContext.EmitToken
 		}
 		h, err := src.m.StartRun(src.sid, runtimeagent.RunRequest{
-			Input:      input,
-			ToolSource: ctx.FrontendContext.ToolSource,
+			Input:       input,
+			ToolSource:  ctx.FrontendContext.ToolSource,
+			ToolOptions: ctx.FrontendContext.ToolOptions,
 		}, cb)
 		if err != nil {
 			return err

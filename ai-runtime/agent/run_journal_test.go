@@ -53,7 +53,7 @@ func newJournaledSessionWithProvider(st ConversationStore, jr *stubRunJournal, p
 	return NewSession(SessionDeps{
 		Config:   runtimeconfig.Default(),
 		AuditDir: "",
-		CollectTools: func(*sandbox.Config) []core.Tool {
+		CollectTools: func(*sandbox.Config, ToolCollectionOptions) []core.Tool {
 			return nil
 		},
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {

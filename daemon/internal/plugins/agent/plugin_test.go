@@ -105,6 +105,51 @@ func TestValidateSessionCWDUsesCurrentConfigSnapshot(t *testing.T) {
 	}
 }
 
+func TestCollectToolsCanOmitOnlyRuntimeDefaults(t *testing.T) {
+	cfg := runtimeconfig.Default()
+	hub, _ := testHub(cfg)
+	hub.Tools = func() []model.Tool {
+		return []model.Tool{
+			{Name: "bash", Description: "plugin bash"},
+			{Name: "read_file", Description: "plugin reader"},
+			{Name: "plugin_tool", Description: "plugin tool"},
+		}
+	}
+	p := &AgentPlugin{hub: hub, cfg: cfg}
+	resources := &sessionResources{mcpTools: []core.Tool{{Name: "mcp_tool"}}}
+
+	tools := p.collectToolsWithResources(nil, resources, runtimeagent.ToolCollectionOptions{DisableDefaultTools: true})
+	got := make(map[string]int, len(tools))
+	for _, tool := range tools {
+		got[tool.Name]++
+	}
+	for _, name := range []string{"bash", "read_file", "plugin_tool", "mcp_tool"} {
+		if got[name] != 1 {
+			t.Errorf("tool %q count = %d, want exactly one custom tool", name, got[name])
+		}
+	}
+	if got["write_file"] != 0 {
+		t.Errorf("default write_file tool should be omitted, got count %d", got["write_file"])
+	}
+
+	allTools := p.collectToolsWithResources(nil, resources, runtimeagent.ToolCollectionOptions{})
+	for name, want := range map[string]int{"bash": 2, "read_file": 2, "write_file": 1} {
+		if count := countCoreTools(allTools, name); count != want {
+			t.Errorf("tool %q count = %d, want %d including registered same-name tools", name, count, want)
+		}
+	}
+}
+
+func countCoreTools(tools []core.Tool, name string) int {
+	count := 0
+	for _, tool := range tools {
+		if tool.Name == name {
+			count++
+		}
+	}
+	return count
+}
+
 func TestCollectToolsPreservesRegisteredToolMetadata(t *testing.T) {
 	cfg := runtimeconfig.Default()
 	hub, _ := testHub(cfg)
@@ -121,7 +166,7 @@ func TestCollectToolsPreservesRegisteredToolMetadata(t *testing.T) {
 	}
 	p := &AgentPlugin{hub: hub, cfg: cfg}
 
-	for _, tool := range p.collectTools(nil) {
+	for _, tool := range p.collectTools(nil, runtimeagent.ToolCollectionOptions{}) {
 		if tool.Name != "custom_write" {
 			continue
 		}
@@ -241,7 +286,7 @@ func newAgentPlugin(hub *model.Hub) *AgentPlugin {
 		Config:       cfg,
 		AuditDir:     "",
 		Memory:       p.memory,
-		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		CollectTools: func(*sandbox.Config, runtimeagent.ToolCollectionOptions) []core.Tool { return nil },
 		NewProvider: func(cfg *runtimeconfig.Config) (core.Provider, error) {
 			provider, _, err := cfg.LLM.ResolveCurrent()
 			if err != nil {
@@ -268,7 +313,7 @@ func newAgentPluginP(hub *model.Hub, pv core.Provider) *AgentPlugin {
 		Config:       cfg,
 		AuditDir:     "",
 		Memory:       p.memory,
-		CollectTools: func(*sandbox.Config) []core.Tool { return nil },
+		CollectTools: func(*sandbox.Config, runtimeagent.ToolCollectionOptions) []core.Tool { return nil },
 		NewProvider: func(*runtimeconfig.Config) (core.Provider, error) {
 			return pv, nil
 		},
@@ -625,7 +670,7 @@ func TestCollectTools_IncludesSkills(t *testing.T) {
 	p := newAgentPlugin(hub)
 	p.skills = []skills.Skill{{Name: "gofmt", Description: "格式化 Go 代码", Content: "用 gofmt 清理代码。"}}
 
-	tools := p.collectTools(nil)
+	tools := p.collectTools(nil, runtimeagent.ToolCollectionOptions{})
 	var found *core.Tool
 	for i := range tools {
 		if tools[i].Name == "skill_gofmt" {
@@ -870,7 +915,7 @@ func TestResourceSnapshotsKeepOldMCPCallsAliveAcrossRefresh(t *testing.T) {
 	}
 	oldResources.mcpTools = []core.Tool{oldTool}
 	p.publishResources(oldResources)
-	oldTools := p.collectToolsWithResources(nil, oldResources)
+	oldTools := p.collectToolsWithResources(nil, oldResources, runtimeagent.ToolCollectionOptions{})
 	foundOldSkill := false
 	for _, tool := range oldTools {
 		if tool.Name == "skill_old_skill" {
@@ -1482,7 +1527,7 @@ func TestCollectTools_RegistersMemorySearch(t *testing.T) {
 	p.memory.UpsertTask(&memory.Task{Title: "查询长沙天气", Status: "closed", Summary: "昨天查的"})
 
 	cfg := p.sandboxConfig()
-	tools := p.collectTools(&cfg)
+	tools := p.collectTools(&cfg, runtimeagent.ToolCollectionOptions{})
 	var ms *core.Tool
 	for i := range tools {
 		if tools[i].Name == "memory_search" {
@@ -1509,7 +1554,7 @@ func TestCollectTools_RegistersMemorySearch(t *testing.T) {
 	p2 := newAgentPlugin(hub2)
 	p2.memory = nil
 	cfg2 := p2.sandboxConfig()
-	for _, tl := range p2.collectTools(&cfg2) {
+	for _, tl := range p2.collectTools(&cfg2, runtimeagent.ToolCollectionOptions{}) {
 		if tl.Name == "memory_search" {
 			t.Fatal("memory_search should not register when memory disabled")
 		}
